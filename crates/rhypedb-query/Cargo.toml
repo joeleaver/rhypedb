@@ -1,0 +1,14 @@
+[package]
+name = "rhypedb-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rhypedb-schema = { workspace = true }
+rhypedb-engine = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rhypedb-storage = { workspace = true }
+tempfile = { workspace = true }
+bytes = { workspace = true }

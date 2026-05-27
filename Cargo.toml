@@ -12,6 +12,7 @@ rhypedb-storage = { path = "crates/rhypedb-storage" }
 rhypedb-schema = { path = "crates/rhypedb-schema" }
 rhypedb-engine = { path = "crates/rhypedb-engine" }
 rhypedb-vector = { path = "crates/rhypedb-vector" }
+rhypedb-query = { path = "crates/rhypedb-query" }
 bytes = "1"
 crc32fast = "1"
 crossbeam-skiplist = "0.1"

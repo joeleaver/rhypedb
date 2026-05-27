@@ -326,6 +326,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhypedb-query"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rhypedb-engine",
+ "rhypedb-schema",
+ "rhypedb-storage",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "rhypedb-schema"
 version = "0.1.0"
 dependencies = [
