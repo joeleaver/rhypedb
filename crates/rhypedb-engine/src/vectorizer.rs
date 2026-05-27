@@ -16,6 +16,19 @@ use rhypedb_vector::hnsw::HnswConfig;
 use crate::object::{deserialize_fields, Value};
 use crate::EngineResult;
 
+/// Aggregate indexing status.
+#[derive(Debug, Clone)]
+pub struct IndexingStatus {
+    pub pending: usize,
+    pub index_stats: Vec<IndexStat>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexStat {
+    pub name: String,
+    pub vectors: usize,
+}
+
 /// State of a vector field on an object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -294,6 +307,35 @@ impl Vectorizer {
         match self.storage.get(&txn, &state_key)? {
             Some(data) if !data.is_empty() => Ok(VectorState::from(data[0])),
             _ => Ok(VectorState::Pending),
+        }
+    }
+
+    /// Get aggregate indexing status: pending queue depth, indexed count, and
+    /// vectors loaded in each HNSW index.
+    pub fn status(&self) -> IndexingStatus {
+        // Count pending jobs in the queue.
+        let txn = self.storage.begin_txn();
+        let prefix = KeyBuilder::queue_prefix();
+        let pending = self
+            .storage
+            .scan_prefix(&txn, &prefix)
+            .map(|e| e.len())
+            .unwrap_or(0);
+        drop(txn);
+
+        // Count vectors in each HNSW index.
+        let indexes = self.indexes.read();
+        let mut index_stats = Vec::new();
+        for (name, index) in indexes.iter() {
+            index_stats.push(IndexStat {
+                name: name.clone(),
+                vectors: index.len(),
+            });
+        }
+
+        IndexingStatus {
+            pending,
+            index_stats,
         }
     }
 

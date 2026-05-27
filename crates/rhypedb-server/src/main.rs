@@ -193,6 +193,29 @@ async fn handle_health(
     )
 }
 
+async fn handle_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let mut result = serde_json::json!({
+        "subscriptions": state.db.subscriptions().subscription_count(),
+    });
+
+    if let Some(vectorizer) = &state.vectorizer {
+        let status = vectorizer.status();
+        let indexes: Vec<serde_json::Value> = status
+            .index_stats
+            .iter()
+            .map(|s| serde_json::json!({ "name": s.name, "vectors": s.vectors }))
+            .collect();
+        result["vectorizer"] = serde_json::json!({
+            "pending": status.pending,
+            "indexes": indexes,
+        });
+    }
+
+    Json(result)
+}
+
 /// WebSocket subscription endpoint.
 /// Query params: ?type=User&id=5&kind=create,update
 #[derive(Deserialize)]
@@ -298,6 +321,7 @@ async fn main() {
     let app = Router::new()
         .route("/query", post(handle_query))
         .route("/subscribe", get(handle_subscribe))
+        .route("/status", get(handle_status))
         .route("/health", get(handle_health))
         .with_state(state);
 
