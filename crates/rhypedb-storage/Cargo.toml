@@ -1,0 +1,14 @@
+[package]
+name = "rhypedb-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+crossbeam-skiplist = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

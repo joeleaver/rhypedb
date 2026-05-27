@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+rhypedb-storage = { path = "crates/rhypedb-storage" }
+bytes = "1"
+crc32fast = "1"
+crossbeam-skiplist = "0.1"
+parking_lot = "0.12"
+thiserror = "2"
+tempfile = "3"
