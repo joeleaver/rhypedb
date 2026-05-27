@@ -20,6 +20,7 @@ pub struct Database {
     storage: LsmTree,
     type_ids: HashMap<String, u64>,
     rel_ids: HashMap<String, u64>,
+    field_ids: HashMap<String, u64>,
     next_object_id: AtomicU64,
 }
 
@@ -32,7 +33,9 @@ impl Database {
         // Assign stable numeric IDs to types and relationships.
         let mut type_ids = HashMap::new();
         let mut rel_ids = HashMap::new();
+        let mut field_ids = HashMap::new();
         let mut next_rel_id = 1u64;
+        let mut next_field_id = 1u64;
 
         let mut type_names: Vec<_> = schema.types.keys().cloned().collect();
         type_names.sort();
@@ -41,9 +44,12 @@ impl Database {
 
             let type_def = &schema.types[name];
             for field in &type_def.fields {
+                let field_key = format!("{}.{}", name, field.name);
+                field_ids.insert(field_key.clone(), next_field_id);
+                next_field_id += 1;
+
                 if matches!(field.field_type, FieldType::Relation(_)) {
-                    let rel_key = format!("{}.{}", name, field.name);
-                    rel_ids.insert(rel_key, next_rel_id);
+                    rel_ids.insert(field_key, next_rel_id);
                     next_rel_id += 1;
                 }
             }
@@ -54,6 +60,7 @@ impl Database {
             storage,
             type_ids,
             rel_ids,
+            field_ids,
             next_object_id: AtomicU64::new(1),
         })
     }
@@ -82,6 +89,17 @@ impl Database {
         let serialized = serialize_fields(&fields);
 
         let mut txn = self.storage.begin_txn();
+
+        // Check and write unique index entries.
+        for (field_name, value) in &fields {
+            let field_def = type_def.get_field(field_name).unwrap();
+            if field_def.is_unique() && !matches!(value, Value::Null) {
+                self.check_unique_and_insert(
+                    &mut txn, type_name, type_id, field_name, value, object_id,
+                )?;
+            }
+        }
+
         self.storage.put(&mut txn, &key, serialized)?;
         self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
@@ -155,6 +173,22 @@ impl Database {
         })?;
 
         let mut fields = deserialize_fields(&existing_data);
+
+        // Check unique constraints for updated fields.
+        for (field_name, value) in &updates {
+            let field_def = type_def.get_field(field_name).unwrap();
+            if field_def.is_unique() && !matches!(value, Value::Null) {
+                // Remove old unique index entry if the field had a value.
+                if let Some(old_value) = fields.get(field_name)
+                    && !matches!(old_value, Value::Null) {
+                        self.remove_unique_index(&mut txn, type_id, field_name, old_value)?;
+                    }
+                self.check_unique_and_insert(
+                    &mut txn, type_name, type_id, field_name, value, object_id,
+                )?;
+            }
+        }
+
         for (k, v) in updates {
             fields.insert(k, v);
         }
@@ -395,12 +429,45 @@ impl Database {
 
     /// Get all targets of a relationship from a source object.
     /// Returns (target_id, edge_fields) pairs.
+    ///
+    /// If the field has an @inverse directive, this transparently uses the
+    /// reverse edge index of the referenced relationship.
     pub fn get_links(
         &self,
         source_type: &str,
         source_id: u64,
         field_name: &str,
     ) -> EngineResult<Vec<(u64, FieldMap)>> {
+        let type_def = self
+            .schema
+            .get_type(source_type)
+            .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
+
+        let field = type_def.get_field(field_name).ok_or_else(|| {
+            EngineError::FieldNotFound {
+                type_name: source_type.into(),
+                field: field_name.into(),
+            }
+        })?;
+
+        let txn = self.storage.begin_txn();
+
+        // If this field has @inverse, traverse via the reverse edge index
+        // of the referenced relationship.
+        if let Some(inv) = field.inverse() {
+            let inv_rel_key = format!("{}.{}", inv.type_name, inv.field_name);
+            let inv_rel_id = *self.rel_ids.get(&inv_rel_key).ok_or_else(|| {
+                EngineError::FieldNotFound {
+                    type_name: inv.type_name.clone(),
+                    field: inv.field_name.clone(),
+                }
+            })?;
+
+            let prefix = KeyBuilder::reverse_edge_prefix(source_id, inv_rel_id);
+            return self.scan_prefix(&txn, &prefix);
+        }
+
+        // Direct forward edge scan.
         let rel_key = format!("{source_type}.{field_name}");
         let rel_id = *self
             .rel_ids
@@ -410,7 +477,6 @@ impl Database {
                 field: field_name.into(),
             })?;
 
-        let txn = self.storage.begin_txn();
         let prefix = KeyBuilder::edge_prefix(source_id, rel_id);
         self.scan_prefix(&txn, &prefix)
     }
@@ -447,6 +513,75 @@ impl Database {
 
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Check that a unique value doesn't already exist, and insert the index entry.
+    fn check_unique_and_insert(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_name: &str,
+        type_id: u64,
+        field_name: &str,
+        value: &Value,
+        object_id: u64,
+    ) -> EngineResult<()> {
+        let field_key = format!("{type_name}.{field_name}");
+        let field_id = self.field_ids[&field_key];
+        let value_bytes = value_to_index_bytes(value);
+        let unique_key = KeyBuilder::unique_index(type_id, field_id, &value_bytes);
+
+        if let Some(existing) = self.storage.get(txn, &unique_key)? {
+            let existing_id = u64::from_be_bytes(existing[..8].try_into().unwrap());
+            if existing_id != object_id {
+                return Err(EngineError::UniqueViolation {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                    value: value.to_string(),
+                });
+            }
+        }
+
+        let mut id_buf = bytes::BytesMut::with_capacity(8);
+        bytes::BufMut::put_u64(&mut id_buf, object_id);
+        self.storage.put(txn, &unique_key, id_buf.freeze())?;
+
+        Ok(())
+    }
+
+    /// Remove a unique index entry.
+    fn remove_unique_index(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_id: u64,
+        field_name: &str,
+        value: &Value,
+    ) -> EngineResult<()> {
+        // Find the field_id — we need to check all types since we only have field_name here.
+        // In practice this is called from update() which already knows the type.
+        for (key, &fid) in &self.field_ids {
+            if key.ends_with(&format!(".{field_name}")) {
+                let value_bytes = value_to_index_bytes(value);
+                let unique_key = KeyBuilder::unique_index(type_id, fid, &value_bytes);
+                self.storage.delete(txn, &unique_key)?;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn value_to_index_bytes(value: &Value) -> Vec<u8> {
+    match value {
+        Value::String(s) => s.as_bytes().to_vec(),
+        Value::U32(v) => v.to_be_bytes().to_vec(),
+        Value::U64(v) => v.to_be_bytes().to_vec(),
+        Value::I32(v) => v.to_be_bytes().to_vec(),
+        Value::I64(v) => v.to_be_bytes().to_vec(),
+        Value::F32(v) => v.to_be_bytes().to_vec(),
+        Value::F64(v) => v.to_be_bytes().to_vec(),
+        Value::Bool(v) => vec![u8::from(*v)],
+        Value::Bytes(b) => b.to_vec(),
+        Value::Null => vec![],
     }
 }
 
@@ -831,5 +966,103 @@ mod tests {
             db.get("Post", post.id),
             Err(EngineError::ObjectNotFound { .. })
         ));
+    }
+
+    #[test]
+    fn inverse_relationship_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                posts: [Post] @inverse(Post.author)
+            }
+            type Post {
+                title: String
+                author: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let mut pf1 = FieldMap::new();
+        pf1.insert("title".into(), Value::String("First Post".into()));
+        let post1 = db.create("Post", pf1).unwrap();
+
+        let mut pf2 = FieldMap::new();
+        pf2.insert("title".into(), Value::String("Second Post".into()));
+        let post2 = db.create("Post", pf2).unwrap();
+
+        // Link posts to alice via Post.author
+        db.link("Post", post1.id, "author", alice.id, None).unwrap();
+        db.link("Post", post2.id, "author", alice.id, None).unwrap();
+
+        // Traverse via User.posts (which is @inverse of Post.author)
+        let posts = db.get_links("User", alice.id, "posts").unwrap();
+        assert_eq!(posts.len(), 2);
+        let ids: Vec<_> = posts.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&post1.id));
+        assert!(ids.contains(&post2.id));
+    }
+
+    #[test]
+    fn unique_constraint_on_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("name".into(), Value::String("Alice".into()));
+        f1.insert("email".into(), Value::String("alice@example.com".into()));
+        db.create("User", f1).unwrap();
+
+        // Same email should fail.
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String("Bob".into()));
+        f2.insert("email".into(), Value::String("alice@example.com".into()));
+        let result = db.create("User", f2);
+        assert!(matches!(result, Err(EngineError::UniqueViolation { .. })));
+    }
+
+    #[test]
+    fn unique_constraint_allows_different_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("name".into(), Value::String("Alice".into()));
+        f1.insert("email".into(), Value::String("alice@example.com".into()));
+        db.create("User", f1).unwrap();
+
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String("Bob".into()));
+        f2.insert("email".into(), Value::String("bob@example.com".into()));
+        db.create("User", f2).unwrap(); // should succeed
+    }
+
+    #[test]
+    fn unique_constraint_on_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("name".into(), Value::String("Alice".into()));
+        f1.insert("email".into(), Value::String("alice@example.com".into()));
+        db.create("User", f1).unwrap();
+
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String("Bob".into()));
+        f2.insert("email".into(), Value::String("bob@example.com".into()));
+        let bob = db.create("User", f2).unwrap();
+
+        // Updating bob's email to alice's should fail.
+        let mut updates = FieldMap::new();
+        updates.insert("email".into(), Value::String("alice@example.com".into()));
+        let result = db.update("User", bob.id, updates);
+        assert!(matches!(result, Err(EngineError::UniqueViolation { .. })));
     }
 }

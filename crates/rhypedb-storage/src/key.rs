@@ -7,6 +7,7 @@ pub enum KeyPrefix {
     Edge = b'e',
     ReverseEdge = b'r',
     Vector = b'v',
+    Unique = b'u',
 }
 
 pub const SEPARATOR: u8 = b':';
@@ -142,6 +143,20 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.put_u64(rel_id);
         buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Unique index key: `u:<type_id>:<field_name_hash>:<value_bytes>`
+    /// Maps to the object_id that holds this unique value.
+    pub fn unique_index(type_id: u64, field_hash: u64, value_bytes: &[u8]) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + value_bytes.len());
+        buf.put_u8(KeyPrefix::Unique as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_hash);
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(value_bytes);
         buf.freeze()
     }
 }
