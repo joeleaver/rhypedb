@@ -297,9 +297,11 @@ impl Vectorizer {
         }
     }
 
-    /// Process all pending jobs in the queue. Called by the background worker
-    /// or directly for synchronous processing in tests.
+    /// Process pending jobs in the queue in bounded batches.
+    /// Returns the number of jobs processed in this call.
     pub fn process_pending(&self) -> EngineResult<usize> {
+        const BATCH_SIZE: usize = 64;
+
         let txn = self.storage.begin_txn();
         let prefix = KeyBuilder::queue_prefix();
         let entries = self.storage.scan_prefix(&txn, &prefix)?;
@@ -309,22 +311,33 @@ impl Vectorizer {
             return Ok(0);
         }
 
-        // Group jobs by model for batch encoding.
+        // Parse jobs, limit to BATCH_SIZE.
+        let mut jobs: Vec<(Bytes, VectorizeJob)> = entries
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let job = VectorizeJob::deserialize(&value)?;
+                Some((key, job))
+            })
+            .take(BATCH_SIZE)
+            .collect();
+
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+
+        // Group this batch by model.
         let mut jobs_by_model: HashMap<String, Vec<(Bytes, VectorizeJob)>> = HashMap::new();
-        for (key, value) in entries {
-            if let Some(job) = VectorizeJob::deserialize(&value) {
-                jobs_by_model
-                    .entry(job.model.clone())
-                    .or_default()
-                    .push((key, job));
-            }
+        for (key, job) in jobs.drain(..) {
+            jobs_by_model
+                .entry(job.model.clone())
+                .or_default()
+                .push((key, job));
         }
 
         let mut processed = 0;
 
-        for (model_name, jobs) in &jobs_by_model {
-            // Get or create embedder for this model.
-            let texts: Vec<String> = jobs
+        for (model_name, batch_jobs) in &jobs_by_model {
+            let texts: Vec<String> = batch_jobs
                 .iter()
                 .filter_map(|(_, job)| {
                     let type_id = self.type_ids.get(&job.type_name)?;
@@ -345,7 +358,6 @@ impl Vectorizer {
 
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
-            // Embed the batch.
             let embeddings = {
                 let mut embedders = self.embedders.lock();
                 let embedder = embedders
@@ -359,33 +371,29 @@ impl Vectorizer {
             let embeddings = match embeddings {
                 Ok(e) => e,
                 Err(e) => {
-                    self.mark_jobs_failed(jobs, &format!("{e}"))?;
+                    self.mark_jobs_failed(batch_jobs, &format!("{e}"))?;
                     continue;
                 }
             };
 
-            // Insert each embedding into the HNSW index, persist to LSM, and update state.
-            for (emb_idx, (queue_key, job)) in jobs.iter().enumerate() {
+            for (emb_idx, (queue_key, job)) in batch_jobs.iter().enumerate() {
                 if emb_idx >= embeddings.len() {
                     break;
                 }
 
                 let embedding = &embeddings[emb_idx];
 
-                // Insert into HNSW index.
                 let index_key = format!("{}.{}", job.type_name, job.vector_field);
                 if let Some(index) = self.indexes.read().get(&index_key) {
                     index.insert(job.object_id, embedding);
                 }
 
-                // Persist the raw embedding to LSM so it survives restart.
                 let type_id = self.type_ids[&job.type_name];
                 let field_key = format!("{}.{}", job.type_name, job.vector_field);
                 let field_id = self.field_ids[&field_key];
 
                 let vector_key = KeyBuilder::vector(type_id, job.object_id, field_id);
                 let vector_bytes = serialize_f32_vec(embedding);
-
                 let state_key =
                     KeyBuilder::vector_state(type_id, job.object_id, field_id);
 
