@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 rhypedb-storage = { workspace = true }
 rhypedb-schema = { workspace = true }
+rhypedb-vector = { workspace = true }
+rhypedb-embed = { workspace = true }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }

@@ -8,6 +8,8 @@ pub enum KeyPrefix {
     ReverseEdge = b'r',
     Vector = b'v',
     Unique = b'u',
+    Queue = b'q',
+    VectorState = b's',
 }
 
 pub const SEPARATOR: u8 = b':';
@@ -157,6 +159,38 @@ impl KeyBuilder {
         buf.put_u64(field_hash);
         buf.put_u8(SEPARATOR);
         buf.put_slice(value_bytes);
+        buf.freeze()
+    }
+
+    /// Vectorization queue entry: `q:<job_id>`
+    /// Value contains the serialized job (type, object_id, source field, vector field, model).
+    pub fn queue_entry(job_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8);
+        buf.put_u8(KeyPrefix::Queue as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(job_id);
+        buf.freeze()
+    }
+
+    /// Queue prefix for scanning all pending jobs: `q:`
+    pub fn queue_prefix() -> Bytes {
+        let mut buf = BytesMut::with_capacity(2);
+        buf.put_u8(KeyPrefix::Queue as u8);
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Vector state key: `s:<type_id>:<object_id>:<field_id>`
+    /// Value: state byte (0=pending, 1=indexed, 2=failed)
+    pub fn vector_state(type_id: u64, object_id: u64, field_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + 8);
+        buf.put_u8(KeyPrefix::VectorState as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(object_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_id);
         buf.freeze()
     }
 }

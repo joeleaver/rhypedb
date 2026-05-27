@@ -2096,8 +2096,10 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "parking_lot",
+ "rhypedb-embed",
  "rhypedb-schema",
  "rhypedb-storage",
+ "rhypedb-vector",
  "tempfile",
  "thiserror",
 ]
