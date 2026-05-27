@@ -336,25 +336,7 @@ fn infer_type_from_objects(objects: &[Object], source: &Source) -> Option<String
 }
 
 fn scan_all_objects(db: &Database, type_name: &str) -> QueryResult<Vec<Object>> {
-    // Scan all objects of a type using the object prefix.
-    // This is a brute-force approach — fine for now, will be optimized
-    // with secondary indexes later.
-    let schema = db.schema();
-    let _type_def = schema
-        .get_type(type_name)
-        .ok_or_else(|| QueryError::Type(format!("unknown type: {type_name}")))?;
-
-    let mut objects = Vec::new();
-    // Try IDs starting from 1 up to a reasonable bound.
-    // This is a temporary approach until we have a proper type scan.
-    for id in 1..10000u64 {
-        match db.get(type_name, id) {
-            Ok(obj) => objects.push(obj),
-            Err(rhypedb_engine::EngineError::ObjectNotFound { .. }) => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(objects)
+    Ok(db.scan_type(type_name)?)
 }
 
 #[cfg(test)]

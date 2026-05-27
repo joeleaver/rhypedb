@@ -155,6 +155,38 @@ impl Database {
         })
     }
 
+    /// Scan all objects of a given type. Uses the LSM prefix scan on the
+    /// object key prefix, so this is a real index scan — not a brute-force probe.
+    pub fn scan_type(&self, type_name: &str) -> EngineResult<Vec<Object>> {
+        let type_id = *self
+            .type_ids
+            .get(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+
+        let prefix = KeyBuilder::object_prefix(type_id);
+        let txn = self.storage.begin_txn();
+        let entries = self.storage.scan_prefix(&txn, &prefix)?;
+
+        let mut objects = Vec::new();
+        for (key, data) in entries {
+            // Object key: o:<type_id>:<object_id> — extract object_id from last 8 bytes.
+            if key.len() < 8 {
+                continue;
+            }
+            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let object_id = u64::from_be_bytes(id_bytes);
+
+            let fields = deserialize_fields(&data);
+            objects.push(Object {
+                type_name: type_name.into(),
+                id: object_id,
+                fields,
+            });
+        }
+
+        Ok(objects)
+    }
+
     /// Update an object's fields. Only the provided fields are updated;
     /// unmentioned fields are preserved.
     pub fn update(
@@ -744,6 +776,54 @@ mod tests {
         assert_eq!(fetched.fields.get("name"), user.fields.get("name"));
         assert_eq!(fetched.fields.get("email"), user.fields.get("email"));
         assert_eq!(fetched.fields.get("age"), user.fields.get("age"));
+    }
+
+    #[test]
+    fn scan_type_returns_all_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        for i in 0..5 {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(format!("User{i}")));
+            db.create("User", f).unwrap();
+        }
+
+        let all = db.scan_type("User").unwrap();
+        assert_eq!(all.len(), 5);
+
+        let names: Vec<_> = all
+            .iter()
+            .filter_map(|o| match o.fields.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"User0".to_string()));
+        assert!(names.contains(&"User4".to_string()));
+    }
+
+    #[test]
+    fn scan_type_excludes_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", f1).unwrap();
+
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String("Bob".into()));
+        db.create("User", f2).unwrap();
+
+        db.delete("User", alice.id).unwrap();
+
+        let all = db.scan_type("User").unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].fields.get("name"),
+            Some(&Value::String("Bob".into()))
+        );
     }
 
     #[test]
