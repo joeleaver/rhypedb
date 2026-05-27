@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -18,7 +19,7 @@ use crate::object::{deserialize_fields, serialize_fields, FieldMap, Object, Valu
 /// enforcing the schema's type constraints and referential integrity.
 pub struct Database {
     schema: Schema,
-    storage: LsmTree,
+    storage: Arc<LsmTree>,
     type_ids: HashMap<String, u64>,
     rel_ids: HashMap<String, u64>,
     field_ids: HashMap<String, u64>,
@@ -30,7 +31,7 @@ impl Database {
     /// Open a database with the given schema and data directory.
     pub fn open(schema: Schema, data_dir: impl AsRef<Path>) -> EngineResult<Self> {
         let config = LsmConfig::new(data_dir);
-        let storage = LsmTree::open(config)?;
+        let storage = Arc::new(LsmTree::open(config)?);
 
         // Assign stable numeric IDs to types and relationships.
         let mut type_ids = HashMap::new();
@@ -649,6 +650,18 @@ impl Database {
 
     pub fn subscriptions(&self) -> &SubscriptionHub {
         &self.subscriptions
+    }
+
+    pub fn storage(&self) -> &Arc<LsmTree> {
+        &self.storage
+    }
+
+    pub fn type_ids(&self) -> &HashMap<String, u64> {
+        &self.type_ids
+    }
+
+    pub fn field_ids(&self) -> &HashMap<String, u64> {
+        &self.field_ids
     }
 
     /// Check that a unique value doesn't already exist, and insert the index entry.

@@ -100,6 +100,66 @@ impl Embedder for FastEmbedder {
     }
 }
 
+/// A scored document from reranking.
+#[derive(Debug, Clone)]
+pub struct RerankResult {
+    pub index: usize,
+    pub score: f32,
+}
+
+/// Trait for cross-encoder reranking.
+pub trait Reranker: Send + Sync {
+    fn rerank(
+        &mut self,
+        query: &str,
+        documents: &[&str],
+        top_k: usize,
+    ) -> EmbedResult<Vec<RerankResult>>;
+}
+
+/// Cross-encoder reranker backed by fastembed.
+pub struct FastReranker {
+    model: fastembed::TextRerank,
+}
+
+impl FastReranker {
+    pub fn new() -> EmbedResult<Self> {
+        let mut init_options = fastembed::RerankInitOptions::default();
+        init_options.show_download_progress = false;
+
+        let model = fastembed::TextRerank::try_new(init_options)
+            .map_err(|e| EmbedError::Model(e.to_string()))?;
+
+        Ok(Self { model })
+    }
+}
+
+impl Reranker for FastReranker {
+    fn rerank(
+        &mut self,
+        query: &str,
+        documents: &[&str],
+        top_k: usize,
+    ) -> EmbedResult<Vec<RerankResult>> {
+        let results = self
+            .model
+            .rerank(query, documents, false, None)
+            .map_err(|e| EmbedError::Model(e.to_string()))?;
+
+        let mut scored: Vec<RerankResult> = results
+            .iter()
+            .map(|r| RerankResult {
+                index: r.index,
+                score: r.score,
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +221,38 @@ mod tests {
     fn unsupported_model_errors() {
         let result = FastEmbedder::new("nonexistent-model");
         assert!(matches!(result, Err(EmbedError::UnsupportedModel(_))));
+    }
+
+    #[test]
+    fn reranker_scores_relevant_higher() {
+        let mut reranker = FastReranker::new().unwrap();
+
+        let query = "What is machine learning?";
+        let documents = [
+            "Machine learning is a subset of artificial intelligence that enables systems to learn from data.",
+            "The weather forecast predicts rain tomorrow in Seattle.",
+            "Deep neural networks are used in modern AI systems for pattern recognition.",
+            "My favorite recipe for chocolate cake requires three eggs.",
+        ];
+
+        let results = reranker.rerank(query, &documents, 4).unwrap();
+
+        // The ML-related documents (0 and 2) should score higher than unrelated ones.
+        assert_eq!(results.len(), 4);
+        let top_2_indices: Vec<usize> = results.iter().take(2).map(|r| r.index).collect();
+        assert!(
+            top_2_indices.contains(&0) && top_2_indices.contains(&2),
+            "expected ML docs in top 2, got indices {:?}",
+            top_2_indices
+        );
+    }
+
+    #[test]
+    fn reranker_respects_top_k() {
+        let mut reranker = FastReranker::new().unwrap();
+
+        let documents = ["doc1", "doc2", "doc3", "doc4", "doc5"];
+        let results = reranker.rerank("query", &documents, 2).unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

@@ -17,7 +17,6 @@ use rhypedb_engine::vectorizer::Vectorizer;
 use rhypedb_query::executor::{ExecContext, QueryOutput};
 use rhypedb_query::parser::parse_query;
 use rhypedb_schema::parser::parse_schema;
-use rhypedb_storage::lsm::LsmTree;
 use rhypedb_subscribe::{ChangeKind, SubscriptionFilter};
 
 #[derive(Parser)]
@@ -130,15 +129,21 @@ async fn handle_query(
                 error: None,
             }),
         ),
-        Ok(QueryOutput::Single(obj)) => (
-            StatusCode::OK,
-            Json(QueryResponse {
-                objects: None,
-                object: Some(ObjectJson::from(obj)),
-                ok: None,
-                error: None,
-            }),
-        ),
+        Ok(QueryOutput::Single(obj)) => {
+            // Enqueue vectorization for created/updated objects.
+            if let Some(vectorizer) = &state.vectorizer {
+                enqueue_vectorize(vectorizer, &state.db, &obj);
+            }
+            (
+                StatusCode::OK,
+                Json(QueryResponse {
+                    objects: None,
+                    object: Some(ObjectJson::from(obj)),
+                    ok: None,
+                    error: None,
+                }),
+            )
+        }
         Ok(QueryOutput::Done) => (
             StatusCode::OK,
             Json(QueryResponse {
@@ -157,6 +162,25 @@ async fn handle_query(
                 error: Some(format!("{e}")),
             }),
         ),
+    }
+}
+
+fn enqueue_vectorize(vectorizer: &Vectorizer, db: &Database, obj: &Object) {
+    let schema = db.schema();
+    if let Some(type_def) = schema.get_type(&obj.type_name) {
+        for field in &type_def.fields {
+            if let Some(vec_def) = field.vectorize() {
+                let _ = vectorizer.enqueue(
+                    rhypedb_engine::vectorizer::VectorizeJob {
+                        type_name: obj.type_name.clone(),
+                        object_id: obj.id,
+                        source_field: vec_def.source_field.clone(),
+                        vector_field: field.name.clone(),
+                        model: vec_def.model.clone(),
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -254,30 +278,14 @@ async fn main() {
         .any(|td| td.fields.iter().any(|f| f.vectorize().is_some()));
 
     let vectorizer = if has_vectorize {
-        let storage = Arc::new(
-            LsmTree::open(rhypedb_storage::lsm::LsmConfig::new(
-                cli.data_dir.join("vectorizer"),
-            ))
-            .unwrap(),
-        );
-
-        let mut type_ids = HashMap::new();
-        let mut field_ids = HashMap::new();
-        let mut next_field_id = 1u64;
-        let mut type_names: Vec<_> = schema.types.keys().cloned().collect();
-        type_names.sort();
-        for (type_id, name) in (1u64..).zip(type_names.iter()) {
-            type_ids.insert(name.clone(), type_id);
-            let type_def = &schema.types[name];
-            for field in &type_def.fields {
-                let field_key = format!("{name}.{}", field.name);
-                field_ids.insert(field_key, next_field_id);
-                next_field_id += 1;
-            }
-        }
-
         let v = Arc::new(
-            Vectorizer::new(storage, schema.clone(), type_ids, field_ids).unwrap(),
+            Vectorizer::new(
+                Arc::clone(db.storage()),
+                schema.clone(),
+                db.type_ids().clone(),
+                db.field_ids().clone(),
+            )
+            .unwrap(),
         );
         v.start_worker();
         Some(v)

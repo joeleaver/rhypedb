@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use rhypedb_embed::{Embedder, FastEmbedder};
+use rhypedb_embed::{Embedder, FastEmbedder, FastReranker, Reranker};
 use rhypedb_schema::{FieldType, Schema, VectorizeDef};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::LsmTree;
@@ -104,6 +104,7 @@ pub struct Vectorizer {
     field_ids: HashMap<String, u64>,
     indexes: parking_lot::RwLock<HashMap<String, Arc<QuantizedIndex>>>,
     embedders: parking_lot::Mutex<HashMap<String, Box<dyn Embedder>>>,
+    reranker: parking_lot::Mutex<Option<Box<dyn Reranker>>>,
     next_job_id: AtomicU64,
     running: Arc<AtomicBool>,
     worker_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -159,6 +160,7 @@ impl Vectorizer {
             field_ids,
             indexes: parking_lot::RwLock::new(indexes),
             embedders: parking_lot::Mutex::new(HashMap::new()),
+            reranker: parking_lot::Mutex::new(None),
             next_job_id: AtomicU64::new(max_job_id + 1),
             running: Arc::new(AtomicBool::new(false)),
             worker_handle: parking_lot::Mutex::new(None),
@@ -365,7 +367,66 @@ impl Vectorizer {
             return Ok(Vec::new());
         }
 
-        Ok(index.search(&query_vec[0], k, ef))
+        // Over-retrieve: get more candidates than k for reranking.
+        let retrieval_k = k * 10;
+        let candidates = index.search(&query_vec[0], retrieval_k, ef.max(retrieval_k));
+
+        // Find the source field for this vector field.
+        let source_field = self
+            .schema
+            .get_type(type_name)
+            .and_then(|td| td.get_field(vector_field))
+            .and_then(|fd| fd.vectorize())
+            .map(|v| v.source_field.clone());
+
+        // Rerank if we have a reranker and can read the source text.
+        if let Some(source_field) = source_field {
+            let type_id = self.type_ids.get(type_name).copied();
+
+            // Fetch original text for each candidate.
+            let mut candidate_texts: Vec<(u64, String)> = Vec::new();
+            if let Some(type_id) = type_id {
+                for (obj_id, _dist) in &candidates {
+                    let obj_key = KeyBuilder::object(type_id, *obj_id);
+                    let txn = self.storage.begin_txn();
+                    if let Ok(Some(data)) = self.storage.get(&txn, &obj_key) {
+                        let fields = deserialize_fields(&data);
+                        if let Some(Value::String(text)) = fields.get(&source_field) {
+                            candidate_texts.push((*obj_id, text.clone()));
+                        }
+                    }
+                }
+            }
+
+            if !candidate_texts.is_empty() {
+                // Lazily initialize the reranker.
+                let mut reranker = self.reranker.lock();
+                if reranker.is_none() {
+                    match FastReranker::new() {
+                        Ok(r) => *reranker = Some(Box::new(r)),
+                        Err(_) => {
+                            // Reranker unavailable — return HNSW results as-is.
+                            return Ok(candidates.into_iter().take(k).collect());
+                        }
+                    }
+                }
+
+                if let Some(ref mut ranker) = *reranker {
+                    let doc_refs: Vec<&str> =
+                        candidate_texts.iter().map(|(_, t)| t.as_str()).collect();
+
+                    if let Ok(reranked) = ranker.rerank(query_text, &doc_refs, k) {
+                        return Ok(reranked
+                            .into_iter()
+                            .map(|r| (candidate_texts[r.index].0, r.score))
+                            .collect());
+                    }
+                }
+            }
+        }
+
+        // Fallback: return HNSW results without reranking.
+        Ok(candidates.into_iter().take(k).collect())
     }
 
     /// Search a vector index with a raw vector.

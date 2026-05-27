@@ -1,0 +1,8 @@
+type Verse {
+    book_name: String
+    book_number: u32
+    chapter: u32
+    verse: u32
+    text: String
+    embedding: Vector<384> @vectorize(source: "text", model: "all-MiniLM-L6-v2") @index(hnsw, metric: cosine, quantization: turboquant_3bit)
+}
