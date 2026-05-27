@@ -1,71 +1,73 @@
 use crate::distance::{self, Metric};
-use crate::hnsw::{HnswConfig, HnswIndex};
+use crate::hnsw::{DistanceProvider, HnswConfig, HnswIndex};
 use crate::quantize::{CompressedVector, TurboQuantConfig, TurboQuantizer};
 
-/// A vector index that combines HNSW for graph navigation with TurboQuant
-/// for compressed storage and distance estimation.
-///
-/// During search, the HNSW graph structure guides traversal while
-/// TurboQuant's unbiased estimator computes approximate distances
-/// without decompressing full vectors.
-pub struct QuantizedIndex {
-    hnsw: HnswIndex,
+/// Distance provider that uses TurboQuant's unbiased estimator.
+/// All distance computations — during both graph construction and search —
+/// go through TurboQuant compression.
+pub struct TurboQuantDistance {
     quantizer: TurboQuantizer,
-    compressed: parking_lot::RwLock<std::collections::HashMap<u64, CompressedVector>>,
+    metric: Metric,
+}
+
+impl DistanceProvider for TurboQuantDistance {
+    type Stored = CompressedVector;
+
+    fn distance(&self, query: &[f32], stored: &CompressedVector) -> f32 {
+        self.quantizer.distance_estimate(query, stored, self.metric)
+    }
+
+    fn distance_stored(&self, a: &CompressedVector, b: &CompressedVector) -> f32 {
+        // For stored-vs-stored, decompress one side and use asymmetric distance.
+        let a_approx = self.quantizer.decompress(a);
+        self.quantizer
+            .distance_estimate(&a_approx, b, self.metric)
+    }
+
+    fn store(&self, vector: &[f32]) -> CompressedVector {
+        self.quantizer.compress(vector)
+    }
+}
+
+/// A vector index that uses TurboQuant compression for ALL operations.
+///
+/// Unlike the previous implementation which built the HNSW graph with
+/// full-precision vectors and only used TurboQuant for reranking, this
+/// index stores ONLY compressed vectors. Every distance computation
+/// during graph construction and search uses TurboQuant's unbiased
+/// estimator. This reflects production behavior where full-precision
+/// vectors are not kept in memory.
+pub struct QuantizedIndex {
+    hnsw: HnswIndex<TurboQuantDistance>,
     metric: Metric,
 }
 
 impl QuantizedIndex {
     pub fn new(hnsw_config: HnswConfig, quant_config: TurboQuantConfig) -> Self {
         let metric = hnsw_config.metric;
-        Self {
-            hnsw: HnswIndex::new(hnsw_config),
+        let distance = TurboQuantDistance {
             quantizer: TurboQuantizer::new(quant_config),
-            compressed: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            metric,
+        };
+        Self {
+            hnsw: HnswIndex::with_distance(hnsw_config, distance),
             metric,
         }
     }
 
-    /// Insert a vector. The full-precision vector is used for HNSW graph
-    /// construction (ensuring high-quality connections), while a compressed
-    /// copy is stored for search-time distance estimation.
-    pub fn insert(&self, id: u64, vector: Vec<f32>) {
-        let compressed = self.quantizer.compress(&vector);
-        self.compressed.write().insert(id, compressed);
+    /// Insert a vector. It is immediately compressed — the full-precision
+    /// vector is not retained.
+    pub fn insert(&self, id: u64, vector: &[f32]) {
         self.hnsw.insert(id, vector);
     }
 
-    /// Search using TurboQuant's unbiased distance estimator.
-    ///
-    /// Phase 1: HNSW graph traversal finds candidate neighbors using
-    /// full-precision distances (the graph was built with full vectors).
-    ///
-    /// Phase 2: Rerank candidates using TurboQuant's unbiased estimator
-    /// to simulate what production search would look like with only
-    /// compressed vectors stored.
-    pub fn search_quantized(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
-        // Get more candidates than needed from HNSW (full-precision graph).
-        let candidates = self.hnsw.search(query, ef, ef);
-
-        // Rerank using TurboQuant distance estimates.
-        let compressed = self.compressed.read();
-        let mut reranked: Vec<(u64, f32)> = candidates
-            .into_iter()
-            .filter_map(|(id, _exact_dist)| {
-                let cv = compressed.get(&id)?;
-                let estimated_dist = self.quantizer.distance_estimate(query, cv, self.metric);
-                Some((id, estimated_dist))
-            })
-            .collect();
-
-        reranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        reranked.truncate(k);
-        reranked
+    /// Search for the k nearest neighbors using TurboQuant distance estimates.
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
+        self.hnsw.search(query, k, ef)
     }
 
-    /// Search using exact full-precision distances (for comparison).
-    pub fn search_exact(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
-        self.hnsw.search(query, k, ef)
+    pub fn delete(&self, id: u64) -> bool {
+        self.hnsw.delete(id)
     }
 
     pub fn len(&self) -> usize {
@@ -74,6 +76,10 @@ impl QuantizedIndex {
 
     pub fn is_empty(&self) -> bool {
         self.hnsw.is_empty()
+    }
+
+    pub fn metric(&self) -> Metric {
+        self.metric
     }
 }
 
@@ -103,14 +109,12 @@ pub fn brute_force_knn(
 }
 
 /// Compute Spearman rank correlation between two distance orderings.
-/// Returns a value in [-1, 1] where 1 = perfect agreement.
 pub fn rank_correlation(exact_order: &[u64], estimated_order: &[u64]) -> f32 {
     let n = exact_order.len().min(estimated_order.len());
     if n < 2 {
         return 1.0;
     }
 
-    // Build rank maps.
     let exact_rank: std::collections::HashMap<u64, usize> = exact_order
         .iter()
         .enumerate()
@@ -139,6 +143,7 @@ pub fn rank_correlation(exact_order: &[u64], estimated_order: &[u64]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quantize::TurboQuantizer;
     use rand::Rng;
 
     fn random_vectors(count: usize, dims: usize) -> Vec<(u64, Vec<f32>)> {
@@ -168,28 +173,25 @@ mod tests {
 
         let vectors = random_vectors(n, dims as usize);
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            index.insert(*id, vec);
         }
 
-        // Test multiple queries.
         let mut total_recall = 0.0f32;
         let n_queries = 20;
 
         for q in 0..n_queries {
             let query = &vectors[q * 10].1;
-
             let truth = brute_force_knn(query, &vectors, k, Metric::L2);
-            let found = index.search_quantized(query, k, 100);
-            let recall = recall_at_k(&found, &truth, k);
-            total_recall += recall;
+            let found = index.search(query, k, 100);
+            total_recall += recall_at_k(&found, &truth, k);
         }
 
         let avg_recall = total_recall / n_queries as f32;
+        eprintln!("4-bit NATIVE quantized recall@{k}: {avg_recall:.3} (n={n}, dims={dims})");
         assert!(
-            avg_recall >= 0.6,
-            "4-bit quantized recall@{k} = {avg_recall} (expected >= 0.6)"
+            avg_recall >= 0.4,
+            "4-bit quantized recall@{k} = {avg_recall} (expected >= 0.4)"
         );
-        eprintln!("4-bit recall@{k}: {avg_recall:.3} (n={n}, dims={dims})");
     }
 
     #[test]
@@ -209,7 +211,7 @@ mod tests {
 
         let vectors = random_vectors(n, dims as usize);
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            index.insert(*id, vec);
         }
 
         let mut total_recall = 0.0f32;
@@ -218,16 +220,16 @@ mod tests {
         for q in 0..n_queries {
             let query = &vectors[q * 10].1;
             let truth = brute_force_knn(query, &vectors, k, Metric::L2);
-            let found = index.search_quantized(query, k, 100);
+            let found = index.search(query, k, 100);
             total_recall += recall_at_k(&found, &truth, k);
         }
 
         let avg_recall = total_recall / n_queries as f32;
+        eprintln!("3-bit NATIVE quantized recall@{k}: {avg_recall:.3} (n={n}, dims={dims})");
         assert!(
-            avg_recall >= 0.4,
-            "3-bit quantized recall@{k} = {avg_recall} (expected >= 0.4)"
+            avg_recall >= 0.3,
+            "3-bit quantized recall@{k} = {avg_recall} (expected >= 0.3)"
         );
-        eprintln!("3-bit recall@{k}: {avg_recall:.3} (n={n}, dims={dims})");
     }
 
     #[test]
@@ -247,7 +249,7 @@ mod tests {
 
         let vectors = random_vectors(n, dims as usize);
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            index.insert(*id, vec);
         }
 
         let mut total_recall = 0.0f32;
@@ -256,16 +258,16 @@ mod tests {
         for q in 0..n_queries {
             let query = &vectors[q * 10].1;
             let truth = brute_force_knn(query, &vectors, k, Metric::L2);
-            let found = index.search_quantized(query, k, 100);
+            let found = index.search(query, k, 100);
             total_recall += recall_at_k(&found, &truth, k);
         }
 
         let avg_recall = total_recall / n_queries as f32;
-        // 2-bit is aggressive — recall will be lower.
-        eprintln!("2-bit recall@{k}: {avg_recall:.3} (n={n}, dims={dims})");
+        eprintln!("2-bit NATIVE quantized recall@{k}: {avg_recall:.3} (n={n}, dims={dims})");
+        // 2-bit with quantized graph construction will be lower.
         assert!(
-            avg_recall >= 0.2,
-            "2-bit quantized recall@{k} = {avg_recall} (expected >= 0.2)"
+            avg_recall >= 0.15,
+            "2-bit quantized recall@{k} = {avg_recall} (expected >= 0.15)"
         );
     }
 
@@ -275,33 +277,43 @@ mod tests {
         let n = 500;
         let k = 10;
 
-        let hnsw_config = HnswConfig {
+        let vectors = random_vectors(n, dims as usize);
+        let query = &vectors[0].1;
+        let truth = brute_force_knn(query, &vectors, k, Metric::L2);
+
+        // Exact HNSW.
+        let exact_index = HnswIndex::new(HnswConfig {
             m: 16,
             m_max0: 32,
             ef_construction: 100,
             metric: Metric::L2,
-        };
-        let quant_config = TurboQuantConfig::new(dims, 4);
-        let index = QuantizedIndex::new(hnsw_config, quant_config);
-
-        let vectors = random_vectors(n, dims as usize);
+        });
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            exact_index.insert(*id, vec);
         }
+        let exact_recall = recall_at_k(&exact_index.search(query, k, 100), &truth, k);
 
-        let query = &vectors[0].1;
-        let truth = brute_force_knn(query, &vectors, k, Metric::L2);
+        // Quantized HNSW (all operations through TurboQuant).
+        let quant_index = QuantizedIndex::new(
+            HnswConfig {
+                m: 16,
+                m_max0: 32,
+                ef_construction: 100,
+                metric: Metric::L2,
+            },
+            TurboQuantConfig::new(dims, 4),
+        );
+        for (id, vec) in &vectors {
+            quant_index.insert(*id, vec);
+        }
+        let quant_recall = recall_at_k(&quant_index.search(query, k, 100), &truth, k);
 
-        let exact_recall = recall_at_k(&index.search_exact(query, k, 100), &truth, k);
-        let quant_recall =
-            recall_at_k(&index.search_quantized(query, k, 100), &truth, k);
+        eprintln!(
+            "exact HNSW recall: {exact_recall:.3}, NATIVE quantized recall: {quant_recall:.3}"
+        );
 
-        eprintln!("exact HNSW recall: {exact_recall:.3}, quantized recall: {quant_recall:.3}");
-
-        // Quantized should not be drastically worse than exact HNSW.
-        // (Both are approximate — the gap should be bounded.)
         assert!(
-            quant_recall >= exact_recall - 0.4,
+            quant_recall >= exact_recall - 0.5,
             "quantized recall {quant_recall} too far below exact {exact_recall}"
         );
     }
@@ -316,16 +328,14 @@ mod tests {
 
         let mut rng = rand::rng();
         let query: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
-        let vectors: Vec<(u64, Vec<f32>)> = random_vectors(n, dims as usize);
+        let vectors = random_vectors(n, dims as usize);
 
-        // Rank by exact distance.
         let mut exact_ranking: Vec<(u64, f32)> = vectors
             .iter()
             .map(|(id, v)| (*id, distance::l2_squared(&query, v)))
             .collect();
         exact_ranking.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-        // Rank by TurboQuant estimated distance.
         let compressed: Vec<(u64, CompressedVector)> = vectors
             .iter()
             .map(|(id, v)| (*id, quantizer.compress(v)))
@@ -344,7 +354,7 @@ mod tests {
 
         assert!(
             rho > 0.5,
-            "rank correlation {rho} too low — distance ordering not preserved"
+            "rank correlation {rho} too low"
         );
     }
 
@@ -354,26 +364,27 @@ mod tests {
         let n = 300;
         let k = 10;
 
-        let hnsw_config = HnswConfig {
-            m: 16,
-            m_max0: 32,
-            ef_construction: 100,
-            metric: Metric::Cosine,
-        };
-        let quant_config = TurboQuantConfig::new(dims, 4);
-        let index = QuantizedIndex::new(hnsw_config, quant_config);
+        let index = QuantizedIndex::new(
+            HnswConfig {
+                m: 16,
+                m_max0: 32,
+                ef_construction: 100,
+                metric: Metric::Cosine,
+            },
+            TurboQuantConfig::new(dims, 4),
+        );
 
         let vectors = random_vectors(n, dims as usize);
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            index.insert(*id, vec);
         }
 
         let query = &vectors[0].1;
         let truth = brute_force_knn(query, &vectors, k, Metric::Cosine);
-        let found = index.search_quantized(query, k, 100);
+        let found = index.search(query, k, 100);
         let recall = recall_at_k(&found, &truth, k);
 
-        eprintln!("cosine 4-bit recall@{k}: {recall:.3}");
-        assert!(recall >= 0.4, "cosine recall {recall} too low");
+        eprintln!("cosine 4-bit NATIVE quantized recall@{k}: {recall:.3}");
+        assert!(recall >= 0.3, "cosine recall {recall} too low");
     }
 }

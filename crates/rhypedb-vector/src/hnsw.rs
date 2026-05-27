@@ -26,29 +26,80 @@ impl Default for HnswConfig {
     }
 }
 
+/// Trait for computing distances between a query and stored representations.
+/// This is what makes HNSW work with both full-precision and compressed vectors.
+pub trait DistanceProvider: Send + Sync {
+    /// The stored representation of a vector (f32 slice, compressed, etc.)
+    type Stored: Send + Sync;
+
+    /// Compute distance between a full-precision query and a stored vector.
+    fn distance(&self, query: &[f32], stored: &Self::Stored) -> f32;
+
+    /// Compute distance between two stored vectors (for neighbor pruning).
+    fn distance_stored(&self, a: &Self::Stored, b: &Self::Stored) -> f32;
+
+    /// Convert a full-precision vector into the stored representation.
+    fn store(&self, vector: &[f32]) -> Self::Stored;
+}
+
+/// Default distance provider using full-precision f32 vectors.
+pub struct ExactDistance {
+    pub metric: Metric,
+}
+
+impl DistanceProvider for ExactDistance {
+    type Stored = Vec<f32>;
+
+    fn distance(&self, query: &[f32], stored: &Vec<f32>) -> f32 {
+        compute_distance(self.metric, query, stored)
+    }
+
+    fn distance_stored(&self, a: &Vec<f32>, b: &Vec<f32>) -> f32 {
+        compute_distance(self.metric, a, b)
+    }
+
+    fn store(&self, vector: &[f32]) -> Vec<f32> {
+        vector.to_vec()
+    }
+}
+
 /// A node in the HNSW graph.
-struct Node {
+struct Node<S> {
     id: u64,
-    vector: Vec<f32>,
+    stored: S,
     neighbors: Vec<Vec<u64>>, // neighbors[layer] = list of neighbor IDs
     deleted: bool,
 }
 
-/// HNSW index for approximate nearest neighbor search.
-pub struct HnswIndex {
+/// HNSW index for approximate nearest neighbor search, generic over
+/// the distance computation and storage strategy.
+pub struct HnswIndex<D: DistanceProvider = ExactDistance> {
     config: HnswConfig,
-    nodes: RwLock<Vec<Node>>,
+    distance: D,
+    nodes: RwLock<Vec<Node<D::Stored>>>,
     id_to_idx: RwLock<std::collections::HashMap<u64, usize>>,
     entry_point: RwLock<Option<usize>>,
     max_layer: RwLock<usize>,
-    ml: f64, // normalization factor for level generation
+    ml: f64,
 }
 
-impl HnswIndex {
+impl HnswIndex<ExactDistance> {
+    /// Create an HNSW index with exact full-precision distance computation.
     pub fn new(config: HnswConfig) -> Self {
+        let distance = ExactDistance {
+            metric: config.metric,
+        };
+        Self::with_distance(config, distance)
+    }
+}
+
+impl<D: DistanceProvider> HnswIndex<D> {
+    /// Create an HNSW index with a custom distance provider.
+    pub fn with_distance(config: HnswConfig, distance: D) -> Self {
         let ml = 1.0 / (config.m as f64).ln();
         Self {
             config,
+            distance,
             nodes: RwLock::new(Vec::new()),
             id_to_idx: RwLock::new(std::collections::HashMap::new()),
             entry_point: RwLock::new(None),
@@ -58,14 +109,15 @@ impl HnswIndex {
     }
 
     /// Insert a vector with the given ID.
-    pub fn insert(&self, id: u64, vector: Vec<f32>) {
+    pub fn insert(&self, id: u64, vector: &[f32]) {
         let level = self.random_level();
         let num_layers = level + 1;
 
-        // Create the node.
+        let stored = self.distance.store(vector);
+
         let node = Node {
             id,
-            vector,
+            stored,
             neighbors: vec![Vec::new(); num_layers],
             deleted: false,
         };
@@ -92,15 +144,15 @@ impl HnswIndex {
         let mut current_ep = ep;
         let nodes = self.nodes.read();
         for layer in (num_layers..=current_max_layer).rev() {
-            current_ep = self.greedy_closest(&nodes, &nodes[node_idx].vector, current_ep, layer);
+            current_ep = self.greedy_closest(&nodes, vector, current_ep, layer);
         }
         drop(nodes);
 
-        // Phase 2: At each layer from insertion level down to 0, find neighbors and connect.
+        // Phase 2: At each layer from insertion level down to 0, find neighbors.
         for layer in (0..num_layers).rev() {
             let ef = self.config.ef_construction;
             let nodes = self.nodes.read();
-            let candidates = self.search_layer(&nodes, &nodes[node_idx].vector, current_ep, ef, layer);
+            let candidates = self.search_layer(&nodes, vector, current_ep, ef, layer);
             drop(nodes);
 
             let max_neighbors = if layer == 0 {
@@ -109,23 +161,20 @@ impl HnswIndex {
                 self.config.m
             };
 
-            // Select the closest candidates as neighbors.
             let neighbors: Vec<u64> = candidates
                 .iter()
                 .take(max_neighbors)
                 .map(|&(_, idx)| {
-                    let nodes = self.nodes.read();
-                    nodes[idx].id
+                    self.nodes.read()[idx].id
                 })
                 .collect();
 
-            // Set neighbors for this node at this layer.
             {
                 let mut nodes = self.nodes.write();
                 nodes[node_idx].neighbors[layer] = neighbors.clone();
             }
 
-            // Add bidirectional connections.
+            // Add bidirectional connections with pruning.
             for &neighbor_id in &neighbors {
                 let neighbor_idx = self.id_to_idx.read()[&neighbor_id];
                 let mut nodes = self.nodes.write();
@@ -133,18 +182,14 @@ impl HnswIndex {
                 if layer < nodes[neighbor_idx].neighbors.len() {
                     nodes[neighbor_idx].neighbors[layer].push(id);
 
-                    // Prune if over capacity.
                     if nodes[neighbor_idx].neighbors[layer].len() > max_neighbors {
-                        let node_vec = nodes[node_idx].vector.clone();
-                        let _ = node_vec; // used below
                         let mut scored: Vec<(f32, u64)> = nodes[neighbor_idx].neighbors[layer]
                             .iter()
                             .map(|&nid| {
                                 let nidx = self.id_to_idx.read()[&nid];
-                                let dist = compute_distance(
-                                    self.config.metric,
-                                    &nodes[neighbor_idx].vector,
-                                    &nodes[nidx].vector,
+                                let dist = self.distance.distance_stored(
+                                    &nodes[neighbor_idx].stored,
+                                    &nodes[nidx].stored,
                                 );
                                 (dist, nid)
                             })
@@ -162,7 +207,6 @@ impl HnswIndex {
             }
         }
 
-        // Update entry point if this node has a higher level.
         if level > current_max_layer {
             *self.entry_point.write() = Some(node_idx);
             *self.max_layer.write() = level;
@@ -170,7 +214,6 @@ impl HnswIndex {
     }
 
     /// Search for the k nearest neighbors of the query vector.
-    /// Returns (id, distance) pairs sorted by distance (ascending).
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         let entry_point = *self.entry_point.read();
         let ep = match entry_point {
@@ -181,17 +224,14 @@ impl HnswIndex {
         let max_layer = *self.max_layer.read();
         let nodes = self.nodes.read();
 
-        // Greedy descent from top layer.
         let mut current_ep = ep;
         for layer in (1..=max_layer).rev() {
             current_ep = self.greedy_closest(&nodes, query, current_ep, layer);
         }
 
-        // Search at layer 0 with ef candidates.
         let search_ef = ef.max(k);
         let candidates = self.search_layer(&nodes, query, current_ep, search_ef, 0);
 
-        // Return top-k, filtering deleted nodes.
         candidates
             .into_iter()
             .filter(|&(_, idx)| !nodes[idx].deleted)
@@ -200,8 +240,6 @@ impl HnswIndex {
             .collect()
     }
 
-    /// Mark a vector as deleted (tombstone). It will be skipped in search results
-    /// but remains in the graph for connectivity until compaction.
     pub fn delete(&self, id: u64) -> bool {
         let idx = match self.id_to_idx.read().get(&id).copied() {
             Some(idx) => idx,
@@ -211,7 +249,6 @@ impl HnswIndex {
         true
     }
 
-    /// Number of vectors in the index (including deleted).
     pub fn len(&self) -> usize {
         self.nodes.read().len()
     }
@@ -220,7 +257,6 @@ impl HnswIndex {
         self.nodes.read().is_empty()
     }
 
-    /// Number of active (non-deleted) vectors.
     pub fn active_count(&self) -> usize {
         self.nodes.read().iter().filter(|n| !n.deleted).count()
     }
@@ -231,9 +267,15 @@ impl HnswIndex {
         (-r.ln() * self.ml).floor() as usize
     }
 
-    fn greedy_closest(&self, nodes: &[Node], query: &[f32], start: usize, layer: usize) -> usize {
+    fn greedy_closest(
+        &self,
+        nodes: &[Node<D::Stored>],
+        query: &[f32],
+        start: usize,
+        layer: usize,
+    ) -> usize {
         let mut current = start;
-        let mut current_dist = compute_distance(self.config.metric, query, &nodes[current].vector);
+        let mut current_dist = self.distance.distance(query, &nodes[current].stored);
 
         loop {
             let mut changed = false;
@@ -242,7 +284,7 @@ impl HnswIndex {
                 for &neighbor_id in &nodes[current].neighbors[layer] {
                     if let Some(&neighbor_idx) = self.id_to_idx.read().get(&neighbor_id) {
                         let dist =
-                            compute_distance(self.config.metric, query, &nodes[neighbor_idx].vector);
+                            self.distance.distance(query, &nodes[neighbor_idx].stored);
                         if dist < current_dist {
                             current = neighbor_idx;
                             current_dist = dist;
@@ -260,25 +302,22 @@ impl HnswIndex {
         current
     }
 
-    /// Search a single layer, returning up to `ef` candidates sorted by distance.
     fn search_layer(
         &self,
-        nodes: &[Node],
+        nodes: &[Node<D::Stored>],
         query: &[f32],
         entry_point: usize,
         ef: usize,
         layer: usize,
     ) -> Vec<(f32, usize)> {
-        let entry_dist = compute_distance(self.config.metric, query, &nodes[entry_point].vector);
+        let entry_dist = self.distance.distance(query, &nodes[entry_point].stored);
 
         let mut visited = HashSet::new();
         visited.insert(entry_point);
 
-        // Min-heap of candidates to explore.
         let mut candidates: BinaryHeap<Reverse<(OrderedFloat, usize)>> = BinaryHeap::new();
         candidates.push(Reverse((OrderedFloat(entry_dist), entry_point)));
 
-        // Max-heap of results (worst first).
         let mut results: BinaryHeap<(OrderedFloat, usize)> = BinaryHeap::new();
         results.push((OrderedFloat(entry_dist), entry_point));
 
@@ -291,37 +330,39 @@ impl HnswIndex {
             if layer < nodes[c_idx].neighbors.len() {
                 for &neighbor_id in &nodes[c_idx].neighbors[layer] {
                     if let Some(&neighbor_idx) = self.id_to_idx.read().get(&neighbor_id)
-                        && visited.insert(neighbor_idx) {
-                            let dist = compute_distance(
-                                self.config.metric,
-                                query,
-                                &nodes[neighbor_idx].vector,
-                            );
-                            let worst_dist =
-                                results.peek().map(|(OrderedFloat(d), _)| *d).unwrap_or(f32::MAX);
+                        && visited.insert(neighbor_idx)
+                    {
+                        let dist = self
+                            .distance
+                            .distance(query, &nodes[neighbor_idx].stored);
+                        let worst_dist = results
+                            .peek()
+                            .map(|(OrderedFloat(d), _)| *d)
+                            .unwrap_or(f32::MAX);
 
-                            if dist < worst_dist || results.len() < ef {
-                                candidates.push(Reverse((OrderedFloat(dist), neighbor_idx)));
-                                results.push((OrderedFloat(dist), neighbor_idx));
+                        if dist < worst_dist || results.len() < ef {
+                            candidates
+                                .push(Reverse((OrderedFloat(dist), neighbor_idx)));
+                            results.push((OrderedFloat(dist), neighbor_idx));
 
-                                if results.len() > ef {
-                                    results.pop();
-                                }
+                            if results.len() > ef {
+                                results.pop();
                             }
                         }
+                    }
                 }
             }
         }
 
-        // Convert to sorted vec.
-        let mut result_vec: Vec<(f32, usize)> =
-            results.into_iter().map(|(OrderedFloat(d), idx)| (d, idx)).collect();
+        let mut result_vec: Vec<(f32, usize)> = results
+            .into_iter()
+            .map(|(OrderedFloat(d), idx)| (d, idx))
+            .collect();
         result_vec.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         result_vec
     }
 }
 
-/// Wrapper for f32 that implements Ord (for BinaryHeap).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct OrderedFloat(f32);
 
@@ -335,7 +376,9 @@ impl PartialOrd for OrderedFloat {
 
 impl Ord for OrderedFloat {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -365,17 +408,14 @@ mod tests {
 
         let vectors = random_vectors(100, 32);
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            index.insert(*id, vec);
         }
 
         assert_eq!(index.len(), 100);
 
-        // Search should return results.
         let query = &vectors[0].1;
         let results = index.search(query, 5, 50);
         assert_eq!(results.len(), 5);
-
-        // The query vector itself should be the closest match.
         assert_eq!(results[0].0, 0);
         assert!(results[0].1 < 1e-6);
     }
@@ -387,7 +427,7 @@ mod tests {
 
         let vectors = random_vectors(50, 16);
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            index.insert(*id, vec);
         }
 
         let results = index.search(&vectors[0].1, 10, 50);
@@ -407,7 +447,7 @@ mod tests {
 
         let vectors = random_vectors(200, 32);
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            index.insert(*id, vec);
         }
 
         let results = index.search(&vectors[0].1, 20, 100);
@@ -432,12 +472,11 @@ mod tests {
 
         let vectors = random_vectors(n, dims);
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            index.insert(*id, vec);
         }
 
         let query = &vectors[0].1;
 
-        // Brute-force ground truth.
         let mut exact: Vec<(f32, u64)> = vectors
             .iter()
             .map(|(id, vec)| (crate::distance::l2_squared(query, vec), *id))
@@ -445,7 +484,6 @@ mod tests {
         exact.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let truth: HashSet<u64> = exact.iter().take(k).map(|(_, id)| *id).collect();
 
-        // HNSW search.
         let results = index.search(query, k, 100);
         let found: HashSet<u64> = results.iter().map(|(id, _)| *id).collect();
 
@@ -466,15 +504,13 @@ mod tests {
 
         let vectors = random_vectors(50, 16);
         for (id, vec) in &vectors {
-            index.insert(*id, vec.clone());
+            index.insert(*id, vec);
         }
 
-        // Delete a specific vector.
         let deleted_id = 5u64;
         assert!(index.delete(deleted_id));
         assert_eq!(index.active_count(), 49);
 
-        // Search should not return the deleted vector.
         let results = index.search(&vectors[0].1, 50, 100);
         assert!(!results.iter().any(|(id, _)| *id == deleted_id));
     }
@@ -494,7 +530,7 @@ mod tests {
             ..Default::default()
         };
         let index = HnswIndex::new(config);
-        index.insert(0, vec![1.0, 2.0, 3.0]);
+        index.insert(0, &[1.0, 2.0, 3.0]);
 
         let results = index.search(&[1.0, 2.0, 3.0], 1, 10);
         assert_eq!(results.len(), 1);
@@ -509,13 +545,11 @@ mod tests {
         };
         let index = HnswIndex::new(config);
 
-        // Insert two vectors: one similar to query, one orthogonal.
-        index.insert(0, vec![1.0, 0.0]);
-        index.insert(1, vec![0.9, 0.1]);
-        index.insert(2, vec![0.0, 1.0]);
+        index.insert(0, &[1.0, 0.0]);
+        index.insert(1, &[0.9, 0.1]);
+        index.insert(2, &[0.0, 1.0]);
 
         let results = index.search(&[1.0, 0.0], 3, 10);
-        // [1.0, 0.0] should be closest, [0.9, 0.1] second, [0.0, 1.0] last.
         assert_eq!(results[0].0, 0);
         assert_eq!(results[1].0, 1);
         assert_eq!(results[2].0, 2);
