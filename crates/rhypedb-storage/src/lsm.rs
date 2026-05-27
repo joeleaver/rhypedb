@@ -153,6 +153,49 @@ impl LsmTree {
         Ok(None)
     }
 
+    /// Scan for all keys with the given prefix, visible at the transaction's snapshot.
+    /// Returns `(user_key, value)` pairs. Tombstones are excluded from results.
+    pub fn scan_prefix(
+        &self,
+        txn: &Transaction,
+        prefix: &[u8],
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let version = txn.snapshot();
+
+        // Collect from all sources.
+        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
+            std::collections::BTreeMap::new();
+
+        // SSTs first (oldest), so newer entries overwrite.
+        let ssts = self.sst_files.read();
+        for sst in ssts.iter() {
+            for (key, value) in sst.scan_prefix(prefix, version) {
+                merged.insert(key, value);
+            }
+        }
+        drop(ssts);
+
+        // Immutable memtables (oldest first).
+        let immutables = self.immutable_memtables.read().clone();
+        for mt in immutables.iter() {
+            for (key, value) in mt.scan_prefix(prefix, version) {
+                merged.insert(key, value);
+            }
+        }
+
+        // Active memtable (newest).
+        let active = self.active_memtable.read().clone();
+        for (key, value) in active.scan_prefix(prefix, version) {
+            merged.insert(key, value);
+        }
+
+        // Filter out tombstones.
+        Ok(merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .collect())
+    }
+
     /// Write a key-value pair within a transaction.
     pub fn put(&self, txn: &mut Transaction, user_key: &[u8], value: Bytes) -> Result<()> {
         let version = self.txn_manager.current_version() + 1; // provisional

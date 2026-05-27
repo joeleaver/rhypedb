@@ -350,6 +350,49 @@ impl SstReader {
         &self.path
     }
 
+    /// Scan for entries whose user key starts with `prefix`, returning the latest
+    /// visible version per user key at the given snapshot version.
+    pub fn scan_prefix(&self, prefix: &[u8], version: u64) -> Vec<(Bytes, Option<Bytes>)> {
+        let mut results = Vec::new();
+        let mut last_user_key: Option<Vec<u8>> = None;
+
+        for (key, value) in self.iter() {
+            if key.len() < 8 {
+                continue;
+            }
+            let user_key = &key[..key.len() - 8];
+
+            // Skip entries before the prefix range.
+            if user_key < prefix {
+                continue;
+            }
+
+            // Stop past the prefix range.
+            if !user_key.starts_with(prefix) {
+                break;
+            }
+
+            let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let entry_version = !u64::from_be_bytes(ver_bytes);
+
+            if entry_version > version {
+                continue;
+            }
+
+            let same_key = last_user_key
+                .as_ref()
+                .is_some_and(|prev| prev.as_slice() == user_key);
+            if same_key {
+                continue;
+            }
+
+            last_user_key = Some(user_key.to_vec());
+            results.push((Bytes::copy_from_slice(user_key), value));
+        }
+
+        results
+    }
+
     /// Iterate all entries in the SST in sorted order.
     pub fn iter(&self) -> SstIterator<'_> {
         let header_size = SST_MAGIC.len() + 4;

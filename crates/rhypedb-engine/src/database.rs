@@ -420,15 +420,29 @@ impl Database {
     fn scan_prefix(
         &self,
         txn: &rhypedb_storage::mvcc::Transaction,
-        _prefix: &[u8],
+        prefix: &[u8],
     ) -> EngineResult<Vec<(u64, FieldMap)>> {
-        // For now, this is a placeholder. A proper implementation needs a prefix
-        // scan on the LSM. We'll implement this as we build out the query engine.
-        // For the current tests, we use a simple approach: track edges in memory.
-        //
-        // TODO: Add prefix scan to LsmTree.
-        let _ = txn;
-        Ok(Vec::new())
+        let entries = self.storage.scan_prefix(txn, prefix)?;
+        let mut results = Vec::new();
+
+        for (key, value) in entries {
+            // The last 8 bytes of the user key are the target/source ID.
+            if key.len() < 8 {
+                continue;
+            }
+            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let id = u64::from_be_bytes(id_bytes);
+
+            let edge_fields = if value.is_empty() {
+                FieldMap::new()
+            } else {
+                deserialize_fields(&value)
+            };
+
+            results.push((id, edge_fields));
+        }
+
+        Ok(results)
     }
 
     pub fn schema(&self) -> &Schema {
@@ -624,8 +638,56 @@ mod tests {
 
         db.link("User", alice.id, "friends", bob.id, None).unwrap();
 
-        // get_links uses scan_prefix which is a placeholder — will work properly
-        // once prefix scan is added to LSM.
+        let links = db.get_links("User", alice.id, "friends").unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].0, bob.id);
+    }
+
+    #[test]
+    fn link_multiple_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                friends: [User] @on_delete(remove)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let alice = db
+            .create("User", {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String("Alice".into()));
+                f
+            })
+            .unwrap();
+        let bob = db
+            .create("User", {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String("Bob".into()));
+                f
+            })
+            .unwrap();
+        let carol = db
+            .create("User", {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String("Carol".into()));
+                f
+            })
+            .unwrap();
+
+        db.link("User", alice.id, "friends", bob.id, None).unwrap();
+        db.link("User", alice.id, "friends", carol.id, None)
+            .unwrap();
+
+        let links = db.get_links("User", alice.id, "friends").unwrap();
+        assert_eq!(links.len(), 2);
+        let ids: Vec<_> = links.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&bob.id));
+        assert!(ids.contains(&carol.id));
     }
 
     #[test]
@@ -652,5 +714,122 @@ mod tests {
 
         db.link("User", alice.id, "friends", bob.id, None).unwrap();
         db.unlink("User", alice.id, "friends", bob.id).unwrap();
+
+        let links = db.get_links("User", alice.id, "friends").unwrap();
+        assert_eq!(links.len(), 0);
+    }
+
+    #[test]
+    fn link_with_edge_properties() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                favorite_movies: [Movie] {
+                    rating: f32
+                } @on_delete(remove)
+            }
+            type Movie {
+                title: String
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        let alien = db.create("Movie", mf).unwrap();
+
+        let mut edge_props = FieldMap::new();
+        edge_props.insert("rating".into(), Value::F32(4.5));
+
+        db.link("User", alice.id, "favorite_movies", alien.id, Some(edge_props))
+            .unwrap();
+
+        let links = db.get_links("User", alice.id, "favorite_movies").unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].0, alien.id);
+        assert_eq!(links[0].1.get("rating"), Some(&Value::F32(4.5)));
+    }
+
+    #[test]
+    fn delete_with_on_delete_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+            }
+            type Post {
+                title: String
+                author: User @on_delete(deny)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let mut pf = FieldMap::new();
+        pf.insert("title".into(), Value::String("Hello World".into()));
+        let post = db.create("Post", pf).unwrap();
+
+        db.link("Post", post.id, "author", alice.id, None).unwrap();
+
+        // Deleting alice should be denied because a post references her.
+        let result = db.delete("User", alice.id);
+        assert!(matches!(result, Err(EngineError::DeleteDenied { .. })));
+
+        // Alice should still exist.
+        assert!(db.get("User", alice.id).is_ok());
+    }
+
+    #[test]
+    fn delete_with_on_delete_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+            }
+            type Post {
+                title: String
+                author: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let mut pf = FieldMap::new();
+        pf.insert("title".into(), Value::String("Hello World".into()));
+        let post = db.create("Post", pf).unwrap();
+
+        db.link("Post", post.id, "author", alice.id, None).unwrap();
+
+        // Deleting alice should cascade-delete the post.
+        db.delete("User", alice.id).unwrap();
+
+        assert!(matches!(
+            db.get("User", alice.id),
+            Err(EngineError::ObjectNotFound { .. })
+        ));
+        assert!(matches!(
+            db.get("Post", post.id),
+            Err(EngineError::ObjectNotFound { .. })
+        ));
     }
 }

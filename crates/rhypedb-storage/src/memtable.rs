@@ -100,6 +100,52 @@ impl MemTable {
     pub fn iter(&self) -> impl Iterator<Item = (Bytes, MemValue)> + '_ {
         self.map.iter().map(|e| (e.key().clone(), e.value().clone()))
     }
+
+    /// Scan for all entries whose user key starts with `prefix`, visible at `version`.
+    /// Returns (user_key, value) pairs, deduplicated to the latest visible version per key.
+    pub fn scan_prefix(&self, prefix: &[u8], version: u64) -> Vec<(Bytes, MemValue)> {
+        // Build the scan start: prefix with version u64::MAX (lowest sort position for prefix).
+        let scan_start = InternalKey::new(prefix, u64::MAX);
+        let scan_bytes = Bytes::copy_from_slice(scan_start.as_bytes());
+
+        let mut results = Vec::new();
+        let mut last_user_key: Option<Vec<u8>> = None;
+
+        for entry in self.map.range(scan_bytes..) {
+            let key = entry.key();
+            if key.len() < 8 {
+                continue;
+            }
+            let user_key = &key[..key.len() - 8];
+
+            // Stop if past the prefix range.
+            if !user_key.starts_with(prefix) {
+                break;
+            }
+
+            // Decode version.
+            let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let entry_version = !u64::from_be_bytes(ver_bytes);
+
+            // Skip if not visible at requested version.
+            if entry_version > version {
+                continue;
+            }
+
+            // Deduplicate: only take the first (latest) visible version per user key.
+            let same_key = last_user_key
+                .as_ref()
+                .is_some_and(|prev| prev.as_slice() == user_key);
+            if same_key {
+                continue;
+            }
+
+            last_user_key = Some(user_key.to_vec());
+            results.push((Bytes::copy_from_slice(user_key), entry.value().clone()));
+        }
+
+        results
+    }
 }
 
 #[cfg(test)]
