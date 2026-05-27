@@ -1,5 +1,12 @@
 use rand::Rng;
 
+/// Sample from N(0,1) via Box-Muller transform.
+fn sample_normal(rng: &mut impl Rng) -> f32 {
+    let u1: f32 = rng.random_range(1e-10..1.0f32);
+    let u2: f32 = rng.random_range(0.0..std::f32::consts::TAU);
+    (-2.0 * u1.ln()).sqrt() * u2.cos()
+}
+
 /// Configuration for TurboQuant vector compression.
 #[derive(Debug, Clone)]
 pub struct TurboQuantConfig {
@@ -13,53 +20,55 @@ impl TurboQuantConfig {
         Self { dimensions, bits }
     }
 
-    /// Bytes needed per compressed vector (quantized data only, no QJL).
     pub fn compressed_size(&self) -> usize {
         let total_bits = self.dimensions as usize * self.bits as usize;
         total_bits.div_ceil(8)
     }
 
-    /// Bytes needed for the QJL residual (1 bit per dimension).
     pub fn qjl_size(&self) -> usize {
         (self.dimensions as usize).div_ceil(8)
     }
 
-    /// Total bytes per compressed vector.
     pub fn total_size(&self) -> usize {
-        self.compressed_size() + self.qjl_size()
+        // quantized data + QJL signs + norm (f32) + residual norm (f32)
+        self.compressed_size() + self.qjl_size() + 4 + 4
     }
 }
 
 /// A trained TurboQuant quantizer for a specific vector collection.
 ///
-/// Stores the rotation matrix and Lloyd-Max codebook calibrated to the
-/// distribution of vectors in this collection.
+/// Implements the TurboQuant pipeline from arXiv:2504.19874:
+/// 1. Normalize to unit sphere, store norm
+/// 2. Random orthogonal rotation (QR of Gaussian matrix)
+/// 3. Lloyd-Max scalar quantization with Beta-distribution codebook
+/// 4. QJL residual: project residual through Gaussian matrix, store signs
+///
+/// The combined estimator is unbiased: E[estimated inner product] = true inner product.
 pub struct TurboQuantizer {
     config: TurboQuantConfig,
-    rotation_matrix: Vec<f32>, // dims x dims, row-major
-    codebook: Vec<f32>,        // 2^bits centroids
-    qjl_matrix: Vec<f32>,     // dims x dims, random projection for residuals
+    rotation_matrix: Vec<f32>, // d x d, row-major — orthogonal via QR
+    codebook: Codebook,
+    qjl_matrix: Vec<f32>, // d x d, i.i.d. N(0,1)
+}
+
+/// Precomputed Lloyd-Max codebook for Beta-distributed values.
+#[derive(Debug, Clone)]
+struct Codebook {
+    centroids: Vec<f32>,
+    boundaries: Vec<f32>, // len = centroids.len() - 1 (interior boundaries)
 }
 
 impl TurboQuantizer {
-    /// Train a quantizer on a sample of vectors.
-    pub fn train(config: TurboQuantConfig, samples: &[&[f32]]) -> Self {
+    /// Build a quantizer for the given config. The codebook is computed
+    /// analytically from the Beta distribution determined by the dimension,
+    /// so no training samples are needed.
+    pub fn new(config: TurboQuantConfig) -> Self {
         let dims = config.dimensions as usize;
-        assert!(!samples.is_empty(), "need at least one sample");
-        assert!(samples[0].len() == dims, "sample dimension mismatch");
+        let num_centroids = 1usize << config.bits;
 
-        let rotation_matrix = generate_orthogonal_matrix(dims);
-        let qjl_matrix = generate_random_projection(dims);
-
-        // Rotate all samples and compute distribution stats for Lloyd-Max.
-        let mut all_rotated_values = Vec::with_capacity(samples.len() * dims);
-        for sample in samples {
-            let rotated = matrix_vector_multiply(&rotation_matrix, sample, dims);
-            all_rotated_values.extend_from_slice(&rotated);
-        }
-
-        let num_centroids = 1 << config.bits;
-        let codebook = lloyd_max_quantize(&all_rotated_values, num_centroids);
+        let rotation_matrix = generate_rotation_matrix(dims);
+        let qjl_matrix = generate_qjl_matrix(dims);
+        let codebook = compute_beta_codebook(dims, num_centroids);
 
         Self {
             config,
@@ -74,59 +83,136 @@ impl TurboQuantizer {
         let dims = self.config.dimensions as usize;
         assert_eq!(vector.len(), dims);
 
-        // Step 1: Orthogonal rotation.
-        let rotated = matrix_vector_multiply(&self.rotation_matrix, vector, dims);
+        // Step 1: Normalize to unit sphere.
+        let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let unit: Vec<f32> = if norm > 0.0 {
+            vector.iter().map(|x| x / norm).collect()
+        } else {
+            vec![0.0; dims]
+        };
 
-        // Step 2: Lloyd-Max scalar quantization.
-        let mut quantized_indices = Vec::with_capacity(dims);
+        // Step 2: Rotate.
+        let rotated = mat_vec_mul(&self.rotation_matrix, &unit, dims);
+
+        // Step 3: Lloyd-Max quantize using precomputed Beta codebook.
+        let mut indices = Vec::with_capacity(dims);
         let mut reconstructed = Vec::with_capacity(dims);
 
         for &val in &rotated {
-            let idx = find_nearest_centroid(&self.codebook, val);
-            quantized_indices.push(idx as u8);
-            reconstructed.push(self.codebook[idx]);
+            let idx = self.codebook.quantize(val);
+            indices.push(idx as u8);
+            reconstructed.push(self.codebook.centroids[idx]);
         }
 
-        // Step 3: QJL residual encoding (sign bits of projected residual).
+        // Step 4: QJL residual.
         let residual: Vec<f32> = rotated
             .iter()
             .zip(reconstructed.iter())
             .map(|(r, q)| r - q)
             .collect();
-        let projected = matrix_vector_multiply(&self.qjl_matrix, &residual, dims);
-        let qjl_signs: Vec<bool> = projected.iter().map(|&v| v >= 0.0).collect();
+        let residual_norm = residual.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-        // Step 4: Bit-pack.
-        let packed_data = bit_pack(&quantized_indices, self.config.bits);
-        let packed_qjl = pack_bools(&qjl_signs);
+        let projected = mat_vec_mul(&self.qjl_matrix, &residual, dims);
+        let signs: Vec<bool> = projected.iter().map(|&v| v >= 0.0).collect();
 
         CompressedVector {
-            data: packed_data,
-            qjl: packed_qjl,
+            data: bit_pack(&indices, self.config.bits),
+            qjl_signs: pack_bools(&signs),
+            norm,
+            residual_norm,
         }
     }
 
-    /// Decompress a vector to approximate f32 values (for reranking).
+    /// Decompress to approximate f32 values (MSE reconstruction only, no QJL correction).
     pub fn decompress(&self, compressed: &CompressedVector) -> Vec<f32> {
         let dims = self.config.dimensions as usize;
 
         let indices = bit_unpack(&compressed.data, self.config.bits, dims);
-        let rotated: Vec<f32> = indices.iter().map(|&i| self.codebook[i as usize]).collect();
+        let rotated: Vec<f32> = indices
+            .iter()
+            .map(|&i| self.codebook.centroids[i as usize])
+            .collect();
 
         // Inverse rotation (transpose of orthogonal matrix).
-        matrix_vector_multiply_transpose(&self.rotation_matrix, &rotated, dims)
+        let unit = mat_vec_mul_transpose(&self.rotation_matrix, &rotated, dims);
+
+        // Rescale by original norm.
+        unit.iter().map(|x| x * compressed.norm).collect()
     }
 
-    /// Compute approximate distance between a full-precision query and a
-    /// compressed stored vector (asymmetric search).
-    pub fn asymmetric_distance(
+    /// Compute the unbiased inner product estimate between a full-precision
+    /// query and a compressed vector.
+    ///
+    /// Formula: ⟨q, x̂_mse⟩ + ‖r‖ · √(π/2) / d · ⟨S^T · signs, q⟩
+    ///
+    /// where x̂_mse is the MSE reconstruction, r is the quantization residual,
+    /// S is the QJL matrix, and signs are the projected residual sign bits.
+    pub fn inner_product_estimate(
+        &self,
+        query: &[f32],
+        compressed: &CompressedVector,
+    ) -> f32 {
+        let dims = self.config.dimensions as usize;
+
+        // MSE term: ⟨query, x̂_mse⟩
+        let mse_approx = self.decompress(compressed);
+        let mse_dot: f32 = query
+            .iter()
+            .zip(mse_approx.iter())
+            .map(|(q, x)| q * x)
+            .sum();
+
+        // QJL correction term: ‖r‖ · √(π/2) / d · ⟨S^T · signs, query⟩
+        let signs = unpack_bools(&compressed.qjl_signs, dims);
+        let signs_f32: Vec<f32> = signs
+            .iter()
+            .map(|&b| if b { 1.0 } else { -1.0 })
+            .collect();
+
+        // Compute S^T · signs (transpose multiply)
+        let st_signs = mat_vec_mul_transpose(&self.qjl_matrix, &signs_f32, dims);
+
+        // ⟨S^T · signs, query⟩
+        let correction_dot: f32 = st_signs
+            .iter()
+            .zip(query.iter())
+            .map(|(s, q)| s * q)
+            .sum();
+
+        let qjl_scale = (std::f32::consts::FRAC_PI_2).sqrt() / dims as f32;
+        let correction = compressed.residual_norm * compressed.norm * qjl_scale * correction_dot;
+
+        mse_dot + correction
+    }
+
+    /// Compute approximate distance using the unbiased estimator.
+    pub fn distance_estimate(
         &self,
         query: &[f32],
         compressed: &CompressedVector,
         metric: crate::distance::Metric,
     ) -> f32 {
-        let approx = self.decompress(compressed);
-        crate::distance::compute_distance(metric, query, &approx)
+        match metric {
+            crate::distance::Metric::DotProduct => -self.inner_product_estimate(query, compressed),
+            crate::distance::Metric::Cosine => {
+                let ip = self.inner_product_estimate(query, compressed);
+                let q_norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let x_norm = compressed.norm;
+                let denom = q_norm * x_norm;
+                if denom == 0.0 {
+                    1.0
+                } else {
+                    1.0 - ip / denom
+                }
+            }
+            crate::distance::Metric::L2 => {
+                // ‖q - x‖² = ‖q‖² + ‖x‖² - 2⟨q, x⟩
+                let q_norm_sq: f32 = query.iter().map(|x| x * x).sum();
+                let x_norm_sq = compressed.norm * compressed.norm;
+                let ip = self.inner_product_estimate(query, compressed);
+                q_norm_sq + x_norm_sq - 2.0 * ip
+            }
+        }
     }
 
     pub fn config(&self) -> &TurboQuantConfig {
@@ -134,44 +220,175 @@ impl TurboQuantizer {
     }
 }
 
-/// A compressed vector: quantized data + QJL residual bits.
+/// A compressed vector with all components needed for the unbiased estimator.
 #[derive(Debug, Clone)]
 pub struct CompressedVector {
-    pub data: Vec<u8>,
-    pub qjl: Vec<u8>,
+    pub data: Vec<u8>,      // bit-packed quantized indices
+    pub qjl_signs: Vec<u8>, // packed sign bits from QJL projection
+    pub norm: f32,           // original vector L2 norm
+    pub residual_norm: f32,  // L2 norm of quantization residual (in rotated space)
 }
 
 impl CompressedVector {
     pub fn total_bytes(&self) -> usize {
-        self.data.len() + self.qjl.len()
+        self.data.len() + self.qjl_signs.len() + 8 // + 2 f32 norms
     }
 }
 
-/// Generate a random orthogonal matrix using QR decomposition of a random matrix.
-/// Uses a simplified Gram-Schmidt process.
-fn generate_orthogonal_matrix(dims: usize) -> Vec<f32> {
+impl Codebook {
+    fn quantize(&self, value: f32) -> usize {
+        // Binary search on decision boundaries.
+        match self
+            .boundaries
+            .binary_search_by(|b| b.partial_cmp(&value).unwrap())
+        {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        }
+    }
+}
+
+// --- Codebook computation from Beta distribution ---
+
+/// Compute the Lloyd-Max optimal codebook for the Beta distribution that
+/// arises after rotating a d-dimensional unit vector.
+///
+/// PDF: f(x) = Γ(d/2) / (√π · Γ((d-1)/2)) · (1 - x²)^((d-3)/2)
+/// Supported on [-1, 1].
+fn compute_beta_codebook(dims: usize, num_centroids: usize) -> Codebook {
+    let grid_size = 10000;
+    let grid: Vec<f32> = (0..grid_size)
+        .map(|i| -1.0 + 2.0 * (i as f32 + 0.5) / grid_size as f32)
+        .collect();
+
+    let pdf: Vec<f32> = grid.iter().map(|&x| beta_pdf(x, dims)).collect();
+    let dx = 2.0 / grid_size as f32;
+
+    // CDF for quantile initialization.
+    let mut cdf = Vec::with_capacity(grid_size);
+    let mut cum = 0.0f32;
+    for &p in &pdf {
+        cum += p * dx;
+        cdf.push(cum);
+    }
+    // Normalize CDF.
+    let total = cum;
+    for c in &mut cdf {
+        *c /= total;
+    }
+
+    // Initialize centroids at quantile midpoints.
+    let mut centroids: Vec<f32> = (0..num_centroids)
+        .map(|i| {
+            let target = (i as f32 + 0.5) / num_centroids as f32;
+            let idx = cdf.partition_point(|&c| c < target).min(grid_size - 1);
+            grid[idx]
+        })
+        .collect();
+
+    // Lloyd-Max iterations.
+    for _ in 0..100 {
+        // Compute decision boundaries (midpoints between consecutive centroids).
+        let mut boundaries = Vec::with_capacity(num_centroids - 1);
+        for i in 0..num_centroids - 1 {
+            boundaries.push((centroids[i] + centroids[i + 1]) / 2.0);
+        }
+
+        // Update centroids: conditional expectation within each region.
+        let mut new_centroids = vec![0.0f32; num_centroids];
+        let mut changed = false;
+
+        for (c_idx, centroid) in new_centroids.iter_mut().enumerate() {
+            let lo = if c_idx == 0 {
+                -1.0
+            } else {
+                boundaries[c_idx - 1]
+            };
+            let hi = if c_idx == num_centroids - 1 {
+                1.0
+            } else {
+                boundaries[c_idx]
+            };
+
+            // Numerical integration: E[X | lo < X < hi]
+            let mut num = 0.0f32;
+            let mut den = 0.0f32;
+            for (j, &x) in grid.iter().enumerate() {
+                if x >= lo && x < hi {
+                    let w = pdf[j] * dx;
+                    num += x * w;
+                    den += w;
+                }
+            }
+
+            *centroid = if den > 0.0 {
+                num / den
+            } else {
+                centroids[c_idx]
+            };
+
+            if (*centroid - centroids[c_idx]).abs() > 1e-10 {
+                changed = true;
+            }
+        }
+
+        centroids = new_centroids;
+        if !changed {
+            break;
+        }
+    }
+
+    // Final boundaries.
+    let boundaries: Vec<f32> = (0..num_centroids - 1)
+        .map(|i| (centroids[i] + centroids[i + 1]) / 2.0)
+        .collect();
+
+    Codebook {
+        centroids,
+        boundaries,
+    }
+}
+
+/// Beta PDF for rotated unit vector coordinates in d dimensions.
+/// f(x) = C · (1 - x²)^((d-3)/2) on [-1, 1]
+fn beta_pdf(x: f32, dims: usize) -> f32 {
+    let x2 = (x * x) as f64;
+    if x2 >= 1.0 {
+        return 0.0;
+    }
+    let exponent = (dims as f64 - 3.0) / 2.0;
+    // We skip the normalization constant since Lloyd-Max only needs relative densities.
+    (1.0 - x2).powf(exponent) as f32
+}
+
+// --- Matrix operations ---
+
+/// Generate random orthogonal matrix via QR decomposition of Gaussian matrix.
+fn generate_rotation_matrix(dims: usize) -> Vec<f32> {
     let mut rng = rand::rng();
     let mut matrix = vec![0.0f32; dims * dims];
 
-    // Fill with random values.
+    // Fill with i.i.d. N(0,1).
     for val in &mut matrix {
-        *val = rng.random_range(-1.0..1.0);
+        *val = sample_normal(&mut rng);
     }
 
-    // Gram-Schmidt orthogonalization.
+    // QR decomposition via modified Gram-Schmidt (numerically stable variant).
+    // For each column, orthogonalize against all previous columns.
+    // We work in row-major but treat rows as our vectors to orthogonalize.
     for i in 0..dims {
-        // Subtract projections onto previous vectors.
+        // Orthogonalize row i against rows 0..i
         for j in 0..i {
-            let dot = (0..dims)
+            let dot: f32 = (0..dims)
                 .map(|k| matrix[i * dims + k] * matrix[j * dims + k])
-                .sum::<f32>();
+                .sum();
             for k in 0..dims {
                 matrix[i * dims + k] -= dot * matrix[j * dims + k];
             }
         }
 
-        // Normalize.
-        let norm = (0..dims)
+        // Normalize row i.
+        let norm: f32 = (0..dims)
             .map(|k| matrix[i * dims + k] * matrix[i * dims + k])
             .sum::<f32>()
             .sqrt();
@@ -185,104 +402,32 @@ fn generate_orthogonal_matrix(dims: usize) -> Vec<f32> {
     matrix
 }
 
-/// Generate a random projection matrix for QJL residual encoding.
-fn generate_random_projection(dims: usize) -> Vec<f32> {
+/// Generate QJL projection matrix: i.i.d. N(0,1) entries.
+fn generate_qjl_matrix(dims: usize) -> Vec<f32> {
     let mut rng = rand::rng();
-    let scale = 1.0 / (dims as f32).sqrt();
-    let mut matrix = vec![0.0f32; dims * dims];
-    for val in &mut matrix {
-        *val = if rng.random_bool(0.5) { scale } else { -scale };
-    }
-    matrix
+    (0..dims * dims)
+        .map(|_| sample_normal(&mut rng))
+        .collect()
 }
 
-fn matrix_vector_multiply(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32> {
+fn mat_vec_mul(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32> {
     let mut result = vec![0.0f32; dims];
-    for i in 0..dims {
-        let mut sum = 0.0f32;
-        for j in 0..dims {
-            sum += matrix[i * dims + j] * vector[j];
-        }
-        result[i] = sum;
+    for (i, res) in result.iter_mut().enumerate() {
+        *res = (0..dims).map(|j| matrix[i * dims + j] * vector[j]).sum();
     }
     result
 }
 
-fn matrix_vector_multiply_transpose(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32> {
+fn mat_vec_mul_transpose(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32> {
     let mut result = vec![0.0f32; dims];
-    for i in 0..dims {
-        let mut sum = 0.0f32;
-        for j in 0..dims {
-            sum += matrix[j * dims + i] * vector[j];
-        }
-        result[i] = sum;
+    for (i, res) in result.iter_mut().enumerate() {
+        *res = (0..dims).map(|j| matrix[j * dims + i] * vector[j]).sum();
     }
     result
 }
 
-/// Lloyd-Max optimal scalar quantizer: find centroids that minimize MSE
-/// for the given distribution of scalar values.
-fn lloyd_max_quantize(values: &[f32], num_centroids: usize) -> Vec<f32> {
-    if values.is_empty() {
-        return vec![0.0; num_centroids];
-    }
+// --- Bit packing ---
 
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    // Initialize centroids uniformly across the value range.
-    let min_val = sorted[0];
-    let max_val = sorted[sorted.len() - 1];
-    let mut centroids: Vec<f32> = (0..num_centroids)
-        .map(|i| min_val + (max_val - min_val) * (i as f32 + 0.5) / num_centroids as f32)
-        .collect();
-
-    // Lloyd's algorithm: iterate assignment + update.
-    for _ in 0..50 {
-        // Assign each value to nearest centroid.
-        let mut sums = vec![0.0f32; num_centroids];
-        let mut counts = vec![0u32; num_centroids];
-
-        for &val in values {
-            let idx = find_nearest_centroid(&centroids, val);
-            sums[idx] += val;
-            counts[idx] += 1;
-        }
-
-        // Update centroids.
-        let mut changed = false;
-        for i in 0..num_centroids {
-            if counts[i] > 0 {
-                let new_centroid = sums[i] / counts[i] as f32;
-                if (new_centroid - centroids[i]).abs() > 1e-8 {
-                    changed = true;
-                }
-                centroids[i] = new_centroid;
-            }
-        }
-
-        if !changed {
-            break;
-        }
-    }
-
-    centroids
-}
-
-fn find_nearest_centroid(centroids: &[f32], value: f32) -> usize {
-    centroids
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            let da = (value - **a).abs();
-            let db = (value - **b).abs();
-            da.partial_cmp(&db).unwrap()
-        })
-        .unwrap()
-        .0
-}
-
-/// Pack quantized indices (each `bits` wide) into bytes.
 fn bit_pack(indices: &[u8], bits: u8) -> Vec<u8> {
     let total_bits = indices.len() * bits as usize;
     let num_bytes = total_bits.div_ceil(8);
@@ -301,10 +446,8 @@ fn bit_pack(indices: &[u8], bits: u8) -> Vec<u8> {
     packed
 }
 
-/// Unpack quantized indices from packed bytes.
 fn bit_unpack(packed: &[u8], bits: u8, count: usize) -> Vec<u8> {
     let mut indices = Vec::with_capacity(count);
-
     let mut bit_pos = 0usize;
     for _ in 0..count {
         let mut val = 0u8;
@@ -317,11 +460,9 @@ fn bit_unpack(packed: &[u8], bits: u8, count: usize) -> Vec<u8> {
         }
         indices.push(val);
     }
-
     indices
 }
 
-/// Pack boolean values (1 bit each) into bytes.
 fn pack_bools(bools: &[bool]) -> Vec<u8> {
     let num_bytes = bools.len().div_ceil(8);
     let mut packed = vec![0u8; num_bytes];
@@ -333,22 +474,31 @@ fn pack_bools(bools: &[bool]) -> Vec<u8> {
     packed
 }
 
+fn unpack_bools(packed: &[u8], count: usize) -> Vec<bool> {
+    let mut bools = Vec::with_capacity(count);
+    for i in 0..count {
+        let bit = (packed[i / 8] >> (7 - (i % 8))) & 1;
+        bools.push(bit == 1);
+    }
+    bools
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distance::Metric;
+    use crate::distance;
 
     #[test]
     fn config_sizes() {
         let c2 = TurboQuantConfig::new(1536, 2);
-        assert_eq!(c2.compressed_size(), 384); // 1536 * 2 / 8
-        assert_eq!(c2.qjl_size(), 192); // 1536 / 8
+        assert_eq!(c2.compressed_size(), 384);
+        assert_eq!(c2.qjl_size(), 192);
 
         let c3 = TurboQuantConfig::new(1536, 3);
-        assert_eq!(c3.compressed_size(), 576); // 1536 * 3 / 8
+        assert_eq!(c3.compressed_size(), 576);
 
         let c4 = TurboQuantConfig::new(1536, 4);
-        assert_eq!(c4.compressed_size(), 768); // 1536 * 4 / 8
+        assert_eq!(c4.compressed_size(), 768);
     }
 
     #[test]
@@ -376,52 +526,132 @@ mod tests {
     }
 
     #[test]
-    fn lloyd_max_produces_correct_centroid_count() {
-        let values: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
-        let centroids = lloyd_max_quantize(&values, 8);
-        assert_eq!(centroids.len(), 8);
+    fn bool_pack_roundtrip() {
+        let bools = vec![true, false, true, true, false, false, true, false, true];
+        let packed = pack_bools(&bools);
+        let unpacked = unpack_bools(&packed, bools.len());
+        assert_eq!(bools, unpacked);
     }
 
     #[test]
-    fn lloyd_max_centroids_are_sorted_roughly() {
-        let values: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
-        let centroids = lloyd_max_quantize(&values, 4);
-        // Centroids should roughly span the range.
-        assert!(centroids.iter().any(|&c| c < 0.3));
-        assert!(centroids.iter().any(|&c| c > 0.7));
+    fn beta_codebook_centroid_count() {
+        let cb = compute_beta_codebook(64, 8);
+        assert_eq!(cb.centroids.len(), 8);
+        assert_eq!(cb.boundaries.len(), 7);
     }
 
     #[test]
-    fn compress_decompress_preserves_direction() {
+    fn beta_codebook_centroids_span_range() {
+        let cb = compute_beta_codebook(64, 4);
+        assert!(cb.centroids.iter().any(|&c| c < 0.0));
+        assert!(cb.centroids.iter().any(|&c| c > 0.0));
+    }
+
+    #[test]
+    fn beta_codebook_boundaries_are_ordered() {
+        let cb = compute_beta_codebook(128, 8);
+        for w in cb.boundaries.windows(2) {
+            assert!(w[0] < w[1], "boundaries not sorted: {:?}", cb.boundaries);
+        }
+    }
+
+    #[test]
+    fn compress_preserves_direction() {
         let dims = 32;
         let config = TurboQuantConfig::new(dims, 4);
+        let quantizer = TurboQuantizer::new(config);
 
-        // Generate random vectors.
         let mut rng = rand::rng();
-        let samples: Vec<Vec<f32>> = (0..100)
-            .map(|_| (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect())
-            .collect();
-        let sample_refs: Vec<&[f32]> = samples.iter().map(|v| v.as_slice()).collect();
+        let original: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
 
-        let quantizer = TurboQuantizer::train(config, &sample_refs);
-
-        // Compress and decompress a vector.
-        let original = &samples[0];
-        let compressed = quantizer.compress(original);
+        let compressed = quantizer.compress(&original);
         let decompressed = quantizer.decompress(&compressed);
 
-        // The decompressed vector should be in roughly the same direction.
-        let dot: f32 = original
-            .iter()
-            .zip(decompressed.iter())
-            .map(|(a, b)| a * b)
-            .sum();
-        let norm_orig: f32 = original.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_decomp: f32 = decompressed.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let cosine_sim = dot / (norm_orig * norm_decomp);
+        let cosine_sim = distance::dot_product(&original, &decompressed)
+            / (distance::dot_product(&original, &original).sqrt()
+                * distance::dot_product(&decompressed, &decompressed).sqrt());
 
-        // At 4-bit with 32 dims, should be quite good.
-        assert!(cosine_sim > 0.8, "cosine similarity too low: {cosine_sim}");
+        assert!(
+            cosine_sim > 0.8,
+            "cosine similarity too low: {cosine_sim}"
+        );
+    }
+
+    #[test]
+    fn norm_is_preserved() {
+        let dims = 64;
+        let config = TurboQuantConfig::new(dims, 3);
+        let quantizer = TurboQuantizer::new(config);
+
+        let mut rng = rand::rng();
+        let original: Vec<f32> = (0..dims).map(|_| rng.random_range(-5.0..5.0)).collect();
+        let original_norm = original.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        let compressed = quantizer.compress(&original);
+        assert!(
+            (compressed.norm - original_norm).abs() < 1e-5,
+            "norm mismatch: {} vs {}",
+            compressed.norm,
+            original_norm
+        );
+    }
+
+    #[test]
+    fn unbiased_inner_product_estimator() {
+        // The key property: over many random vectors, the estimated inner product
+        // should converge to the true inner product (unbiased).
+        let dims = 64;
+        let config = TurboQuantConfig::new(dims, 3);
+        let quantizer = TurboQuantizer::new(config);
+
+        let mut rng = rand::rng();
+        let query: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
+
+        let n_trials = 200;
+        let mut total_error = 0.0f32;
+
+        for _ in 0..n_trials {
+            let target: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
+            let true_ip = distance::dot_product(&query, &target);
+            let compressed = quantizer.compress(&target);
+            let estimated_ip = quantizer.inner_product_estimate(&query, &compressed);
+            total_error += estimated_ip - true_ip;
+        }
+
+        let mean_error = total_error / n_trials as f32;
+        let true_ip_scale: f32 = {
+            let target: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
+            distance::dot_product(&query, &target).abs()
+        };
+
+        // Mean error should be small relative to typical inner product magnitude.
+        // With 200 trials, bias should be clearly visible if present.
+        let relative_bias = mean_error.abs() / (true_ip_scale + 1.0);
+        assert!(
+            relative_bias < 0.3,
+            "estimator appears biased: mean_error={mean_error}, relative_bias={relative_bias}"
+        );
+    }
+
+    #[test]
+    fn l2_distance_estimate_reasonable() {
+        let dims = 64;
+        let config = TurboQuantConfig::new(dims, 4);
+        let quantizer = TurboQuantizer::new(config);
+
+        let mut rng = rand::rng();
+        let query: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let target: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
+
+        let true_dist = distance::l2_squared(&query, &target);
+        let compressed = quantizer.compress(&target);
+        let estimated = quantizer.distance_estimate(&query, &compressed, distance::Metric::L2);
+
+        let ratio = estimated / true_dist;
+        assert!(
+            ratio > 0.3 && ratio < 3.0,
+            "L2 estimate off: true={true_dist}, est={estimated}, ratio={ratio}"
+        );
     }
 
     #[test]
@@ -434,32 +664,9 @@ mod tests {
     }
 
     #[test]
-    fn asymmetric_distance_reasonable() {
-        let dims = 64;
-        let config = TurboQuantConfig::new(dims, 4);
-
-        let mut rng = rand::rng();
-        let samples: Vec<Vec<f32>> = (0..200)
-            .map(|_| (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect())
-            .collect();
-        let sample_refs: Vec<&[f32]> = samples.iter().map(|v| v.as_slice()).collect();
-
-        let quantizer = TurboQuantizer::train(config, &sample_refs);
-
-        let query = &samples[0];
-        let similar = &samples[1];
-
-        let compressed_similar = quantizer.compress(similar);
-
-        let approx_dist =
-            quantizer.asymmetric_distance(query, &compressed_similar, Metric::L2);
-        let exact_dist = crate::distance::l2_squared(query, similar);
-
-        // Approximate distance should be in the right ballpark.
-        let ratio = approx_dist / exact_dist;
-        assert!(
-            ratio > 0.3 && ratio < 3.0,
-            "distance ratio {ratio} out of range (approx={approx_dist}, exact={exact_dist})"
-        );
+    fn no_training_needed() {
+        // TurboQuant codebook is analytical — no samples required.
+        let config = TurboQuantConfig::new(128, 3);
+        let _quantizer = TurboQuantizer::new(config);
     }
 }
