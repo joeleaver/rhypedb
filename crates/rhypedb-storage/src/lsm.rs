@@ -46,28 +46,18 @@ pub struct LsmTree {
 
 impl LsmTree {
     /// Open or create an LSM-tree at the given directory.
+    ///
+    /// Recovery procedure:
+    /// 1. Discover and open existing SST files, tracking max version
+    /// 2. Replay WAL records into a fresh memtable, tracking max version
+    /// 3. Initialize the transaction manager at the recovered max version
     pub fn open(config: LsmConfig) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)?;
         std::fs::create_dir_all(config.data_dir.join("sst"))?;
 
-        let wal_path = config.data_dir.join("wal.log");
-        let txn_manager = Arc::new(TransactionManager::new());
+        let mut max_version = 0u64;
 
-        // Recover from WAL if it exists.
-        let memtable = Arc::new(MemTable::new());
-        let records = Wal::replay(&wal_path)?;
-        for record in &records {
-            match record.record_type {
-                RecordType::Put => {
-                    memtable.put(&record.key, record.version, record.value.clone());
-                }
-                RecordType::Delete => {
-                    memtable.delete(&record.key, record.version);
-                }
-            }
-        }
-
-        // Discover existing SST files.
+        // Discover existing SST files and find max version across all of them.
         let mut sst_readers = Vec::new();
         let mut max_sst_id = 0u64;
         let sst_dir = config.data_dir.join("sst");
@@ -91,19 +81,42 @@ impl LsmTree {
                 {
                     max_sst_id = max_sst_id.max(id);
                 }
-                sst_readers.push(SstReader::open(entry.path())?);
+                let reader = SstReader::open(entry.path())?;
+                max_version = max_version.max(reader.max_version());
+                sst_readers.push(reader);
             }
         }
 
+        // Replay WAL into a memtable, tracking max version.
+        let wal_path = config.data_dir.join("wal.log");
+        let memtable = Arc::new(MemTable::new());
+        let records = Wal::replay(&wal_path)?;
+        for record in &records {
+            max_version = max_version.max(record.version);
+            match record.record_type {
+                RecordType::Put => {
+                    memtable.put(&record.key, record.version, record.value.clone());
+                }
+                RecordType::Delete => {
+                    memtable.delete(&record.key, record.version);
+                }
+            }
+        }
+
+        // Initialize transaction manager at the recovered version.
+        let txn_manager = Arc::new(TransactionManager::recover_at_version(max_version));
+
+        // Open WAL for new writes (append to existing — records are still
+        // needed until the next flush persists them to SST).
         let wal = Wal::open(&wal_path)?;
 
         Ok(Self {
             config,
-            active_memtable: Arc::new(RwLock::new(Arc::new(memtable.as_ref().clone_into_new()))),
+            active_memtable: Arc::new(RwLock::new(memtable)),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
             sst_files: Arc::new(RwLock::new(sst_readers)),
             wal: Arc::new(parking_lot::Mutex::new(wal)),
-            txn_manager: Arc::new(txn_manager.as_ref().clone_into_new()),
+            txn_manager,
             next_sst_id: std::sync::atomic::AtomicU64::new(max_sst_id + 1),
         })
     }
@@ -294,9 +307,9 @@ impl LsmTree {
         let mut immutables = self.immutable_memtables.write();
         immutables.retain(|mt| !Arc::ptr_eq(mt, &old_memtable));
 
-        // Start a new WAL (old data is now in the SST).
+        // Truncate the WAL — flushed data is now durable in the SST.
         let wal_path = self.config.data_dir.join("wal.log");
-        let new_wal = Wal::open(&wal_path)?;
+        let new_wal = Wal::create_fresh(&wal_path)?;
         *self.wal.lock() = new_wal;
 
         Ok(())
@@ -409,29 +422,6 @@ impl LsmTree {
     /// Number of SST files on disk.
     pub fn sst_count(&self) -> usize {
         self.sst_files.read().len()
-    }
-}
-
-/// Helper to create a fresh MemTable by replaying into a new one.
-/// We need this because MemTable wraps a SkipMap which isn't Clone.
-trait CloneIntoNew {
-    fn clone_into_new(&self) -> Self;
-}
-
-impl CloneIntoNew for MemTable {
-    fn clone_into_new(&self) -> Self {
-        let new = MemTable::new();
-        // For a fresh open, the recovered memtable's entries need to be copied.
-        // But we actually just need a fresh empty one for the active slot.
-        // The recovered data is already in the memtable we're replacing.
-        new
-    }
-}
-
-impl CloneIntoNew for TransactionManager {
-    fn clone_into_new(&self) -> Self {
-        // Fresh manager — version state was reconstructed from WAL.
-        TransactionManager::new()
     }
 }
 
@@ -657,5 +647,139 @@ mod tests {
         assert_eq!(tree.sst_count(), 1);
         tree.compact().unwrap();
         assert_eq!(tree.sst_count(), 1); // unchanged
+    }
+
+    #[test]
+    fn recovery_from_wal_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write data, don't flush (stays in WAL only).
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, b"wal-key", Bytes::from("wal-value"))
+                .unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+        // Tree dropped — simulates process exit.
+
+        // Reopen — should recover from WAL.
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            let txn = tree.begin_txn();
+            let val = tree.get(&txn, b"wal-key").unwrap();
+            assert_eq!(val, Some(Bytes::from("wal-value")));
+        }
+    }
+
+    #[test]
+    fn recovery_from_sst_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Write and flush (data in SST).
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, b"sst-key", Bytes::from("sst-value"))
+                .unwrap();
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+        }
+
+        // Reopen — should find data in SST.
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            let txn = tree.begin_txn();
+            let val = tree.get(&txn, b"sst-key").unwrap();
+            assert_eq!(val, Some(Bytes::from("sst-value")));
+        }
+    }
+
+    #[test]
+    fn version_counter_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let version_after_writes;
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            for i in 0..10u64 {
+                let mut txn = tree.begin_txn();
+                tree.put(&mut txn, format!("k{i}").as_bytes(), Bytes::from("v"))
+                    .unwrap();
+                tree.commit(&mut txn).unwrap();
+            }
+            version_after_writes = tree.txn_manager().current_version();
+        }
+
+        // Reopen — version counter should resume, not reset.
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            let recovered_version = tree.txn_manager().current_version();
+            assert!(
+                recovered_version >= version_after_writes,
+                "version counter went backwards: {recovered_version} < {version_after_writes}"
+            );
+
+            // New writes should get higher versions.
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, b"new-key", Bytes::from("new-val"))
+                .unwrap();
+            let new_version = tree.commit(&mut txn).unwrap();
+            assert!(
+                new_version > version_after_writes,
+                "new version {new_version} should be > {version_after_writes}"
+            );
+        }
+    }
+
+    #[test]
+    fn wal_truncated_after_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("wal.log");
+
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, b"before-flush", Bytes::from("val"))
+                .unwrap();
+            tree.commit(&mut txn).unwrap();
+
+            // WAL should have records before flush.
+            let records_before = Wal::replay(&wal_path).unwrap();
+            assert!(!records_before.is_empty());
+
+            tree.flush().unwrap();
+
+            // WAL should be empty after flush.
+            let records_after = Wal::replay(&wal_path).unwrap();
+            assert!(
+                records_after.is_empty(),
+                "WAL should be empty after flush, has {} records",
+                records_after.len()
+            );
+        }
+    }
+
+    #[test]
+    fn new_writes_after_reopen_dont_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, b"key", Bytes::from("v1")).unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+
+        // Reopen and overwrite the same key — should succeed, not conflict.
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, b"key", Bytes::from("v2")).unwrap();
+            tree.commit(&mut txn).unwrap();
+
+            let txn2 = tree.begin_txn();
+            assert_eq!(tree.get(&txn2, b"key").unwrap(), Some(Bytes::from("v2")));
+        }
     }
 }

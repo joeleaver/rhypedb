@@ -55,13 +55,31 @@ impl Database {
             }
         }
 
+        // Recover the max object ID by scanning existing objects.
+        let mut max_object_id = 0u64;
+        let txn = storage.begin_txn();
+        for &type_id in type_ids.values() {
+            let prefix = KeyBuilder::object_prefix(type_id);
+            if let Ok(entries) = storage.scan_prefix(&txn, &prefix) {
+                for (key, _) in &entries {
+                    // Object key: o:<type_id>:<object_id> — last 8 bytes are the object ID.
+                    if key.len() >= 8 {
+                        let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+                        let object_id = u64::from_be_bytes(id_bytes);
+                        max_object_id = max_object_id.max(object_id);
+                    }
+                }
+            }
+        }
+        drop(txn);
+
         Ok(Self {
             schema,
             storage,
             type_ids,
             rel_ids,
             field_ids,
-            next_object_id: AtomicU64::new(1),
+            next_object_id: AtomicU64::new(max_object_id + 1),
         })
     }
 
@@ -181,7 +199,7 @@ impl Database {
                 // Remove old unique index entry if the field had a value.
                 if let Some(old_value) = fields.get(field_name)
                     && !matches!(old_value, Value::Null) {
-                        self.remove_unique_index(&mut txn, type_id, field_name, old_value)?;
+                        self.remove_unique_index(&mut txn, type_name, type_id, field_name, old_value)?;
                     }
                 self.check_unique_and_insert(
                     &mut txn, type_name, type_id, field_name, value, object_id,
@@ -208,25 +226,76 @@ impl Database {
     }
 
     /// Delete an object, enforcing @on_delete policies on all inbound relationships.
+    /// Cascades are recursive — if deleting A cascades to B, and B has its own
+    /// cascade relationships, those are followed too.
     pub fn delete(&self, type_name: &str, object_id: u64) -> EngineResult<()> {
+        let mut txn = self.storage.begin_txn();
+        let mut deleted = std::collections::HashSet::new();
+        self.delete_inner(&mut txn, type_name, object_id, &mut deleted)?;
+
+        self.storage.commit(&mut txn).map_err(|e| match e {
+            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+            other => EngineError::Storage(other),
+        })?;
+
+        Ok(())
+    }
+
+    /// Internal recursive delete. The `deleted` set prevents infinite loops
+    /// if there are circular cascade relationships.
+    fn delete_inner(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_name: &str,
+        object_id: u64,
+        deleted: &mut std::collections::HashSet<(String, u64)>,
+    ) -> EngineResult<()> {
+        let delete_key = (type_name.to_string(), object_id);
+        if !deleted.insert(delete_key) {
+            return Ok(()); // already deleted in this cascade chain
+        }
+
         let type_id = *self
             .type_ids
             .get(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
 
-        let mut txn = self.storage.begin_txn();
-
-        // Verify object exists.
         let obj_key = KeyBuilder::object(type_id, object_id);
-        if self.storage.get(&txn, &obj_key)?.is_none() {
+
+        // Read the object's fields for unique index cleanup.
+        let obj_data = self.storage.get(txn, &obj_key)?;
+        if obj_data.is_none() {
             return Err(EngineError::ObjectNotFound {
                 type_name: type_name.into(),
                 object_id,
             });
         }
 
-        // Check all relationship fields across all types that might reference this object.
-        // Use the reverse edge index to find inbound references.
+        // Clean up unique index entries for this object.
+        if let Some(data) = &obj_data {
+            let fields = deserialize_fields(data);
+            if let Some(type_def) = self.schema.get_type(type_name) {
+                for field_def in &type_def.fields {
+                    if field_def.is_unique()
+                        && let Some(value) = fields.get(&field_def.name)
+                            && !matches!(value, Value::Null) {
+                                let field_key = format!("{type_name}.{}", field_def.name);
+                                let field_id = self.field_ids[&field_key];
+                                let value_bytes = value_to_index_bytes(value);
+                                let unique_key =
+                                    KeyBuilder::unique_index(type_id, field_id, &value_bytes);
+                                self.storage.delete(txn, &unique_key)?;
+                            }
+                }
+            }
+        }
+
+        // Process inbound relationships (other objects pointing at this one).
+        // Collect all work upfront to avoid borrowing issues.
+        let mut deny_violations = Vec::new();
+        let mut edges_to_remove = Vec::new();
+        let mut objects_to_cascade = Vec::new();
+
         for (other_type_name, other_type_def) in &self.schema.types {
             for field in &other_type_def.fields {
                 if let FieldType::Relation(rel) = &field.field_type {
@@ -242,47 +311,30 @@ impl Database {
                         OnDeletePolicy::Deny
                     });
 
-                    // Scan reverse edges for this relationship pointing at our object.
                     let rev_prefix = KeyBuilder::reverse_edge_prefix(object_id, rel_id);
-                    let reverse_edges = self.scan_prefix(&txn, &rev_prefix)?;
+                    let reverse_edges = self.scan_prefix(txn, &rev_prefix)?;
 
                     if reverse_edges.is_empty() {
                         continue;
                     }
 
-                    match policy {
-                        OnDeletePolicy::Deny => {
-                            return Err(EngineError::DeleteDenied {
-                                type_name: type_name.into(),
-                                object_id,
-                                referencing_type: other_type_name.clone(),
-                                referencing_field: field.name.clone(),
-                            });
-                        }
-                        OnDeletePolicy::Remove => {
-                            // Remove the edges.
-                            for (source_id, _) in &reverse_edges {
-                                let edge_key = KeyBuilder::edge(*source_id, rel_id, object_id);
-                                let rev_key =
-                                    KeyBuilder::reverse_edge(*source_id, rel_id, object_id);
-                                self.storage.delete(&mut txn, &edge_key)?;
-                                self.storage.delete(&mut txn, &rev_key)?;
+                    for (source_id, _) in reverse_edges {
+                        match policy {
+                            OnDeletePolicy::Deny => {
+                                deny_violations.push((
+                                    other_type_name.clone(),
+                                    field.name.clone(),
+                                ));
                             }
-                        }
-                        OnDeletePolicy::Cascade => {
-                            // Delete the referencing objects (recursively).
-                            for (source_id, _) in &reverse_edges {
-                                let edge_key = KeyBuilder::edge(*source_id, rel_id, object_id);
-                                let rev_key =
-                                    KeyBuilder::reverse_edge(*source_id, rel_id, object_id);
-                                self.storage.delete(&mut txn, &edge_key)?;
-                                self.storage.delete(&mut txn, &rev_key)?;
-
-                                // Delete the source object.
-                                let other_type_id = self.type_ids[other_type_name];
-                                let source_obj_key =
-                                    KeyBuilder::object(other_type_id, *source_id);
-                                self.storage.delete(&mut txn, &source_obj_key)?;
+                            OnDeletePolicy::Remove => {
+                                edges_to_remove.push((source_id, rel_id, object_id));
+                            }
+                            OnDeletePolicy::Cascade => {
+                                edges_to_remove.push((source_id, rel_id, object_id));
+                                objects_to_cascade.push((
+                                    other_type_name.clone(),
+                                    source_id,
+                                ));
                             }
                         }
                     }
@@ -290,30 +342,49 @@ impl Database {
             }
         }
 
+        // Check deny violations first (before any mutations).
+        if let Some((ref_type, ref_field)) = deny_violations.into_iter().next() {
+            return Err(EngineError::DeleteDenied {
+                type_name: type_name.into(),
+                object_id,
+                referencing_type: ref_type,
+                referencing_field: ref_field,
+            });
+        }
+
+        // Remove inbound edges.
+        for (source_id, rel_id, target_id) in &edges_to_remove {
+            let edge_key = KeyBuilder::edge(*source_id, *rel_id, *target_id);
+            let rev_key = KeyBuilder::reverse_edge(*target_id, *rel_id, *source_id);
+            self.storage.delete(txn, &edge_key)?;
+            self.storage.delete(txn, &rev_key)?;
+        }
+
+        // Recursively delete cascade targets.
+        for (cascade_type, cascade_id) in objects_to_cascade {
+            self.delete_inner(txn, &cascade_type, cascade_id, deleted)?;
+        }
+
         // Delete outbound edges from this object.
-        let type_def = &self.schema.types[type_name];
-        for field in &type_def.fields {
-            if let FieldType::Relation(_) = &field.field_type {
-                let rel_key_name = format!("{type_name}.{}", field.name);
-                let rel_id = self.rel_ids[&rel_key_name];
-                let edge_prefix = KeyBuilder::edge_prefix(object_id, rel_id);
-                let outbound = self.scan_prefix(&txn, &edge_prefix)?;
-                for (target_id, _) in &outbound {
-                    let edge_key = KeyBuilder::edge(object_id, rel_id, *target_id);
-                    let rev_key = KeyBuilder::reverse_edge(*target_id, rel_id, object_id);
-                    self.storage.delete(&mut txn, &edge_key)?;
-                    self.storage.delete(&mut txn, &rev_key)?;
+        if let Some(type_def) = self.schema.get_type(type_name) {
+            for field in &type_def.fields {
+                if let FieldType::Relation(_) = &field.field_type {
+                    let rel_key_name = format!("{type_name}.{}", field.name);
+                    let rel_id = self.rel_ids[&rel_key_name];
+                    let edge_prefix = KeyBuilder::edge_prefix(object_id, rel_id);
+                    let outbound = self.scan_prefix(txn, &edge_prefix)?;
+                    for (target_id, _) in &outbound {
+                        let edge_key = KeyBuilder::edge(object_id, rel_id, *target_id);
+                        let rev_key = KeyBuilder::reverse_edge(*target_id, rel_id, object_id);
+                        self.storage.delete(txn, &edge_key)?;
+                        self.storage.delete(txn, &rev_key)?;
+                    }
                 }
             }
         }
 
         // Delete the object itself.
-        self.storage.delete(&mut txn, &obj_key)?;
-
-        self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
-            other => EngineError::Storage(other),
-        })?;
+        self.storage.delete(txn, &obj_key)?;
 
         Ok(())
     }
@@ -552,20 +623,16 @@ impl Database {
     fn remove_unique_index(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_name: &str,
         type_id: u64,
         field_name: &str,
         value: &Value,
     ) -> EngineResult<()> {
-        // Find the field_id — we need to check all types since we only have field_name here.
-        // In practice this is called from update() which already knows the type.
-        for (key, &fid) in &self.field_ids {
-            if key.ends_with(&format!(".{field_name}")) {
-                let value_bytes = value_to_index_bytes(value);
-                let unique_key = KeyBuilder::unique_index(type_id, fid, &value_bytes);
-                self.storage.delete(txn, &unique_key)?;
-                return Ok(());
-            }
-        }
+        let field_key = format!("{type_name}.{field_name}");
+        let field_id = self.field_ids[&field_key];
+        let value_bytes = value_to_index_bytes(value);
+        let unique_key = KeyBuilder::unique_index(type_id, field_id, &value_bytes);
+        self.storage.delete(txn, &unique_key)?;
         Ok(())
     }
 }
@@ -1064,5 +1131,140 @@ mod tests {
         updates.insert("email".into(), Value::String("alice@example.com".into()));
         let result = db.update("User", bob.id, updates);
         assert!(matches!(result, Err(EngineError::UniqueViolation { .. })));
+    }
+
+    #[test]
+    fn recursive_cascade_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+            }
+            type Post {
+                title: String
+                author: User @on_delete(cascade)
+            }
+            type Comment {
+                body: String
+                post: Post @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let mut pf = FieldMap::new();
+        pf.insert("title".into(), Value::String("My Post".into()));
+        let post = db.create("Post", pf).unwrap();
+        db.link("Post", post.id, "author", alice.id, None).unwrap();
+
+        let mut cf = FieldMap::new();
+        cf.insert("body".into(), Value::String("Great post!".into()));
+        let comment = db.create("Comment", cf).unwrap();
+        db.link("Comment", comment.id, "post", post.id, None)
+            .unwrap();
+
+        // Deleting alice should cascade to post, which cascades to comment.
+        db.delete("User", alice.id).unwrap();
+
+        assert!(matches!(
+            db.get("User", alice.id),
+            Err(EngineError::ObjectNotFound { .. })
+        ));
+        assert!(matches!(
+            db.get("Post", post.id),
+            Err(EngineError::ObjectNotFound { .. })
+        ));
+        assert!(matches!(
+            db.get("Comment", comment.id),
+            Err(EngineError::ObjectNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn object_id_recovery_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+
+        let first_id;
+        {
+            let db = Database::open(schema.clone(), dir.path()).unwrap();
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("Alice".into()));
+            let obj = db.create("User", f).unwrap();
+            first_id = obj.id;
+        }
+
+        // Reopen — new objects should get IDs after the existing ones.
+        {
+            let db = Database::open(schema, dir.path()).unwrap();
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("Bob".into()));
+            let obj = db.create("User", f).unwrap();
+            assert!(
+                obj.id > first_id,
+                "new ID {} should be > existing ID {}",
+                obj.id,
+                first_id
+            );
+
+            // Original object should still exist.
+            let alice = db.get("User", first_id).unwrap();
+            assert_eq!(
+                alice.fields.get("name"),
+                Some(&Value::String("Alice".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn unique_index_cleaned_on_cascade_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+            }
+            type Post {
+                slug: String @unique
+                author: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let mut pf = FieldMap::new();
+        pf.insert("slug".into(), Value::String("hello-world".into()));
+        let post = db.create("Post", pf).unwrap();
+        db.link("Post", post.id, "author", alice.id, None).unwrap();
+
+        // Delete alice — cascades to post.
+        db.delete("User", alice.id).unwrap();
+
+        // Now creating a new post with the same slug should succeed
+        // because the unique index was cleaned up.
+        let mut uf2 = FieldMap::new();
+        uf2.insert("name".into(), Value::String("Bob".into()));
+        let bob = db.create("User", uf2).unwrap();
+
+        let mut pf2 = FieldMap::new();
+        pf2.insert("slug".into(), Value::String("hello-world".into()));
+        let post2 = db.create("Post", pf2).unwrap();
+        db.link("Post", post2.id, "author", bob.id, None).unwrap();
+
+        assert_eq!(
+            db.get("Post", post2.id).unwrap().fields.get("slug"),
+            Some(&Value::String("hello-world".into()))
+        );
     }
 }

@@ -39,6 +39,17 @@ impl TransactionManager {
         }
     }
 
+    /// Create a transaction manager that resumes from a known version.
+    /// Used during recovery to restore the version counter from WAL/SST state.
+    pub fn recover_at_version(version: u64) -> Self {
+        Self {
+            next_version: AtomicU64::new(version + 1),
+            active_snapshots: RwLock::new(HashSet::new()),
+            committed_log: Mutex::new(VecDeque::new()),
+            max_committed_log_size: 1024,
+        }
+    }
+
     /// Start a new transaction, returning its snapshot version.
     pub fn begin(&self) -> Transaction {
         let snapshot = self.next_version.load(Ordering::SeqCst) - 1;

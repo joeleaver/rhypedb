@@ -171,6 +171,21 @@ impl Wal {
         Ok(records)
     }
 
+    /// Create a fresh empty WAL, replacing any existing file.
+    /// Used after flush to discard already-persisted records.
+    pub fn create_fresh(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        Ok(Self {
+            path,
+            writer: BufWriter::new(file),
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

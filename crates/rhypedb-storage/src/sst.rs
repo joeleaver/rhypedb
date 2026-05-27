@@ -350,6 +350,20 @@ impl SstReader {
         &self.path
     }
 
+    /// Find the maximum version stored in this SST file.
+    /// Used during recovery to restore the transaction version counter.
+    pub fn max_version(&self) -> u64 {
+        let mut max_ver = 0u64;
+        for (key, _) in self.iter() {
+            if key.len() >= 8 {
+                let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+                let version = !u64::from_be_bytes(ver_bytes);
+                max_ver = max_ver.max(version);
+            }
+        }
+        max_ver
+    }
+
     /// Scan for entries whose user key starts with `prefix`, returning the latest
     /// visible version per user key at the given snapshot version.
     pub fn scan_prefix(&self, prefix: &[u8], version: u64) -> Vec<(Bytes, Option<Bytes>)> {
