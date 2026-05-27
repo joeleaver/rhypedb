@@ -11,9 +11,11 @@ license = "MIT"
 rhypedb-storage = { path = "crates/rhypedb-storage" }
 rhypedb-schema = { path = "crates/rhypedb-schema" }
 rhypedb-engine = { path = "crates/rhypedb-engine" }
+rhypedb-vector = { path = "crates/rhypedb-vector" }
 bytes = "1"
 crc32fast = "1"
 crossbeam-skiplist = "0.1"
 parking_lot = "0.12"
+rand = "0.9"
 thiserror = "2"
 tempfile = "3"
