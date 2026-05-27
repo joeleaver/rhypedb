@@ -1,0 +1,17 @@
+type User {
+    name: String
+    email: String @unique
+    age: u32
+    friends: [User] @on_delete(remove)
+    posts: [Post] @inverse(Post.author)
+}
+
+type Post {
+    title: String
+    body: String
+    author: User @on_delete(cascade)
+}
+
+type Tag {
+    name: String @unique
+}

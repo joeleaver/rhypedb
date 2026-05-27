@@ -171,13 +171,9 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        if !self.committed {
-            // Safety net: if a transaction is dropped without commit/abort,
-            // we can't clean up the snapshot set here because we don't have
-            // a reference to the manager. The snapshot will be leaked.
-            // Users should always explicitly commit or abort.
+        if !self.committed && !self.write_set.is_empty() {
             eprintln!(
-                "WARNING: transaction with snapshot {} dropped without commit/abort",
+                "WARNING: read-write transaction with snapshot {} dropped without commit/abort",
                 self.snapshot
             );
         }

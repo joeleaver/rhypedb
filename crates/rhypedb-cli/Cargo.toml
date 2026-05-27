@@ -1,0 +1,11 @@
+[package]
+name = "rhypedb-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rustyline = { workspace = true }
+ureq = { workspace = true }
