@@ -258,6 +258,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhypedb-engine"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "parking_lot",
+ "rhypedb-schema",
+ "rhypedb-storage",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "rhypedb-schema"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "rhypedb-server"
 version = "0.1.0"
 dependencies = [

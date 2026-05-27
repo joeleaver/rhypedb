@@ -1,0 +1,14 @@
+[package]
+name = "rhypedb-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rhypedb-storage = { workspace = true }
+rhypedb-schema = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -155,7 +155,7 @@ pub struct SstMeta {
 pub struct SstReader {
     data: Vec<u8>,
     index: Vec<IndexEntry>,
-    _path: PathBuf,
+    path: PathBuf,
 }
 
 impl SstReader {
@@ -209,7 +209,7 @@ impl SstReader {
         Ok(Self {
             data,
             index,
-            _path: path,
+            path,
         })
     }
 
@@ -344,6 +344,10 @@ impl SstReader {
         }
 
         Ok(None)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Iterate all entries in the SST in sorted order.

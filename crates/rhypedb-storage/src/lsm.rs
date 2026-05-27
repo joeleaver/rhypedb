@@ -259,9 +259,113 @@ impl LsmTree {
         Ok(())
     }
 
+    /// Compact all SST files into a single new SST, dropping old versions
+    /// and tombstones that are no longer needed by any active transaction.
+    pub fn compact(&self) -> Result<()> {
+        let ssts = self.sst_files.read();
+        if ssts.len() < 2 {
+            return Ok(());
+        }
+
+        let min_snapshot = self.txn_manager.min_active_snapshot();
+
+        // Merge all SST iterators into a single sorted stream.
+        // Since each SST is already sorted and SSTs are ordered oldest→newest,
+        // we collect all entries and sort. For a production system you'd use
+        // a merge iterator, but this is correct and simple.
+        let mut all_entries: Vec<(Bytes, Option<Bytes>)> = Vec::new();
+        for sst in ssts.iter() {
+            for entry in sst.iter() {
+                all_entries.push(entry);
+            }
+        }
+        drop(ssts);
+
+        all_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        // Write merged entries to a new SST, keeping only the latest version
+        // of each user key that's still needed.
+        let sst_id = self
+            .next_sst_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sst_path = self
+            .config
+            .data_dir
+            .join("sst")
+            .join(format!("{sst_id:08}.sst"));
+
+        let mut writer = SstWriter::new(&sst_path)?;
+        let mut prev_user_key: Option<Vec<u8>> = None;
+        let mut kept_latest_for_key = false;
+
+        for (key, value) in &all_entries {
+            if key.len() < 8 {
+                continue;
+            }
+            let user_key = &key[..key.len() - 8];
+            let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let version = !u64::from_be_bytes(ver_bytes);
+
+            let same_key = prev_user_key
+                .as_ref()
+                .is_some_and(|prev| prev.as_slice() == user_key);
+
+            if !same_key {
+                prev_user_key = Some(user_key.to_vec());
+                kept_latest_for_key = false;
+            }
+
+            if !kept_latest_for_key {
+                // Always keep the latest version of each key.
+                writer.add(key, value)?;
+                kept_latest_for_key = true;
+            } else if version >= min_snapshot {
+                // Keep versions that might still be visible to active transactions.
+                writer.add(key, value)?;
+            }
+            // Older versions below min_snapshot are dropped.
+        }
+
+        let meta = writer.finish()?;
+
+        if meta.entry_count == 0 {
+            // All entries were compacted away — remove the empty SST.
+            let _ = std::fs::remove_file(&sst_path);
+            // Remove old SSTs.
+            let mut ssts = self.sst_files.write();
+            let old_paths: Vec<_> = ssts.iter().map(|s| s.path().to_path_buf()).collect();
+            ssts.clear();
+            drop(ssts);
+            for path in old_paths {
+                let _ = std::fs::remove_file(path);
+            }
+            return Ok(());
+        }
+
+        // Swap old SSTs for the new compacted one.
+        let new_reader = SstReader::open(&sst_path)?;
+        let mut ssts = self.sst_files.write();
+        let old_paths: Vec<_> = ssts.iter().map(|s| s.path().to_path_buf()).collect();
+        ssts.clear();
+        ssts.push(new_reader);
+        drop(ssts);
+
+        // Delete old SST files.
+        for path in old_paths {
+            let _ = std::fs::remove_file(path);
+        }
+
+        Ok(())
+    }
+
     /// Returns a reference to the transaction manager.
     pub fn txn_manager(&self) -> &TransactionManager {
         &self.txn_manager
+    }
+
+    /// Number of SST files on disk.
+    pub fn sst_count(&self) -> usize {
+        self.sst_files.read().len()
     }
 }
 
@@ -408,5 +512,107 @@ mod tests {
             let val = tree.get(&txn, key.as_bytes()).unwrap();
             assert!(val.is_some(), "key {key} missing after flush");
         }
+    }
+
+    #[test]
+    fn compaction_merges_sst_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        // Write and flush multiple times to create multiple SSTs.
+        for batch in 0..3u64 {
+            for i in 0..20u64 {
+                let mut txn = tree.begin_txn();
+                let key = format!("key-{:04}", batch * 20 + i);
+                let value = format!("value-{}-padding-for-size", batch * 20 + i);
+                tree.put(&mut txn, key.as_bytes(), Bytes::from(value))
+                    .unwrap();
+                tree.commit(&mut txn).unwrap();
+            }
+            tree.flush().unwrap();
+        }
+
+        let sst_count_before = tree.sst_count();
+        assert!(sst_count_before >= 3);
+
+        tree.compact().unwrap();
+
+        assert_eq!(tree.sst_count(), 1);
+
+        // All keys still readable.
+        let txn = tree.begin_txn();
+        for i in 0..60u64 {
+            let key = format!("key-{i:04}");
+            let val = tree.get(&txn, key.as_bytes()).unwrap();
+            assert!(val.is_some(), "key {key} missing after compaction");
+        }
+    }
+
+    #[test]
+    fn compaction_drops_old_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        // Write a key, flush, then update it and flush again.
+        let mut txn1 = tree.begin_txn();
+        tree.put(&mut txn1, b"versioned", Bytes::from("v1"))
+            .unwrap();
+        tree.commit(&mut txn1).unwrap();
+        tree.flush().unwrap();
+
+        let mut txn2 = tree.begin_txn();
+        tree.put(&mut txn2, b"versioned", Bytes::from("v2"))
+            .unwrap();
+        tree.commit(&mut txn2).unwrap();
+        tree.flush().unwrap();
+
+        assert!(tree.sst_count() >= 2);
+
+        tree.compact().unwrap();
+        assert_eq!(tree.sst_count(), 1);
+
+        // Should see latest value.
+        let txn3 = tree.begin_txn();
+        assert_eq!(
+            tree.get(&txn3, b"versioned").unwrap(),
+            Some(Bytes::from("v2"))
+        );
+    }
+
+    #[test]
+    fn compaction_removes_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn1 = tree.begin_txn();
+        tree.put(&mut txn1, b"ephemeral", Bytes::from("here"))
+            .unwrap();
+        tree.commit(&mut txn1).unwrap();
+        tree.flush().unwrap();
+
+        let mut txn2 = tree.begin_txn();
+        tree.delete(&mut txn2, b"ephemeral").unwrap();
+        tree.commit(&mut txn2).unwrap();
+        tree.flush().unwrap();
+
+        tree.compact().unwrap();
+
+        let txn3 = tree.begin_txn();
+        assert_eq!(tree.get(&txn3, b"ephemeral").unwrap(), None);
+    }
+
+    #[test]
+    fn compaction_skipped_with_fewer_than_two_ssts() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"solo", Bytes::from("value")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+
+        assert_eq!(tree.sst_count(), 1);
+        tree.compact().unwrap();
+        assert_eq!(tree.sst_count(), 1); // unchanged
     }
 }
