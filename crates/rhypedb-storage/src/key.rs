@@ -148,6 +148,18 @@ impl KeyBuilder {
         buf.freeze()
     }
 
+    /// Vector prefix for scanning all vectors of a type: `v:<type_id>:`
+    /// Returns all vectors across all fields for this type. The caller
+    /// filters by field_id (encoded in the last 8 bytes of each key).
+    pub fn vector_prefix(type_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1);
+        buf.put_u8(KeyPrefix::Vector as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
     /// Unique index key: `u:<type_id>:<field_name_hash>:<value_bytes>`
     /// Maps to the object_id that holds this unique value.
     pub fn unique_index(type_id: u64, field_hash: u64, value_bytes: &[u8]) -> Bytes {

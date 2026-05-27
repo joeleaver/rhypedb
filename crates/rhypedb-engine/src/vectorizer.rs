@@ -153,7 +153,7 @@ impl Vectorizer {
         }
         drop(txn);
 
-        Ok(Self {
+        let vectorizer = Self {
             storage,
             schema,
             type_ids,
@@ -164,7 +164,90 @@ impl Vectorizer {
             next_job_id: AtomicU64::new(max_job_id + 1),
             running: Arc::new(AtomicBool::new(false)),
             worker_handle: parking_lot::Mutex::new(None),
-        })
+        };
+
+        vectorizer.rebuild_indexes()?;
+
+        Ok(vectorizer)
+    }
+
+    /// Rebuild HNSW indexes from persisted vectors in the LSM.
+    /// Called during startup to restore the in-memory HNSW graph from
+    /// vectors that were previously indexed and durably stored.
+    fn rebuild_indexes(&self) -> EngineResult<()> {
+        let indexes = self.indexes.read();
+        if indexes.is_empty() {
+            return Ok(());
+        }
+
+        // For each vectorize field, scan its persisted vectors and reinsert into HNSW.
+        for type_def in self.schema.types.values() {
+            for field in &type_def.fields {
+                if field.vectorize().is_none() {
+                    continue;
+                }
+                let index_key = format!("{}.{}", type_def.name, field.name);
+                let index = match indexes.get(&index_key) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+
+                let type_id = match self.type_ids.get(&type_def.name) {
+                    Some(&id) => id,
+                    None => continue,
+                };
+                let field_key = format!("{}.{}", type_def.name, field.name);
+                let field_id = match self.field_ids.get(&field_key) {
+                    Some(&id) => id,
+                    None => continue,
+                };
+
+                // Scan all vector entries for this type.
+                let prefix = KeyBuilder::vector_prefix(type_id);
+                let txn = self.storage.begin_txn();
+                let entries = self.storage.scan_prefix(&txn, &prefix)?;
+                drop(txn);
+
+                let mut count = 0usize;
+                for (key, data) in &entries {
+                    // Vector key: v:<type_id>:<object_id>:<field_id>
+                    // Extract object_id and field_id from the key.
+                    // Key structure after prefix: <object_id (8 bytes)>:<field_id (8 bytes)>
+                    if key.len() < 2 + 8 + 1 + 8 + 1 + 8 {
+                        continue;
+                    }
+
+                    // Parse out the field_id from the last 8 bytes to verify it matches.
+                    let key_field_id_bytes: [u8; 8] =
+                        key[key.len() - 8..].try_into().unwrap();
+                    let key_field_id = u64::from_be_bytes(key_field_id_bytes);
+                    if key_field_id != field_id {
+                        continue;
+                    }
+
+                    // Extract object_id: 8 bytes before the separator + field_id.
+                    let obj_id_start = key.len() - 8 - 1 - 8;
+                    let obj_id_bytes: [u8; 8] =
+                        key[obj_id_start..obj_id_start + 8].try_into().unwrap();
+                    let object_id = u64::from_be_bytes(obj_id_bytes);
+
+                    // Deserialize the f32 vector.
+                    if let Some(vector) = deserialize_f32_vec(data) {
+                        index.insert(object_id, &vector);
+                        count += 1;
+                    }
+                }
+
+                if count > 0 {
+                    eprintln!(
+                        "rebuilt HNSW index for {}.{}: {} vectors",
+                        type_def.name, field.name, count
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Enqueue a vectorization job for an object.
@@ -281,31 +364,38 @@ impl Vectorizer {
                 }
             };
 
-            // Insert each embedding into the HNSW index and update state.
+            // Insert each embedding into the HNSW index, persist to LSM, and update state.
             for (emb_idx, (queue_key, job)) in jobs.iter().enumerate() {
                 if emb_idx >= embeddings.len() {
                     break;
                 }
 
+                let embedding = &embeddings[emb_idx];
+
+                // Insert into HNSW index.
                 let index_key = format!("{}.{}", job.type_name, job.vector_field);
                 if let Some(index) = self.indexes.read().get(&index_key) {
-                    index.insert(job.object_id, &embeddings[emb_idx]);
+                    index.insert(job.object_id, embedding);
                 }
 
-                // Update vector state to indexed.
+                // Persist the raw embedding to LSM so it survives restart.
                 let type_id = self.type_ids[&job.type_name];
                 let field_key = format!("{}.{}", job.type_name, job.vector_field);
                 let field_id = self.field_ids[&field_key];
+
+                let vector_key = KeyBuilder::vector(type_id, job.object_id, field_id);
+                let vector_bytes = serialize_f32_vec(embedding);
+
                 let state_key =
                     KeyBuilder::vector_state(type_id, job.object_id, field_id);
 
                 let mut txn = self.storage.begin_txn();
+                self.storage.put(&mut txn, &vector_key, vector_bytes)?;
                 self.storage.put(
                     &mut txn,
                     &state_key,
                     Bytes::from(vec![VectorState::Indexed as u8]),
                 )?;
-                // Remove job from queue.
                 self.storage.delete(&mut txn, queue_key)?;
                 self.storage.commit(&mut txn).map_err(|e| match e {
                     rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
@@ -538,6 +628,25 @@ impl Drop for Vectorizer {
     }
 }
 
+fn serialize_f32_vec(vec: &[f32]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(vec.len() * 4);
+    for &v in vec {
+        buf.put_f32(v);
+    }
+    buf.freeze()
+}
+
+fn deserialize_f32_vec(data: &[u8]) -> Option<Vec<f32>> {
+    if !data.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut vec = Vec::with_capacity(data.len() / 4);
+    for chunk in data.chunks_exact(4) {
+        vec.push(f32::from_be_bytes(chunk.try_into().ok()?));
+    }
+    Some(vec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,6 +837,71 @@ mod tests {
 
             let processed = vectorizer.process_pending().unwrap();
             assert_eq!(processed, 1);
+        }
+    }
+
+    #[test]
+    fn indexed_vectors_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First run: index a document.
+        {
+            let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+            store_object(&storage, 1, 1, "machine learning and neural networks");
+            store_object(&storage, 1, 2, "cooking pasta with tomato sauce");
+
+            let vectorizer = Vectorizer::new(
+                Arc::clone(&storage),
+                schema,
+                type_ids,
+                field_ids,
+            )
+            .unwrap();
+
+            for id in 1..=2 {
+                vectorizer
+                    .enqueue(VectorizeJob {
+                        type_name: "Post".into(),
+                        object_id: id,
+                        source_field: "body".into(),
+                        vector_field: "embedding".into(),
+                        model: "all-MiniLM-L6-v2".into(),
+                    })
+                    .unwrap();
+            }
+
+            let processed = vectorizer.process_pending().unwrap();
+            assert_eq!(processed, 2);
+
+            // Verify search works.
+            let results = vectorizer
+                .search_text("Post", "embedding", "artificial intelligence", 1, 50)
+                .unwrap();
+            assert!(!results.is_empty(), "search should return results before restart");
+        }
+
+        // Second run: vectors should be rebuilt from LSM without re-encoding.
+        {
+            let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+            let vectorizer = Vectorizer::new(
+                Arc::clone(&storage),
+                schema,
+                type_ids,
+                field_ids,
+            )
+            .unwrap();
+
+            // Search should work immediately — no need to re-process.
+            let results = vectorizer
+                .search_text("Post", "embedding", "artificial intelligence", 1, 50)
+                .unwrap();
+            assert!(
+                !results.is_empty(),
+                "search should return results after restart (vectors rebuilt from LSM)"
+            );
+
+            // The ML document should rank above the cooking document.
+            assert_eq!(results[0].0, 1, "ML document should be the top result");
         }
     }
 
