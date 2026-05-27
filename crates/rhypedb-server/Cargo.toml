@@ -10,6 +10,7 @@ rhypedb-engine = { workspace = true }
 rhypedb-query = { workspace = true }
 rhypedb-embed = { workspace = true }
 rhypedb-vector = { workspace = true }
+rhypedb-subscribe = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

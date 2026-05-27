@@ -14,9 +14,10 @@ rhypedb-engine = { path = "crates/rhypedb-engine" }
 rhypedb-vector = { path = "crates/rhypedb-vector" }
 rhypedb-query = { path = "crates/rhypedb-query" }
 rhypedb-embed = { path = "crates/rhypedb-embed" }
+rhypedb-subscribe = { path = "crates/rhypedb-subscribe" }
 bytes = "1"
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }

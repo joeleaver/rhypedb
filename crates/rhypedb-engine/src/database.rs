@@ -7,6 +7,7 @@ use bytes::Bytes;
 use rhypedb_schema::{FieldType, OnDeletePolicy, Schema};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::{LsmConfig, LsmTree};
+use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionHub};
 
 use crate::error::{EngineError, EngineResult};
 use crate::object::{deserialize_fields, serialize_fields, FieldMap, Object, Value};
@@ -22,6 +23,7 @@ pub struct Database {
     rel_ids: HashMap<String, u64>,
     field_ids: HashMap<String, u64>,
     next_object_id: AtomicU64,
+    subscriptions: SubscriptionHub,
 }
 
 impl Database {
@@ -80,6 +82,7 @@ impl Database {
             rel_ids,
             field_ids,
             next_object_id: AtomicU64::new(max_object_id + 1),
+            subscriptions: SubscriptionHub::new(),
         })
     }
 
@@ -119,10 +122,18 @@ impl Database {
         }
 
         self.storage.put(&mut txn, &key, serialized)?;
-        self.storage.commit(&mut txn).map_err(|e| match e {
+        let version = self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
             other => EngineError::Storage(other),
         })?;
+
+        self.subscriptions.publish(ChangeEvent {
+            version,
+            kind: ChangeKind::Create,
+            type_name: type_name.into(),
+            object_id,
+            fields: Some(fields_to_json(&fields)),
+        });
 
         Ok(Object {
             type_name: type_name.into(),
@@ -245,10 +256,18 @@ impl Database {
 
         let serialized = serialize_fields(&fields);
         self.storage.put(&mut txn, &key, serialized)?;
-        self.storage.commit(&mut txn).map_err(|e| match e {
+        let version = self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
             other => EngineError::Storage(other),
         })?;
+
+        self.subscriptions.publish(ChangeEvent {
+            version,
+            kind: ChangeKind::Update,
+            type_name: type_name.into(),
+            object_id,
+            fields: Some(fields_to_json(&fields)),
+        });
 
         Ok(Object {
             type_name: type_name.into(),
@@ -265,10 +284,20 @@ impl Database {
         let mut deleted = std::collections::HashSet::new();
         self.delete_inner(&mut txn, type_name, object_id, &mut deleted)?;
 
-        self.storage.commit(&mut txn).map_err(|e| match e {
+        let version = self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
             other => EngineError::Storage(other),
         })?;
+
+        for (del_type, del_id) in &deleted {
+            self.subscriptions.publish(ChangeEvent {
+                version,
+                kind: ChangeKind::Delete,
+                type_name: del_type.clone(),
+                object_id: *del_id,
+                fields: None,
+            });
+        }
 
         Ok(())
     }
@@ -618,6 +647,10 @@ impl Database {
         &self.schema
     }
 
+    pub fn subscriptions(&self) -> &SubscriptionHub {
+        &self.subscriptions
+    }
+
     /// Check that a unique value doesn't already exist, and insert the index entry.
     fn check_unique_and_insert(
         &self,
@@ -682,6 +715,27 @@ fn value_to_index_bytes(value: &Value) -> Vec<u8> {
         Value::Bytes(b) => b.to_vec(),
         Value::Null => vec![],
     }
+}
+
+fn fields_to_json(fields: &FieldMap) -> HashMap<String, serde_json::Value> {
+    fields
+        .iter()
+        .map(|(k, v)| {
+            let json_val = match v {
+                Value::String(s) => serde_json::Value::String(s.clone()),
+                Value::U32(n) => serde_json::json!(n),
+                Value::U64(n) => serde_json::json!(n),
+                Value::I32(n) => serde_json::json!(n),
+                Value::I64(n) => serde_json::json!(n),
+                Value::F32(n) => serde_json::json!(n),
+                Value::F64(n) => serde_json::json!(n),
+                Value::Bool(b) => serde_json::Value::Bool(*b),
+                Value::Bytes(b) => serde_json::json!(format!("<{} bytes>", b.len())),
+                Value::Null => serde_json::Value::Null,
+            };
+            (k.clone(), json_val)
+        })
+        .collect()
 }
 
 fn validate_value(
@@ -1346,5 +1400,116 @@ mod tests {
             db.get("Post", post2.id).unwrap().fields.get("slug"),
             Some(&Value::String("hello-world".into()))
         );
+    }
+
+    #[test]
+    fn subscription_receives_create_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let (_id, rx) = db
+            .subscriptions()
+            .subscribe(rhypedb_subscribe::SubscriptionFilter::for_type("User"));
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", f).unwrap();
+
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Create);
+        assert_eq!(event.type_name, "User");
+        assert_eq!(event.object_id, user.id);
+    }
+
+    #[test]
+    fn subscription_receives_update_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", f).unwrap();
+
+        let (_id, rx) = db
+            .subscriptions()
+            .subscribe(rhypedb_subscribe::SubscriptionFilter::for_object("User", user.id));
+
+        let mut updates = FieldMap::new();
+        updates.insert("name".into(), Value::String("Bob".into()));
+        db.update("User", user.id, updates).unwrap();
+
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Update);
+        assert_eq!(event.object_id, user.id);
+    }
+
+    #[test]
+    fn subscription_receives_delete_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", f).unwrap();
+
+        let (_id, rx) = db
+            .subscriptions()
+            .subscribe(rhypedb_subscribe::SubscriptionFilter::for_type("User"));
+        // Drain the create event.
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+
+        db.delete("User", user.id).unwrap();
+
+        let event = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Delete);
+        assert_eq!(event.object_id, user.id);
+    }
+
+    #[test]
+    fn subscription_receives_cascade_delete_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User { name: String }
+            type Post {
+                title: String
+                author: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let mut pf = FieldMap::new();
+        pf.insert("title".into(), Value::String("Post 1".into()));
+        let post = db.create("Post", pf).unwrap();
+        db.link("Post", post.id, "author", alice.id, None).unwrap();
+
+        // Subscribe to all delete events.
+        let mut filter = rhypedb_subscribe::SubscriptionFilter::all();
+        filter.kinds = vec![rhypedb_subscribe::ChangeKind::Delete];
+        let (_id, rx) = db.subscriptions().subscribe(filter);
+
+        db.delete("User", alice.id).unwrap();
+
+        // Should receive delete events for both User and Post.
+        let mut deleted_types = Vec::new();
+        for _ in 0..2 {
+            if let Ok(event) = rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                deleted_types.push(event.type_name.clone());
+            }
+        }
+        deleted_types.sort();
+        assert_eq!(deleted_types, vec!["Post", "User"]);
     }
 }
