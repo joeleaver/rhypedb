@@ -42,10 +42,11 @@ pub enum Step {
         predicate: Predicate,
     },
 
-    /// `.similar(.field, vec, k: N)` — vector similarity search.
+    /// `.similar(.field, query, k: N)` — vector similarity search.
+    /// Query can be a text string (encoded by the vectorizer) or a raw vector.
     Similar {
         field_name: String,
-        vector: Vec<f32>,
+        query: SimilarQuery,
         k: usize,
     },
 
@@ -119,6 +120,15 @@ impl CompareOp {
             Self::Ge => ">=",
         }
     }
+}
+
+/// Query input for vector similarity search.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SimilarQuery {
+    /// A text string to be encoded by the vectorizer.
+    Text(String),
+    /// A raw vector of floats.
+    Vector(Vec<f32>),
 }
 
 /// A literal value in a query.

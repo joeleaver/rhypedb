@@ -445,7 +445,15 @@ impl<'a> Parser<'a> {
                 self.expect_char('.')?;
                 let field_name = self.parse_ident()?;
                 self.expect_char(',')?;
-                let vector = self.parse_vector_literal()?;
+
+                // Detect text string vs raw vector.
+                self.skip_ws();
+                let query = if self.peek() == Some('"') {
+                    SimilarQuery::Text(self.parse_string_literal()?)
+                } else {
+                    SimilarQuery::Vector(self.parse_vector_literal()?)
+                };
+
                 self.expect_char(',')?;
                 self.skip_ws();
                 self.expect_str("k:")?;
@@ -453,7 +461,7 @@ impl<'a> Parser<'a> {
                 self.expect_char(')')?;
                 Ok(Step::Similar {
                     field_name,
-                    vector,
+                    query,
                     k,
                 })
             }
@@ -621,18 +629,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_similar() {
+    fn parse_similar_with_vector() {
         let q = parse_query("Post.similar(.embedding, [1.0, 2.0, 3.0], k: 10)").unwrap();
         assert_eq!(q.steps.len(), 1);
         match &q.steps[0] {
             Step::Similar {
                 field_name,
-                vector,
+                query,
                 k,
             } => {
                 assert_eq!(field_name, "embedding");
-                assert_eq!(vector, &[1.0, 2.0, 3.0]);
+                assert_eq!(*query, SimilarQuery::Vector(vec![1.0, 2.0, 3.0]));
                 assert_eq!(*k, 10);
+            }
+            _ => panic!("expected Similar step"),
+        }
+    }
+
+    #[test]
+    fn parse_similar_with_text() {
+        let q = parse_query(r#"Post.similar(.embedding, "distributed systems", k: 5)"#).unwrap();
+        assert_eq!(q.steps.len(), 1);
+        match &q.steps[0] {
+            Step::Similar {
+                field_name,
+                query,
+                k,
+            } => {
+                assert_eq!(field_name, "embedding");
+                assert_eq!(
+                    *query,
+                    SimilarQuery::Text("distributed systems".into())
+                );
+                assert_eq!(*k, 5);
             }
             _ => panic!("expected Similar step"),
         }

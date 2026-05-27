@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use rhypedb_engine::database::Database;
 use rhypedb_engine::object::{FieldMap, Object, Value};
+use rhypedb_engine::vectorizer::Vectorizer;
 
 use crate::ast::*;
 use crate::error::{QueryError, QueryResult};
@@ -19,14 +20,18 @@ pub enum QueryOutput {
     Done,
 }
 
-/// Execute a parsed query against the database.
-pub fn execute(db: &Database, query: &Query) -> QueryResult<QueryOutput> {
-    // Execute the source to get an initial result set.
-    let mut result = execute_source(db, &query.source)?;
+/// Context for query execution.
+pub struct ExecContext<'a> {
+    pub db: &'a Database,
+    pub vectorizer: Option<&'a Vectorizer>,
+}
 
-    // Apply each step in the chain.
+/// Execute a parsed query against the database.
+pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput> {
+    let mut result = execute_source(ctx.db, &query.source)?;
+
     for step in &query.steps {
-        result = execute_step(db, result, step, &query.source)?;
+        result = execute_step(ctx, result, step, &query.source)?;
     }
 
     Ok(result)
@@ -65,11 +70,12 @@ fn execute_source(db: &Database, source: &Source) -> QueryResult<QueryOutput> {
 }
 
 fn execute_step(
-    db: &Database,
+    ctx: &ExecContext<'_>,
     current: QueryOutput,
     step: &Step,
     source: &Source,
 ) -> QueryResult<QueryOutput> {
+    let db = ctx.db;
     match step {
         Step::Traverse { field_name } => {
             let objects = extract_objects(current)?;
@@ -178,12 +184,34 @@ fn execute_step(
             Ok(QueryOutput::Done)
         }
 
-        Step::Similar { .. } => {
-            // Vector search integration will be implemented when we connect
-            // the vector engine to the query executor.
-            Err(QueryError::Type(
-                "vector similarity search not yet integrated with query executor".into(),
-            ))
+        Step::Similar {
+            field_name,
+            query,
+            k,
+        } => {
+            let vectorizer = ctx.vectorizer.ok_or_else(|| {
+                QueryError::Type("vector similarity search requires a vectorizer".into())
+            })?;
+
+            let type_name = infer_type_from_objects(&[], source)
+                .ok_or_else(|| QueryError::Type("cannot determine type for similar()".into()))?;
+
+            let ef = (*k).max(50); // search width >= k
+            let results = match query {
+                SimilarQuery::Text(text) => {
+                    vectorizer.search_text(&type_name, field_name, text, *k, ef)?
+                }
+                SimilarQuery::Vector(vec) => {
+                    vectorizer.search_vector(&type_name, field_name, vec, *k, ef)?
+                }
+            };
+
+            let objects: Vec<Object> = results
+                .iter()
+                .filter_map(|(id, _dist)| db.get(&type_name, *id).ok())
+                .collect();
+
+            Ok(QueryOutput::Objects(objects))
         }
 
         Step::Limit { count } => {
@@ -364,7 +392,7 @@ mod tests {
         let db = test_db(dir.path());
 
         let q = parse_query(r#"User.create({ name: "Alice", age: 30 })"#).unwrap();
-        let result = execute(&db, &q).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
         let obj = match result {
             QueryOutput::Single(o) => o,
             _ => panic!("expected Single"),
@@ -372,7 +400,7 @@ mod tests {
         assert_eq!(obj.fields.get("name"), Some(&Value::String("Alice".into())));
 
         let q = parse_query(&format!("User.get({})", obj.id)).unwrap();
-        let result = execute(&db, &q).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
         match result {
             QueryOutput::Objects(objs) => {
                 assert_eq!(objs.len(), 1);
@@ -395,7 +423,7 @@ mod tests {
         create_user(&db, "Carol", 20);
 
         let q = parse_query("User.filter(.age > 22)").unwrap();
-        let result = execute(&db, &q).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
         match result {
             QueryOutput::Objects(objs) => {
                 assert_eq!(objs.len(), 2);
@@ -422,7 +450,7 @@ mod tests {
             alice.id
         ))
         .unwrap();
-        let result = execute(&db, &q).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
 
         match result {
             QueryOutput::Single(obj) => {
@@ -440,7 +468,7 @@ mod tests {
         let alice = create_user(&db, "Alice", 25);
 
         let q = parse_query(&format!("User.get({}).delete()", alice.id)).unwrap();
-        let result = execute(&db, &q).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
         assert!(matches!(result, QueryOutput::Done));
 
         assert!(db.get("User", alice.id).is_err());
@@ -457,7 +485,7 @@ mod tests {
             .unwrap();
 
         let q = parse_query(&format!("User.get({}).friends", alice.id)).unwrap();
-        let result = execute(&db, &q).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
 
         match result {
             QueryOutput::Objects(objs) => {
@@ -481,7 +509,7 @@ mod tests {
         }
 
         let q = parse_query("User.filter(.age >= 0).limit(2)").unwrap();
-        let result = execute(&db, &q).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
         match result {
             QueryOutput::Objects(objs) => {
                 assert_eq!(objs.len(), 2);
@@ -503,7 +531,7 @@ mod tests {
         db.create("User", f).unwrap();
 
         let q = parse_query("User.filter(.active == true)").unwrap();
-        let result = execute(&db, &q).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
         match result {
             QueryOutput::Objects(objs) => {
                 assert_eq!(objs.len(), 1);
