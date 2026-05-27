@@ -1,0 +1,8 @@
+[package]
+name = "rhypedb-embed"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fastembed = { workspace = true }
+thiserror = { workspace = true }

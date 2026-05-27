@@ -114,6 +114,66 @@ Hierarchical Navigable Small World graph for approximate nearest neighbor search
 - Tombstone-based deletes with periodic graph repair during compaction
 - Configurable via SDL: `@index(hnsw, metric: cosine, quantization: turboquant_3bit)`
 
+## Vectorizer
+
+### Server-Side Encoding
+
+rhypedb encodes text into vectors server-side — clients never need to interact with an embedding model directly. This is configured in the schema via the `@vectorize` directive:
+
+```
+type Post {
+  body: String
+  embedding: Vector<384> @vectorize(
+    source: "body",
+    model: "all-MiniLM-L6-v2"
+  ) @index(hnsw, metric: cosine, quantization: turboquant_3bit)
+}
+```
+
+When a Post is created or its `body` field is updated, rhypedb automatically encodes the text into a 384-dimensional vector, compresses it with TurboQuant, and inserts it into the HNSW index. Similarity queries accept text strings that are encoded transparently at query time:
+
+```
+Post.similar(.embedding, "distributed systems", k: 10)
+```
+
+### Async Vectorization Pipeline
+
+Embedding inference takes 10-30ms per document on CPU. To avoid blocking the write path, vectorization is asynchronous:
+
+```
+Client: Post.create({ body: "hello world" })
+  │
+  ├─ Immediate: object stored in LSM, return to client
+  │
+  └─ Background: encode text → TurboQuant compress → HNSW insert
+```
+
+Objects are queryable by scalar fields and relationships the moment `create` returns. Vectors become searchable after the background worker processes them.
+
+**Components:**
+
+1. **Vectorization queue** — persistent queue stored in the LSM (survives crash and scale-to-zero). When an object with a `@vectorize` field is created or its source field is updated, a job is enqueued.
+
+2. **Background worker** — dedicated thread pool that pulls from the queue, runs the embedding model (via ONNX Runtime), compresses with TurboQuant, and inserts into the HNSW index. Batches documents for efficient inference.
+
+3. **Vector state** — each vector field tracks its state: `pending` (queued, not yet searchable), `indexed` (compressed and in HNSW), or `failed` (encoding error). Similarity queries only search indexed vectors.
+
+4. **Backpressure** — if the queue grows during burst inserts, the worker batches efficiently. Embedding models are faster with larger batches. The queue depth is observable for monitoring.
+
+### Default Embedding Model
+
+The default model is `all-MiniLM-L6-v2`:
+- 384 dimensions, ~80MB model size
+- <30ms per document on CPU
+- Good quality for general-purpose semantic search
+- Available as quantized ONNX model via the `fastembed` crate (`ort` ONNX Runtime bindings)
+
+With TurboQuant 3-bit compression, each 384-dim vector is stored in ~150 bytes.
+
+### Scale-to-Zero Behavior
+
+On Firecracker VM snapshot, the vectorization queue is persisted in the WAL. On wake, the background worker resumes processing any pending jobs. No vectors are lost.
+
 ## Transaction Model
 
 ### MVCC with Snapshot Isolation

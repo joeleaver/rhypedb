@@ -13,8 +13,10 @@ rhypedb-schema = { path = "crates/rhypedb-schema" }
 rhypedb-engine = { path = "crates/rhypedb-engine" }
 rhypedb-vector = { path = "crates/rhypedb-vector" }
 rhypedb-query = { path = "crates/rhypedb-query" }
+rhypedb-embed = { path = "crates/rhypedb-embed" }
 bytes = "1"
 crc32fast = "1"
+fastembed = "5"
 crossbeam-skiplist = "0.1"
 parking_lot = "0.12"
 rand = "0.9"

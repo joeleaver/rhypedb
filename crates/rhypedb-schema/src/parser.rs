@@ -40,6 +40,28 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                     return Err(SchemaError::UnknownType(rel.target_type.clone()));
                 }
 
+            // Validate @vectorize references.
+            if let Some(vec_def) = field.vectorize() {
+                if !matches!(field.field_type, FieldType::Vector(_)) {
+                    return Err(SchemaError::Validation(format!(
+                        "@vectorize on '{}.{}' requires a Vector field type",
+                        type_def.name, field.name
+                    )));
+                }
+                let source = type_def.get_field(&vec_def.source_field).ok_or_else(|| {
+                    SchemaError::Validation(format!(
+                        "@vectorize source field '{}.{}' not found",
+                        type_def.name, vec_def.source_field
+                    ))
+                })?;
+                if !matches!(source.field_type, FieldType::Scalar(ScalarType::String)) {
+                    return Err(SchemaError::Validation(format!(
+                        "@vectorize source field '{}.{}' must be a String",
+                        type_def.name, vec_def.source_field
+                    )));
+                }
+            }
+
             // Validate @inverse references.
             if let Some(inv) = field.inverse() {
                 let target_type = schema
@@ -395,8 +417,71 @@ impl<'a> Parser<'a> {
                 }))
             }
 
+            "vectorize" => {
+                self.expect('(')?;
+                let mut source_field = None;
+                let mut model = None;
+
+                loop {
+                    self.skip_whitespace();
+                    if self.peek() == Some(')') {
+                        self.advance();
+                        break;
+                    }
+                    if source_field.is_some() || model.is_some() {
+                        self.expect(',')?;
+                    }
+
+                    let key = self.parse_ident()?;
+                    self.expect(':')?;
+
+                    match key.as_str() {
+                        "source" => {
+                            self.skip_whitespace();
+                            source_field = Some(self.parse_string_value()?);
+                        }
+                        "model" => {
+                            self.skip_whitespace();
+                            model = Some(self.parse_string_value()?);
+                        }
+                        _ => {
+                            return Err(
+                                self.error(format!("unknown @vectorize parameter: {key}"))
+                            )
+                        }
+                    }
+                }
+
+                let source_field = source_field.ok_or_else(|| {
+                    self.error("@vectorize requires 'source' parameter".into())
+                })?;
+                let model = model.ok_or_else(|| {
+                    self.error("@vectorize requires 'model' parameter".into())
+                })?;
+
+                Ok(Directive::Vectorize(VectorizeDef {
+                    source_field,
+                    model,
+                }))
+            }
+
             _ => Err(self.error(format!("unknown directive: @{name}"))),
         }
+    }
+
+    fn parse_string_value(&mut self) -> SchemaResult<String> {
+        self.skip_whitespace();
+        self.expect('"')?;
+        let start = self.pos;
+        while let Some(ch) = self.peek() {
+            if ch == '"' {
+                let s = self.input[start..self.pos].to_string();
+                self.advance();
+                return Ok(s);
+            }
+            self.advance();
+        }
+        Err(self.error("unterminated string".into()))
     }
 }
 
@@ -695,5 +780,83 @@ mod tests {
         assert_eq!(user.scalar_fields().count(), 3); // name, email, reputation
         assert_eq!(user.relationship_fields().count(), 2); // friends, posts
         assert_eq!(user.vector_fields().count(), 1); // embedding
+    }
+
+    #[test]
+    fn parse_vectorize_directive() {
+        let schema = parse_schema(
+            r#"
+            type Post {
+                body: String
+                embedding: Vector<384> @vectorize(source: "body", model: "all-MiniLM-L6-v2")
+            }
+            "#,
+        )
+        .unwrap();
+
+        let post = schema.get_type("Post").unwrap();
+        let emb = post.get_field("embedding").unwrap();
+        let vec_def = emb.vectorize().unwrap();
+        assert_eq!(vec_def.source_field, "body");
+        assert_eq!(vec_def.model, "all-MiniLM-L6-v2");
+    }
+
+    #[test]
+    fn vectorize_with_index() {
+        let schema = parse_schema(
+            r#"
+            type Post {
+                body: String
+                embedding: Vector<384> @vectorize(source: "body", model: "all-MiniLM-L6-v2") @index(hnsw, metric: cosine, quantization: turboquant_3bit)
+            }
+            "#,
+        )
+        .unwrap();
+
+        let post = schema.get_type("Post").unwrap();
+        let emb = post.get_field("embedding").unwrap();
+        assert!(emb.vectorize().is_some());
+        let idx = emb.directives.iter().find_map(|d| match d {
+            Directive::Index(i) => Some(i),
+            _ => None,
+        });
+        assert!(idx.is_some());
+    }
+
+    #[test]
+    fn reject_vectorize_on_non_vector_field() {
+        let result = parse_schema(
+            r#"
+            type Post {
+                body: String @vectorize(source: "body", model: "test")
+            }
+            "#,
+        );
+        assert!(matches!(result, Err(SchemaError::Validation(_))));
+    }
+
+    #[test]
+    fn reject_vectorize_missing_source() {
+        let result = parse_schema(
+            r#"
+            type Post {
+                embedding: Vector<384> @vectorize(source: "nonexistent", model: "test")
+            }
+            "#,
+        );
+        assert!(matches!(result, Err(SchemaError::Validation(_))));
+    }
+
+    #[test]
+    fn reject_vectorize_non_string_source() {
+        let result = parse_schema(
+            r#"
+            type Post {
+                count: u32
+                embedding: Vector<384> @vectorize(source: "count", model: "test")
+            }
+            "#,
+        );
+        assert!(matches!(result, Err(SchemaError::Validation(_))));
     }
 }

@@ -67,6 +67,13 @@ impl FieldDef {
             _ => None,
         })
     }
+
+    pub fn vectorize(&self) -> Option<&VectorizeDef> {
+        self.directives.iter().find_map(|d| match d {
+            Directive::Vectorize(v) => Some(v),
+            _ => None,
+        })
+    }
 }
 
 /// The type of a field — scalar, relationship, or vector.
@@ -117,6 +124,13 @@ pub enum Directive {
     OnDelete(OnDeletePolicy),
     Inverse(InverseDef),
     Index(IndexDef),
+    Vectorize(VectorizeDef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorizeDef {
+    pub source_field: String,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
