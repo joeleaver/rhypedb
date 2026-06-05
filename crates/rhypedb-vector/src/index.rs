@@ -2,7 +2,7 @@ use std::io;
 
 use crate::distance::{self, Metric};
 use crate::hnsw::{DistanceProvider, HnswConfig, HnswIndex};
-use crate::quantize::{CompressedVector, TurboQuantConfig, TurboQuantizer};
+use crate::quantize::{CompressedVector, PreparedQuery, TurboQuantConfig, TurboQuantizer};
 use crate::serial::{read_u8, write_u8};
 
 const QUANTIZED_INDEX_MAGIC: &[u8; 4] = b"RQNT";
@@ -18,9 +18,14 @@ pub struct TurboQuantDistance {
 
 impl DistanceProvider for TurboQuantDistance {
     type Stored = CompressedVector;
+    type Query = PreparedQuery;
 
-    fn distance(&self, query: &[f32], stored: &CompressedVector) -> f32 {
-        self.quantizer.distance_estimate(query, stored, self.metric)
+    fn prepare(&self, query: &[f32]) -> PreparedQuery {
+        self.quantizer.prepare_query(query)
+    }
+
+    fn distance(&self, query: &PreparedQuery, stored: &CompressedVector) -> f32 {
+        self.quantizer.distance_estimate_prepared(query, stored, self.metric)
     }
 
     fn distance_stored(&self, a: &CompressedVector, b: &CompressedVector) -> f32 {
@@ -28,6 +33,10 @@ impl DistanceProvider for TurboQuantDistance {
         let a_approx = self.quantizer.decompress(a);
         self.quantizer
             .distance_estimate(&a_approx, b, self.metric)
+    }
+
+    fn prepare_stored(&self, stored: &CompressedVector) -> PreparedQuery {
+        self.quantizer.prepare_query(&self.quantizer.decompress(stored))
     }
 
     fn store(&self, vector: &[f32]) -> CompressedVector {

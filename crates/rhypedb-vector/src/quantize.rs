@@ -147,43 +147,48 @@ impl TurboQuantizer {
         unit.iter().map(|x| x * compressed.norm).collect()
     }
 
-    /// Compute the unbiased inner product estimate between a full-precision
-    /// query and a compressed vector.
-    ///
-    /// Formula: ⟨q, x̂_mse⟩ + ‖r‖ · √(π/2) / d · ⟨S^T · signs, q⟩
-    ///
-    /// where x̂_mse is the MSE reconstruction, r is the quantization residual,
-    /// S is the QJL matrix, and signs are the projected residual sign bits.
-    pub fn inner_product_estimate(
+    /// Project a full-precision query through both matrices ONCE so every
+    /// candidate distance can reuse them. This is the key optimization: it turns
+    /// the per-distance cost from two O(d²) matrix multiplies (the inverse
+    /// rotation inside `decompress`, and the QJL `S^T·signs`) into two O(d) dot
+    /// products, via the identities
+    ///   ⟨q, R^T·cv⟩ = ⟨R·q, cv⟩   and   ⟨S^T·signs, q⟩ = ⟨signs, S·q⟩.
+    pub fn prepare_query(&self, query: &[f32]) -> PreparedQuery {
+        let dims = self.config.dimensions as usize;
+        PreparedQuery {
+            rq: mat_vec_mul(&self.rotation_matrix, query, dims),
+            sq: mat_vec_mul(&self.qjl_matrix, query, dims),
+            q_norm: query.iter().map(|x| x * x).sum::<f32>().sqrt(),
+        }
+    }
+
+    /// Unbiased inner-product estimate reusing a [`PreparedQuery`]. O(d) per
+    /// call — no matrix multiplies and no full `decompress`.
+    pub fn inner_product_estimate_prepared(
         &self,
-        query: &[f32],
+        prepared: &PreparedQuery,
         compressed: &CompressedVector,
     ) -> f32 {
         let dims = self.config.dimensions as usize;
 
-        // MSE term: ⟨query, x̂_mse⟩
-        let mse_approx = self.decompress(compressed);
-        let mse_dot: f32 = query
+        // MSE term: ⟨q, x̂_mse⟩ = ‖x‖ · ⟨R·q, cv⟩, where cv[i] is the centroid for
+        // the quantized rotated coordinate i (decompress's pre-inverse-rotation
+        // values). Avoids materializing x̂_mse (which would need the R^T multiply).
+        let indices = bit_unpack(&compressed.data, self.config.bits, dims);
+        let mse_dot: f32 = indices
             .iter()
-            .zip(mse_approx.iter())
-            .map(|(q, x)| q * x)
-            .sum();
+            .zip(prepared.rq.iter())
+            .map(|(&i, &rqi)| self.codebook.centroids[i as usize] * rqi)
+            .sum::<f32>()
+            * compressed.norm;
 
-        // QJL correction term: ‖r‖ · √(π/2) / d · ⟨S^T · signs, query⟩
+        // QJL correction: ‖r‖ · ‖x‖ · √(π/2)/d · ⟨signs, S·q⟩ (signs are ±1, so a
+        // signed sum over the pre-projected sq).
         let signs = unpack_bools(&compressed.qjl_signs, dims);
-        let signs_f32: Vec<f32> = signs
+        let correction_dot: f32 = signs
             .iter()
-            .map(|&b| if b { 1.0 } else { -1.0 })
-            .collect();
-
-        // Compute S^T · signs (transpose multiply)
-        let st_signs = mat_vec_mul_transpose(&self.qjl_matrix, &signs_f32, dims);
-
-        // ⟨S^T · signs, query⟩
-        let correction_dot: f32 = st_signs
-            .iter()
-            .zip(query.iter())
-            .map(|(s, q)| s * q)
+            .zip(prepared.sq.iter())
+            .map(|(&b, &s)| if b { s } else { -s })
             .sum();
 
         let qjl_scale = (std::f32::consts::FRAC_PI_2).sqrt() / dims as f32;
@@ -192,20 +197,46 @@ impl TurboQuantizer {
         mse_dot + correction
     }
 
-    /// Compute approximate distance using the unbiased estimator.
+    /// Compute the unbiased inner product estimate between a full-precision
+    /// query and a compressed vector. Convenience wrapper that prepares the
+    /// query then delegates; prefer preparing once and reusing
+    /// [`Self::inner_product_estimate_prepared`] across many candidates.
+    pub fn inner_product_estimate(
+        &self,
+        query: &[f32],
+        compressed: &CompressedVector,
+    ) -> f32 {
+        let prepared = self.prepare_query(query);
+        self.inner_product_estimate_prepared(&prepared, compressed)
+    }
+
+    /// Compute approximate distance using the unbiased estimator. Wrapper that
+    /// prepares the query once; prefer [`Self::distance_estimate_prepared`] when
+    /// scoring many candidates against the same query.
     pub fn distance_estimate(
         &self,
         query: &[f32],
         compressed: &CompressedVector,
         metric: crate::distance::Metric,
     ) -> f32 {
+        let prepared = self.prepare_query(query);
+        self.distance_estimate_prepared(&prepared, compressed, metric)
+    }
+
+    /// Approximate distance reusing a [`PreparedQuery`].
+    pub fn distance_estimate_prepared(
+        &self,
+        prepared: &PreparedQuery,
+        compressed: &CompressedVector,
+        metric: crate::distance::Metric,
+    ) -> f32 {
         match metric {
-            crate::distance::Metric::DotProduct => -self.inner_product_estimate(query, compressed),
+            crate::distance::Metric::DotProduct => {
+                -self.inner_product_estimate_prepared(prepared, compressed)
+            }
             crate::distance::Metric::Cosine => {
-                let ip = self.inner_product_estimate(query, compressed);
-                let q_norm = query.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let x_norm = compressed.norm;
-                let denom = q_norm * x_norm;
+                let ip = self.inner_product_estimate_prepared(prepared, compressed);
+                let denom = prepared.q_norm * compressed.norm;
                 if denom == 0.0 {
                     1.0
                 } else {
@@ -214,10 +245,8 @@ impl TurboQuantizer {
             }
             crate::distance::Metric::L2 => {
                 // ‖q - x‖² = ‖q‖² + ‖x‖² - 2⟨q, x⟩
-                let q_norm_sq: f32 = query.iter().map(|x| x * x).sum();
-                let x_norm_sq = compressed.norm * compressed.norm;
-                let ip = self.inner_product_estimate(query, compressed);
-                q_norm_sq + x_norm_sq - 2.0 * ip
+                let ip = self.inner_product_estimate_prepared(prepared, compressed);
+                prepared.q_norm * prepared.q_norm + compressed.norm * compressed.norm - 2.0 * ip
             }
         }
     }
@@ -249,6 +278,19 @@ impl TurboQuantizer {
             qjl_matrix,
         })
     }
+}
+
+/// A query projected through the rotation and QJL matrices once, so that many
+/// candidate distances can be estimated against it in O(d) each. Built by
+/// [`TurboQuantizer::prepare_query`].
+#[derive(Debug, Clone)]
+pub struct PreparedQuery {
+    /// R · query — the rotated query (reused by the MSE term).
+    pub rq: Vec<f32>,
+    /// S · query — the QJL-projected query (reused by the correction term).
+    pub sq: Vec<f32>,
+    /// ‖query‖ — cached for the cosine/L2 conversions.
+    pub q_norm: f32,
 }
 
 /// A compressed vector with all components needed for the unbiased estimator.

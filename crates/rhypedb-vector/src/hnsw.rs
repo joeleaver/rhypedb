@@ -41,11 +41,23 @@ pub trait DistanceProvider: Send + Sync {
     /// The stored representation of a vector (f32 slice, compressed, etc.)
     type Stored: Send + Sync;
 
-    /// Compute distance between a full-precision query and a stored vector.
-    fn distance(&self, query: &[f32], stored: &Self::Stored) -> f32;
+    /// A query prepared once for repeated distance computations against many
+    /// stored vectors (e.g. precomputed projections). Built via [`Self::prepare`].
+    type Query: Send + Sync;
+
+    /// Prepare a full-precision query for repeated distance computations.
+    fn prepare(&self, query: &[f32]) -> Self::Query;
+
+    /// Compute distance between a prepared query and a stored vector.
+    fn distance(&self, query: &Self::Query, stored: &Self::Stored) -> f32;
 
     /// Compute distance between two stored vectors (for neighbor pruning).
     fn distance_stored(&self, a: &Self::Stored, b: &Self::Stored) -> f32;
+
+    /// Prepare a *stored* vector as a query, so pruning can score many candidates
+    /// against one fixed stored vector with the projection matvecs hoisted out of
+    /// the loop. Equivalent to preparing its reconstruction.
+    fn prepare_stored(&self, stored: &Self::Stored) -> Self::Query;
 
     /// Convert a full-precision vector into the stored representation.
     fn store(&self, vector: &[f32]) -> Self::Stored;
@@ -64,13 +76,22 @@ pub struct ExactDistance {
 
 impl DistanceProvider for ExactDistance {
     type Stored = Vec<f32>;
+    type Query = Vec<f32>;
 
-    fn distance(&self, query: &[f32], stored: &Vec<f32>) -> f32 {
+    fn prepare(&self, query: &[f32]) -> Vec<f32> {
+        query.to_vec()
+    }
+
+    fn distance(&self, query: &Vec<f32>, stored: &Vec<f32>) -> f32 {
         compute_distance(self.metric, query, stored)
     }
 
     fn distance_stored(&self, a: &Vec<f32>, b: &Vec<f32>) -> f32 {
         compute_distance(self.metric, a, b)
+    }
+
+    fn prepare_stored(&self, stored: &Vec<f32>) -> Vec<f32> {
+        stored.clone()
     }
 
     fn store(&self, vector: &[f32]) -> Vec<f32> {
@@ -164,12 +185,13 @@ impl<D: DistanceProvider> HnswIndex<D> {
 
         let ep = entry_point.unwrap();
         let current_max_layer = *self.max_layer.read();
+        let prepared = self.distance.prepare(vector);
 
         // Phase 1: Greedily traverse from top to the node's insertion level.
         let mut current_ep = ep;
         let nodes = self.nodes.read();
         for layer in (num_layers..=current_max_layer).rev() {
-            current_ep = self.greedy_closest(&nodes, vector, current_ep, layer);
+            current_ep = self.greedy_closest(&nodes, &prepared, current_ep, layer);
         }
         drop(nodes);
 
@@ -177,7 +199,7 @@ impl<D: DistanceProvider> HnswIndex<D> {
         for layer in (0..num_layers).rev() {
             let ef = self.config.ef_construction;
             let nodes = self.nodes.read();
-            let candidates = self.search_layer(&nodes, vector, current_ep, ef, layer);
+            let candidates = self.search_layer(&nodes, &prepared, current_ep, ef, layer);
             drop(nodes);
 
             let max_neighbors = if layer == 0 {
@@ -208,14 +230,17 @@ impl<D: DistanceProvider> HnswIndex<D> {
                     nodes[neighbor_idx].neighbors[layer].push(id);
 
                     if nodes[neighbor_idx].neighbors[layer].len() > max_neighbors {
+                        // Prepare the fixed neighbor vector once, then score all of
+                        // its candidate edges against it — hoists the projection
+                        // matvecs out of the inner loop.
+                        let prepared =
+                            self.distance.prepare_stored(&nodes[neighbor_idx].stored);
                         let mut scored: Vec<(f32, u64)> = nodes[neighbor_idx].neighbors[layer]
                             .iter()
                             .map(|&nid| {
                                 let nidx = self.id_to_idx.read()[&nid];
-                                let dist = self.distance.distance_stored(
-                                    &nodes[neighbor_idx].stored,
-                                    &nodes[nidx].stored,
-                                );
+                                let dist =
+                                    self.distance.distance(&prepared, &nodes[nidx].stored);
                                 (dist, nid)
                             })
                             .collect();
@@ -246,16 +271,17 @@ impl<D: DistanceProvider> HnswIndex<D> {
             None => return Vec::new(),
         };
 
+        let prepared = self.distance.prepare(query);
         let max_layer = *self.max_layer.read();
         let nodes = self.nodes.read();
 
         let mut current_ep = ep;
         for layer in (1..=max_layer).rev() {
-            current_ep = self.greedy_closest(&nodes, query, current_ep, layer);
+            current_ep = self.greedy_closest(&nodes, &prepared, current_ep, layer);
         }
 
         let search_ef = ef.max(k);
-        let candidates = self.search_layer(&nodes, query, current_ep, search_ef, 0);
+        let candidates = self.search_layer(&nodes, &prepared, current_ep, search_ef, 0);
 
         candidates
             .into_iter()
@@ -414,7 +440,7 @@ impl<D: DistanceProvider> HnswIndex<D> {
     fn greedy_closest(
         &self,
         nodes: &[Node<D::Stored>],
-        query: &[f32],
+        query: &D::Query,
         start: usize,
         layer: usize,
     ) -> usize {
@@ -449,7 +475,7 @@ impl<D: DistanceProvider> HnswIndex<D> {
     fn search_layer(
         &self,
         nodes: &[Node<D::Stored>],
-        query: &[f32],
+        query: &D::Query,
         entry_point: usize,
         ef: usize,
         layer: usize,
