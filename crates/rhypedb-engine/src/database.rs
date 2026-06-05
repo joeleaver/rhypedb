@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -13,7 +13,7 @@ use rhypedb_storage::lsm::{LsmConfig, LsmTree};
 use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionHub};
 
 use crate::error::{EngineError, EngineResult};
-use crate::object::{deserialize_fields, serialize_fields, FieldMap, Object, Value};
+use crate::object::{FieldMap, Object, Value, deserialize_fields, serialize_fields};
 
 /// One row of the precomputed reverse-relation index used by cascade delete.
 /// `is_many` distinguishes forward 1:1 incoming relations (where the source's
@@ -64,8 +64,7 @@ impl TombstoneArena {
     }
 
     fn push_reverse_edge(&mut self, target_id: u64, rel_id: u64, source_id: u64) {
-        let r =
-            KeyBuilder::reverse_edge_into(&mut self.buf, target_id, rel_id, source_id);
+        let r = KeyBuilder::reverse_edge_into(&mut self.buf, target_id, rel_id, source_id);
         self.ranges.push(r);
     }
 
@@ -74,14 +73,8 @@ impl TombstoneArena {
         self.ranges.push(r);
     }
 
-    fn push_unique_index(
-        &mut self,
-        type_id: u64,
-        field_hash: u64,
-        value_bytes: &[u8],
-    ) {
-        let r =
-            KeyBuilder::unique_index_into(&mut self.buf, type_id, field_hash, value_bytes);
+    fn push_unique_index(&mut self, type_id: u64, field_hash: u64, value_bytes: &[u8]) {
+        let r = KeyBuilder::unique_index_into(&mut self.buf, type_id, field_hash, value_bytes);
         self.ranges.push(r);
     }
 
@@ -229,8 +222,7 @@ pub struct Database {
     /// closing the channel and prompting the worker to exit cleanly.
     cover_refresh_tx: parking_lot::Mutex<Option<std::sync::mpsc::Sender<(u64, u64)>>>,
     /// Join handle for the cover-refresh worker thread. Taken on drop.
-    cover_refresh_handle:
-        parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    cover_refresh_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// One @indexed scalar field on a type, with everything the write path needs
@@ -276,6 +268,15 @@ pub struct OpenOptions {
     /// current. Disable for benchmarks that don't want the background
     /// CPU or for tests that need deterministic stale-cover state.
     pub background_cover_refresh: bool,
+    /// Reserved for the tombstone-migration phase (card 2/5). In phase
+    /// 1 this flag is REJECTED at the schema-shrink gate regardless of
+    /// its value: opening with a shrinking schema returns
+    /// `CatalogError::SchemaShrink` (flag `false`) or
+    /// `CatalogError::SchemaShrinkNotYetSupported` (flag `true`). The
+    /// field exists so callers can wire the intent through their
+    /// config today and the gate flips when phase 2 ships, without a
+    /// breaking API change. Defaults to `false`.
+    pub allow_schema_shrink: bool,
 }
 
 impl Default for OpenOptions {
@@ -283,6 +284,7 @@ impl Default for OpenOptions {
         Self {
             sync_on_commit: true,
             background_cover_refresh: true,
+            allow_schema_shrink: false,
         }
     }
 }
@@ -317,30 +319,17 @@ impl Database {
         config.sync_on_commit = options.sync_on_commit;
         let storage = LsmTree::open(config)?;
 
-        // Assign stable numeric IDs to types and relationships.
-        let mut type_ids = HashMap::new();
-        let mut rel_ids = HashMap::new();
-        let mut field_ids = HashMap::new();
-        let mut next_rel_id = 1u64;
-        let mut next_field_id = 1u64;
-
-        let mut type_names: Vec<_> = schema.types.keys().cloned().collect();
-        type_names.sort();
-        for (type_id, name) in (1u64..).zip(type_names.iter()) {
-            type_ids.insert(name.clone(), type_id);
-
-            let type_def = &schema.types[name];
-            for field in &type_def.fields {
-                let field_key = format!("{}.{}", name, field.name);
-                field_ids.insert(field_key.clone(), next_field_id);
-                next_field_id += 1;
-
-                if matches!(field.field_type, FieldType::Relation(_)) {
-                    rel_ids.insert(field_key, next_rel_id);
-                    next_rel_id += 1;
-                }
-            }
-        }
+        // Pull stable numeric IDs from the persisted schema catalog
+        // (see `catalog.rs`). For a legacy / fresh database the
+        // catalog backfill produces the same IDs the prior
+        // alphabetical algorithm did, so existing on-disk data is
+        // untouched; for an extended schema the catalog allocates new
+        // IDs from persisted counters without renumbering anything.
+        let cat =
+            crate::catalog::load_or_initialize(&storage, &schema, options.allow_schema_shrink)?;
+        let type_ids = cat.type_ids;
+        let rel_ids = cat.rel_ids;
+        let field_ids = cat.field_ids;
 
         // Recover the max object ID by scanning existing objects.
         let mut max_object_id = 0u64;
@@ -469,9 +458,7 @@ impl Database {
                         FieldType::Scalar(ScalarType::String) => IndexedKind::String,
                         FieldType::Scalar(ScalarType::Bytes) => IndexedKind::Bytes,
                         FieldType::Scalar(ScalarType::Bool) => IndexedKind::Bool,
-                        FieldType::Scalar(ScalarType::F32 | ScalarType::F64) => {
-                            IndexedKind::Float
-                        }
+                        FieldType::Scalar(ScalarType::F32 | ScalarType::F64) => IndexedKind::Float,
                         _ => IndexedKind::Integer,
                     };
                     list.push(IndexedField {
@@ -502,7 +489,10 @@ impl Database {
                 let obj_id_bytes: [u8; 8] = key[11..19].try_into().unwrap();
                 let v_bytes: [u8; 8] = value[..].try_into().unwrap();
                 version_counters.insert(
-                    (u64::from_be_bytes(type_id_bytes), u64::from_be_bytes(obj_id_bytes)),
+                    (
+                        u64::from_be_bytes(type_id_bytes),
+                        u64::from_be_bytes(obj_id_bytes),
+                    ),
                     u64::from_be_bytes(v_bytes),
                 );
             }
@@ -620,13 +610,7 @@ impl Database {
         let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
 
         let scalar_fields = self.stage_create_writes(
-            &mut txn,
-            type_name,
-            type_def,
-            type_id,
-            object_id,
-            &fields,
-            &mut puts,
+            &mut txn, type_name, type_def, type_id, object_id, &fields, &mut puts,
         )?;
 
         self.storage.put_batch(&mut txn, &puts)?;
@@ -684,12 +668,13 @@ impl Database {
         let mut links: Vec<(String, u64, String, Bytes, u64, u64, bool)> = Vec::new();
 
         for (field_name, value) in fields {
-            let field_def = type_def.get_field(field_name).ok_or_else(|| {
-                EngineError::FieldNotFound {
-                    type_name: type_name.into(),
-                    field: field_name.clone(),
-                }
-            })?;
+            let field_def =
+                type_def
+                    .get_field(field_name)
+                    .ok_or_else(|| EngineError::FieldNotFound {
+                        type_name: type_name.into(),
+                        field: field_name.clone(),
+                    })?;
             validate_value(field_def, value)?;
 
             match &field_def.field_type {
@@ -723,10 +708,10 @@ impl Database {
                             });
                         }
                     };
-                    let target_type_id =
-                        *self.type_ids.get(&rel.target_type).ok_or_else(|| {
-                            EngineError::TypeNotFound(rel.target_type.clone())
-                        })?;
+                    let target_type_id = *self
+                        .type_ids
+                        .get(&rel.target_type)
+                        .ok_or_else(|| EngineError::TypeNotFound(rel.target_type.clone()))?;
                     let target_key = KeyBuilder::object(target_type_id, target_id);
                     let target_data = self.storage.get(txn, &target_key)?.ok_or_else(|| {
                         EngineError::ObjectNotFound {
@@ -736,12 +721,14 @@ impl Database {
                     })?;
                     let target_version = self.object_version(&rel.target_type, target_id);
                     let rel_key = format!("{type_name}.{field_name}");
-                    let rel_id = *self.rel_ids.get(&rel_key).ok_or_else(|| {
-                        EngineError::FieldNotFound {
-                            type_name: type_name.into(),
-                            field: field_name.clone(),
-                        }
-                    })?;
+                    let rel_id =
+                        *self
+                            .rel_ids
+                            .get(&rel_key)
+                            .ok_or_else(|| EngineError::FieldNotFound {
+                                type_name: type_name.into(),
+                                field: field_name.clone(),
+                            })?;
                     let is_1to1_forward = !rel.is_many;
                     links.push((
                         field_name.clone(),
@@ -807,15 +794,8 @@ impl Database {
                 Bytes::new(),
             ));
 
-            let rev_value = build_inflight_cover(
-                self,
-                txn,
-                &scalar_fields,
-                field_name,
-                *target_id,
-                &links,
-                i,
-            )?;
+            let rev_value =
+                build_inflight_cover(self, txn, &scalar_fields, field_name, *target_id, &links, i)?;
             puts.push((
                 KeyBuilder::reverse_edge(*target_id, *rel_id, object_id),
                 rev_value,
@@ -834,11 +814,7 @@ impl Database {
     /// whole batch rolls back — none of the rows land. This is intentional:
     /// callers reaching for the bulk path want the all-or-nothing shape of
     /// `COPY ... FROM STDIN`, not a partial insert.
-    pub fn create_batch(
-        &self,
-        type_name: &str,
-        rows: Vec<FieldMap>,
-    ) -> EngineResult<Vec<Object>> {
+    pub fn create_batch(&self, type_name: &str, rows: Vec<FieldMap>) -> EngineResult<Vec<Object>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -863,13 +839,7 @@ impl Database {
         for fields in &rows {
             let object_id = self.next_object_id.fetch_add(1, Ordering::SeqCst);
             let scalar_fields = self.stage_create_writes(
-                &mut txn,
-                type_name,
-                type_def,
-                type_id,
-                object_id,
-                fields,
-                &mut puts,
+                &mut txn, type_name, type_def, type_id, object_id, fields, &mut puts,
             )?;
             scalar_rows.push(scalar_fields);
             object_ids.push(object_id);
@@ -886,7 +856,7 @@ impl Database {
         // Events report only the scalar fields (relation values went into
         // the edge index, not the object payload).
         let mut out = Vec::with_capacity(scalar_rows.len());
-        for (id, scalar_fields) in object_ids.into_iter().zip(scalar_rows.into_iter()) {
+        for (id, scalar_fields) in object_ids.into_iter().zip(scalar_rows) {
             self.subscriptions.publish(ChangeEvent {
                 version,
                 kind: ChangeKind::Create,
@@ -913,12 +883,13 @@ impl Database {
 
         let key = KeyBuilder::object(type_id, object_id);
         let snapshot = self.storage.read_snapshot();
-        let data = self.storage.get_at(snapshot, &key)?.ok_or_else(|| {
-            EngineError::ObjectNotFound {
-                type_name: type_name.into(),
-                object_id,
-            }
-        })?;
+        let data =
+            self.storage
+                .get_at(snapshot, &key)?
+                .ok_or_else(|| EngineError::ObjectNotFound {
+                    type_name: type_name.into(),
+                    object_id,
+                })?;
 
         let fields = deserialize_fields(&data);
         Ok(Object {
@@ -962,7 +933,7 @@ impl Database {
         // Public API: return Objects with `fields` populated. Callers that
         // accept the lazy shortcut should use `get_many_lazy` instead.
         let mut out = Vec::with_capacity(sorted.len());
-        for (id, value) in sorted.into_iter().zip(values.into_iter()) {
+        for (id, value) in sorted.into_iter().zip(values) {
             if let Some(data) = value {
                 out.push(Object {
                     type_name: type_name.into(),
@@ -1005,7 +976,7 @@ impl Database {
         let values = self.storage.multi_get_at(snapshot, &key_refs)?;
 
         let mut out = Vec::with_capacity(sorted.len());
-        for (id, value) in sorted.into_iter().zip(values.into_iter()) {
+        for (id, value) in sorted.into_iter().zip(values) {
             if let Some(data) = value {
                 out.push(Object::from_raw(type_name.into(), id, data));
             }
@@ -1078,19 +1049,20 @@ impl Database {
         target: i64,
         limit: Option<usize>,
     ) -> EngineResult<Vec<Object>> {
-        use rhypedb_storage::zone::{hash_field_name, FieldPredicate};
+        use rhypedb_storage::zone::{FieldPredicate, hash_field_name};
 
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
         let type_id = self.type_ids[type_name];
-        let field_def = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
-                type_name: type_name.into(),
-                field: field_name.into(),
-            }
-        })?;
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
 
         // Cast the raw query target to the field's actual integer type so the
         // encoding matches what's on disk. Bail out to `scan_type` (no perf
@@ -1260,18 +1232,18 @@ impl Database {
                     return Ok(Vec::new());
                 }
                 let seek_bytes = (target_u64 + 1).to_be_bytes();
-                let mut start_key =
-                    bytes::BytesMut::with_capacity(prefix.len() + 8);
+                let mut start_key = bytes::BytesMut::with_capacity(prefix.len() + 8);
                 start_key.extend_from_slice(&prefix);
                 start_key.extend_from_slice(&seek_bytes);
-                self.storage.scan_from_at_limited(snapshot, &prefix, &start_key, n)?
+                self.storage
+                    .scan_from_at_limited(snapshot, &prefix, &start_key, n)?
             }
             (CompareOp::Ge, Some(n)) => {
-                let mut start_key =
-                    bytes::BytesMut::with_capacity(prefix.len() + 8);
+                let mut start_key = bytes::BytesMut::with_capacity(prefix.len() + 8);
                 start_key.extend_from_slice(&prefix);
                 start_key.extend_from_slice(target_bytes);
-                self.storage.scan_from_at_limited(snapshot, &prefix, &start_key, n)?
+                self.storage
+                    .scan_from_at_limited(snapshot, &prefix, &start_key, n)?
             }
             (CompareOp::Lt, Some(n)) | (CompareOp::Le, Some(n)) => {
                 self.storage.scan_prefix_at_limited(snapshot, &prefix, n)?
@@ -1340,12 +1312,13 @@ impl Database {
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
         let type_id = self.type_ids[type_name];
-        let field_def = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
-                type_name: type_name.into(),
-                field: field_name.into(),
-            }
-        })?;
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
         if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bool)) {
             return self.scan_type(type_name);
         }
@@ -1356,7 +1329,12 @@ impl Database {
         {
             let encoded = encode_bool_for_index(&Value::Bool(target)).unwrap();
             return self.filter_scan_via_index(
-                type_name, type_id, ifd.field_id, op, &encoded, limit,
+                type_name,
+                type_id,
+                ifd.field_id,
+                op,
+                &encoded,
+                limit,
             );
         }
         self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
@@ -1381,12 +1359,13 @@ impl Database {
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
         let type_id = self.type_ids[type_name];
-        let field_def = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
-                type_name: type_name.into(),
-                field: field_name.into(),
-            }
-        })?;
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
         let is_float = matches!(
             field_def.field_type,
             FieldType::Scalar(ScalarType::F32 | ScalarType::F64)
@@ -1401,7 +1380,12 @@ impl Database {
         {
             let encoded = encode_f64_for_index(target);
             return self.filter_scan_via_index(
-                type_name, type_id, ifd.field_id, op, &encoded, limit,
+                type_name,
+                type_id,
+                ifd.field_id,
+                op,
+                &encoded,
+                limit,
             );
         }
         self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
@@ -1427,12 +1411,13 @@ impl Database {
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
         let type_id = self.type_ids[type_name];
-        let field_def = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
-                type_name: type_name.into(),
-                field: field_name.into(),
-            }
-        })?;
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
         if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bytes)) {
             return self.scan_type(type_name);
         }
@@ -1478,12 +1463,13 @@ impl Database {
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
         let type_id = self.type_ids[type_name];
-        let field_def = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
-                type_name: type_name.into(),
-                field: field_name.into(),
-            }
-        })?;
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
 
         // Non-string scalar field — no point pretending the literal applies.
         if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::String)) {
@@ -1532,7 +1518,11 @@ impl Database {
             if out.len() >= cap {
                 break;
             }
-            let pass = obj.fields.get(field_name).and_then(&mut predicate).unwrap_or(false);
+            let pass = obj
+                .fields
+                .get(field_name)
+                .and_then(&mut predicate)
+                .unwrap_or(false);
             if pass {
                 out.push(obj);
             }
@@ -1687,24 +1677,26 @@ impl Database {
 
         // Validate update fields.
         for (field_name, value) in &updates {
-            let field_def = type_def.get_field(field_name).ok_or_else(|| {
-                EngineError::FieldNotFound {
-                    type_name: type_name.into(),
-                    field: field_name.clone(),
-                }
-            })?;
+            let field_def =
+                type_def
+                    .get_field(field_name)
+                    .ok_or_else(|| EngineError::FieldNotFound {
+                        type_name: type_name.into(),
+                        field: field_name.clone(),
+                    })?;
             validate_value(field_def, value)?;
         }
 
         let key = KeyBuilder::object(type_id, object_id);
         let mut txn = self.storage.begin_txn();
 
-        let existing_data = self.storage.get(&txn, &key)?.ok_or_else(|| {
-            EngineError::ObjectNotFound {
-                type_name: type_name.into(),
-                object_id,
-            }
-        })?;
+        let existing_data =
+            self.storage
+                .get(&txn, &key)?
+                .ok_or_else(|| EngineError::ObjectNotFound {
+                    type_name: type_name.into(),
+                    object_id,
+                })?;
 
         let mut fields = deserialize_fields(&existing_data);
 
@@ -1714,9 +1706,10 @@ impl Database {
             if field_def.is_unique() && !matches!(value, Value::Null) {
                 // Remove old unique index entry if the field had a value.
                 if let Some(old_value) = fields.get(field_name)
-                    && !matches!(old_value, Value::Null) {
-                        self.remove_unique_index(&mut txn, type_name, type_id, field_name, old_value)?;
-                    }
+                    && !matches!(old_value, Value::Null)
+                {
+                    self.remove_unique_index(&mut txn, type_name, type_id, field_name, old_value)?;
+                }
                 self.check_unique_and_insert(
                     &mut txn, type_name, type_id, field_name, value, object_id,
                 )?;
@@ -1762,7 +1755,12 @@ impl Database {
                         && !matches!(old_v, Value::Null)
                     {
                         self.remove_field_index(
-                            &mut txn, type_id, ifd.field_id, ifd.kind, old_v, object_id,
+                            &mut txn,
+                            type_id,
+                            ifd.field_id,
+                            ifd.kind,
+                            old_v,
+                            object_id,
                         )?;
                     }
                     if let Some(new_v) = &new_value_opt
@@ -1778,22 +1776,21 @@ impl Database {
                             serialized.clone(),
                         )?;
                     }
-                } else if any_update {
-                    if let Some(new_v) = &new_value_opt
-                        && !matches!(new_v, Value::Null)
-                    {
-                        // Same key — `put` overwrites the value with the new
-                        // covering payload.
-                        self.insert_field_index(
-                            &mut txn,
-                            type_id,
-                            ifd.field_id,
-                            ifd.kind,
-                            new_v,
-                            object_id,
-                            serialized.clone(),
-                        )?;
-                    }
+                } else if any_update
+                    && let Some(new_v) = &new_value_opt
+                    && !matches!(new_v, Value::Null)
+                {
+                    // Same key — `put` overwrites the value with the new
+                    // covering payload.
+                    self.insert_field_index(
+                        &mut txn,
+                        type_id,
+                        ifd.field_id,
+                        ifd.kind,
+                        new_v,
+                        object_id,
+                        serialized.clone(),
+                    )?;
                 }
             }
         }
@@ -1810,12 +1807,7 @@ impl Database {
         // handled lazily via the per-object version + reader-side fall-
         // through, plus a background sweeper that opportunistically rewrites
         // stale embedded covers — see `cover_refresh_worker`.)
-        self.refresh_outbound_rev_edges(
-            &mut txn,
-            type_name,
-            object_id,
-            Some(&serialized),
-        )?;
+        self.refresh_outbound_rev_edges(&mut txn, type_name, object_id, Some(&serialized))?;
 
         // Phase 2: bump this object's generation. Every rev_edge that
         // embedded us as `<name>__cover` earlier now has a stale snapshot;
@@ -1989,16 +1981,14 @@ impl Database {
         if meta.has_unique || meta.has_indexed || verify_exists {
             let obj_key = KeyBuilder::object(type_id, object_id);
             let obj_data = self.storage.get(txn, &obj_key)?;
-            if obj_data.is_none() {
-                if verify_exists {
-                    return Err(EngineError::ObjectNotFound {
-                        type_name: meta.type_name.clone(),
-                        object_id,
-                    });
-                }
-                // Cascade-recursive call against an object that's already
-                // gone (e.g. a circular cascade chain). Continue silently.
+            if obj_data.is_none() && verify_exists {
+                return Err(EngineError::ObjectNotFound {
+                    type_name: meta.type_name.clone(),
+                    object_id,
+                });
             }
+            // Cascade-recursive call against an object that's already
+            // gone (e.g. a circular cascade chain). Continue silently.
             if let Some(data) = &obj_data {
                 let fields = deserialize_fields(data);
                 if meta.has_unique
@@ -2007,22 +1997,20 @@ impl Database {
                     for field_def in &type_def.fields {
                         if field_def.is_unique()
                             && let Some(value) = fields.get(&field_def.name)
-                                && !matches!(value, Value::Null) {
-                                    let field_key =
-                                        format!("{}.{}", meta.type_name, field_def.name);
-                                    let field_id = self.field_ids[&field_key];
-                                    let value_bytes = value_to_index_bytes(value);
-                                    arena.push_unique_index(
-                                        type_id,
-                                        field_id,
-                                        &value_bytes,
-                                    );
-                                }
+                            && !matches!(value, Value::Null)
+                        {
+                            let field_key = format!("{}.{}", meta.type_name, field_def.name);
+                            let field_id = self.field_ids[&field_key];
+                            let value_bytes = value_to_index_bytes(value);
+                            arena.push_unique_index(type_id, field_id, &value_bytes);
+                        }
                     }
                 }
                 if let Some(idx_fields) = type_idx_fields {
                     for ifd in idx_fields {
-                        let Some(value) = fields.get(&ifd.name) else { continue };
+                        let Some(value) = fields.get(&ifd.name) else {
+                            continue;
+                        };
                         if matches!(value, Value::Null) {
                             continue;
                         }
@@ -2106,8 +2094,7 @@ impl Database {
                 }
                 match inc.policy {
                     OnDeletePolicy::Deny => {
-                        deny_info =
-                            Some((inc.source_type.clone(), inc.source_field.clone()));
+                        deny_info = Some((inc.source_type.clone(), inc.source_field.clone()));
                         break 'incoming;
                     }
                     OnDeletePolicy::Remove => {
@@ -2150,9 +2137,7 @@ impl Database {
         // exist — skip the existence check on the recursive call. The
         // rev_edge value (cover blob) goes with each child, paired with
         // the rel_id that walked us there.
-        for (cascade_type_id, cascade_id, cascade_rel_id, cascade_cover) in
-            objects_to_cascade
-        {
+        for (cascade_type_id, cascade_id, cascade_rel_id, cascade_cover) in objects_to_cascade {
             self.delete_inner(
                 txn,
                 cascade_type_id,
@@ -2244,12 +2229,12 @@ impl Database {
             .get_type(source_type)
             .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
 
-        let field = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
+        let field = type_def
+            .get_field(field_name)
+            .ok_or_else(|| EngineError::FieldNotFound {
                 type_name: source_type.into(),
                 field: field_name.into(),
-            }
-        })?;
+            })?;
 
         let rel = match &field.field_type {
             FieldType::Relation(r) => r,
@@ -2257,7 +2242,7 @@ impl Database {
                 return Err(EngineError::FieldNotFound {
                     type_name: source_type.into(),
                     field: field_name.into(),
-                })
+                });
             }
         };
 
@@ -2377,12 +2362,12 @@ impl Database {
             .get_type(source_type)
             .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
 
-        let field = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
+        let field = type_def
+            .get_field(field_name)
+            .ok_or_else(|| EngineError::FieldNotFound {
                 type_name: source_type.into(),
                 field: field_name.into(),
-            }
-        })?;
+            })?;
 
         let snapshot = self.storage.read_snapshot();
 
@@ -2390,12 +2375,14 @@ impl Database {
         // of the referenced relationship.
         if let Some(inv) = field.inverse() {
             let inv_rel_key = format!("{}.{}", inv.type_name, inv.field_name);
-            let inv_rel_id = *self.rel_ids.get(&inv_rel_key).ok_or_else(|| {
-                EngineError::FieldNotFound {
-                    type_name: inv.type_name.clone(),
-                    field: inv.field_name.clone(),
-                }
-            })?;
+            let inv_rel_id =
+                *self
+                    .rel_ids
+                    .get(&inv_rel_key)
+                    .ok_or_else(|| EngineError::FieldNotFound {
+                        type_name: inv.type_name.clone(),
+                        field: inv.field_name.clone(),
+                    })?;
 
             let prefix = KeyBuilder::reverse_edge_prefix(source_id, inv_rel_id);
             return self.scan_prefix_at(snapshot, &prefix);
@@ -2439,32 +2426,34 @@ impl Database {
             .get_type(source_type)
             .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
 
-        let field = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
+        let field = type_def
+            .get_field(field_name)
+            .ok_or_else(|| EngineError::FieldNotFound {
                 type_name: source_type.into(),
                 field: field_name.into(),
-            }
-        })?;
+            })?;
 
         // Resolve the relation ID once (forward or inverse) — outside the
         // per-source loop the original get_links was paying.
         let (rel_id, use_inverse) = if let Some(inv) = field.inverse() {
             let inv_rel_key = format!("{}.{}", inv.type_name, inv.field_name);
-            let id = *self.rel_ids.get(&inv_rel_key).ok_or_else(|| {
-                EngineError::FieldNotFound {
+            let id = *self
+                .rel_ids
+                .get(&inv_rel_key)
+                .ok_or_else(|| EngineError::FieldNotFound {
                     type_name: inv.type_name.clone(),
                     field: inv.field_name.clone(),
-                }
-            })?;
+                })?;
             (id, true)
         } else {
             let rel_key = format!("{source_type}.{field_name}");
-            let id = *self.rel_ids.get(&rel_key).ok_or_else(|| {
-                EngineError::FieldNotFound {
+            let id = *self
+                .rel_ids
+                .get(&rel_key)
+                .ok_or_else(|| EngineError::FieldNotFound {
                     type_name: source_type.into(),
                     field: field_name.into(),
-                }
-            })?;
+                })?;
             (id, false)
         };
 
@@ -2544,11 +2533,7 @@ impl Database {
 
     /// Scan for keys with a given prefix at a snapshot version (used by the
     /// read-only fast path).
-    fn scan_prefix_at(
-        &self,
-        snapshot: u64,
-        prefix: &[u8],
-    ) -> EngineResult<Vec<(u64, FieldMap)>> {
+    fn scan_prefix_at(&self, snapshot: u64, prefix: &[u8]) -> EngineResult<Vec<(u64, FieldMap)>> {
         let entries = self.storage.scan_prefix_at(snapshot, prefix)?;
         Ok(Self::decode_edge_entries(entries))
     }
@@ -2766,11 +2751,7 @@ impl Database {
     /// All rewrites happen in one txn so partial work can't make the index
     /// temporarily inconsistent. A commit failure (write conflict) is
     /// surfaced; the next bump re-enqueues the target so retry is cheap.
-    fn refresh_covers_for_target(
-        &self,
-        target_type_id: u64,
-        target_id: u64,
-    ) -> EngineResult<()> {
+    fn refresh_covers_for_target(&self, target_type_id: u64, target_id: u64) -> EngineResult<()> {
         let Some(incoming) = self.incoming_relations.get(&target_type_id) else {
             return Ok(());
         };
@@ -2811,12 +2792,7 @@ impl Database {
                 continue;
             };
             let s_type_name = s_type_name.clone();
-            self.refresh_outbound_rev_edges(
-                &mut txn,
-                &s_type_name,
-                s_id,
-                Some(&s_bytes),
-            )?;
+            self.refresh_outbound_rev_edges(&mut txn, &s_type_name, s_id, Some(&s_bytes))?;
         }
         self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
@@ -2907,13 +2883,7 @@ fn build_inflight_cover(
     let other_1to1: Vec<&(String, u64, String, Bytes, u64, u64, bool)> = links
         .iter()
         .enumerate()
-        .filter_map(|(j, l)| {
-            if j == this_idx || !l.6 {
-                None
-            } else {
-                Some(l)
-            }
-        })
+        .filter_map(|(j, l)| if j == this_idx || !l.6 { None } else { Some(l) })
         .collect();
     if other_1to1.is_empty() {
         return Ok(Bytes::new());
@@ -2928,13 +2898,7 @@ fn build_inflight_cover(
         // Augment the in-memory target_data with 3rd-degree covers — same
         // recursion as build_covering_rev_value does at link() time. The
         // type of the link's target is stored as link.2.
-        let nested = with_nested_forward_covers(
-            db,
-            txn,
-            &link.2,
-            link.3.clone(),
-            link.1,
-        )?;
+        let nested = with_nested_forward_covers(db, txn, &link.2, link.3.clone(), link.1)?;
         effective.insert(format!("{}__cover", link.0), Value::Bytes(nested));
         effective.insert(format!("{}__cover_v", link.0), Value::U64(link.4));
     }
@@ -3034,19 +2998,11 @@ fn build_covering_rev_value(
             };
             let target_key = KeyBuilder::object(target_type_id, *tid);
             if let Ok(Some(target_data)) = db.storage.get(txn, &target_key) {
-                let nested = with_nested_forward_covers(
-                    db,
-                    txn,
-                    &rel.target_type,
-                    target_data,
-                    *tid,
-                )?;
+                let nested =
+                    with_nested_forward_covers(db, txn, &rel.target_type, target_data, *tid)?;
                 effective.insert(format!("{name}__cover"), Value::Bytes(nested));
                 let target_version = db.object_version(&rel.target_type, *tid);
-                effective.insert(
-                    format!("{name}__cover_v"),
-                    Value::U64(target_version),
-                );
+                effective.insert(format!("{name}__cover_v"), Value::U64(target_version));
             }
         }
     }
@@ -3084,8 +3040,7 @@ fn with_nested_forward_covers(
     // relations? If not, skip the deserialize+reserialize round trip and
     // return the original bytes (refcount-only, no copy).
     let has_any_forward_1to1 = type_def.fields.iter().any(|f| {
-        matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many)
-            && f.inverse().is_none()
+        matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many) && f.inverse().is_none()
     });
     if !has_any_forward_1to1 {
         return Ok(target_data);
@@ -3171,10 +3126,7 @@ fn fields_to_json(fields: &FieldMap) -> HashMap<String, serde_json::Value> {
         .collect()
 }
 
-fn validate_value(
-    field_def: &rhypedb_schema::FieldDef,
-    value: &Value,
-) -> EngineResult<()> {
+fn validate_value(field_def: &rhypedb_schema::FieldDef, value: &Value) -> EngineResult<()> {
     if matches!(value, Value::Null) {
         return Ok(());
     }
@@ -3412,34 +3364,34 @@ fn build_field_index_key(
     match kind {
         IndexedKind::Integer => {
             let encoded = encode_int_for_zone(value)?;
-            Some(KeyBuilder::field_index(type_id, field_id, &encoded, object_id))
+            Some(KeyBuilder::field_index(
+                type_id, field_id, &encoded, object_id,
+            ))
         }
         IndexedKind::Bool => {
             let encoded = encode_bool_for_index(value)?;
-            Some(KeyBuilder::field_index(type_id, field_id, &encoded, object_id))
+            Some(KeyBuilder::field_index(
+                type_id, field_id, &encoded, object_id,
+            ))
         }
         IndexedKind::Float => {
             let encoded = encode_float_for_index(value)?;
-            Some(KeyBuilder::field_index(type_id, field_id, &encoded, object_id))
+            Some(KeyBuilder::field_index(
+                type_id, field_id, &encoded, object_id,
+            ))
         }
         IndexedKind::String => {
             let Value::String(s) = value else { return None };
             let encoded = encode_str_for_index(s);
             Some(KeyBuilder::field_index_var(
-                type_id,
-                field_id,
-                &encoded,
-                object_id,
+                type_id, field_id, &encoded, object_id,
             ))
         }
         IndexedKind::Bytes => {
             let Value::Bytes(b) = value else { return None };
             let encoded = encode_bytes_for_index(b);
             Some(KeyBuilder::field_index_var(
-                type_id,
-                field_id,
-                &encoded,
-                object_id,
+                type_id, field_id, &encoded, object_id,
             ))
         }
     }
@@ -3765,8 +3717,14 @@ mod tests {
         let mut edge_props = FieldMap::new();
         edge_props.insert("rating".into(), Value::F32(4.5));
 
-        db.link("User", alice.id, "favorite_movies", alien.id, Some(edge_props))
-            .unwrap();
+        db.link(
+            "User",
+            alice.id,
+            "favorite_movies",
+            alien.id,
+            Some(edge_props),
+        )
+        .unwrap();
 
         let links = db.get_links("User", alice.id, "favorite_movies").unwrap();
         assert_eq!(links.len(), 1);
@@ -4095,9 +4053,7 @@ mod tests {
         f.insert("name".into(), Value::String("Alice".into()));
         let user = db.create("User", f).unwrap();
 
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        let event = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Create);
         assert_eq!(event.type_name, "User");
         assert_eq!(event.object_id, user.id);
@@ -4112,17 +4068,17 @@ mod tests {
         f.insert("name".into(), Value::String("Alice".into()));
         let user = db.create("User", f).unwrap();
 
-        let (_id, rx) = db
-            .subscriptions()
-            .subscribe(rhypedb_subscribe::SubscriptionFilter::for_object("User", user.id));
+        let (_id, rx) =
+            db.subscriptions()
+                .subscribe(rhypedb_subscribe::SubscriptionFilter::for_object(
+                    "User", user.id,
+                ));
 
         let mut updates = FieldMap::new();
         updates.insert("name".into(), Value::String("Bob".into()));
         db.update("User", user.id, updates).unwrap();
 
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        let event = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Update);
         assert_eq!(event.object_id, user.id);
     }
@@ -4144,9 +4100,7 @@ mod tests {
 
         db.delete("User", user.id).unwrap();
 
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        let event = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Delete);
         assert_eq!(event.object_id, user.id);
     }
@@ -4209,7 +4163,9 @@ mod tests {
             db.create("User", f).unwrap();
         }
 
-        let gt = db.filter_scan("User", "age", CompareOp::Gt, 30, None).unwrap();
+        let gt = db
+            .filter_scan("User", "age", CompareOp::Gt, 30, None)
+            .unwrap();
         assert_eq!(gt.len(), 20, "age > 30 should match users with age 31..=50");
         for u in &gt {
             match u.fields.get("age") {
@@ -4218,11 +4174,15 @@ mod tests {
             }
         }
 
-        let eq = db.filter_scan("User", "age", CompareOp::Eq, 25, None).unwrap();
+        let eq = db
+            .filter_scan("User", "age", CompareOp::Eq, 25, None)
+            .unwrap();
         assert_eq!(eq.len(), 1);
         assert!(matches!(eq[0].fields.get("age"), Some(Value::U32(25))));
 
-        let lt = db.filter_scan("User", "age", CompareOp::Lt, 5, None).unwrap();
+        let lt = db
+            .filter_scan("User", "age", CompareOp::Lt, 5, None)
+            .unwrap();
         assert_eq!(lt.len(), 4, "age < 5 should match users 1..=4");
     }
 
@@ -4244,10 +4204,7 @@ mod tests {
     fn count_index_entries(db: &Database) -> usize {
         // Field-index prefix is just `i:` — works regardless of type/field.
         let snapshot = db.storage().read_snapshot();
-        let entries = db
-            .storage()
-            .scan_prefix_at(snapshot, b"i:")
-            .unwrap();
+        let entries = db.storage().scan_prefix_at(snapshot, b"i:").unwrap();
         entries.len()
     }
 
@@ -4289,7 +4246,9 @@ mod tests {
         f.insert("year".into(), Value::U32(2010));
         db.create("Movie", f).unwrap();
 
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 2000, None).unwrap();
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 2000, None)
+            .unwrap();
         assert_eq!(hits.len(), 3);
         for h in &hits {
             assert_eq!(h.fields.get("year"), Some(&Value::U32(2000)));
@@ -4310,16 +4269,24 @@ mod tests {
             db.create("Movie", f).unwrap();
         }
 
-        let gt = db.filter_scan("Movie", "year", CompareOp::Gt, 2010, None).unwrap();
+        let gt = db
+            .filter_scan("Movie", "year", CompareOp::Gt, 2010, None)
+            .unwrap();
         assert_eq!(gt.len(), 10, "years 2011..=2020 should match");
 
-        let gt_limited = db.filter_scan("Movie", "year", CompareOp::Gt, 2010, Some(3)).unwrap();
+        let gt_limited = db
+            .filter_scan("Movie", "year", CompareOp::Gt, 2010, Some(3))
+            .unwrap();
         assert_eq!(gt_limited.len(), 3);
 
-        let lt = db.filter_scan("Movie", "year", CompareOp::Lt, 1955, None).unwrap();
+        let lt = db
+            .filter_scan("Movie", "year", CompareOp::Lt, 1955, None)
+            .unwrap();
         assert_eq!(lt.len(), 5, "years 1950..=1954 should match");
 
-        let le = db.filter_scan("Movie", "year", CompareOp::Le, 1952, None).unwrap();
+        let le = db
+            .filter_scan("Movie", "year", CompareOp::Le, 1952, None)
+            .unwrap();
         assert_eq!(le.len(), 3, "years 1950..=1952 should match");
     }
 
@@ -4342,10 +4309,14 @@ mod tests {
         db.update("Movie", movie.id, upd).unwrap();
         assert_eq!(count_index_entries(&db), 1);
 
-        let old = db.filter_scan("Movie", "year", CompareOp::Eq, 1979, None).unwrap();
+        let old = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1979, None)
+            .unwrap();
         assert_eq!(old.len(), 0, "old year value should no longer be indexed");
 
-        let new = db.filter_scan("Movie", "year", CompareOp::Eq, 1986, None).unwrap();
+        let new = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1986, None)
+            .unwrap();
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].id, movie.id);
     }
@@ -4372,8 +4343,14 @@ mod tests {
         db.delete("Movie", a.id).unwrap();
         assert_eq!(count_index_entries(&db), 1);
 
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 2000, None).unwrap();
-        assert_eq!(hits.len(), 1, "deleted entry must not reappear via the index");
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 2000, None)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "deleted entry must not reappear via the index"
+        );
     }
 
     #[test]
@@ -4414,7 +4391,9 @@ mod tests {
             "cascade-deleted movies must also drop their secondary-index entries"
         );
 
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 1986, None).unwrap();
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1986, None)
+            .unwrap();
         assert_eq!(hits.len(), 0);
     }
 
@@ -4437,7 +4416,9 @@ mod tests {
 
         assert_eq!(count_index_entries(&db), 10);
 
-        let mid = db.filter_scan("Movie", "year", CompareOp::Eq, 1955, None).unwrap();
+        let mid = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1955, None)
+            .unwrap();
         assert_eq!(mid.len(), 1);
     }
 
@@ -4458,7 +4439,9 @@ mod tests {
             db.create("Movie", f).unwrap();
         }
 
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 2013, None).unwrap();
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 2013, None)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].fields.get("year"), Some(&Value::U32(2013)));
         assert_eq!(
@@ -4467,7 +4450,9 @@ mod tests {
             "covering index must surface the title field, not just the indexed value"
         );
 
-        let range = db.filter_scan("Movie", "year", CompareOp::Gt, 2012, Some(3)).unwrap();
+        let range = db
+            .filter_scan("Movie", "year", CompareOp::Gt, 2012, Some(3))
+            .unwrap();
         assert_eq!(range.len(), 3);
         for h in &range {
             assert!(h.fields.contains_key("title"));
@@ -4496,7 +4481,9 @@ mod tests {
         db.update("Movie", movie.id, upd).unwrap();
 
         // filter_scan via index should see the NEW title, not the stale Old Title.
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 1999, None).unwrap();
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1999, None)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(
             hits[0].fields.get("title"),
@@ -4529,7 +4516,9 @@ mod tests {
             db.create("Movie", f).unwrap();
         }
 
-        let gt = db.filter_scan("Movie", "year", CompareOp::Gt, 1954, None).unwrap();
+        let gt = db
+            .filter_scan("Movie", "year", CompareOp::Gt, 1954, None)
+            .unwrap();
         assert_eq!(
             gt.len(),
             15,
@@ -4856,15 +4845,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(multi_indexed_schema(), dir.path()).unwrap();
 
-        let payloads: &[&[u8]] =
-            &[b"\x00ab", b"abc", b"abcd", b"abc\x00xyz", b"zzz"];
+        let payloads: &[&[u8]] = &[b"\x00ab", b"abc", b"abcd", b"abc\x00xyz", b"zzz"];
         for &p in payloads {
             let mut f = FieldMap::new();
             f.insert("name".into(), Value::String("x".into()));
             f.insert("active".into(), Value::Bool(false));
             f.insert("rating".into(), Value::F32(0.0));
             f.insert("weight".into(), Value::F64(0.0));
-            f.insert("hash".into(), Value::Bytes(bytes::Bytes::copy_from_slice(p)));
+            f.insert(
+                "hash".into(),
+                Value::Bytes(bytes::Bytes::copy_from_slice(p)),
+            );
             f.insert("age".into(), Value::U32(0));
             db.create("Item", f).unwrap();
         }
@@ -4921,9 +4912,7 @@ mod tests {
 
     /// Set up one User u, one Movie m, one Rating r linked to both.
     /// Returns (db, user_id, movie_id, rating_id, tempdir).
-    fn build_one_rating(
-        schema: Schema,
-    ) -> (Arc<Database>, u64, u64, u64, tempfile::TempDir) {
+    fn build_one_rating(schema: Schema) -> (Arc<Database>, u64, u64, u64, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(schema, dir.path()).unwrap();
 
@@ -4942,7 +4931,8 @@ mod tests {
         // Link order matters: first link writes empty rev_edge cover,
         // second link writes the cover with the other-target's data.
         db.link("Rating", rating.id, "user", user.id, None).unwrap();
-        db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None)
+            .unwrap();
 
         (db, user.id, movie.id, rating.id, dir)
     }
@@ -5006,17 +4996,14 @@ mod tests {
         rf.insert("movie".into(), Value::U64(movie.id));
         db.create("Rating", rf).unwrap();
 
-        let user_side = db
-            .get_links_many("User", &[user.id], "ratings")
-            .unwrap();
+        let user_side = db.get_links_many("User", &[user.id], "ratings").unwrap();
         assert_eq!(user_side[0].len(), 1);
         let (_rid, user_side_cover) = &user_side[0][0];
         // movie__cover should be present in user-side rev_edge cover.
-        let movie_cover = find_bytes_field_in_raw(user_side_cover, "movie__cover")
-            .expect(
-                "inline-relations create should write symmetric covers — \
+        let movie_cover = find_bytes_field_in_raw(user_side_cover, "movie__cover").expect(
+            "inline-relations create should write symmetric covers — \
                  movie__cover missing from user-side rev_edge",
-            );
+        );
         let movie_fields = deserialize_fields(&movie_cover);
         assert_eq!(
             movie_fields.get("title"),
@@ -5024,14 +5011,15 @@ mod tests {
         );
 
         // Movie-side rev_edge should also carry user__cover.
-        let movie_side = db
-            .get_links_many("Movie", &[movie.id], "ratings")
-            .unwrap();
+        let movie_side = db.get_links_many("Movie", &[movie.id], "ratings").unwrap();
         let (_rid, movie_side_cover) = &movie_side[0][0];
         let user_cover = find_bytes_field_in_raw(movie_side_cover, "user__cover")
             .expect("user__cover missing from movie-side rev_edge");
         let user_fields = deserialize_fields(&user_cover);
-        assert_eq!(user_fields.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(
+            user_fields.get("name"),
+            Some(&Value::String("Alice".into()))
+        );
     }
 
     #[test]
@@ -5153,9 +5141,7 @@ mod tests {
         assert_eq!(ratings.len(), 3);
 
         // Three rev_edges hanging off the movie.
-        let movie_side = db
-            .get_links_many("Movie", &[movie.id], "ratings")
-            .unwrap();
+        let movie_side = db.get_links_many("Movie", &[movie.id], "ratings").unwrap();
         assert_eq!(movie_side[0].len(), 3);
 
         // Each rating's forward edge to the user.
@@ -5178,9 +5164,7 @@ mod tests {
         upd.insert("stars".into(), Value::U32(1));
         db.update("Rating", rid, upd).unwrap();
 
-        let groups = db
-            .get_links_many("Movie", &[mid], "ratings")
-            .unwrap();
+        let groups = db.get_links_many("Movie", &[mid], "ratings").unwrap();
         let group = &groups[0];
         assert_eq!(group.len(), 1);
         let (got_rid, cover) = &group[0];
@@ -5224,7 +5208,8 @@ mod tests {
         rf.insert("stars".into(), Value::U32(5));
         let rating = db.create("Rating", rf).unwrap();
         db.link("Rating", rating.id, "user", user.id, None).unwrap();
-        db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None)
+            .unwrap();
         (db, user.id, movie.id, rating.id, dir)
     }
 
@@ -5241,8 +5226,7 @@ mod tests {
         // (Phase 3, the background cover-refresh sweeper, ASYNCHRONOUSLY
         // repairs the stale covers later. This test runs with the sweeper
         // disabled so the post-update inspection is deterministic.)
-        let (db, uid, mid, _rid, _dir) =
-            build_one_rating_no_sweeper(covering_schema());
+        let (db, uid, mid, _rid, _dir) = build_one_rating_no_sweeper(covering_schema());
 
         assert_eq!(
             db.object_version("User", uid),
@@ -5260,9 +5244,7 @@ mod tests {
             "successful update must bump the per-object generation"
         );
 
-        let groups = db
-            .get_links_many("Movie", &[mid], "ratings")
-            .unwrap();
+        let groups = db.get_links_many("Movie", &[mid], "ratings").unwrap();
         let group = &groups[0];
         assert_eq!(group.len(), 1);
         let (_rid, cover) = &group[0];
@@ -5280,9 +5262,8 @@ mod tests {
 
         // …but the stamped `user__cover_v` is below the live counter,
         // which is exactly the signal the executor uses to fall through.
-        let stamped_v =
-            crate::object::find_u64_field_in_raw(cover, "user__cover_v")
-                .expect("cover_v stamp should be present");
+        let stamped_v = crate::object::find_u64_field_in_raw(cover, "user__cover_v")
+            .expect("cover_v stamp should be present");
         assert_eq!(
             stamped_v, 0,
             "stamp records the target's generation as of cover-write time"
@@ -5296,10 +5277,7 @@ mod tests {
     /// Helper: poll the `r:<movie>:movie:<rating>` rev_edge value and read
     /// the embedded `user__cover_v` stamp. Returns the stamp or `None` if
     /// the rev_edge isn't present or doesn't carry a cover.
-    fn read_movie_side_user_cover_v(
-        db: &Database,
-        movie_id: u64,
-    ) -> Option<u64> {
+    fn read_movie_side_user_cover_v(db: &Database, movie_id: u64) -> Option<u64> {
         let groups = db.get_links_many("Movie", &[movie_id], "ratings").ok()?;
         let group = groups.into_iter().next()?;
         let (_rid, cover) = group.into_iter().next()?;
@@ -5342,8 +5320,8 @@ mod tests {
         //      user.name.
         let (db, uid, mid, _rid, _dir) = build_one_rating(covering_schema());
 
-        let stamp_before = read_movie_side_user_cover_v(&db, mid)
-            .expect("cover_v should be present pre-update");
+        let stamp_before =
+            read_movie_side_user_cover_v(&db, mid).expect("cover_v should be present pre-update");
         assert_eq!(stamp_before, 0);
 
         let mut upd = FieldMap::new();
@@ -5399,8 +5377,7 @@ mod tests {
         // the embedded cover — the OnlyHand path is the reader's cover_v
         // fall-through. This guards against the sweeper being silently
         // re-enabled by future refactors.
-        let (db, uid, mid, _rid, _dir) =
-            build_one_rating_no_sweeper(covering_schema());
+        let (db, uid, mid, _rid, _dir) = build_one_rating_no_sweeper(covering_schema());
 
         let mut upd = FieldMap::new();
         upd.insert("name".into(), Value::String("Renamed".into()));
@@ -5494,9 +5471,8 @@ mod tests {
             director_fields.get("name"),
             Some(&Value::String("Scott".into()))
         );
-        let stamp =
-            crate::object::find_u64_field_in_raw(&movie_cover_bytes, "director__cover_v")
-                .expect("movie__cover should carry director__cover_v stamp");
+        let stamp = crate::object::find_u64_field_in_raw(&movie_cover_bytes, "director__cover_v")
+            .expect("movie__cover should carry director__cover_v stamp");
         assert_eq!(stamp, 0, "fresh director has generation 0");
     }
 
@@ -5530,9 +5506,8 @@ mod tests {
         // forward 1:1 — that cover should be User's bare scalars.
         let groups = db.get_links_many("Movie", &[movie.id], "ratings").unwrap();
         let (_rid, rating_cover) = &groups[0][0];
-        let user_cover_bytes =
-            crate::object::find_bytes_field_in_raw(rating_cover, "user__cover")
-                .expect("movie-side rev_edge should embed user__cover");
+        let user_cover_bytes = crate::object::find_bytes_field_in_raw(rating_cover, "user__cover")
+            .expect("movie-side rev_edge should embed user__cover");
         let user_fields = deserialize_fields(&user_cover_bytes);
         assert_eq!(
             user_fields.get("name"),
@@ -5566,7 +5541,8 @@ mod tests {
         let mut mf = FieldMap::new();
         mf.insert("title".into(), Value::String("Alien".into()));
         let movie = db.create("Movie", mf).unwrap();
-        db.link("Movie", movie.id, "director", director.id, None).unwrap();
+        db.link("Movie", movie.id, "director", director.id, None)
+            .unwrap();
 
         let mut uf = FieldMap::new();
         uf.insert("name".into(), Value::String("Alice".into()));
@@ -5574,7 +5550,8 @@ mod tests {
         let mut rf = FieldMap::new();
         rf.insert("stars".into(), Value::U32(5));
         let rating = db.create("Rating", rf).unwrap();
-        db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None)
+            .unwrap();
         db.link("Rating", rating.id, "user", user.id, None).unwrap();
 
         let groups = db.get_links_many("User", &[user.id], "ratings").unwrap();
@@ -5620,7 +5597,9 @@ mod tests {
             db.create("User", f).unwrap();
         }
 
-        let gt = db.filter_scan("User", "age", CompareOp::Gt, 15, None).unwrap();
+        let gt = db
+            .filter_scan("User", "age", CompareOp::Gt, 15, None)
+            .unwrap();
         assert_eq!(gt.len(), 25, "should include 16..=40");
     }
 }

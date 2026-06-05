@@ -1,9 +1,10 @@
+pub(crate) mod catalog;
 pub mod database;
-pub mod object;
 pub mod error;
+pub mod object;
 pub mod vectorizer;
 
-pub use error::{EngineError, EngineResult};
+pub use error::{CatalogError, EngineError, EngineResult};
 
 // Re-export the storage-layer `CompareOp` so query callers can construct
 // `filter_scan` arguments without taking a direct dependency on the storage
