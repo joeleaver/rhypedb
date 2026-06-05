@@ -315,7 +315,7 @@ impl Database {
         // predicate without per-entry decode + compare.
         config.zone_extractor = Some(Arc::new(extract_zone_fields));
         config.sync_on_commit = options.sync_on_commit;
-        let storage = Arc::new(LsmTree::open(config)?);
+        let storage = LsmTree::open(config)?;
 
         // Assign stable numeric IDs to types and relationships.
         let mut type_ids = HashMap::new();

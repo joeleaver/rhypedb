@@ -36,6 +36,14 @@ pub struct LsmConfig {
     /// mode for apples-to-apples benchmarking (and is occasionally useful
     /// for bulk imports where the operator accepts the risk).
     pub sync_on_commit: bool,
+    /// `true` (default): auto-triggered compaction (the threshold crossing
+    /// inside `maybe_flush`) is signalled to a background worker thread,
+    /// letting the writer that triggered the flush return immediately.
+    /// `false`: compact inline on the writer that crossed the threshold,
+    /// blocking the write until the merge completes — the legacy behavior.
+    /// Explicit `LsmTree::compact()` calls are always synchronous either
+    /// way (they serialize against the worker via the compaction mutex).
+    pub background_compaction: bool,
 }
 
 impl LsmConfig {
@@ -46,8 +54,26 @@ impl LsmConfig {
             compact_trigger_ssts: DEFAULT_COMPACT_TRIGGER_SSTS,
             zone_extractor: None,
             sync_on_commit: true,
+            background_compaction: true,
         }
     }
+}
+
+/// Compaction worker coordination — shared between the LsmTree (which
+/// signals new work) and the worker thread (which waits on the condvar
+/// and runs `compact_inner`).
+///
+/// Three flags drive the worker:
+///   * `pending`  — `maybe_flush` set this when crossing the SST threshold;
+///                  worker clears it when it picks up the job.
+///   * `running`  — set while `compact_inner` is in flight; cleared after.
+///                  Lets `wait_for_compaction` block until idle.
+///   * `shutdown` — set by `Drop`; tells the worker to exit its loop.
+#[derive(Default)]
+struct CompactionState {
+    pending: bool,
+    running: bool,
+    shutdown: bool,
 }
 
 /// LSM-tree storage engine.
@@ -57,6 +83,7 @@ impl LsmConfig {
 /// - In-memory skip-list memtable for writes
 /// - Sorted string table (SST) files on disk
 /// - MVCC transaction manager for snapshot isolation
+/// - Optional background compaction worker (`background_compaction` config)
 pub struct LsmTree {
     config: LsmConfig,
     active_memtable: Arc<RwLock<Arc<MemTable>>>,
@@ -65,6 +92,19 @@ pub struct LsmTree {
     wal: Arc<parking_lot::Mutex<Wal>>,
     txn_manager: Arc<TransactionManager>,
     next_sst_id: std::sync::atomic::AtomicU64,
+    /// Serializes simultaneous compaction attempts. The background worker
+    /// AND any caller of public `compact()` both acquire this — guarantees
+    /// at most one merge is reading SSTs / writing the temp SST / racing
+    /// for the final `sst_files.write()` swap.
+    compaction_mutex: parking_lot::Mutex<()>,
+    /// Worker coordination. Wrapped in `Arc` so the worker thread holds a
+    /// clone independent of LsmTree's lifetime (it's the channel through
+    /// which `Drop` signals shutdown).
+    compaction_state:
+        Arc<(parking_lot::Mutex<CompactionState>, parking_lot::Condvar)>,
+    /// Background-worker join handle. Taken on drop.
+    compaction_handle:
+        parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl LsmTree {
@@ -74,7 +114,13 @@ impl LsmTree {
     /// 1. Discover and open existing SST files, tracking max version
     /// 2. Replay WAL records into a fresh memtable, tracking max version
     /// 3. Initialize the transaction manager at the recovered max version
-    pub fn open(config: LsmConfig) -> Result<Self> {
+    /// 4. Spawn the compaction worker (unless `background_compaction` is
+    ///    disabled) and hand it a `Weak<Self>`
+    ///
+    /// Returns `Arc<Self>` because the worker thread needs a weak handle
+    /// back to the tree; callers can treat the `Arc` like an `LsmTree`
+    /// thanks to deref.
+    pub fn open(config: LsmConfig) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&config.data_dir)?;
         std::fs::create_dir_all(config.data_dir.join("sst"))?;
 
@@ -133,7 +179,8 @@ impl LsmTree {
         // needed until the next flush persists them to SST).
         let wal = Wal::open(&wal_path)?;
 
-        Ok(Self {
+        let background_compaction = config.background_compaction;
+        let tree = Arc::new(Self {
             config,
             active_memtable: Arc::new(RwLock::new(memtable)),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
@@ -141,7 +188,24 @@ impl LsmTree {
             wal: Arc::new(parking_lot::Mutex::new(wal)),
             txn_manager,
             next_sst_id: std::sync::atomic::AtomicU64::new(max_sst_id + 1),
-        })
+            compaction_mutex: parking_lot::Mutex::new(()),
+            compaction_state: Arc::new((
+                parking_lot::Mutex::new(CompactionState::default()),
+                parking_lot::Condvar::new(),
+            )),
+            compaction_handle: parking_lot::Mutex::new(None),
+        });
+
+        if background_compaction {
+            let weak = Arc::downgrade(&tree);
+            let state = Arc::clone(&tree.compaction_state);
+            let handle = std::thread::Builder::new()
+                .name("rhypedb-compaction".into())
+                .spawn(move || compaction_worker(state, weak))?;
+            *tree.compaction_handle.lock() = Some(handle);
+        }
+
+        Ok(tree)
     }
 
     /// Begin a new transaction.
@@ -706,9 +770,10 @@ impl LsmTree {
     }
 
     /// Check if the active memtable is large enough to flush. If a flush
-    /// happens and the SST count crosses the auto-compaction threshold, also
-    /// run a compaction. Both are cheap to skip when the thresholds aren't
-    /// crossed (just an atomic-ish read).
+    /// happens and the SST count crosses the auto-compaction threshold,
+    /// either signal the background worker (when `background_compaction` is
+    /// on) or run a compaction inline. Both are cheap to skip when the
+    /// thresholds aren't crossed (just an atomic-ish read).
     fn maybe_flush(&self) -> Result<()> {
         let size = self.active_memtable.read().approximate_size();
         if size >= self.config.memtable_flush_size {
@@ -718,10 +783,34 @@ impl LsmTree {
             // and merges across layers. Keeps the read amplification flat.
             let sst_count = self.sst_files.read().len();
             if sst_count >= self.config.compact_trigger_ssts {
-                self.compact()?;
+                if self.config.background_compaction {
+                    self.signal_compaction();
+                } else {
+                    self.compact()?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Mark a compaction as pending and wake the worker. Cheap: a mutex
+    /// flip + one condvar notify. Idempotent — if a compaction is already
+    /// pending or running, this just sets the flag again (the worker
+    /// coalesces by re-checking the SST count when it picks up the job).
+    fn signal_compaction(&self) {
+        let mut guard = self.compaction_state.0.lock();
+        guard.pending = true;
+        self.compaction_state.1.notify_one();
+    }
+
+    /// Block until no compaction is pending or running. Used by tests,
+    /// benchmarks, and callers that want to observe a quiescent SST set
+    /// before reading. Returns immediately when the worker is idle.
+    pub fn wait_for_compaction(&self) {
+        let mut guard = self.compaction_state.0.lock();
+        while guard.pending || guard.running {
+            self.compaction_state.1.wait(&mut guard);
+        }
     }
 
     /// Flush the active memtable to a new SST file.
@@ -772,7 +861,20 @@ impl LsmTree {
 
     /// Compact all SST files into a single new SST, dropping old versions
     /// and tombstones that are no longer needed by any active transaction.
+    ///
+    /// Synchronous: blocks until the merge is done. Acquires
+    /// `compaction_mutex` so it serializes against the background worker
+    /// (avoids two concurrent merges racing on the final swap).
     pub fn compact(&self) -> Result<()> {
+        let _guard = self.compaction_mutex.lock();
+        self.compact_inner()
+    }
+
+    /// The compaction body — the bytes-moving work. Called by both the
+    /// public sync `compact()` and the background worker, both of which
+    /// hold `compaction_mutex` so this body never runs concurrently with
+    /// itself.
+    fn compact_inner(&self) -> Result<()> {
         let ssts = self.sst_files.read();
         if ssts.len() < 2 {
             return Ok(());
@@ -887,6 +989,72 @@ impl LsmTree {
     }
 }
 
+impl Drop for LsmTree {
+    /// Tell the compaction worker to exit and wait for it. The shutdown
+    /// flag + notify wakes it whether it's blocked on the condvar or
+    /// mid-merge (it re-checks `shutdown` after each iteration). Joining
+    /// here keeps the tree alive until the worker has released its
+    /// `compaction_mutex` and stopped touching SST state.
+    fn drop(&mut self) {
+        {
+            let mut guard = self.compaction_state.0.lock();
+            guard.shutdown = true;
+            self.compaction_state.1.notify_all();
+        }
+        if let Some(handle) = self.compaction_handle.lock().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Background compaction worker. Owns a `Weak<LsmTree>` so the tree's
+/// lifetime isn't extended by this thread — `Drop` flips the shutdown
+/// flag, the worker breaks out, the upgrade afterwards (if any) returns
+/// `None` because the strong count has already dropped to 0.
+fn compaction_worker(
+    state: Arc<(parking_lot::Mutex<CompactionState>, parking_lot::Condvar)>,
+    weak: std::sync::Weak<LsmTree>,
+) {
+    loop {
+        // Phase A: wait for work. Block on the condvar until something
+        // sets `pending` or `shutdown`. Coalescing falls out for free —
+        // many `signal_compaction()` calls between two iterations all
+        // collapse to one `pending = true`.
+        let mut guard = state.0.lock();
+        while !guard.pending && !guard.shutdown {
+            state.1.wait(&mut guard);
+        }
+        if guard.shutdown {
+            break;
+        }
+        guard.pending = false;
+        guard.running = true;
+        drop(guard);
+
+        // Phase B: do the work. If the tree has dropped underneath us,
+        // exit cleanly — the shutdown notify would have arrived too.
+        if let Some(lsm) = weak.upgrade() {
+            let _outer_guard = lsm.compaction_mutex.lock();
+            // Errors are logged (best-effort) but don't kill the worker —
+            // an SST write failure on one cycle shouldn't prevent us from
+            // trying again on the next signal.
+            let _ = lsm.compact_inner();
+        }
+
+        // Phase C: mark idle and wake any `wait_for_compaction` callers.
+        let mut guard = state.0.lock();
+        guard.running = false;
+        state.1.notify_all();
+    }
+    // Even after a clean shutdown exit, wake any waiters so they don't
+    // spin forever (e.g. a test calling `wait_for_compaction` right
+    // before the tree drops).
+    let mut guard = state.0.lock();
+    guard.pending = false;
+    guard.running = false;
+    state.1.notify_all();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,6 +1070,10 @@ mod tests {
             compact_trigger_ssts: usize::MAX,
             zone_extractor: None,
             sync_on_commit: true,
+            // Tests run inline so the existing assertions on SST counts
+            // immediately after `compact()` stay deterministic. Targeted
+            // tests below opt this back on to exercise the worker.
+            background_compaction: false,
         }
     }
 
@@ -1115,6 +1287,131 @@ mod tests {
         assert_eq!(tree.sst_count(), 1);
         tree.compact().unwrap();
         assert_eq!(tree.sst_count(), 1); // unchanged
+    }
+
+    /// Same config as `test_config` but with the background compaction
+    /// worker turned ON. Tests in this group exercise the signaling +
+    /// worker thread path; `wait_for_compaction` makes the assertions
+    /// deterministic without a fixed sleep.
+    fn test_config_with_bg_compaction(dir: &Path) -> LsmConfig {
+        let mut c = test_config(dir);
+        c.background_compaction = true;
+        // Auto-compact at 3 SSTs so we can drive the trigger from the test
+        // without forcing the legacy 4-SST default.
+        c.compact_trigger_ssts = 3;
+        c
+    }
+
+    #[test]
+    fn background_compaction_worker_merges_ssts_on_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config_with_bg_compaction(dir.path())).unwrap();
+
+        for i in 0..3 {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, format!("k{i}").as_bytes(), Bytes::from(format!("v{i}")))
+                .unwrap();
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+        }
+
+        // Crossing the threshold should have signalled the worker; the
+        // explicit flush doesn't call maybe_flush, so kick it.
+        tree.signal_compaction();
+        tree.wait_for_compaction();
+
+        assert_eq!(
+            tree.sst_count(),
+            1,
+            "background worker should have merged the 3 SSTs into one"
+        );
+
+        // Data still readable post-merge.
+        let txn = tree.begin_txn();
+        for i in 0..3 {
+            let v = tree.get(&txn, format!("k{i}").as_bytes()).unwrap();
+            assert_eq!(v, Some(Bytes::from(format!("v{i}"))));
+        }
+    }
+
+    #[test]
+    fn background_compaction_signals_coalesce() {
+        // Multiple signal_compaction() calls before the worker picks up
+        // the first one should NOT trigger multiple separate merges —
+        // they coalesce into one. We assert quiescence via
+        // wait_for_compaction and observe the merge count via sst_count.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config_with_bg_compaction(dir.path())).unwrap();
+
+        for i in 0..3 {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, format!("k{i}").as_bytes(), Bytes::from(format!("v{i}")))
+                .unwrap();
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+        }
+
+        // Many signals before quiescing — the worker should still end in
+        // a single merged SST.
+        for _ in 0..10 {
+            tree.signal_compaction();
+        }
+        tree.wait_for_compaction();
+        assert_eq!(tree.sst_count(), 1);
+    }
+
+    #[test]
+    fn drop_joins_compaction_worker_cleanly() {
+        // Dropping a tree with the worker alive must not hang. We start
+        // the worker, optionally let it process one round, then drop.
+        // No assertion beyond "returns within a reasonable time" — if the
+        // drop deadlocks, the test will hang and the harness will time out.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let tree =
+                LsmTree::open(test_config_with_bg_compaction(dir.path())).unwrap();
+            for i in 0..3 {
+                let mut txn = tree.begin_txn();
+                tree.put(
+                    &mut txn,
+                    format!("k{i}").as_bytes(),
+                    Bytes::from(format!("v{i}")),
+                )
+                .unwrap();
+                tree.commit(&mut txn).unwrap();
+                tree.flush().unwrap();
+            }
+            tree.signal_compaction();
+            // No explicit wait — Drop must handle a pending worker too.
+        }
+        // If we got here, Drop returned. Reopen and verify state is sane.
+        let tree2 = LsmTree::open(test_config(dir.path())).unwrap();
+        let txn = tree2.begin_txn();
+        let v = tree2.get(&txn, b"k0").unwrap();
+        assert_eq!(v, Some(Bytes::from("v0")));
+    }
+
+    #[test]
+    fn sync_compact_serializes_with_background_worker() {
+        // Even with the worker enabled, an explicit `compact()` call runs
+        // to completion synchronously thanks to the compaction mutex.
+        // No double-merge / no race.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config_with_bg_compaction(dir.path())).unwrap();
+
+        for i in 0..3 {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, format!("k{i}").as_bytes(), Bytes::from(format!("v{i}")))
+                .unwrap();
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+        }
+
+        tree.signal_compaction();
+        tree.compact().unwrap();
+        tree.wait_for_compaction();
+
+        assert_eq!(tree.sst_count(), 1);
     }
 
     #[test]

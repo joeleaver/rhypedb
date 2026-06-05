@@ -895,7 +895,7 @@ mod tests {
         .unwrap();
 
         let config = LsmConfig::new(dir);
-        let storage = Arc::new(LsmTree::open(config).unwrap());
+        let storage = LsmTree::open(config).unwrap();
 
         let mut type_ids = HashMap::new();
         type_ids.insert("Post".into(), 1u64);
