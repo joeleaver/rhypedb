@@ -5,9 +5,14 @@ type User {
     ratings: [Rating] @inverse(Rating.user)
 }
 
+type Director {
+    name: String
+}
+
 type Movie {
     title: String
     year: u32 @indexed
+    director: Director
     ratings: [Rating] @inverse(Rating.movie)
 }
 

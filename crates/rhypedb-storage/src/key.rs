@@ -22,6 +22,15 @@ pub enum KeyPrefix {
     /// against the current generation to detect stale covers and fall
     /// through to a fresh LSM probe for those targets.
     Generation = b'g',
+    /// Persisted schema catalog: `c:<subtype>:<…>`. The catalog stores the
+    /// mapping from schema name to stable numeric ID for every type, field,
+    /// and relation in the schema. IDs are assigned exactly once (at first
+    /// open) and persisted so that schema edits (adding a type, renaming a
+    /// field) never silently renumber existing storage keys.
+    /// See `rhypedb-engine/src/catalog.rs` for the subtype tag table
+    /// (`F` format, `I` initialized, `M` metadata, `D` digest, `T` type,
+    /// `E` field, `R` relation, `N` counter) and value-encoding format.
+    Catalog = b'c',
 }
 
 pub const SEPARATOR: u8 = b':';
@@ -247,6 +256,55 @@ impl KeyBuilder {
         buf.freeze()
     }
 
+    /// Secondary field index key for variable-length encoded values:
+    /// `i:<type_id>:<field_hash>:<encoded_value><object_id>`.
+    ///
+    /// `encoded_value` is the caller-supplied sort-preserving encoding which
+    /// MUST embed its own end-of-value marker (e.g. the engine's string
+    /// encoder appends `\x00\x00`). No `:` separator sits between the
+    /// encoded value and the object_id — the embedded terminator already
+    /// disambiguates the value's end. Empty value payload, same as the
+    /// fixed-width variant; sorts ascending by encoded value then object_id.
+    pub fn field_index_var(
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8],
+        object_id: u64,
+    ) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + encoded_value.len() + 8);
+        buf.put_u8(KeyPrefix::FieldIndex as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_hash);
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(encoded_value);
+        buf.put_u64(object_id);
+        buf.freeze()
+    }
+
+    /// Equality-prefix for the variable-length secondary index:
+    /// `i:<type_id>:<field_hash>:<encoded_value>`. Used for `Eq` lookups —
+    /// matches every key whose encoded value equals the supplied bytes,
+    /// regardless of object_id. Because `encoded_value` carries its own
+    /// terminator, this prefix can't be confused with a longer value that
+    /// shares the same starting bytes.
+    pub fn field_index_var_value_prefix(
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8],
+    ) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + encoded_value.len());
+        buf.put_u8(KeyPrefix::FieldIndex as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_hash);
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(encoded_value);
+        buf.freeze()
+    }
+
     /// Vectorization queue entry: `q:<job_id>`
     /// Value contains the serialized job (type, object_id, source field, vector field, model).
     pub fn queue_entry(job_id: u64) -> Bytes {
@@ -312,12 +370,7 @@ impl KeyBuilder {
         (start, buf.len() as u32)
     }
 
-    pub fn edge_into(
-        buf: &mut Vec<u8>,
-        source_id: u64,
-        rel_id: u64,
-        target_id: u64,
-    ) -> (u32, u32) {
+    pub fn edge_into(buf: &mut Vec<u8>, source_id: u64, rel_id: u64, target_id: u64) -> (u32, u32) {
         let start = buf.len() as u32;
         buf.push(KeyPrefix::Edge as u8);
         buf.push(SEPARATOR);
@@ -346,11 +399,7 @@ impl KeyBuilder {
         (start, buf.len() as u32)
     }
 
-    pub fn object_version_into(
-        buf: &mut Vec<u8>,
-        type_id: u64,
-        object_id: u64,
-    ) -> (u32, u32) {
+    pub fn object_version_into(buf: &mut Vec<u8>, type_id: u64, object_id: u64) -> (u32, u32) {
         let start = buf.len() as u32;
         buf.push(KeyPrefix::Generation as u8);
         buf.push(SEPARATOR);
@@ -397,11 +446,218 @@ impl KeyBuilder {
         (start, buf.len() as u32)
     }
 
+    /// Arena-style variant of `field_index_var`. Layout matches the owned
+    /// constructor exactly: `i:<type>:<field>:<encoded_value><object_id>` —
+    /// no separator between the value and id (the caller-supplied terminator
+    /// inside `encoded_value` already disambiguates the boundary).
+    pub fn field_index_var_into(
+        buf: &mut Vec<u8>,
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8],
+        object_id: u64,
+    ) -> (u32, u32) {
+        let start = buf.len() as u32;
+        buf.push(KeyPrefix::FieldIndex as u8);
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&type_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&field_hash.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(encoded_value);
+        buf.extend_from_slice(&object_id.to_be_bytes());
+        (start, buf.len() as u32)
+    }
+
     /// Prefix for scanning every per-object generation counter: `g:`.
     /// Used at `Database::open` to repopulate the in-memory counter map.
     pub fn object_version_prefix() -> Bytes {
         let mut buf = BytesMut::with_capacity(2);
         buf.put_u8(KeyPrefix::Generation as u8);
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    // -------------------------------------------------------------------
+    // Persisted schema catalog keys. Subtype is a single ASCII byte to
+    // keep the keyspace tight; per-entry fields use `\x00` as the inner
+    // separator since the schema validator rejects `\x00` and `:` in
+    // identifier names. See `rhypedb-engine/src/catalog.rs`.
+    // -------------------------------------------------------------------
+
+    /// Catalog format-version sentinel: `c:F:` → 8-byte u64 BE.
+    /// Read first on every open before any other catalog decode; a
+    /// future-version binary refuses an unknown format cleanly.
+    pub fn catalog_format() -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'F');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Catalog initialized marker: `c:I:` → 10-byte marker value
+    /// (record header + unix-millis). Presence indicates the catalog is
+    /// whole; absence (with other `c:` rows present) signals a torn write.
+    pub fn catalog_initialized() -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'I');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Catalog metadata header: `c:M:` → TLV body (reserved for future
+    /// per-deploy state and capability bits; phase 1 leaves this absent).
+    pub fn catalog_metadata() -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'M');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Schema digest: `c:D:` → 32 bytes SHA-256 over canonical schema
+    /// shape. Drives the fast-path reconcile skip on unchanged schemas.
+    pub fn catalog_digest() -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'D');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Type catalog entry: `c:T:<type_name>` → encoded `IdEntry`.
+    pub fn catalog_type(type_name: &str) -> Bytes {
+        debug_assert!(
+            !type_name.as_bytes().contains(&0) && !type_name.as_bytes().contains(&SEPARATOR),
+            "type name must not contain NUL or ':'"
+        );
+        let mut buf = BytesMut::with_capacity(3 + type_name.len());
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'T');
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(type_name.as_bytes());
+        buf.freeze()
+    }
+
+    /// Field catalog entry: `c:E:<type>\x00<field>` → encoded `IdEntry`.
+    /// `E` is for "fiEld" — `F` is taken by the format-version sentinel.
+    pub fn catalog_field(type_name: &str, field_name: &str) -> Bytes {
+        debug_assert!(
+            !type_name.as_bytes().contains(&0) && !type_name.as_bytes().contains(&SEPARATOR),
+            "type name must not contain NUL or ':'"
+        );
+        debug_assert!(
+            !field_name.as_bytes().contains(&0) && !field_name.as_bytes().contains(&SEPARATOR),
+            "field name must not contain NUL or ':'"
+        );
+        let mut buf = BytesMut::with_capacity(4 + type_name.len() + field_name.len());
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'E');
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(type_name.as_bytes());
+        buf.put_u8(0);
+        buf.put_slice(field_name.as_bytes());
+        buf.freeze()
+    }
+
+    /// Relation catalog entry: `c:R:<type>\x00<field>` → encoded `IdEntry`.
+    pub fn catalog_rel(type_name: &str, field_name: &str) -> Bytes {
+        debug_assert!(
+            !type_name.as_bytes().contains(&0) && !type_name.as_bytes().contains(&SEPARATOR),
+            "type name must not contain NUL or ':'"
+        );
+        debug_assert!(
+            !field_name.as_bytes().contains(&0) && !field_name.as_bytes().contains(&SEPARATOR),
+            "field name must not contain NUL or ':'"
+        );
+        let mut buf = BytesMut::with_capacity(4 + type_name.len() + field_name.len());
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'R');
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(type_name.as_bytes());
+        buf.put_u8(0);
+        buf.put_slice(field_name.as_bytes());
+        buf.freeze()
+    }
+
+    /// Next-type-id counter: `c:N:T` → encoded counter value.
+    pub fn catalog_next_type() -> Bytes {
+        let mut buf = BytesMut::with_capacity(5);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'N');
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'T');
+        buf.freeze()
+    }
+
+    /// Next-field-id counter: `c:N:E`.
+    pub fn catalog_next_field() -> Bytes {
+        let mut buf = BytesMut::with_capacity(5);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'N');
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'E');
+        buf.freeze()
+    }
+
+    /// Next-relation-id counter: `c:N:R`.
+    pub fn catalog_next_rel() -> Bytes {
+        let mut buf = BytesMut::with_capacity(5);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'N');
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'R');
+        buf.freeze()
+    }
+
+    /// Scan prefix for all type catalog entries: `c:T:`.
+    pub fn catalog_prefix_type() -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'T');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Scan prefix for all field catalog entries: `c:E:`.
+    pub fn catalog_prefix_field() -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'E');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Scan prefix for all relation catalog entries: `c:R:`.
+    pub fn catalog_prefix_rel() -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'R');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Scan prefix for the entire catalog keyspace: `c:`. Used by the
+    /// torn-write recovery path to clear partial state before re-running
+    /// deterministic backfill, and by debug dumps.
+    pub fn catalog_prefix_all() -> Bytes {
+        let mut buf = BytesMut::with_capacity(2);
+        buf.put_u8(KeyPrefix::Catalog as u8);
         buf.put_u8(SEPARATOR);
         buf.freeze()
     }
@@ -472,6 +728,35 @@ mod tests {
     }
 
     #[test]
+    fn field_index_var_prefix_is_prefix_of_full_key() {
+        let value = b"hello\x00\x00";
+        let prefix = KeyBuilder::field_index_var_value_prefix(1, 0xdead, value);
+        let full = KeyBuilder::field_index_var(1, 0xdead, value, 99);
+        assert!(full.starts_with(&prefix));
+        // Object id occupies the last 8 bytes — no separator before it.
+        let id_bytes: [u8; 8] = full[full.len() - 8..].try_into().unwrap();
+        assert_eq!(u64::from_be_bytes(id_bytes), 99);
+    }
+
+    #[test]
+    fn field_index_var_keys_sort_by_value() {
+        // Encoded "abc" < encoded "abd" by byte-wise comparison.
+        let lo = KeyBuilder::field_index_var(1, 0xfeed, b"abc\x00\x00", 100);
+        let hi = KeyBuilder::field_index_var(1, 0xfeed, b"abd\x00\x00", 5);
+        assert!(lo < hi);
+    }
+
+    #[test]
+    fn field_index_var_value_prefix_disambiguates_via_terminator() {
+        // "abc\x00\x00" prefix must NOT match "abcd\x00\x00" — the embedded
+        // terminator is the disambiguator (without it, "abc" would prefix
+        // every value beginning with "abc").
+        let prefix = KeyBuilder::field_index_var_value_prefix(1, 0xfeed, b"abc\x00\x00");
+        let other = KeyBuilder::field_index_var(1, 0xfeed, b"abcd\x00\x00", 99);
+        assert!(!other.starts_with(&prefix));
+    }
+
+    #[test]
     fn field_index_keys_sort_by_value_then_id() {
         // Same type+field, two different encoded values: the lower value's
         // key must sort before the higher value's, regardless of id.
@@ -483,5 +768,61 @@ mod tests {
         let id1 = KeyBuilder::field_index(1, 0xfeed, &10u64.to_be_bytes(), 1);
         let id2 = KeyBuilder::field_index(1, 0xfeed, &10u64.to_be_bytes(), 2);
         assert!(id1 < id2);
+    }
+
+    #[test]
+    fn catalog_header_keys_have_expected_bytes() {
+        assert_eq!(&KeyBuilder::catalog_format()[..], b"c:F:");
+        assert_eq!(&KeyBuilder::catalog_initialized()[..], b"c:I:");
+        assert_eq!(&KeyBuilder::catalog_metadata()[..], b"c:M:");
+        assert_eq!(&KeyBuilder::catalog_digest()[..], b"c:D:");
+        assert_eq!(&KeyBuilder::catalog_next_type()[..], b"c:N:T");
+        assert_eq!(&KeyBuilder::catalog_next_field()[..], b"c:N:E");
+        assert_eq!(&KeyBuilder::catalog_next_rel()[..], b"c:N:R");
+    }
+
+    #[test]
+    fn catalog_type_field_rel_keys_have_expected_bytes() {
+        let t = KeyBuilder::catalog_type("User");
+        assert_eq!(&t[..], b"c:T:User");
+
+        let f = KeyBuilder::catalog_field("User", "name");
+        assert_eq!(&f[..4], b"c:E:");
+        assert_eq!(&f[4..8], b"User");
+        assert_eq!(f[8], 0u8);
+        assert_eq!(&f[9..], b"name");
+
+        let r = KeyBuilder::catalog_rel("User", "friends");
+        assert_eq!(&r[..4], b"c:R:");
+        assert_eq!(&r[4..8], b"User");
+        assert_eq!(r[8], 0u8);
+        assert_eq!(&r[9..], b"friends");
+    }
+
+    #[test]
+    fn catalog_prefixes_match_their_entries() {
+        let prefix_t = KeyBuilder::catalog_prefix_type();
+        let prefix_f = KeyBuilder::catalog_prefix_field();
+        let prefix_r = KeyBuilder::catalog_prefix_rel();
+        let prefix_all = KeyBuilder::catalog_prefix_all();
+
+        assert!(KeyBuilder::catalog_type("User").starts_with(&prefix_t));
+        assert!(KeyBuilder::catalog_field("User", "name").starts_with(&prefix_f));
+        assert!(KeyBuilder::catalog_rel("User", "friends").starts_with(&prefix_r));
+
+        assert!(prefix_t.starts_with(&prefix_all));
+        assert!(prefix_f.starts_with(&prefix_all));
+        assert!(prefix_r.starts_with(&prefix_all));
+        assert!(KeyBuilder::catalog_format().starts_with(&prefix_all));
+    }
+
+    #[test]
+    fn catalog_field_and_rel_disambiguate_via_nul() {
+        // The `\x00` separator means `c:E:Use\x00rname` and `c:E:User\x00name`
+        // are distinct keys even though both could exist if we used `.` as
+        // the separator (since `.` is allowed in user identifier territory).
+        let a = KeyBuilder::catalog_field("Use", "rname");
+        let b = KeyBuilder::catalog_field("User", "name");
+        assert_ne!(a, b);
     }
 }

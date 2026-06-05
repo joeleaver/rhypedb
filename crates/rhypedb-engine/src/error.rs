@@ -10,6 +10,9 @@ pub enum EngineError {
     #[error("schema error: {0}")]
     Schema(#[from] rhypedb_schema::SchemaError),
 
+    #[error("catalog error: {0}")]
+    Catalog(#[from] CatalogError),
+
     #[error("type not found: {0}")]
     TypeNotFound(String),
 
@@ -33,7 +36,9 @@ pub enum EngineError {
         value: String,
     },
 
-    #[error("delete denied: {type_name}:{object_id} is referenced by {referencing_type}.{referencing_field}")]
+    #[error(
+        "delete denied: {type_name}:{object_id} is referenced by {referencing_type}.{referencing_field}"
+    )]
     DeleteDenied {
         type_name: String,
         object_id: u64,
@@ -43,4 +48,168 @@ pub enum EngineError {
 
     #[error("write conflict")]
     WriteConflict,
+}
+
+/// Failures specific to the persisted schema catalog (see
+/// `crates/rhypedb-engine/src/catalog.rs`). Each variant maps to a
+/// distinct operator action — distinguishing "your binary is too old"
+/// from "your schema dropped a type" from "the catalog is corrupted"
+/// matters because the responses are completely different.
+#[derive(Debug, Error)]
+pub enum CatalogError {
+    /// The on-disk catalog declares a format version newer than this
+    /// binary understands. Refuse cleanly so a downgraded binary can't
+    /// silently truncate forward-compat state. Upgrade the binary.
+    #[error(
+        "catalog format version {got} is not supported by this binary (max supported = {max_supported}); upgrade the rhypedb binary"
+    )]
+    UnsupportedFormat { got: u64, max_supported: u64 },
+
+    /// A specific catalog row uses a record-format byte newer than this
+    /// binary knows. Distinct from `UnsupportedFormat` because the
+    /// catalog-wide format may match while individual rows carry future
+    /// semantics (phases 2+).
+    #[error("catalog row {row} uses record format version {got}; max supported = {max_supported}")]
+    UnsupportedRecordFormat {
+        row: String,
+        got: u8,
+        max_supported: u8,
+    },
+
+    /// Value-kind discriminant (byte 1 of every catalog value) does not
+    /// match any kind this binary knows.
+    #[error("catalog value at {key_debug} has unknown value-kind tag 0x{tag:02x}")]
+    UnknownValueKind { key_debug: String, tag: u8 },
+
+    /// Value-kind discriminant didn't match the expected kind for the
+    /// catalog row we were reading. Indicates external tampering — e.g.
+    /// a counter row was overwritten with an id-entry envelope.
+    #[error(
+        "catalog value at {key_debug} has wrong kind: expected {expected}, got tag 0x{got_tag:02x}"
+    )]
+    WrongValueKind {
+        key_debug: String,
+        expected: &'static str,
+        got_tag: u8,
+    },
+
+    /// Catalog row payload was shorter than the format requires.
+    #[error("catalog value at {key_debug} is truncated (len={len}, expected at least {min})")]
+    Truncated {
+        key_debug: String,
+        len: usize,
+        min: usize,
+    },
+
+    /// Two TLV records with the same tag inside one id-entry body.
+    #[error("catalog row {key_debug} has duplicate TLV tag 0x{tag:02x}")]
+    DuplicateTlv { key_debug: String, tag: u8 },
+
+    /// A required TLV tag was absent from an id-entry body.
+    #[error("catalog row {key_debug} missing required TLV tag 0x{tag:02x}")]
+    MissingRequiredTlv { key_debug: String, tag: u8 },
+
+    /// A required top-level catalog key was absent on a catalog that
+    /// otherwise appeared to be initialized (e.g. `c:I:` present but
+    /// `c:N:T` missing).
+    #[error("required catalog key missing: {key_debug}")]
+    MissingRequiredKey { key_debug: String },
+
+    /// A catalog key's payload (the bytes after the subtype tag) was
+    /// malformed — e.g. a `c:E:` key with no NUL separator.
+    #[error("catalog key has malformed payload: {key_debug}")]
+    MalformedKey { key_debug: String },
+
+    /// The catalog header keys (`c:F:` and `c:I:`) disagree about
+    /// whether the catalog is initialized. Phase 1 recovers by clearing
+    /// the catalog and re-running deterministic backfill; this error is
+    /// only surfaced if the recovery itself fails.
+    #[error(
+        "catalog header keys are inconsistent (c:F: present={format_present}, c:I: present={initialized_present}) after a recovery attempt; manual inspection required"
+    )]
+    PartialCatalog {
+        format_present: bool,
+        initialized_present: bool,
+    },
+
+    /// The schema removes one or more entries that exist in the
+    /// persisted catalog. Phase 1 refuses; the operator must re-add the
+    /// dropped entries or open the DB with the original schema. Phase 2
+    /// will flip this to a tombstone path under
+    /// `OpenOptions::allow_schema_shrink`.
+    #[error(
+        "schema would drop catalog entries (types={dropped_types:?}, fields={dropped_fields:?}, relations={dropped_rels:?}); re-add the removed entries or open with the original schema"
+    )]
+    SchemaShrink {
+        dropped_types: Vec<String>,
+        dropped_fields: Vec<String>,
+        dropped_rels: Vec<String>,
+    },
+
+    /// `OpenOptions::allow_schema_shrink` was set but the tombstone
+    /// migration phase (card 2/5) has not yet shipped.
+    #[error(
+        "allow_schema_shrink is reserved for the tombstone migration phase and is not yet implemented (would-be drops: types={dropped_types:?}, fields={dropped_fields:?}, relations={dropped_rels:?})"
+    )]
+    SchemaShrinkNotYetSupported {
+        dropped_types: Vec<String>,
+        dropped_fields: Vec<String>,
+        dropped_rels: Vec<String>,
+    },
+
+    /// A field changed shape between catalog and schema — either a
+    /// scalar swapped types (Int → String) or scalar↔relation flipped.
+    /// On-disk values cannot be reinterpreted under the new kind without
+    /// the per-row re-encode pass that card 4/5 will provide.
+    #[error(
+        "field {qualified} changed kind from {was} to {now}; on-disk values cannot be reinterpreted under the new kind (card 4/5 will add a migration path)"
+    )]
+    FieldKindChanged {
+        qualified: String,
+        was: &'static str,
+        now: &'static str,
+    },
+
+    /// A monotonic counter loaded from the catalog is smaller than or
+    /// equal to the largest ID already assigned in the catalog. This is
+    /// a tampering indicator (external tooling rolled back the counter)
+    /// and would cause silent ID reuse on the next additive allocation.
+    #[error(
+        "counter c:N:{kind} ({counter}) is not greater than the largest allocated {kind} id ({max_allocated}); catalog is internally inconsistent"
+    )]
+    CounterBelowAllocatedId {
+        kind: &'static str,
+        counter: u64,
+        max_allocated: u64,
+    },
+
+    /// Two catalog rows of the same family carry the same numeric ID.
+    /// Internal-consistency violation; engine refuses to open rather
+    /// than silently picking a winner.
+    #[error("duplicate {kind} id {id} on catalog entries {first} and {second}")]
+    DuplicateId {
+        kind: &'static str,
+        id: u64,
+        first: String,
+        second: String,
+    },
+
+    /// Counter overflowed u64 during allocation. Practically unreachable
+    /// (would require 2^64 schema additions) but better than `unwrap`.
+    #[error("counter c:N:{kind} overflowed u64")]
+    CounterOverflow { kind: &'static str },
+
+    /// Concurrent catalog write conflicted with another opener and
+    /// exhausted the bounded internal retry budget. Surface as a hard
+    /// error; the caller may retry `Database::open`.
+    #[error(
+        "concurrent catalog initialization or reconcile detected (write conflict exhausted retry budget); retry Database::open"
+    )]
+    ConcurrentInit,
+
+    /// An identifier (type name, field name) contains a byte the
+    /// catalog encoder reserves (`\x00` or `:`). Should be prevented by
+    /// the schema validator; surfaces here as a defense-in-depth check.
+    #[error("identifier {name:?} contains reserved byte 0x{byte:02x}")]
+    ReservedByteInIdentifier { name: String, byte: u8 },
 }

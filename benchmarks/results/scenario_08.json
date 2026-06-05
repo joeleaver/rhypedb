@@ -1,0 +1,98 @@
+[
+  {
+    "scenario": "1.8 traversal_3hop_user_to_directors",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 29.796177,
+      "p50_ms": 29.837535,
+      "p95_ms": 38.016231,
+      "p99_ms": 38.016231,
+      "max_ms": 38.016231,
+      "mean_ms": 32.549981
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 43.763,
+      "p50_us": 59.061,
+      "p95_us": 80.141,
+      "p99_us": 117.442,
+      "max_us": 6344.937,
+      "mean_us": 64.469746,
+      "total_ms": 96.70461900000001
+    },
+    "rss_cold_mb": 3.875,
+    "rss_post_load_mb": 3.875,
+    "rss_peak_mb": 3.875,
+    "rss_steady_mb": 3.875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "template": "User.get({uid}).ratings.movie.director"
+    }
+  },
+  {
+    "scenario": "1.8 traversal_3hop_user_to_directors",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 231.734572,
+      "p50_ms": 240.816761,
+      "p95_ms": 249.538441,
+      "p99_ms": 249.538441,
+      "max_ms": 249.538441,
+      "mean_ms": 240.69659133333334
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 345.812,
+      "p50_us": 451.091,
+      "p95_us": 608.778,
+      "p99_us": 763.049,
+      "max_us": 10193.806,
+      "mean_us": 480.60098666666664,
+      "total_ms": 720.90148
+    },
+    "rss_cold_mb": 43.8828125,
+    "rss_post_load_mb": 43.8828125,
+    "rss_peak_mb": 43.8828125,
+    "rss_steady_mb": 43.8828125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "mode": "idiomatic"
+    }
+  },
+  {
+    "scenario": "1.8 traversal_3hop_user_to_directors",
+    "implementation": "pg-optimal",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 80.695866,
+      "p50_ms": 81.713736,
+      "p95_ms": 82.870848,
+      "p99_ms": 82.870848,
+      "max_ms": 82.870848,
+      "mean_ms": 81.76015
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 131.478,
+      "p50_us": 154.782,
+      "p95_us": 217.761,
+      "p99_us": 287.593,
+      "max_us": 468.774,
+      "mean_us": 162.89968666666667,
+      "total_ms": 244.34953
+    },
+    "rss_cold_mb": 43.8828125,
+    "rss_post_load_mb": 43.8828125,
+    "rss_peak_mb": 43.8828125,
+    "rss_steady_mb": 43.8828125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "mode": "optimal"
+    }
+  }
+]

@@ -1,27 +1,32 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
 use bytes::Bytes;
 
-use rhypedb_schema::{FieldType, OnDeletePolicy, Schema};
+use rhypedb_schema::{FieldType, OnDeletePolicy, ScalarType, Schema};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::{LsmConfig, LsmTree};
 use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionHub};
 
 use crate::error::{EngineError, EngineResult};
-use crate::object::{deserialize_fields, serialize_fields, FieldMap, Object, Value};
+use crate::object::{FieldMap, Object, Value, deserialize_fields, serialize_fields};
 
 /// One row of the precomputed reverse-relation index used by cascade delete.
+/// `is_many` distinguishes forward 1:1 incoming relations (where the source's
+/// rev_edge cover embeds the target's data) from many-relations (where the
+/// target isn't embedded). The cover-refresh sweeper consults it to decide
+/// whether an incoming source S needs Phase 1 re-run after T is updated.
 #[derive(Debug, Clone)]
 struct IncomingRelation {
     source_type_id: u64,
     source_type: String,
     source_field: String,
     rel_id: u64,
+    is_many: bool,
     policy: OnDeletePolicy,
 }
 
@@ -59,8 +64,7 @@ impl TombstoneArena {
     }
 
     fn push_reverse_edge(&mut self, target_id: u64, rel_id: u64, source_id: u64) {
-        let r =
-            KeyBuilder::reverse_edge_into(&mut self.buf, target_id, rel_id, source_id);
+        let r = KeyBuilder::reverse_edge_into(&mut self.buf, target_id, rel_id, source_id);
         self.ranges.push(r);
     }
 
@@ -69,14 +73,8 @@ impl TombstoneArena {
         self.ranges.push(r);
     }
 
-    fn push_unique_index(
-        &mut self,
-        type_id: u64,
-        field_hash: u64,
-        value_bytes: &[u8],
-    ) {
-        let r =
-            KeyBuilder::unique_index_into(&mut self.buf, type_id, field_hash, value_bytes);
+    fn push_unique_index(&mut self, type_id: u64, field_hash: u64, value_bytes: &[u8]) {
+        let r = KeyBuilder::unique_index_into(&mut self.buf, type_id, field_hash, value_bytes);
         self.ranges.push(r);
     }
 
@@ -88,6 +86,23 @@ impl TombstoneArena {
         object_id: u64,
     ) {
         let r = KeyBuilder::field_index_into(
+            &mut self.buf,
+            type_id,
+            field_hash,
+            encoded_value,
+            object_id,
+        );
+        self.ranges.push(r);
+    }
+
+    fn push_field_index_var(
+        &mut self,
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8],
+        object_id: u64,
+    ) {
+        let r = KeyBuilder::field_index_var_into(
             &mut self.buf,
             type_id,
             field_hash,
@@ -197,15 +212,42 @@ pub struct Database {
     /// (insert + delete, no updates) this saves 100 RwLock acquires per
     /// User-delete at K=100. Updated alongside every map mutation.
     version_counter_count: std::sync::atomic::AtomicUsize,
+    /// Outbound channel to the cover-refresh worker. Each successful
+    /// `update()` pushes the bumped target's `(type_id, object_id)` here;
+    /// the worker scans `r:<target>:*` for incoming 1:1 forward sources
+    /// and re-runs Phase 1 for each (rewriting their outbound rev_edges
+    /// with the target's fresh cover).
+    ///
+    /// Wrapped in `Mutex<Option<...>>` so `Drop` can `take()` the sender,
+    /// closing the channel and prompting the worker to exit cleanly.
+    cover_refresh_tx: parking_lot::Mutex<Option<std::sync::mpsc::Sender<(u64, u64)>>>,
+    /// Join handle for the cover-refresh worker thread. Taken on drop.
+    cover_refresh_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// One @indexed scalar field on a type, with everything the write path needs
 /// to emit/withdraw its `idx:` entry without re-resolving from the schema.
 /// `field_id` is the same stable per-`{Type.field}` u64 the unique index uses.
+/// `kind` decides which encoder + key layout the field uses:
+///
+///   * `Integer` / `Bool` / `Float` → fixed 8-byte sortable encoding,
+///     written into the legacy `KeyBuilder::field_index` layout.
+///   * `String` / `Bytes` → variable-length escape-encoded + NUL-NUL
+///     terminator, written into `KeyBuilder::field_index_var`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexedKind {
+    Integer,
+    Bool,
+    Float,
+    String,
+    Bytes,
+}
+
 #[derive(Debug, Clone)]
 struct IndexedField {
     name: String,
     field_id: u64,
+    kind: IndexedKind,
 }
 
 /// Operator-tunable knobs that don't depend on schema. Pass to
@@ -219,19 +261,43 @@ pub struct OpenOptions {
     /// `fsync=off + synchronous_commit=off` mode for benchmarking, and
     /// is useful for bulk imports that accept the risk.
     pub sync_on_commit: bool,
+    /// `true` (default): spawn the cover-refresh worker thread. Every
+    /// `update()` that bumps an object's generation queues the target;
+    /// the worker scans for incoming 1:1 forward sources and rewrites
+    /// their outbound rev_edges so embedded `<name>__cover` blobs stay
+    /// current. Disable for benchmarks that don't want the background
+    /// CPU or for tests that need deterministic stale-cover state.
+    pub background_cover_refresh: bool,
+    /// Reserved for the tombstone-migration phase (card 2/5). In phase
+    /// 1 this flag is REJECTED at the schema-shrink gate regardless of
+    /// its value: opening with a shrinking schema returns
+    /// `CatalogError::SchemaShrink` (flag `false`) or
+    /// `CatalogError::SchemaShrinkNotYetSupported` (flag `true`). The
+    /// field exists so callers can wire the intent through their
+    /// config today and the gate flips when phase 2 ships, without a
+    /// breaking API change. Defaults to `false`.
+    pub allow_schema_shrink: bool,
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
             sync_on_commit: true,
+            background_cover_refresh: true,
+            allow_schema_shrink: false,
         }
     }
 }
 
 impl Database {
     /// Open a database with the given schema and data directory.
-    pub fn open(schema: Schema, data_dir: impl AsRef<Path>) -> EngineResult<Self> {
+    ///
+    /// Returns an `Arc<Database>` because the engine owns a background
+    /// cover-refresh worker thread that holds a `Weak<Database>` reference
+    /// — the Arc wrapper is required for the worker's lifetime to track
+    /// the database's. All callers can treat the `Arc` like a `Database`
+    /// directly thanks to deref.
+    pub fn open(schema: Schema, data_dir: impl AsRef<Path>) -> EngineResult<Arc<Self>> {
         Self::open_with_options(schema, data_dir, OpenOptions::default())
     }
 
@@ -243,7 +309,7 @@ impl Database {
         schema: Schema,
         data_dir: impl AsRef<Path>,
         options: OpenOptions,
-    ) -> EngineResult<Self> {
+    ) -> EngineResult<Arc<Self>> {
         let mut config = LsmConfig::new(data_dir);
         // Wire a zone-field extractor that pulls integer field values out of
         // object entries' FieldMap blobs at SST flush/compaction time. Lets
@@ -251,32 +317,19 @@ impl Database {
         // predicate without per-entry decode + compare.
         config.zone_extractor = Some(Arc::new(extract_zone_fields));
         config.sync_on_commit = options.sync_on_commit;
-        let storage = Arc::new(LsmTree::open(config)?);
+        let storage = LsmTree::open(config)?;
 
-        // Assign stable numeric IDs to types and relationships.
-        let mut type_ids = HashMap::new();
-        let mut rel_ids = HashMap::new();
-        let mut field_ids = HashMap::new();
-        let mut next_rel_id = 1u64;
-        let mut next_field_id = 1u64;
-
-        let mut type_names: Vec<_> = schema.types.keys().cloned().collect();
-        type_names.sort();
-        for (type_id, name) in (1u64..).zip(type_names.iter()) {
-            type_ids.insert(name.clone(), type_id);
-
-            let type_def = &schema.types[name];
-            for field in &type_def.fields {
-                let field_key = format!("{}.{}", name, field.name);
-                field_ids.insert(field_key.clone(), next_field_id);
-                next_field_id += 1;
-
-                if matches!(field.field_type, FieldType::Relation(_)) {
-                    rel_ids.insert(field_key, next_rel_id);
-                    next_rel_id += 1;
-                }
-            }
-        }
+        // Pull stable numeric IDs from the persisted schema catalog
+        // (see `catalog.rs`). For a legacy / fresh database the
+        // catalog backfill produces the same IDs the prior
+        // alphabetical algorithm did, so existing on-disk data is
+        // untouched; for an extended schema the catalog allocates new
+        // IDs from persisted counters without renumbering anything.
+        let cat =
+            crate::catalog::load_or_initialize(&storage, &schema, options.allow_schema_shrink)?;
+        let type_ids = cat.type_ids;
+        let rel_ids = cat.rel_ids;
+        let field_ids = cat.field_ids;
 
         // Recover the max object ID by scanning existing objects.
         let mut max_object_id = 0u64;
@@ -330,6 +383,7 @@ impl Database {
                             source_type: source_type.clone(),
                             source_field: field.name.clone(),
                             rel_id,
+                            is_many: rel.is_many,
                             policy,
                         });
                 }
@@ -400,9 +454,17 @@ impl Database {
                 if field.is_indexed() {
                     let key = format!("{type_name}.{}", field.name);
                     let field_id = field_ids[&key];
+                    let kind = match &field.field_type {
+                        FieldType::Scalar(ScalarType::String) => IndexedKind::String,
+                        FieldType::Scalar(ScalarType::Bytes) => IndexedKind::Bytes,
+                        FieldType::Scalar(ScalarType::Bool) => IndexedKind::Bool,
+                        FieldType::Scalar(ScalarType::F32 | ScalarType::F64) => IndexedKind::Float,
+                        _ => IndexedKind::Integer,
+                    };
                     list.push(IndexedField {
                         name: field.name.clone(),
                         field_id,
+                        kind,
                     });
                 }
             }
@@ -427,14 +489,17 @@ impl Database {
                 let obj_id_bytes: [u8; 8] = key[11..19].try_into().unwrap();
                 let v_bytes: [u8; 8] = value[..].try_into().unwrap();
                 version_counters.insert(
-                    (u64::from_be_bytes(type_id_bytes), u64::from_be_bytes(obj_id_bytes)),
+                    (
+                        u64::from_be_bytes(type_id_bytes),
+                        u64::from_be_bytes(obj_id_bytes),
+                    ),
                     u64::from_be_bytes(v_bytes),
                 );
             }
         }
         drop(txn2);
 
-        Ok(Self {
+        let db = Arc::new(Self {
             schema,
             storage,
             type_ids,
@@ -448,7 +513,27 @@ impl Database {
             indexed_fields,
             version_counter_count: std::sync::atomic::AtomicUsize::new(version_counters.len()),
             version_counters: RwLock::new(version_counters),
-        })
+            cover_refresh_tx: parking_lot::Mutex::new(None),
+            cover_refresh_handle: parking_lot::Mutex::new(None),
+        });
+
+        // Spawn the cover-refresh worker now that `db` lives inside an Arc
+        // we can downgrade. The worker holds a `Weak<Database>` so it
+        // doesn't extend the database's lifetime — once external Arcs are
+        // dropped, our Drop impl closes the channel and joins. Skipped when
+        // the caller opts out via `OpenOptions::background_cover_refresh`.
+        if options.background_cover_refresh {
+            let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+            let weak = Arc::downgrade(&db);
+            let handle = std::thread::Builder::new()
+                .name("rhypedb-cover-refresh".into())
+                .spawn(move || cover_refresh_worker(rx, weak))
+                .map_err(|e| EngineError::Storage(rhypedb_storage::Error::Io(e)))?;
+            *db.cover_refresh_tx.lock() = Some(tx);
+            *db.cover_refresh_handle.lock() = Some(handle);
+        }
+
+        Ok(db)
     }
 
     /// Current generation of the object `(type_name, object_id)`. Returns 0
@@ -525,13 +610,7 @@ impl Database {
         let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
 
         let scalar_fields = self.stage_create_writes(
-            &mut txn,
-            type_name,
-            type_def,
-            type_id,
-            object_id,
-            &fields,
-            &mut puts,
+            &mut txn, type_name, type_def, type_id, object_id, &fields, &mut puts,
         )?;
 
         self.storage.put_batch(&mut txn, &puts)?;
@@ -589,12 +668,13 @@ impl Database {
         let mut links: Vec<(String, u64, String, Bytes, u64, u64, bool)> = Vec::new();
 
         for (field_name, value) in fields {
-            let field_def = type_def.get_field(field_name).ok_or_else(|| {
-                EngineError::FieldNotFound {
-                    type_name: type_name.into(),
-                    field: field_name.clone(),
-                }
-            })?;
+            let field_def =
+                type_def
+                    .get_field(field_name)
+                    .ok_or_else(|| EngineError::FieldNotFound {
+                        type_name: type_name.into(),
+                        field: field_name.clone(),
+                    })?;
             validate_value(field_def, value)?;
 
             match &field_def.field_type {
@@ -628,10 +708,10 @@ impl Database {
                             });
                         }
                     };
-                    let target_type_id =
-                        *self.type_ids.get(&rel.target_type).ok_or_else(|| {
-                            EngineError::TypeNotFound(rel.target_type.clone())
-                        })?;
+                    let target_type_id = *self
+                        .type_ids
+                        .get(&rel.target_type)
+                        .ok_or_else(|| EngineError::TypeNotFound(rel.target_type.clone()))?;
                     let target_key = KeyBuilder::object(target_type_id, target_id);
                     let target_data = self.storage.get(txn, &target_key)?.ok_or_else(|| {
                         EngineError::ObjectNotFound {
@@ -641,12 +721,14 @@ impl Database {
                     })?;
                     let target_version = self.object_version(&rel.target_type, target_id);
                     let rel_key = format!("{type_name}.{field_name}");
-                    let rel_id = *self.rel_ids.get(&rel_key).ok_or_else(|| {
-                        EngineError::FieldNotFound {
-                            type_name: type_name.into(),
-                            field: field_name.clone(),
-                        }
-                    })?;
+                    let rel_id =
+                        *self
+                            .rel_ids
+                            .get(&rel_key)
+                            .ok_or_else(|| EngineError::FieldNotFound {
+                                type_name: type_name.into(),
+                                field: field_name.clone(),
+                            })?;
                     let is_1to1_forward = !rel.is_many;
                     links.push((
                         field_name.clone(),
@@ -689,17 +771,10 @@ impl Database {
             for ifd in idx_fields {
                 if let Some(value) = scalar_fields.get(&ifd.name)
                     && !matches!(value, Value::Null)
-                    && let Some(encoded) = encode_int_for_zone(value)
+                    && let Some(key) =
+                        build_field_index_key(type_id, ifd.field_id, ifd.kind, value, object_id)
                 {
-                    puts.push((
-                        KeyBuilder::field_index(
-                            type_id,
-                            ifd.field_id,
-                            &encoded,
-                            object_id,
-                        ),
-                        serialized.clone(),
-                    ));
+                    puts.push((key, serialized.clone()));
                 }
             }
         }
@@ -719,13 +794,8 @@ impl Database {
                 Bytes::new(),
             ));
 
-            let rev_value = build_inflight_cover(
-                &scalar_fields,
-                field_name,
-                *target_id,
-                &links,
-                i,
-            );
+            let rev_value =
+                build_inflight_cover(self, txn, &scalar_fields, field_name, *target_id, &links, i)?;
             puts.push((
                 KeyBuilder::reverse_edge(*target_id, *rel_id, object_id),
                 rev_value,
@@ -744,11 +814,7 @@ impl Database {
     /// whole batch rolls back — none of the rows land. This is intentional:
     /// callers reaching for the bulk path want the all-or-nothing shape of
     /// `COPY ... FROM STDIN`, not a partial insert.
-    pub fn create_batch(
-        &self,
-        type_name: &str,
-        rows: Vec<FieldMap>,
-    ) -> EngineResult<Vec<Object>> {
+    pub fn create_batch(&self, type_name: &str, rows: Vec<FieldMap>) -> EngineResult<Vec<Object>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -773,13 +839,7 @@ impl Database {
         for fields in &rows {
             let object_id = self.next_object_id.fetch_add(1, Ordering::SeqCst);
             let scalar_fields = self.stage_create_writes(
-                &mut txn,
-                type_name,
-                type_def,
-                type_id,
-                object_id,
-                fields,
-                &mut puts,
+                &mut txn, type_name, type_def, type_id, object_id, fields, &mut puts,
             )?;
             scalar_rows.push(scalar_fields);
             object_ids.push(object_id);
@@ -796,7 +856,7 @@ impl Database {
         // Events report only the scalar fields (relation values went into
         // the edge index, not the object payload).
         let mut out = Vec::with_capacity(scalar_rows.len());
-        for (id, scalar_fields) in object_ids.into_iter().zip(scalar_rows.into_iter()) {
+        for (id, scalar_fields) in object_ids.into_iter().zip(scalar_rows) {
             self.subscriptions.publish(ChangeEvent {
                 version,
                 kind: ChangeKind::Create,
@@ -823,12 +883,13 @@ impl Database {
 
         let key = KeyBuilder::object(type_id, object_id);
         let snapshot = self.storage.read_snapshot();
-        let data = self.storage.get_at(snapshot, &key)?.ok_or_else(|| {
-            EngineError::ObjectNotFound {
-                type_name: type_name.into(),
-                object_id,
-            }
-        })?;
+        let data =
+            self.storage
+                .get_at(snapshot, &key)?
+                .ok_or_else(|| EngineError::ObjectNotFound {
+                    type_name: type_name.into(),
+                    object_id,
+                })?;
 
         let fields = deserialize_fields(&data);
         Ok(Object {
@@ -872,7 +933,7 @@ impl Database {
         // Public API: return Objects with `fields` populated. Callers that
         // accept the lazy shortcut should use `get_many_lazy` instead.
         let mut out = Vec::with_capacity(sorted.len());
-        for (id, value) in sorted.into_iter().zip(values.into_iter()) {
+        for (id, value) in sorted.into_iter().zip(values) {
             if let Some(data) = value {
                 out.push(Object {
                     type_name: type_name.into(),
@@ -915,7 +976,7 @@ impl Database {
         let values = self.storage.multi_get_at(snapshot, &key_refs)?;
 
         let mut out = Vec::with_capacity(sorted.len());
-        for (id, value) in sorted.into_iter().zip(values.into_iter()) {
+        for (id, value) in sorted.into_iter().zip(values) {
             if let Some(data) = value {
                 out.push(Object::from_raw(type_name.into(), id, data));
             }
@@ -988,20 +1049,20 @@ impl Database {
         target: i64,
         limit: Option<usize>,
     ) -> EngineResult<Vec<Object>> {
-        use rhypedb_schema::ScalarType;
-        use rhypedb_storage::zone::{hash_field_name, FieldPredicate};
+        use rhypedb_storage::zone::{FieldPredicate, hash_field_name};
 
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
         let type_id = self.type_ids[type_name];
-        let field_def = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
-                type_name: type_name.into(),
-                field: field_name.into(),
-            }
-        })?;
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
 
         // Cast the raw query target to the field's actual integer type so the
         // encoding matches what's on disk. Bail out to `scan_type` (no perf
@@ -1171,18 +1232,18 @@ impl Database {
                     return Ok(Vec::new());
                 }
                 let seek_bytes = (target_u64 + 1).to_be_bytes();
-                let mut start_key =
-                    bytes::BytesMut::with_capacity(prefix.len() + 8);
+                let mut start_key = bytes::BytesMut::with_capacity(prefix.len() + 8);
                 start_key.extend_from_slice(&prefix);
                 start_key.extend_from_slice(&seek_bytes);
-                self.storage.scan_from_at_limited(snapshot, &prefix, &start_key, n)?
+                self.storage
+                    .scan_from_at_limited(snapshot, &prefix, &start_key, n)?
             }
             (CompareOp::Ge, Some(n)) => {
-                let mut start_key =
-                    bytes::BytesMut::with_capacity(prefix.len() + 8);
+                let mut start_key = bytes::BytesMut::with_capacity(prefix.len() + 8);
                 start_key.extend_from_slice(&prefix);
                 start_key.extend_from_slice(target_bytes);
-                self.storage.scan_from_at_limited(snapshot, &prefix, &start_key, n)?
+                self.storage
+                    .scan_from_at_limited(snapshot, &prefix, &start_key, n)?
             }
             (CompareOp::Lt, Some(n)) | (CompareOp::Le, Some(n)) => {
                 self.storage.scan_prefix_at_limited(snapshot, &prefix, n)?
@@ -1235,6 +1296,371 @@ impl Database {
         Ok(out)
     }
 
+    /// Bool-valued filtered scan. Routes to the secondary index when the
+    /// field is `@indexed`; otherwise falls back to a typed scan + per-row
+    /// comparison.
+    pub fn filter_scan_bool(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: bool,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.type_ids[type_name];
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
+        if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bool)) {
+            return self.scan_type(type_name);
+        }
+
+        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+            && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
+            && ifd.kind == IndexedKind::Bool
+        {
+            let encoded = encode_bool_for_index(&Value::Bool(target)).unwrap();
+            return self.filter_scan_via_index(
+                type_name,
+                type_id,
+                ifd.field_id,
+                op,
+                &encoded,
+                limit,
+            );
+        }
+        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+            Value::Bool(b) => Some(compare_bool(*b, op, target)),
+            _ => Some(false),
+        })
+    }
+
+    /// Float-valued filtered scan. `target` is interpreted as `f64`; both
+    /// `f32` and `f64` index entries share the same 8-byte sortable layout
+    /// (`f32` values widen on write).
+    pub fn filter_scan_float(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: f64,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.type_ids[type_name];
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
+        let is_float = matches!(
+            field_def.field_type,
+            FieldType::Scalar(ScalarType::F32 | ScalarType::F64)
+        );
+        if !is_float {
+            return self.scan_type(type_name);
+        }
+
+        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+            && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
+            && ifd.kind == IndexedKind::Float
+        {
+            let encoded = encode_f64_for_index(target);
+            return self.filter_scan_via_index(
+                type_name,
+                type_id,
+                ifd.field_id,
+                op,
+                &encoded,
+                limit,
+            );
+        }
+        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+            Value::F64(f) => Some(compare_partial(*f, op, target)),
+            Value::F32(f) => Some(compare_partial(*f as f64, op, target)),
+            _ => Some(false),
+        })
+    }
+
+    /// Bytes-valued filtered scan. Mirrors `filter_scan_str` but for the
+    /// `Bytes` scalar — the encoder, key layout, and parsing are identical
+    /// (variable-length escape + `\x00\x00` terminator).
+    pub fn filter_scan_bytes(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: &[u8],
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.type_ids[type_name];
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
+        if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bytes)) {
+            return self.scan_type(type_name);
+        }
+
+        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+            && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
+            && ifd.kind == IndexedKind::Bytes
+        {
+            return self.filter_scan_via_index_var(
+                type_name,
+                type_id,
+                ifd.field_id,
+                op,
+                &encode_bytes_for_index(target),
+                limit,
+            );
+        }
+        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+            Value::Bytes(b) => Some(compare_ord(b.as_ref(), op, target)),
+            _ => Some(false),
+        })
+    }
+
+    /// String-valued filtered scan. Mirrors `filter_scan` but for `String`
+    /// scalars: pushes a single-field comparison against a string literal
+    /// down to the secondary index when one is declared on the field. The
+    /// fast path uses the variable-length encoded value layout
+    /// (`KeyBuilder::field_index_var`).
+    ///
+    /// Falls back to `scan_type` + per-row comparison when the field isn't
+    /// indexed or isn't a `String` scalar — strings have no zone-map
+    /// acceleration today, so the non-indexed path is a full scan.
+    pub fn filter_scan_str(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: &str,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.type_ids[type_name];
+        let field_def =
+            type_def
+                .get_field(field_name)
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                })?;
+
+        // Non-string scalar field — no point pretending the literal applies.
+        if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::String)) {
+            return self.scan_type(type_name);
+        }
+
+        // === Indexed fast path ===
+        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+            && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
+            && ifd.kind == IndexedKind::String
+        {
+            return self.filter_scan_via_index_var(
+                type_name,
+                type_id,
+                ifd.field_id,
+                op,
+                &encode_str_for_index(target),
+                limit,
+            );
+        }
+
+        // === Non-indexed fallback: full type scan, post-filter ===
+        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+            Value::String(s) => Some(compare_ord(s.as_str(), op, target)),
+            _ => Some(false),
+        })
+    }
+
+    /// Per-row fallback when no index serves the predicate. Walks every
+    /// object of the type via `scan_type` and applies `predicate` to the
+    /// field's value, capping at `limit` matches. `predicate` returns
+    /// `Some(bool)` (pass / fail) per value; `None` is treated as fail.
+    fn filter_scan_fallback<F>(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        limit: Option<usize>,
+        mut predicate: F,
+    ) -> EngineResult<Vec<Object>>
+    where
+        F: FnMut(&Value) -> Option<bool>,
+    {
+        let cap = limit.unwrap_or(usize::MAX);
+        let mut out = Vec::new();
+        for obj in self.scan_type(type_name)? {
+            if out.len() >= cap {
+                break;
+            }
+            let pass = obj
+                .fields
+                .get(field_name)
+                .and_then(&mut predicate)
+                .unwrap_or(false);
+            if pass {
+                out.push(obj);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Index-backed fast path for variable-length encoded values (String,
+    /// Bytes). The on-disk key layout is
+    /// `i:<type>:<field>:<escaped_value>\x00\x00<object_id>`. `target_encoded`
+    /// is the caller's value run through the same encoder used at write
+    /// time (`encode_bytes_for_index` / `encode_str_for_index`).
+    ///
+    /// Eq narrows to the value-prefix scan; range/Ne walk the field's full
+    /// prefix and compare encoded value bytes (which preserve sort order).
+    /// Covering payload semantics match the fixed-width variant — empty
+    /// value falls back to per-id `get_many` for legacy entries.
+    fn filter_scan_via_index_var(
+        &self,
+        type_name: &str,
+        type_id: u64,
+        field_id: u64,
+        op: rhypedb_storage::zone::CompareOp,
+        target_encoded: &[u8],
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        use rhypedb_storage::zone::CompareOp;
+
+        let snapshot = self.storage.read_snapshot();
+        let cap = limit.unwrap_or(usize::MAX);
+
+        // === Eq fast path — narrow value-prefix scan ===
+        if matches!(op, CompareOp::Eq) {
+            let prefix =
+                KeyBuilder::field_index_var_value_prefix(type_id, field_id, target_encoded);
+            let entries = if let Some(n) = limit {
+                self.storage.scan_prefix_at_limited(snapshot, &prefix, n)?
+            } else {
+                self.storage.scan_prefix_at(snapshot, &prefix)?
+            };
+            let mut out = Vec::with_capacity(entries.len().min(cap));
+            let mut fallback_ids: Vec<u64> = Vec::new();
+            for (key, value) in entries {
+                if out.len() + fallback_ids.len() >= cap {
+                    break;
+                }
+                if key.len() < 8 {
+                    continue;
+                }
+                let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+                let object_id = u64::from_be_bytes(id_bytes);
+                if value.is_empty() {
+                    fallback_ids.push(object_id);
+                } else {
+                    out.push(Object {
+                        type_name: type_name.into(),
+                        id: object_id,
+                        fields: deserialize_fields(&value),
+                        raw_fields: None,
+                    });
+                }
+            }
+            if !fallback_ids.is_empty() {
+                out.extend(self.get_many(type_name, &fallback_ids)?);
+            }
+            return Ok(out);
+        }
+
+        // === Range/Ne path — scan the whole field prefix ===
+        let prefix = KeyBuilder::field_index_prefix(type_id, field_id);
+        let plen = prefix.len();
+        let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
+
+        let mut out = Vec::with_capacity(entries.len().min(cap));
+        let mut fallback_ids: Vec<u64> = Vec::new();
+        for (key, value) in entries {
+            if out.len() + fallback_ids.len() >= cap {
+                break;
+            }
+            // Need plen + at least one 0x00 0x00 terminator + 8 byte id.
+            if key.len() < plen + 2 + 8 {
+                continue;
+            }
+            // Find the embedded `\x00\x00` terminator. Encoded values cannot
+            // contain it (every embedded NUL is followed by 0x01), so the
+            // first occurrence at or after `plen` is the boundary.
+            let mut term_at: Option<usize> = None;
+            let mut i = plen;
+            while i + 1 < key.len() - 8 {
+                if key[i] == 0 && key[i + 1] == 0 {
+                    term_at = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            let Some(term) = term_at else { continue };
+            // Encoded value (with terminator) for byte-wise compare; range
+            // checks compare against target_encoded which carries the same
+            // shape, so sort order is preserved.
+            let value_with_term = &key[plen..term + 2];
+            let cmp = value_with_term.cmp(target_encoded);
+            let pass = match op {
+                CompareOp::Lt => cmp.is_lt(),
+                CompareOp::Le => cmp.is_le(),
+                CompareOp::Gt => cmp.is_gt(),
+                CompareOp::Ge => cmp.is_ge(),
+                CompareOp::Ne => cmp.is_ne(),
+                CompareOp::Eq => unreachable!("Eq handled above"),
+            };
+            if !pass {
+                // The scan is sorted ascending by encoded value, so once
+                // Lt/Le starts failing we can stop. Gt/Ge fail at the
+                // start until they begin passing — can't short-circuit.
+                if matches!(op, CompareOp::Lt | CompareOp::Le) {
+                    break;
+                }
+                continue;
+            }
+            let id_bytes: [u8; 8] = key[term + 2..term + 10].try_into().unwrap();
+            let object_id = u64::from_be_bytes(id_bytes);
+            if value.is_empty() {
+                fallback_ids.push(object_id);
+            } else {
+                out.push(Object {
+                    type_name: type_name.into(),
+                    id: object_id,
+                    fields: deserialize_fields(&value),
+                    raw_fields: None,
+                });
+            }
+        }
+
+        if !fallback_ids.is_empty() {
+            out.extend(self.get_many(type_name, &fallback_ids)?);
+        }
+        Ok(out)
+    }
+
     /// Update an object's fields. Only the provided fields are updated;
     /// unmentioned fields are preserved.
     pub fn update(
@@ -1251,24 +1677,26 @@ impl Database {
 
         // Validate update fields.
         for (field_name, value) in &updates {
-            let field_def = type_def.get_field(field_name).ok_or_else(|| {
-                EngineError::FieldNotFound {
-                    type_name: type_name.into(),
-                    field: field_name.clone(),
-                }
-            })?;
+            let field_def =
+                type_def
+                    .get_field(field_name)
+                    .ok_or_else(|| EngineError::FieldNotFound {
+                        type_name: type_name.into(),
+                        field: field_name.clone(),
+                    })?;
             validate_value(field_def, value)?;
         }
 
         let key = KeyBuilder::object(type_id, object_id);
         let mut txn = self.storage.begin_txn();
 
-        let existing_data = self.storage.get(&txn, &key)?.ok_or_else(|| {
-            EngineError::ObjectNotFound {
-                type_name: type_name.into(),
-                object_id,
-            }
-        })?;
+        let existing_data =
+            self.storage
+                .get(&txn, &key)?
+                .ok_or_else(|| EngineError::ObjectNotFound {
+                    type_name: type_name.into(),
+                    object_id,
+                })?;
 
         let mut fields = deserialize_fields(&existing_data);
 
@@ -1278,9 +1706,10 @@ impl Database {
             if field_def.is_unique() && !matches!(value, Value::Null) {
                 // Remove old unique index entry if the field had a value.
                 if let Some(old_value) = fields.get(field_name)
-                    && !matches!(old_value, Value::Null) {
-                        self.remove_unique_index(&mut txn, type_name, type_id, field_name, old_value)?;
-                    }
+                    && !matches!(old_value, Value::Null)
+                {
+                    self.remove_unique_index(&mut txn, type_name, type_id, field_name, old_value)?;
+                }
                 self.check_unique_and_insert(
                     &mut txn, type_name, type_id, field_name, value, object_id,
                 )?;
@@ -1326,7 +1755,12 @@ impl Database {
                         && !matches!(old_v, Value::Null)
                     {
                         self.remove_field_index(
-                            &mut txn, type_id, ifd.field_id, old_v, object_id,
+                            &mut txn,
+                            type_id,
+                            ifd.field_id,
+                            ifd.kind,
+                            old_v,
+                            object_id,
                         )?;
                     }
                     if let Some(new_v) = &new_value_opt
@@ -1336,26 +1770,27 @@ impl Database {
                             &mut txn,
                             type_id,
                             ifd.field_id,
+                            ifd.kind,
                             new_v,
                             object_id,
                             serialized.clone(),
                         )?;
                     }
-                } else if any_update {
-                    if let Some(new_v) = &new_value_opt
-                        && !matches!(new_v, Value::Null)
-                    {
-                        // Same key — `put` overwrites the value with the new
-                        // covering payload.
-                        self.insert_field_index(
-                            &mut txn,
-                            type_id,
-                            ifd.field_id,
-                            new_v,
-                            object_id,
-                            serialized.clone(),
-                        )?;
-                    }
+                } else if any_update
+                    && let Some(new_v) = &new_value_opt
+                    && !matches!(new_v, Value::Null)
+                {
+                    // Same key — `put` overwrites the value with the new
+                    // covering payload.
+                    self.insert_field_index(
+                        &mut txn,
+                        type_id,
+                        ifd.field_id,
+                        ifd.kind,
+                        new_v,
+                        object_id,
+                        serialized.clone(),
+                    )?;
                 }
             }
         }
@@ -1370,49 +1805,9 @@ impl Database {
         // relations. (Phase 2 — refreshing this object's OWN cover in the
         // rev_edges that INCOMING references hold us under `__cover` — is
         // handled lazily via the per-object version + reader-side fall-
-        // through, since the count can be unbounded.)
-        if let Some(type_def) = self.schema.get_type(type_name) {
-            let has_forward_1to1 = type_def.fields.iter().any(|f| {
-                matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many)
-                    && f.inverse().is_none()
-            });
-            if has_forward_1to1 {
-                for field in &type_def.fields {
-                    if !matches!(field.field_type, FieldType::Relation(_)) {
-                        continue;
-                    }
-                    if field.inverse().is_some() {
-                        continue;
-                    }
-                    let rel_key = format!("{type_name}.{}", field.name);
-                    let Some(&rel_id) = self.rel_ids.get(&rel_key) else {
-                        continue;
-                    };
-                    let prefix = KeyBuilder::edge_prefix(object_id, rel_id);
-                    let entries = self.scan_prefix(&txn, &prefix)?;
-                    // Walk every linked target across both 1:1 and many
-                    // outbound relations: their rev_edge values all carry
-                    // source's covering fields and need refresh.
-                    for (target_id, _edge_value) in entries {
-                        let rev_value = build_covering_rev_value(
-                            self,
-                            &txn,
-                            type_name,
-                            object_id,
-                            Some(&serialized),
-                            &field.name,
-                            target_id,
-                        )?;
-                        let rev_key = KeyBuilder::reverse_edge(
-                            target_id,
-                            rel_id,
-                            object_id,
-                        );
-                        self.storage.put(&mut txn, &rev_key, rev_value)?;
-                    }
-                }
-            }
-        }
+        // through, plus a background sweeper that opportunistically rewrites
+        // stale embedded covers — see `cover_refresh_worker`.)
+        self.refresh_outbound_rev_edges(&mut txn, type_name, object_id, Some(&serialized))?;
 
         // Phase 2: bump this object's generation. Every rev_edge that
         // embedded us as `<name>__cover` earlier now has a stale snapshot;
@@ -1439,6 +1834,16 @@ impl Database {
                 other => EngineError::Storage(other),
             }
         })?;
+
+        // Enqueue cover refresh for this target. Every other rev_edge that
+        // embedded this object as `<name>__cover` (under a different source)
+        // now has a stale snapshot; the worker will scan `r:<target>:*` to
+        // find those sources and re-run Phase 1 for each. Send failure means
+        // the channel was closed (Drop in progress) — fall through, the
+        // next read still detects staleness via cover_v.
+        if let Some(tx) = self.cover_refresh_tx.lock().as_ref() {
+            let _ = tx.send((type_id, object_id));
+        }
 
         self.subscriptions.publish(ChangeEvent {
             version,
@@ -1576,16 +1981,14 @@ impl Database {
         if meta.has_unique || meta.has_indexed || verify_exists {
             let obj_key = KeyBuilder::object(type_id, object_id);
             let obj_data = self.storage.get(txn, &obj_key)?;
-            if obj_data.is_none() {
-                if verify_exists {
-                    return Err(EngineError::ObjectNotFound {
-                        type_name: meta.type_name.clone(),
-                        object_id,
-                    });
-                }
-                // Cascade-recursive call against an object that's already
-                // gone (e.g. a circular cascade chain). Continue silently.
+            if obj_data.is_none() && verify_exists {
+                return Err(EngineError::ObjectNotFound {
+                    type_name: meta.type_name.clone(),
+                    object_id,
+                });
             }
+            // Cascade-recursive call against an object that's already
+            // gone (e.g. a circular cascade chain). Continue silently.
             if let Some(data) = &obj_data {
                 let fields = deserialize_fields(data);
                 if meta.has_unique
@@ -1594,31 +1997,76 @@ impl Database {
                     for field_def in &type_def.fields {
                         if field_def.is_unique()
                             && let Some(value) = fields.get(&field_def.name)
-                                && !matches!(value, Value::Null) {
-                                    let field_key =
-                                        format!("{}.{}", meta.type_name, field_def.name);
-                                    let field_id = self.field_ids[&field_key];
-                                    let value_bytes = value_to_index_bytes(value);
-                                    arena.push_unique_index(
-                                        type_id,
-                                        field_id,
-                                        &value_bytes,
-                                    );
-                                }
+                            && !matches!(value, Value::Null)
+                        {
+                            let field_key = format!("{}.{}", meta.type_name, field_def.name);
+                            let field_id = self.field_ids[&field_key];
+                            let value_bytes = value_to_index_bytes(value);
+                            arena.push_unique_index(type_id, field_id, &value_bytes);
+                        }
                     }
                 }
                 if let Some(idx_fields) = type_idx_fields {
                     for ifd in idx_fields {
-                        if let Some(value) = fields.get(&ifd.name)
-                            && !matches!(value, Value::Null)
-                            && let Some(encoded) = encode_int_for_zone(value)
-                        {
-                            arena.push_field_index(
-                                type_id,
-                                ifd.field_id,
-                                &encoded,
-                                object_id,
-                            );
+                        let Some(value) = fields.get(&ifd.name) else {
+                            continue;
+                        };
+                        if matches!(value, Value::Null) {
+                            continue;
+                        }
+                        match ifd.kind {
+                            IndexedKind::Integer => {
+                                if let Some(encoded) = encode_int_for_zone(value) {
+                                    arena.push_field_index(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
+                            IndexedKind::Bool => {
+                                if let Some(encoded) = encode_bool_for_index(value) {
+                                    arena.push_field_index(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
+                            IndexedKind::Float => {
+                                if let Some(encoded) = encode_float_for_index(value) {
+                                    arena.push_field_index(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
+                            IndexedKind::String => {
+                                if let Value::String(s) = value {
+                                    let encoded = encode_str_for_index(s);
+                                    arena.push_field_index_var(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
+                            IndexedKind::Bytes => {
+                                if let Value::Bytes(b) = value {
+                                    let encoded = encode_bytes_for_index(b);
+                                    arena.push_field_index_var(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1646,8 +2094,7 @@ impl Database {
                 }
                 match inc.policy {
                     OnDeletePolicy::Deny => {
-                        deny_info =
-                            Some((inc.source_type.clone(), inc.source_field.clone()));
+                        deny_info = Some((inc.source_type.clone(), inc.source_field.clone()));
                         break 'incoming;
                     }
                     OnDeletePolicy::Remove => {
@@ -1690,9 +2137,7 @@ impl Database {
         // exist — skip the existence check on the recursive call. The
         // rev_edge value (cover blob) goes with each child, paired with
         // the rel_id that walked us there.
-        for (cascade_type_id, cascade_id, cascade_rel_id, cascade_cover) in
-            objects_to_cascade
-        {
+        for (cascade_type_id, cascade_id, cascade_rel_id, cascade_cover) in objects_to_cascade {
             self.delete_inner(
                 txn,
                 cascade_type_id,
@@ -1784,12 +2229,12 @@ impl Database {
             .get_type(source_type)
             .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
 
-        let field = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
+        let field = type_def
+            .get_field(field_name)
+            .ok_or_else(|| EngineError::FieldNotFound {
                 type_name: source_type.into(),
                 field: field_name.into(),
-            }
-        })?;
+            })?;
 
         let rel = match &field.field_type {
             FieldType::Relation(r) => r,
@@ -1797,7 +2242,7 @@ impl Database {
                 return Err(EngineError::FieldNotFound {
                     type_name: source_type.into(),
                     field: field_name.into(),
-                })
+                });
             }
         };
 
@@ -1917,12 +2362,12 @@ impl Database {
             .get_type(source_type)
             .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
 
-        let field = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
+        let field = type_def
+            .get_field(field_name)
+            .ok_or_else(|| EngineError::FieldNotFound {
                 type_name: source_type.into(),
                 field: field_name.into(),
-            }
-        })?;
+            })?;
 
         let snapshot = self.storage.read_snapshot();
 
@@ -1930,12 +2375,14 @@ impl Database {
         // of the referenced relationship.
         if let Some(inv) = field.inverse() {
             let inv_rel_key = format!("{}.{}", inv.type_name, inv.field_name);
-            let inv_rel_id = *self.rel_ids.get(&inv_rel_key).ok_or_else(|| {
-                EngineError::FieldNotFound {
-                    type_name: inv.type_name.clone(),
-                    field: inv.field_name.clone(),
-                }
-            })?;
+            let inv_rel_id =
+                *self
+                    .rel_ids
+                    .get(&inv_rel_key)
+                    .ok_or_else(|| EngineError::FieldNotFound {
+                        type_name: inv.type_name.clone(),
+                        field: inv.field_name.clone(),
+                    })?;
 
             let prefix = KeyBuilder::reverse_edge_prefix(source_id, inv_rel_id);
             return self.scan_prefix_at(snapshot, &prefix);
@@ -1979,32 +2426,34 @@ impl Database {
             .get_type(source_type)
             .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
 
-        let field = type_def.get_field(field_name).ok_or_else(|| {
-            EngineError::FieldNotFound {
+        let field = type_def
+            .get_field(field_name)
+            .ok_or_else(|| EngineError::FieldNotFound {
                 type_name: source_type.into(),
                 field: field_name.into(),
-            }
-        })?;
+            })?;
 
         // Resolve the relation ID once (forward or inverse) — outside the
         // per-source loop the original get_links was paying.
         let (rel_id, use_inverse) = if let Some(inv) = field.inverse() {
             let inv_rel_key = format!("{}.{}", inv.type_name, inv.field_name);
-            let id = *self.rel_ids.get(&inv_rel_key).ok_or_else(|| {
-                EngineError::FieldNotFound {
+            let id = *self
+                .rel_ids
+                .get(&inv_rel_key)
+                .ok_or_else(|| EngineError::FieldNotFound {
                     type_name: inv.type_name.clone(),
                     field: inv.field_name.clone(),
-                }
-            })?;
+                })?;
             (id, true)
         } else {
             let rel_key = format!("{source_type}.{field_name}");
-            let id = *self.rel_ids.get(&rel_key).ok_or_else(|| {
-                EngineError::FieldNotFound {
+            let id = *self
+                .rel_ids
+                .get(&rel_key)
+                .ok_or_else(|| EngineError::FieldNotFound {
                     type_name: source_type.into(),
                     field: field_name.into(),
-                }
-            })?;
+                })?;
             (id, false)
         };
 
@@ -2084,11 +2533,7 @@ impl Database {
 
     /// Scan for keys with a given prefix at a snapshot version (used by the
     /// read-only fast path).
-    fn scan_prefix_at(
-        &self,
-        snapshot: u64,
-        prefix: &[u8],
-    ) -> EngineResult<Vec<(u64, FieldMap)>> {
+    fn scan_prefix_at(&self, snapshot: u64, prefix: &[u8]) -> EngineResult<Vec<(u64, FieldMap)>> {
         let entries = self.storage.scan_prefix_at(snapshot, prefix)?;
         Ok(Self::decode_edge_entries(entries))
     }
@@ -2168,42 +2613,46 @@ impl Database {
         Ok(())
     }
 
-    /// Insert a non-unique secondary index entry: `i:<type>:<field>:<value>:<id>`.
+    /// Insert a non-unique secondary index entry. The on-disk shape depends
+    /// on `kind`:
+    ///
+    ///   * `Integer` → fixed-width `i:<type>:<field>:<8-byte encoded>:<id>`.
+    ///   * `String`  → variable-length `i:<type>:<field>:<escaped>\x00\x00<id>`.
+    ///
     /// The `covering` bytes get stored as the entry value — when non-empty,
     /// this is the source object's serialized FieldMap, which lets
     /// `filter_scan_via_index` reconstruct Objects without an extra `get_many`
     /// probe per match. Pass `Bytes::new()` for legacy / non-covering mode.
     ///
-    /// Caller must hold a write txn. Silently no-ops on non-integer or null
-    /// values — `encode_int_for_zone` returns `None` and there's nothing to
-    /// index.
+    /// Caller must hold a write txn. Silently no-ops on value-kind mismatches
+    /// (e.g. null, or wrong scalar type) — there's nothing to index.
     fn insert_field_index(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
         type_id: u64,
         field_id: u64,
+        kind: IndexedKind,
         value: &Value,
         object_id: u64,
         covering: Bytes,
     ) -> EngineResult<()> {
-        if let Some(encoded) = encode_int_for_zone(value) {
-            let key = KeyBuilder::field_index(type_id, field_id, &encoded, object_id);
+        if let Some(key) = build_field_index_key(type_id, field_id, kind, value, object_id) {
             self.storage.put(txn, &key, covering)?;
         }
         Ok(())
     }
 
-    /// Remove a secondary index entry. No-op on non-integer or null values.
+    /// Remove a secondary index entry. Same dispatch as `insert_field_index`.
     fn remove_field_index(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
         type_id: u64,
         field_id: u64,
+        kind: IndexedKind,
         value: &Value,
         object_id: u64,
     ) -> EngineResult<()> {
-        if let Some(encoded) = encode_int_for_zone(value) {
-            let key = KeyBuilder::field_index(type_id, field_id, &encoded, object_id);
+        if let Some(key) = build_field_index_key(type_id, field_id, kind, value, object_id) {
             self.storage.delete(txn, &key)?;
         }
         Ok(())
@@ -2224,6 +2673,179 @@ impl Database {
         let unique_key = KeyBuilder::unique_index(type_id, field_id, &value_bytes);
         self.storage.delete(txn, &unique_key)?;
         Ok(())
+    }
+
+    /// Rewrite every outbound rev_edge whose source is `(type_name, object_id)`.
+    /// For each forward (non-inverse) relation, walk every linked target in
+    /// the edge index and `put` a freshly built `build_covering_rev_value`
+    /// payload at `r:<target>:<rel>:<source>`. This is the Phase 1 work
+    /// `update()` does for the source-side cover refresh; the cover-refresh
+    /// worker calls the same code to repair stale covers in OTHER sources
+    /// after a target's data changes.
+    ///
+    /// `source_data` provides the source object's effective scalar bytes —
+    /// `Some(b)` for `update()` (where the new bytes haven't been committed
+    /// yet) and the current persisted bytes for the worker path.
+    fn refresh_outbound_rev_edges(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_name: &str,
+        object_id: u64,
+        source_data: Option<&[u8]>,
+    ) -> EngineResult<()> {
+        let Some(type_def) = self.schema.get_type(type_name) else {
+            return Ok(());
+        };
+        let has_forward_1to1 = type_def.fields.iter().any(|f| {
+            matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many)
+                && f.inverse().is_none()
+        });
+        if !has_forward_1to1 {
+            return Ok(());
+        }
+        for field in &type_def.fields {
+            if !matches!(field.field_type, FieldType::Relation(_)) {
+                continue;
+            }
+            if field.inverse().is_some() {
+                continue;
+            }
+            let rel_key = format!("{type_name}.{}", field.name);
+            let Some(&rel_id) = self.rel_ids.get(&rel_key) else {
+                continue;
+            };
+            let prefix = KeyBuilder::edge_prefix(object_id, rel_id);
+            let entries = self.scan_prefix(txn, &prefix)?;
+            for (target_id, _edge_value) in entries {
+                let rev_value = build_covering_rev_value(
+                    self,
+                    txn,
+                    type_name,
+                    object_id,
+                    source_data,
+                    &field.name,
+                    target_id,
+                )?;
+                let rev_key = KeyBuilder::reverse_edge(target_id, rel_id, object_id);
+                self.storage.put(txn, &rev_key, rev_value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh every stale embedded cover whose underlying target is
+    /// `(target_type_id, target_id)`. Used by the cover-refresh worker after
+    /// a target update has bumped its generation.
+    ///
+    /// Algorithm:
+    ///   1. Scan every incoming 1:1 forward rev_edge of the target —
+    ///      `r:<target>:<rel>:*` for each relation listed in
+    ///      `incoming_relations` whose source field is 1:1. Each match gives
+    ///      us a source object S that has the target embedded as one of S's
+    ///      other-target covers.
+    ///   2. For each S, re-run Phase 1 — `refresh_outbound_rev_edges` —
+    ///      which rewrites every outbound rev_edge of S with fresh covers
+    ///      pulled from each peer's current state (including the target's
+    ///      newly written data + bumped generation).
+    ///
+    /// All rewrites happen in one txn so partial work can't make the index
+    /// temporarily inconsistent. A commit failure (write conflict) is
+    /// surfaced; the next bump re-enqueues the target so retry is cheap.
+    fn refresh_covers_for_target(&self, target_type_id: u64, target_id: u64) -> EngineResult<()> {
+        let Some(incoming) = self.incoming_relations.get(&target_type_id) else {
+            return Ok(());
+        };
+
+        // Phase A: read pass — find every (S_type_id, S_id) that links to
+        // the target via a 1:1 forward relation. Done in a read-only scan
+        // outside the write txn so the prefix scan doesn't see in-flight
+        // writes from this same worker pass.
+        let read_txn = self.storage.begin_txn();
+        let mut sources: Vec<(u64, u64)> = Vec::new();
+        for inc in incoming {
+            if inc.is_many {
+                continue;
+            }
+            let rev_prefix = KeyBuilder::reverse_edge_prefix(target_id, inc.rel_id);
+            let entries = self.scan_prefix_raw(&read_txn, &rev_prefix)?;
+            for (source_id, _value) in entries {
+                sources.push((inc.source_type_id, source_id));
+            }
+        }
+        drop(read_txn);
+
+        if sources.is_empty() {
+            return Ok(());
+        }
+
+        // Phase B: write pass — for each source, re-run Phase 1 in a fresh
+        // txn so commit is atomic. We collect the source bytes inside the
+        // same txn that does the put so a concurrent S-update doesn't get
+        // overwritten with stale cover content.
+        let mut txn = self.storage.begin_txn();
+        for (s_type_id, s_id) in sources {
+            let Some(s_type_name) = self.type_name_by_id.get(&s_type_id) else {
+                continue;
+            };
+            let obj_key = KeyBuilder::object(s_type_id, s_id);
+            let Some(s_bytes) = self.storage.get(&txn, &obj_key)? else {
+                continue;
+            };
+            let s_type_name = s_type_name.clone();
+            self.refresh_outbound_rev_edges(&mut txn, &s_type_name, s_id, Some(&s_bytes))?;
+        }
+        self.storage.commit(&mut txn).map_err(|e| match e {
+            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+            other => EngineError::Storage(other),
+        })?;
+        Ok(())
+    }
+}
+
+impl Drop for Database {
+    /// Tear down the cover-refresh worker. Dropping the sender closes the
+    /// channel — the worker's blocked `recv()` returns `Err`, the loop
+    /// breaks, the thread exits. We then join so this `Drop` doesn't
+    /// return while the worker is still touching the LSM.
+    ///
+    /// Self-join guard: the worker temporarily holds an `Arc<Database>`
+    /// during each iteration (via `Weak::upgrade`). If the external
+    /// holder drops their `Arc` while the worker is processing, the
+    /// worker's local Arc can become the last one — its end-of-scope
+    /// drop fires `Database::drop` on the worker thread itself, where
+    /// `handle.join()` would deadlock against the current thread. In
+    /// that case the worker is already finishing its iteration and will
+    /// exit naturally on the next `rx.recv()` (which now returns `Err`
+    /// because we just dropped the sender), so we just skip the join.
+    fn drop(&mut self) {
+        *self.cover_refresh_tx.lock() = None;
+        if let Some(handle) = self.cover_refresh_handle.lock().take()
+            && handle.thread().id() != std::thread::current().id()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Cover-refresh worker. Loops on the per-database channel, popping each
+/// target `(type_id, object_id)` that just had its generation bumped and
+/// asking the database to repair every embedded cover for that target.
+///
+/// Holds a `Weak<Database>` so the database's lifetime isn't extended by
+/// this thread — when external `Arc<Database>` refs all drop, our upgrade
+/// returns `None` and we exit. The channel-close signal from `Drop` covers
+/// the case where the worker is blocked in `recv()` at that moment.
+fn cover_refresh_worker(
+    rx: std::sync::mpsc::Receiver<(u64, u64)>,
+    weak: std::sync::Weak<Database>,
+) {
+    while let Ok((type_id, object_id)) = rx.recv() {
+        let Some(db) = weak.upgrade() else { break };
+        // Best-effort: a refresh failure (write conflict, IO error) is
+        // self-healing. The next update on the target re-enqueues it; the
+        // reader fall-through continues to detect staleness via cover_v
+        // in the meantime.
+        let _ = db.refresh_covers_for_target(type_id, object_id);
     }
 }
 
@@ -2250,25 +2872,21 @@ impl Database {
 /// Returns `Bytes::new()` if there are no other 1:1 peers (matches the
 /// existing convention so the SST doesn't carry empty cover blobs).
 fn build_inflight_cover(
+    db: &Database,
+    txn: &rhypedb_storage::mvcc::Transaction,
     scalar_fields: &FieldMap,
     this_field: &str,
     this_target: u64,
     links: &[(String, u64, String, Bytes, u64, u64, bool)],
     this_idx: usize,
-) -> Bytes {
-    let mut other_1to1: Vec<&(String, u64, String, Bytes, u64, u64, bool)> = links
+) -> EngineResult<Bytes> {
+    let other_1to1: Vec<&(String, u64, String, Bytes, u64, u64, bool)> = links
         .iter()
         .enumerate()
-        .filter_map(|(j, l)| {
-            if j == this_idx || !l.6 {
-                None
-            } else {
-                Some(l)
-            }
-        })
+        .filter_map(|(j, l)| if j == this_idx || !l.6 { None } else { Some(l) })
         .collect();
     if other_1to1.is_empty() {
-        return Bytes::new();
+        return Ok(Bytes::new());
     }
 
     let mut effective = scalar_fields.clone();
@@ -2276,17 +2894,15 @@ fn build_inflight_cover(
     for link in &other_1to1 {
         effective.insert(link.0.clone(), Value::U64(link.1));
     }
-    for link in &mut other_1to1 {
-        effective.insert(
-            format!("{}__cover", link.0),
-            Value::Bytes(link.3.clone()),
-        );
-        effective.insert(
-            format!("{}__cover_v", link.0),
-            Value::U64(link.4),
-        );
+    for link in &other_1to1 {
+        // Augment the in-memory target_data with 3rd-degree covers — same
+        // recursion as build_covering_rev_value does at link() time. The
+        // type of the link's target is stored as link.2.
+        let nested = with_nested_forward_covers(db, txn, &link.2, link.3.clone(), link.1)?;
+        effective.insert(format!("{}__cover", link.0), Value::Bytes(nested));
+        effective.insert(format!("{}__cover_v", link.0), Value::U64(link.4));
     }
-    serialize_fields(&effective)
+    Ok(serialize_fields(&effective))
 }
 
 fn build_covering_rev_value(
@@ -2360,6 +2976,14 @@ fn build_covering_rev_value(
     // rev_edge was written) and fall back to a fresh LSM probe for that
     // specific target — instead of forcing an unbounded rev_edge rewrite
     // on every update to a hot key.
+    //
+    // Third-degree (3-hop) covering: when the other-target is itself the
+    // source of an outgoing 1:1 forward relation, that next-level target's
+    // data + cover_v stamp get embedded INSIDE the other-target's serialized
+    // form via `with_nested_forward_covers`. A query like `S.<other>.<next>`
+    // can then extract `next` straight from the rev_edge bytes — no LSM
+    // probe at either hop. Bounded by one extra storage.get per nested
+    // 1:1 forward field per other-target.
     if let Some(type_def) = db.schema.get_type(source_type) {
         for (name, tid) in &other_targets {
             let Some(field) = type_def.get_field(name) else {
@@ -2374,16 +2998,95 @@ fn build_covering_rev_value(
             };
             let target_key = KeyBuilder::object(target_type_id, *tid);
             if let Ok(Some(target_data)) = db.storage.get(txn, &target_key) {
-                effective.insert(format!("{name}__cover"), Value::Bytes(target_data));
+                let nested =
+                    with_nested_forward_covers(db, txn, &rel.target_type, target_data, *tid)?;
+                effective.insert(format!("{name}__cover"), Value::Bytes(nested));
                 let target_version = db.object_version(&rel.target_type, *tid);
-                effective.insert(
-                    format!("{name}__cover_v"),
-                    Value::U64(target_version),
-                );
+                effective.insert(format!("{name}__cover_v"), Value::U64(target_version));
             }
         }
     }
 
+    Ok(serialize_fields(&effective))
+}
+
+/// Augment a target's serialized fields with 3rd-degree cover data: for
+/// each 1:1 forward (non-inverse, non-many) relation on `target_type`,
+/// fetch that next-hop target's data and embed under `<field>__cover` /
+/// `<field>__cover_v` directly inside the target's FieldMap before
+/// serialization. Also writes `<field>: Value::U64(next_tid)` so the
+/// executor's `find_u64_field_in_raw` can locate the next-hop id without
+/// a second edge scan.
+///
+/// This is the engine-side recursion that turns 2-hop covering into
+/// 3-hop covering. Depth is capped at one extra level — recursion would
+/// be unsound for cyclic 1:1 schemas (e.g. User.partner: User) without
+/// cycle detection, and the storage cost compounds. Bench schemas with
+/// chained 1:1 forward relations get the win; schemas without any
+/// outgoing 1:1 on the target (the existing Movie/User shape) get
+/// `target_data` back verbatim.
+fn with_nested_forward_covers(
+    db: &Database,
+    txn: &rhypedb_storage::mvcc::Transaction,
+    target_type: &str,
+    target_data: Bytes,
+    target_id: u64,
+) -> EngineResult<Bytes> {
+    let Some(type_def) = db.schema.get_type(target_type) else {
+        return Ok(target_data);
+    };
+
+    // Cheap pre-check: does this type even have any 1:1 forward outgoing
+    // relations? If not, skip the deserialize+reserialize round trip and
+    // return the original bytes (refcount-only, no copy).
+    let has_any_forward_1to1 = type_def.fields.iter().any(|f| {
+        matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many) && f.inverse().is_none()
+    });
+    if !has_any_forward_1to1 {
+        return Ok(target_data);
+    }
+
+    let mut effective = deserialize_fields(&target_data);
+    let mut wrote_any = false;
+
+    for field in &type_def.fields {
+        let rel = match &field.field_type {
+            FieldType::Relation(r) => r,
+            _ => continue,
+        };
+        if rel.is_many || field.inverse().is_some() {
+            continue;
+        }
+        let rel_key = format!("{target_type}.{}", field.name);
+        let Some(rel_id) = db.rel_ids.get(&rel_key).copied() else {
+            continue;
+        };
+        // Find the next-hop target via the forward edge index.
+        let prefix = KeyBuilder::edge_prefix(target_id, rel_id);
+        let entries = db.scan_prefix(txn, &prefix)?;
+        let Some(&(next_tid, _)) = entries.first() else {
+            continue;
+        };
+        let Some(next_type_id) = db.type_ids.get(&rel.target_type).copied() else {
+            continue;
+        };
+        let next_key = KeyBuilder::object(next_type_id, next_tid);
+        let Ok(Some(next_data)) = db.storage.get(txn, &next_key) else {
+            continue;
+        };
+        wrote_any = true;
+        effective.insert(field.name.clone(), Value::U64(next_tid));
+        effective.insert(format!("{}__cover", field.name), Value::Bytes(next_data));
+        let next_v = db.object_version(&rel.target_type, next_tid);
+        effective.insert(format!("{}__cover_v", field.name), Value::U64(next_v));
+    }
+
+    if !wrote_any {
+        // No outgoing 1:1 edges actually populated (type has the fields
+        // but this instance hasn't been linked yet). Return original bytes
+        // unchanged so we don't pay reserialization cost for no benefit.
+        return Ok(target_data);
+    }
     Ok(serialize_fields(&effective))
 }
 
@@ -2423,12 +3126,7 @@ fn fields_to_json(fields: &FieldMap) -> HashMap<String, serde_json::Value> {
         .collect()
 }
 
-fn validate_value(
-    field_def: &rhypedb_schema::FieldDef,
-    value: &Value,
-) -> EngineResult<()> {
-    use rhypedb_schema::ScalarType;
-
+fn validate_value(field_def: &rhypedb_schema::FieldDef, value: &Value) -> EngineResult<()> {
     if matches!(value, Value::Null) {
         return Ok(());
     }
@@ -2538,6 +3236,167 @@ pub(crate) fn entry_passes_int_predicate(
 /// positives; narrow types widen to 64 bits first. Returns `None` for non-
 /// integer values (strings, floats, bools, nulls, bytes) — those aren't
 /// zone-mapped.
+/// Sort-preserving variable-length encoding for `String` and `Bytes`
+/// secondary index entries.
+///
+/// Every byte is copied through with one escape rule — `0x00` becomes
+/// `0x00 0x01` — and a terminator `0x00 0x00` is appended. Properties:
+///
+///   * Byte-wise lexicographic order on the encoded form matches byte-wise
+///     order on the original. For UTF-8 strings this means code-point order
+///     for ASCII and raw byte order otherwise, matching PG's default `text`
+///     collation = `C`.
+///   * The terminator `0x00 0x00` can never appear inside a valid encoded
+///     value, because every embedded `0x00` is followed by `0x01`. So a
+///     prefix scan keyed by `encoded || 0x00 0x00` matches exactly the keys
+///     whose encoded value equals `encoded` — no false positives from
+///     longer values that share the prefix.
+///   * Empty values still produce two bytes (the terminator), so empties
+///     sort before any non-empty value starting with `0x00 0x01` and after
+///     every other value.
+pub(crate) fn encode_bytes_for_index(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len() + 2);
+    for &x in b {
+        if x == 0 {
+            out.push(0);
+            out.push(1);
+        } else {
+            out.push(x);
+        }
+    }
+    out.push(0);
+    out.push(0);
+    out
+}
+
+pub(crate) fn encode_str_for_index(s: &str) -> Vec<u8> {
+    encode_bytes_for_index(s.as_bytes())
+}
+
+/// Sort-preserving fixed-width encoding for IEEE-754 floats.
+///
+/// Both `f32` and `f64` widen to `f64` so they share one 8-byte slot in
+/// `KeyBuilder::field_index`. The bit transformation is the standard
+/// sortable-float trick:
+///
+///   * Positive (or +0): flip the sign bit. Positives now have a leading
+///     `1`, so they sort above negatives.
+///   * Negative (or -0): flip all bits. Negatives reverse their magnitude
+///     ordering so larger-magnitude negatives sort first.
+///
+/// After the transformation, byte-wise lexicographic order matches numeric
+/// order for every non-NaN value. NaN values map deterministically based on
+/// their bit pattern and sort at one end — fine for our index (we don't
+/// distinguish NaN from itself for Eq), but the exact NaN position isn't a
+/// stable API guarantee.
+pub(crate) fn encode_f64_for_index(v: f64) -> [u8; 8] {
+    let bits = v.to_bits();
+    let xform = if bits & 0x8000_0000_0000_0000 != 0 {
+        !bits
+    } else {
+        bits ^ 0x8000_0000_0000_0000
+    };
+    xform.to_be_bytes()
+}
+
+fn encode_float_for_index(value: &Value) -> Option<[u8; 8]> {
+    let v = match value {
+        Value::F32(v) => *v as f64,
+        Value::F64(v) => *v,
+        _ => return None,
+    };
+    Some(encode_f64_for_index(v))
+}
+
+fn encode_bool_for_index(value: &Value) -> Option<[u8; 8]> {
+    let Value::Bool(b) = value else { return None };
+    let mut out = [0u8; 8];
+    out[7] = u8::from(*b);
+    Some(out)
+}
+
+/// Apply a `CompareOp` to any pair of `Ord` values. Used by the
+/// non-indexed fallback for strings and bytes.
+fn compare_ord<T: Ord + ?Sized>(a: &T, op: rhypedb_storage::zone::CompareOp, b: &T) -> bool {
+    use rhypedb_storage::zone::CompareOp;
+    match op {
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
+        CompareOp::Lt => a < b,
+        CompareOp::Le => a <= b,
+        CompareOp::Gt => a > b,
+        CompareOp::Ge => a >= b,
+    }
+}
+
+/// Apply a `CompareOp` to `PartialOrd` values (i.e. floats). NaN
+/// comparisons return `false` for every op except `Ne`, matching IEEE 754
+/// and SQL semantics.
+fn compare_partial<T: PartialOrd>(a: T, op: rhypedb_storage::zone::CompareOp, b: T) -> bool {
+    use rhypedb_storage::zone::CompareOp;
+    match op {
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
+        CompareOp::Lt => a < b,
+        CompareOp::Le => a <= b,
+        CompareOp::Gt => a > b,
+        CompareOp::Ge => a >= b,
+    }
+}
+
+fn compare_bool(a: bool, op: rhypedb_storage::zone::CompareOp, b: bool) -> bool {
+    // false < true; defer to `compare_ord` via u8.
+    compare_ord(&u8::from(a), op, &u8::from(b))
+}
+
+/// Build the secondary-index key for one `(type_id, field_id, value, object_id)`
+/// tuple, picking the encoder + key layout that matches the indexed field's
+/// `kind`. Returns `None` when the value isn't representable in the chosen
+/// encoder (null, mismatched scalar type) — caller treats that as "nothing
+/// to index" and skips the write/delete.
+fn build_field_index_key(
+    type_id: u64,
+    field_id: u64,
+    kind: IndexedKind,
+    value: &Value,
+    object_id: u64,
+) -> Option<Bytes> {
+    match kind {
+        IndexedKind::Integer => {
+            let encoded = encode_int_for_zone(value)?;
+            Some(KeyBuilder::field_index(
+                type_id, field_id, &encoded, object_id,
+            ))
+        }
+        IndexedKind::Bool => {
+            let encoded = encode_bool_for_index(value)?;
+            Some(KeyBuilder::field_index(
+                type_id, field_id, &encoded, object_id,
+            ))
+        }
+        IndexedKind::Float => {
+            let encoded = encode_float_for_index(value)?;
+            Some(KeyBuilder::field_index(
+                type_id, field_id, &encoded, object_id,
+            ))
+        }
+        IndexedKind::String => {
+            let Value::String(s) = value else { return None };
+            let encoded = encode_str_for_index(s);
+            Some(KeyBuilder::field_index_var(
+                type_id, field_id, &encoded, object_id,
+            ))
+        }
+        IndexedKind::Bytes => {
+            let Value::Bytes(b) = value else { return None };
+            let encoded = encode_bytes_for_index(b);
+            Some(KeyBuilder::field_index_var(
+                type_id, field_id, &encoded, object_id,
+            ))
+        }
+    }
+}
+
 pub(crate) fn encode_int_for_zone(value: &Value) -> Option<[u8; 8]> {
     let bits: u64 = match value {
         Value::U32(v) => *v as u64,
@@ -2858,8 +3717,14 @@ mod tests {
         let mut edge_props = FieldMap::new();
         edge_props.insert("rating".into(), Value::F32(4.5));
 
-        db.link("User", alice.id, "favorite_movies", alien.id, Some(edge_props))
-            .unwrap();
+        db.link(
+            "User",
+            alice.id,
+            "favorite_movies",
+            alien.id,
+            Some(edge_props),
+        )
+        .unwrap();
 
         let links = db.get_links("User", alice.id, "favorite_movies").unwrap();
         assert_eq!(links.len(), 1);
@@ -3188,9 +4053,7 @@ mod tests {
         f.insert("name".into(), Value::String("Alice".into()));
         let user = db.create("User", f).unwrap();
 
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        let event = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Create);
         assert_eq!(event.type_name, "User");
         assert_eq!(event.object_id, user.id);
@@ -3205,17 +4068,17 @@ mod tests {
         f.insert("name".into(), Value::String("Alice".into()));
         let user = db.create("User", f).unwrap();
 
-        let (_id, rx) = db
-            .subscriptions()
-            .subscribe(rhypedb_subscribe::SubscriptionFilter::for_object("User", user.id));
+        let (_id, rx) =
+            db.subscriptions()
+                .subscribe(rhypedb_subscribe::SubscriptionFilter::for_object(
+                    "User", user.id,
+                ));
 
         let mut updates = FieldMap::new();
         updates.insert("name".into(), Value::String("Bob".into()));
         db.update("User", user.id, updates).unwrap();
 
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        let event = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Update);
         assert_eq!(event.object_id, user.id);
     }
@@ -3237,9 +4100,7 @@ mod tests {
 
         db.delete("User", user.id).unwrap();
 
-        let event = rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap();
+        let event = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Delete);
         assert_eq!(event.object_id, user.id);
     }
@@ -3302,7 +4163,9 @@ mod tests {
             db.create("User", f).unwrap();
         }
 
-        let gt = db.filter_scan("User", "age", CompareOp::Gt, 30, None).unwrap();
+        let gt = db
+            .filter_scan("User", "age", CompareOp::Gt, 30, None)
+            .unwrap();
         assert_eq!(gt.len(), 20, "age > 30 should match users with age 31..=50");
         for u in &gt {
             match u.fields.get("age") {
@@ -3311,11 +4174,15 @@ mod tests {
             }
         }
 
-        let eq = db.filter_scan("User", "age", CompareOp::Eq, 25, None).unwrap();
+        let eq = db
+            .filter_scan("User", "age", CompareOp::Eq, 25, None)
+            .unwrap();
         assert_eq!(eq.len(), 1);
         assert!(matches!(eq[0].fields.get("age"), Some(Value::U32(25))));
 
-        let lt = db.filter_scan("User", "age", CompareOp::Lt, 5, None).unwrap();
+        let lt = db
+            .filter_scan("User", "age", CompareOp::Lt, 5, None)
+            .unwrap();
         assert_eq!(lt.len(), 4, "age < 5 should match users 1..=4");
     }
 
@@ -3337,10 +4204,7 @@ mod tests {
     fn count_index_entries(db: &Database) -> usize {
         // Field-index prefix is just `i:` — works regardless of type/field.
         let snapshot = db.storage().read_snapshot();
-        let entries = db
-            .storage()
-            .scan_prefix_at(snapshot, b"i:")
-            .unwrap();
+        let entries = db.storage().scan_prefix_at(snapshot, b"i:").unwrap();
         entries.len()
     }
 
@@ -3382,7 +4246,9 @@ mod tests {
         f.insert("year".into(), Value::U32(2010));
         db.create("Movie", f).unwrap();
 
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 2000, None).unwrap();
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 2000, None)
+            .unwrap();
         assert_eq!(hits.len(), 3);
         for h in &hits {
             assert_eq!(h.fields.get("year"), Some(&Value::U32(2000)));
@@ -3403,16 +4269,24 @@ mod tests {
             db.create("Movie", f).unwrap();
         }
 
-        let gt = db.filter_scan("Movie", "year", CompareOp::Gt, 2010, None).unwrap();
+        let gt = db
+            .filter_scan("Movie", "year", CompareOp::Gt, 2010, None)
+            .unwrap();
         assert_eq!(gt.len(), 10, "years 2011..=2020 should match");
 
-        let gt_limited = db.filter_scan("Movie", "year", CompareOp::Gt, 2010, Some(3)).unwrap();
+        let gt_limited = db
+            .filter_scan("Movie", "year", CompareOp::Gt, 2010, Some(3))
+            .unwrap();
         assert_eq!(gt_limited.len(), 3);
 
-        let lt = db.filter_scan("Movie", "year", CompareOp::Lt, 1955, None).unwrap();
+        let lt = db
+            .filter_scan("Movie", "year", CompareOp::Lt, 1955, None)
+            .unwrap();
         assert_eq!(lt.len(), 5, "years 1950..=1954 should match");
 
-        let le = db.filter_scan("Movie", "year", CompareOp::Le, 1952, None).unwrap();
+        let le = db
+            .filter_scan("Movie", "year", CompareOp::Le, 1952, None)
+            .unwrap();
         assert_eq!(le.len(), 3, "years 1950..=1952 should match");
     }
 
@@ -3435,10 +4309,14 @@ mod tests {
         db.update("Movie", movie.id, upd).unwrap();
         assert_eq!(count_index_entries(&db), 1);
 
-        let old = db.filter_scan("Movie", "year", CompareOp::Eq, 1979, None).unwrap();
+        let old = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1979, None)
+            .unwrap();
         assert_eq!(old.len(), 0, "old year value should no longer be indexed");
 
-        let new = db.filter_scan("Movie", "year", CompareOp::Eq, 1986, None).unwrap();
+        let new = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1986, None)
+            .unwrap();
         assert_eq!(new.len(), 1);
         assert_eq!(new[0].id, movie.id);
     }
@@ -3465,8 +4343,14 @@ mod tests {
         db.delete("Movie", a.id).unwrap();
         assert_eq!(count_index_entries(&db), 1);
 
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 2000, None).unwrap();
-        assert_eq!(hits.len(), 1, "deleted entry must not reappear via the index");
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 2000, None)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "deleted entry must not reappear via the index"
+        );
     }
 
     #[test]
@@ -3507,7 +4391,9 @@ mod tests {
             "cascade-deleted movies must also drop their secondary-index entries"
         );
 
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 1986, None).unwrap();
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1986, None)
+            .unwrap();
         assert_eq!(hits.len(), 0);
     }
 
@@ -3530,7 +4416,9 @@ mod tests {
 
         assert_eq!(count_index_entries(&db), 10);
 
-        let mid = db.filter_scan("Movie", "year", CompareOp::Eq, 1955, None).unwrap();
+        let mid = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1955, None)
+            .unwrap();
         assert_eq!(mid.len(), 1);
     }
 
@@ -3551,7 +4439,9 @@ mod tests {
             db.create("Movie", f).unwrap();
         }
 
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 2013, None).unwrap();
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 2013, None)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].fields.get("year"), Some(&Value::U32(2013)));
         assert_eq!(
@@ -3560,7 +4450,9 @@ mod tests {
             "covering index must surface the title field, not just the indexed value"
         );
 
-        let range = db.filter_scan("Movie", "year", CompareOp::Gt, 2012, Some(3)).unwrap();
+        let range = db
+            .filter_scan("Movie", "year", CompareOp::Gt, 2012, Some(3))
+            .unwrap();
         assert_eq!(range.len(), 3);
         for h in &range {
             assert!(h.fields.contains_key("title"));
@@ -3589,7 +4481,9 @@ mod tests {
         db.update("Movie", movie.id, upd).unwrap();
 
         // filter_scan via index should see the NEW title, not the stale Old Title.
-        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 1999, None).unwrap();
+        let hits = db
+            .filter_scan("Movie", "year", CompareOp::Eq, 1999, None)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(
             hits[0].fields.get("title"),
@@ -3622,12 +4516,372 @@ mod tests {
             db.create("Movie", f).unwrap();
         }
 
-        let gt = db.filter_scan("Movie", "year", CompareOp::Gt, 1954, None).unwrap();
+        let gt = db
+            .filter_scan("Movie", "year", CompareOp::Gt, 1954, None)
+            .unwrap();
         assert_eq!(
             gt.len(),
             15,
             "should include 1955..=1969 across both flushed SST and active memtable"
         );
+    }
+
+    fn string_indexed_schema() -> Schema {
+        parse_schema(
+            r#"
+            type User {
+                name: String @indexed
+                bio: String
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn string_indexed_create_writes_index_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        assert_eq!(count_index_entries(&db), 0);
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        f.insert("bio".into(), Value::String("hi".into()));
+        db.create("User", f).unwrap();
+
+        assert_eq!(count_index_entries(&db), 1);
+    }
+
+    #[test]
+    fn string_indexed_filter_scan_eq_uses_index() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        for n in &["Alice", "Bob", "Carol", "Alice", "Dave"] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String((*n).into()));
+            db.create("User", f).unwrap();
+        }
+
+        let hits = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Alice", None)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            assert_eq!(h.fields.get("name"), Some(&Value::String("Alice".into())));
+        }
+    }
+
+    #[test]
+    fn string_indexed_terminator_disambiguates_prefix() {
+        // "ab"'s value-prefix must NOT match keys for "abc" — the embedded
+        // \x00\x00 terminator is what makes the prefix unambiguous.
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        for n in &["ab", "abc", "abcd", "b"] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String((*n).into()));
+            db.create("User", f).unwrap();
+        }
+
+        let ab = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "ab", None)
+            .unwrap();
+        assert_eq!(ab.len(), 1);
+        assert_eq!(ab[0].fields.get("name"), Some(&Value::String("ab".into())));
+    }
+
+    #[test]
+    fn string_indexed_values_with_embedded_nul_roundtrip() {
+        // The escape rule (0x00 -> 0x00 0x01) is what keeps embedded NUL
+        // values distinct from the terminator. Verify both Eq lookup and
+        // sort order with embedded NULs.
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        let with_nul: String = "ab\0c".into();
+        let without_nul: String = "ab".into();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("name".into(), Value::String(with_nul.clone()));
+        db.create("User", f1).unwrap();
+
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String(without_nul.clone()));
+        db.create("User", f2).unwrap();
+
+        let hit = db
+            .filter_scan_str("User", "name", CompareOp::Eq, &with_nul, None)
+            .unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(
+            hit[0].fields.get("name"),
+            Some(&Value::String(with_nul.clone()))
+        );
+
+        // "ab" alone must NOT match the "ab\0c" entry.
+        let hit_short = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "ab", None)
+            .unwrap();
+        assert_eq!(hit_short.len(), 1);
+        assert_eq!(
+            hit_short[0].fields.get("name"),
+            Some(&Value::String(without_nul))
+        );
+    }
+
+    #[test]
+    fn string_indexed_filter_scan_range() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        for n in &["alice", "bob", "carol", "dave", "eve"] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String((*n).into()));
+            db.create("User", f).unwrap();
+        }
+
+        let lt = db
+            .filter_scan_str("User", "name", CompareOp::Lt, "carol", None)
+            .unwrap();
+        let mut lt_names: Vec<_> = lt
+            .iter()
+            .filter_map(|o| match o.fields.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        lt_names.sort();
+        assert_eq!(lt_names, vec!["alice".to_string(), "bob".into()]);
+
+        let ge = db
+            .filter_scan_str("User", "name", CompareOp::Ge, "carol", None)
+            .unwrap();
+        assert_eq!(ge.len(), 3);
+
+        let ne = db
+            .filter_scan_str("User", "name", CompareOp::Ne, "carol", None)
+            .unwrap();
+        assert_eq!(ne.len(), 4);
+
+        let lt_limited = db
+            .filter_scan_str("User", "name", CompareOp::Lt, "carol", Some(1))
+            .unwrap();
+        assert_eq!(lt_limited.len(), 1);
+    }
+
+    #[test]
+    fn string_indexed_update_updates_index_entry() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", f).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        let mut upd = FieldMap::new();
+        upd.insert("name".into(), Value::String("Bob".into()));
+        db.update("User", user.id, upd).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        let old = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Alice", None)
+            .unwrap();
+        assert_eq!(old.len(), 0);
+
+        let new = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Bob", None)
+            .unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].id, user.id);
+    }
+
+    #[test]
+    fn string_indexed_delete_removes_index_entry() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("name".into(), Value::String("Alice".into()));
+        let a = db.create("User", f1).unwrap();
+
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String("Alice".into()));
+        db.create("User", f2).unwrap();
+        assert_eq!(count_index_entries(&db), 2);
+
+        db.delete("User", a.id).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        let hits = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Alice", None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn string_indexed_covering_returns_full_fieldmap() {
+        // Covering: the filter_scan result must include all the source
+        // object's scalar fields, not just the indexed column.
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        f.insert("bio".into(), Value::String("hello world".into()));
+        db.create("User", f).unwrap();
+
+        let hits = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Alice", None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].fields.get("bio"),
+            Some(&Value::String("hello world".into())),
+            "covering payload must include non-indexed scalars"
+        );
+    }
+
+    fn multi_indexed_schema() -> Schema {
+        // One type with every indexable scalar type so the dispatch code
+        // gets exercised across all encoders in one place.
+        parse_schema(
+            r#"
+            type Item {
+                name: String @indexed
+                active: Bool @indexed
+                rating: f32 @indexed
+                weight: f64 @indexed
+                hash: Bytes @indexed
+                age: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bool_indexed_eq_uses_index() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(multi_indexed_schema(), dir.path()).unwrap();
+
+        for active in [true, true, false, true, false] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("x".into()));
+            f.insert("active".into(), Value::Bool(active));
+            f.insert("rating".into(), Value::F32(0.0));
+            f.insert("weight".into(), Value::F64(0.0));
+            f.insert("hash".into(), Value::Bytes(bytes::Bytes::from_static(b"")));
+            f.insert("age".into(), Value::U32(0));
+            db.create("Item", f).unwrap();
+        }
+
+        let actives = db
+            .filter_scan_bool("Item", "active", CompareOp::Eq, true, None)
+            .unwrap();
+        assert_eq!(actives.len(), 3);
+        for h in &actives {
+            assert_eq!(h.fields.get("active"), Some(&Value::Bool(true)));
+        }
+
+        let inactives = db
+            .filter_scan_bool("Item", "active", CompareOp::Eq, false, None)
+            .unwrap();
+        assert_eq!(inactives.len(), 2);
+    }
+
+    #[test]
+    fn float_indexed_range_preserves_order() {
+        // The sortable-float encoding must keep numeric order across the
+        // sign boundary (negatives sort below positives) AND within each
+        // sign (smaller magnitudes closer to zero).
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(multi_indexed_schema(), dir.path()).unwrap();
+
+        for r in [-3.5f32, -0.5, 0.0, 0.25, 1.5, 4.0] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("x".into()));
+            f.insert("active".into(), Value::Bool(false));
+            f.insert("rating".into(), Value::F32(r));
+            f.insert("weight".into(), Value::F64(0.0));
+            f.insert("hash".into(), Value::Bytes(bytes::Bytes::from_static(b"")));
+            f.insert("age".into(), Value::U32(0));
+            db.create("Item", f).unwrap();
+        }
+
+        let lt0 = db
+            .filter_scan_float("Item", "rating", CompareOp::Lt, 0.0, None)
+            .unwrap();
+        assert_eq!(lt0.len(), 2, "values < 0.0 should match -3.5 and -0.5");
+
+        let ge_half = db
+            .filter_scan_float("Item", "rating", CompareOp::Ge, 0.5, None)
+            .unwrap();
+        assert_eq!(ge_half.len(), 2, "values >= 0.5 should match 1.5 and 4.0");
+
+        let eq_zero = db
+            .filter_scan_float("Item", "rating", CompareOp::Eq, 0.0, None)
+            .unwrap();
+        assert_eq!(eq_zero.len(), 1);
+    }
+
+    #[test]
+    fn bytes_indexed_eq_and_range() {
+        // Bytes uses the same variable-length escape encoding as String,
+        // including round-trip through 0x00 bytes.
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(multi_indexed_schema(), dir.path()).unwrap();
+
+        let payloads: &[&[u8]] = &[b"\x00ab", b"abc", b"abcd", b"abc\x00xyz", b"zzz"];
+        for &p in payloads {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("x".into()));
+            f.insert("active".into(), Value::Bool(false));
+            f.insert("rating".into(), Value::F32(0.0));
+            f.insert("weight".into(), Value::F64(0.0));
+            f.insert(
+                "hash".into(),
+                Value::Bytes(bytes::Bytes::copy_from_slice(p)),
+            );
+            f.insert("age".into(), Value::U32(0));
+            db.create("Item", f).unwrap();
+        }
+
+        // "abc" Eq should match only the exact "abc" payload — not "abcd"
+        // and not "abc\x00xyz".
+        let hits = db
+            .filter_scan_bytes("Item", "hash", CompareOp::Eq, b"abc", None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].fields.get("hash"),
+            Some(&Value::Bytes(bytes::Bytes::from_static(b"abc")))
+        );
+
+        // "abc" with embedded NUL should round-trip via Eq.
+        let with_nul = db
+            .filter_scan_bytes("Item", "hash", CompareOp::Eq, b"abc\x00xyz", None)
+            .unwrap();
+        assert_eq!(with_nul.len(), 1);
+
+        // Range: < "abc" should hit only "\x00ab".
+        let lt = db
+            .filter_scan_bytes("Item", "hash", CompareOp::Lt, b"abc", None)
+            .unwrap();
+        assert_eq!(lt.len(), 1);
     }
 
     fn covering_schema() -> Schema {
@@ -3658,9 +4912,7 @@ mod tests {
 
     /// Set up one User u, one Movie m, one Rating r linked to both.
     /// Returns (db, user_id, movie_id, rating_id, tempdir).
-    fn build_one_rating(
-        schema: Schema,
-    ) -> (Database, u64, u64, u64, tempfile::TempDir) {
+    fn build_one_rating(schema: Schema) -> (Arc<Database>, u64, u64, u64, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(schema, dir.path()).unwrap();
 
@@ -3679,7 +4931,8 @@ mod tests {
         // Link order matters: first link writes empty rev_edge cover,
         // second link writes the cover with the other-target's data.
         db.link("Rating", rating.id, "user", user.id, None).unwrap();
-        db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None)
+            .unwrap();
 
         (db, user.id, movie.id, rating.id, dir)
     }
@@ -3743,17 +4996,14 @@ mod tests {
         rf.insert("movie".into(), Value::U64(movie.id));
         db.create("Rating", rf).unwrap();
 
-        let user_side = db
-            .get_links_many("User", &[user.id], "ratings")
-            .unwrap();
+        let user_side = db.get_links_many("User", &[user.id], "ratings").unwrap();
         assert_eq!(user_side[0].len(), 1);
         let (_rid, user_side_cover) = &user_side[0][0];
         // movie__cover should be present in user-side rev_edge cover.
-        let movie_cover = find_bytes_field_in_raw(user_side_cover, "movie__cover")
-            .expect(
-                "inline-relations create should write symmetric covers — \
+        let movie_cover = find_bytes_field_in_raw(user_side_cover, "movie__cover").expect(
+            "inline-relations create should write symmetric covers — \
                  movie__cover missing from user-side rev_edge",
-            );
+        );
         let movie_fields = deserialize_fields(&movie_cover);
         assert_eq!(
             movie_fields.get("title"),
@@ -3761,14 +5011,15 @@ mod tests {
         );
 
         // Movie-side rev_edge should also carry user__cover.
-        let movie_side = db
-            .get_links_many("Movie", &[movie.id], "ratings")
-            .unwrap();
+        let movie_side = db.get_links_many("Movie", &[movie.id], "ratings").unwrap();
         let (_rid, movie_side_cover) = &movie_side[0][0];
         let user_cover = find_bytes_field_in_raw(movie_side_cover, "user__cover")
             .expect("user__cover missing from movie-side rev_edge");
         let user_fields = deserialize_fields(&user_cover);
-        assert_eq!(user_fields.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(
+            user_fields.get("name"),
+            Some(&Value::String("Alice".into()))
+        );
     }
 
     #[test]
@@ -3890,9 +5141,7 @@ mod tests {
         assert_eq!(ratings.len(), 3);
 
         // Three rev_edges hanging off the movie.
-        let movie_side = db
-            .get_links_many("Movie", &[movie.id], "ratings")
-            .unwrap();
+        let movie_side = db.get_links_many("Movie", &[movie.id], "ratings").unwrap();
         assert_eq!(movie_side[0].len(), 3);
 
         // Each rating's forward edge to the user.
@@ -3915,9 +5164,7 @@ mod tests {
         upd.insert("stars".into(), Value::U32(1));
         db.update("Rating", rid, upd).unwrap();
 
-        let groups = db
-            .get_links_many("Movie", &[mid], "ratings")
-            .unwrap();
+        let groups = db.get_links_many("Movie", &[mid], "ratings").unwrap();
         let group = &groups[0];
         assert_eq!(group.len(), 1);
         let (got_rid, cover) = &group[0];
@@ -3934,22 +5181,52 @@ mod tests {
         );
     }
 
+    /// Open the covering-schema database with the background cover-refresh
+    /// sweeper disabled. Used by tests that need to observe the cover_v
+    /// mismatch BEFORE the sweeper would otherwise repair it.
+    fn build_one_rating_no_sweeper(
+        schema: Schema,
+    ) -> (Arc<Database>, u64, u64, u64, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_options(
+            schema,
+            dir.path(),
+            OpenOptions {
+                background_cover_refresh: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Aliens".into()));
+        let movie = db.create("Movie", mf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        let rating = db.create("Rating", rf).unwrap();
+        db.link("Rating", rating.id, "user", user.id, None).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None)
+            .unwrap();
+        (db, user.id, movie.id, rating.id, dir)
+    }
+
     #[test]
     fn second_degree_cover_staleness_is_detectable_via_versions() {
-        // Phase 2 invalidation-tombstone design: User.update does NOT rewrite
-        // the millions of rev_edge values that embedded the user under
-        // `user__cover`. Instead it bumps an in-memory + persisted per-object
-        // generation counter. Cover writers stamp the target's version at
-        // write time into `<name>__cover_v`. Readers compare against the
-        // live counter and fall through to a fresh LSM probe when they
-        // disagree — bounded write cost regardless of fan-in.
+        // Phase 2 invalidation-tombstone design: User.update does NOT
+        // synchronously rewrite the rev_edge values that embedded the user
+        // under `user__cover`. Instead it bumps the per-object generation
+        // counter; cover writers stamp the target's version into
+        // `<name>__cover_v`. Readers compare against the live counter and
+        // fall through to a fresh LSM probe when they disagree — bounded
+        // write cost regardless of fan-in.
         //
-        // This test verifies the mechanism: the embedded `user__cover_v`
-        // value is the old (pre-update) generation, and the live counter is
-        // the new (post-update) generation, so the reader will detect the
-        // mismatch. The end-to-end query result is exercised in
-        // rhypedb-query's executor tests.
-        let (db, uid, mid, _rid, _dir) = build_one_rating(covering_schema());
+        // (Phase 3, the background cover-refresh sweeper, ASYNCHRONOUSLY
+        // repairs the stale covers later. This test runs with the sweeper
+        // disabled so the post-update inspection is deterministic.)
+        let (db, uid, mid, _rid, _dir) = build_one_rating_no_sweeper(covering_schema());
 
         assert_eq!(
             db.object_version("User", uid),
@@ -3967,9 +5244,7 @@ mod tests {
             "successful update must bump the per-object generation"
         );
 
-        let groups = db
-            .get_links_many("Movie", &[mid], "ratings")
-            .unwrap();
+        let groups = db.get_links_many("Movie", &[mid], "ratings").unwrap();
         let group = &groups[0];
         assert_eq!(group.len(), 1);
         let (_rid, cover) = &group[0];
@@ -3987,9 +5262,8 @@ mod tests {
 
         // …but the stamped `user__cover_v` is below the live counter,
         // which is exactly the signal the executor uses to fall through.
-        let stamped_v =
-            crate::object::find_u64_field_in_raw(cover, "user__cover_v")
-                .expect("cover_v stamp should be present");
+        let stamped_v = crate::object::find_u64_field_in_raw(cover, "user__cover_v")
+            .expect("cover_v stamp should be present");
         assert_eq!(
             stamped_v, 0,
             "stamp records the target's generation as of cover-write time"
@@ -3997,6 +5271,300 @@ mod tests {
         assert!(
             stamped_v < db.object_version("User", uid),
             "stamp < live counter triggers reader fall-through"
+        );
+    }
+
+    /// Helper: poll the `r:<movie>:movie:<rating>` rev_edge value and read
+    /// the embedded `user__cover_v` stamp. Returns the stamp or `None` if
+    /// the rev_edge isn't present or doesn't carry a cover.
+    fn read_movie_side_user_cover_v(db: &Database, movie_id: u64) -> Option<u64> {
+        let groups = db.get_links_many("Movie", &[movie_id], "ratings").ok()?;
+        let group = groups.into_iter().next()?;
+        let (_rid, cover) = group.into_iter().next()?;
+        crate::object::find_u64_field_in_raw(&cover, "user__cover_v")
+    }
+
+    fn read_movie_side_user_name(db: &Database, movie_id: u64) -> Option<String> {
+        let groups = db.get_links_many("Movie", &[movie_id], "ratings").ok()?;
+        let group = groups.into_iter().next()?;
+        let (_rid, cover) = group.into_iter().next()?;
+        let inner = crate::object::find_bytes_field_in_raw(&cover, "user__cover")?;
+        let fields = deserialize_fields(&inner);
+        match fields.get("name")? {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Poll predicate up to `attempts` × 10ms. Returns true if the predicate
+    /// held within the window. Used by sweeper tests to wait for the
+    /// background thread to repair a stale cover without sleeping for a
+    /// fixed (potentially flaky) duration.
+    fn poll_until(mut p: impl FnMut() -> bool, attempts: u32) -> bool {
+        for _ in 0..attempts {
+            if p() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        p()
+    }
+
+    #[test]
+    fn cover_refresh_worker_repairs_stale_user_cover() {
+        // End-to-end check that the background sweeper rewrites the
+        // movie-side rev_edge `user__cover` after the user updates. Verifies:
+        //   1. Pre-update: cover_v stamp == 0 (user never bumped).
+        //   2. Post-update + post-sweep: cover_v stamp matches the new
+        //      live generation AND the embedded cover bytes reflect the new
+        //      user.name.
+        let (db, uid, mid, _rid, _dir) = build_one_rating(covering_schema());
+
+        let stamp_before =
+            read_movie_side_user_cover_v(&db, mid).expect("cover_v should be present pre-update");
+        assert_eq!(stamp_before, 0);
+
+        let mut upd = FieldMap::new();
+        upd.insert("name".into(), Value::String("Renamed".into()));
+        db.update("User", uid, upd).unwrap();
+        let new_v = db.object_version("User", uid);
+        assert_eq!(new_v, 1);
+
+        // Sweeper runs asynchronously; poll until repair lands or fail.
+        let repaired = poll_until(
+            || read_movie_side_user_cover_v(&db, mid) == Some(new_v),
+            200, // ≤ 2 seconds; sweeper should take micros
+        );
+        assert!(
+            repaired,
+            "cover-refresh worker did not stamp the new cover_v within 2s"
+        );
+
+        assert_eq!(
+            read_movie_side_user_name(&db, mid).as_deref(),
+            Some("Renamed"),
+            "embedded user__cover bytes must contain the post-update name"
+        );
+    }
+
+    #[test]
+    fn cover_refresh_idempotent_under_repeated_bumps() {
+        // Multiple updates in quick succession enqueue multiple sweeps.
+        // Each sweep is independently safe: the final rev_edge state still
+        // reflects the LAST update.
+        let (db, uid, mid, _rid, _dir) = build_one_rating(covering_schema());
+
+        for new_name in ["B", "C", "D", "E"] {
+            let mut upd = FieldMap::new();
+            upd.insert("name".into(), Value::String(new_name.into()));
+            db.update("User", uid, upd).unwrap();
+        }
+        let final_v = db.object_version("User", uid);
+
+        let landed = poll_until(
+            || {
+                read_movie_side_user_cover_v(&db, mid) == Some(final_v)
+                    && read_movie_side_user_name(&db, mid).as_deref() == Some("E")
+            },
+            200,
+        );
+        assert!(landed, "sweeper did not converge on the final state");
+    }
+
+    #[test]
+    fn cover_refresh_worker_disabled_leaves_cover_stale() {
+        // With the background sweeper opted out, an update never rewrites
+        // the embedded cover — the OnlyHand path is the reader's cover_v
+        // fall-through. This guards against the sweeper being silently
+        // re-enabled by future refactors.
+        let (db, uid, mid, _rid, _dir) = build_one_rating_no_sweeper(covering_schema());
+
+        let mut upd = FieldMap::new();
+        upd.insert("name".into(), Value::String("Renamed".into()));
+        db.update("User", uid, upd).unwrap();
+
+        // Give a real sweeper a generous window to PROVE it isn't running.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let stamp = read_movie_side_user_cover_v(&db, mid).unwrap();
+        assert_eq!(stamp, 0, "no sweeper means cover_v stamp must stay at 0");
+        assert_eq!(
+            read_movie_side_user_name(&db, mid).as_deref(),
+            Some("Alice"),
+            "no sweeper means embedded user.name must stay at the pre-update value"
+        );
+    }
+
+    /// Schema with a chained 1:1 forward relation: `Rating.movie` → Movie,
+    /// `Movie.director` → Director. Used by the 3-hop covering tests below
+    /// to verify the recursive cover embed.
+    fn three_hop_schema() -> Schema {
+        parse_schema(
+            r#"
+            type Director {
+                name: String
+            }
+            type Movie {
+                title: String
+                director: Director
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+            type User {
+                name: String
+                ratings: [Rating] @inverse(Rating.user)
+            }
+            type Rating {
+                stars: u32
+                user: User
+                movie: Movie
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// Verify the cover writer embeds the 3rd-degree target's data inside
+    /// the 2nd-degree cover blob. Inspecting the rev_edge bytes directly:
+    /// `r:user:rel:rating` value should carry `movie__cover` which itself
+    /// is a serialized FieldMap containing `director: U64(...)` and
+    /// `director__cover: Bytes(...)` with the director's data.
+    #[test]
+    fn three_hop_cover_embeds_director_inside_movie_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(three_hop_schema(), dir.path()).unwrap();
+
+        let mut df = FieldMap::new();
+        df.insert("name".into(), Value::String("Scott".into()));
+        let director = db.create("Director", df).unwrap();
+
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        mf.insert("director".into(), Value::U64(director.id));
+        let movie = db.create("Movie", mf).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(user.id));
+        rf.insert("movie".into(), Value::U64(movie.id));
+        db.create("Rating", rf).unwrap();
+
+        // Walk the user-side rev_edge → extract the movie_cover →
+        // extract director from inside that cover.
+        let groups = db.get_links_many("User", &[user.id], "ratings").unwrap();
+        let (_rid, rating_cover) = &groups[0][0];
+        let movie_cover_bytes =
+            crate::object::find_bytes_field_in_raw(rating_cover, "movie__cover")
+                .expect("rating rev_edge should embed movie__cover");
+        let director_in_movie =
+            crate::object::find_u64_field_in_raw(&movie_cover_bytes, "director")
+                .expect("movie__cover should carry director id (3-hop)");
+        assert_eq!(director_in_movie, director.id);
+        let director_cover_bytes =
+            crate::object::find_bytes_field_in_raw(&movie_cover_bytes, "director__cover")
+                .expect("movie__cover should carry director__cover (3-hop)");
+        let director_fields = deserialize_fields(&director_cover_bytes);
+        assert_eq!(
+            director_fields.get("name"),
+            Some(&Value::String("Scott".into()))
+        );
+        let stamp = crate::object::find_u64_field_in_raw(&movie_cover_bytes, "director__cover_v")
+            .expect("movie__cover should carry director__cover_v stamp");
+        assert_eq!(stamp, 0, "fresh director has generation 0");
+    }
+
+    #[test]
+    fn three_hop_cover_omitted_when_target_has_no_forward_1to1() {
+        // The Movie-side rev_edge's `user__cover` should NOT carry any
+        // <next>__cover — User has no forward 1:1 relations to embed
+        // (only the @inverse `ratings`). Pre-check in
+        // `with_nested_forward_covers` should short-circuit and return
+        // the original target bytes unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(three_hop_schema(), dir.path()).unwrap();
+
+        let mut df = FieldMap::new();
+        df.insert("name".into(), Value::String("Scott".into()));
+        let director = db.create("Director", df).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        mf.insert("director".into(), Value::U64(director.id));
+        let movie = db.create("Movie", mf).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(user.id));
+        rf.insert("movie".into(), Value::U64(movie.id));
+        db.create("Rating", rf).unwrap();
+
+        // The Movie-side rev_edge contains user__cover. User has no
+        // forward 1:1 — that cover should be User's bare scalars.
+        let groups = db.get_links_many("Movie", &[movie.id], "ratings").unwrap();
+        let (_rid, rating_cover) = &groups[0][0];
+        let user_cover_bytes = crate::object::find_bytes_field_in_raw(rating_cover, "user__cover")
+            .expect("movie-side rev_edge should embed user__cover");
+        let user_fields = deserialize_fields(&user_cover_bytes);
+        assert_eq!(
+            user_fields.get("name"),
+            Some(&Value::String("Alice".into()))
+        );
+        // No nested cover fields should appear since User has no outgoing 1:1.
+        assert!(
+            !user_fields
+                .keys()
+                .any(|k| k.ends_with("__cover") || k.ends_with("__cover_v")),
+            "user__cover should not embed any nested __cover entries"
+        );
+    }
+
+    #[test]
+    fn three_hop_cover_picked_up_after_separate_link_call() {
+        // Inline-relations create above goes through build_inflight_cover.
+        // The legacy `create + link` flow goes through build_covering_rev_value.
+        // Verify the 3-hop nesting works for that path too. Link order
+        // matters: the first link sees no peers and writes an empty
+        // rev_edge; the second link embeds the first link's target. So
+        // we link movie FIRST and user SECOND — the user-side rev_edge
+        // (the second one written) ends up with `movie__cover`, which
+        // is where 3-hop embeds `director` + `director__cover`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(three_hop_schema(), dir.path()).unwrap();
+
+        let mut df = FieldMap::new();
+        df.insert("name".into(), Value::String("Scott".into()));
+        let director = db.create("Director", df).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        let movie = db.create("Movie", mf).unwrap();
+        db.link("Movie", movie.id, "director", director.id, None)
+            .unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        let rating = db.create("Rating", rf).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None)
+            .unwrap();
+        db.link("Rating", rating.id, "user", user.id, None).unwrap();
+
+        let groups = db.get_links_many("User", &[user.id], "ratings").unwrap();
+        let (_rid, rating_cover) = &groups[0][0];
+        let movie_cover_bytes =
+            crate::object::find_bytes_field_in_raw(rating_cover, "movie__cover")
+                .expect("rating rev_edge should embed movie__cover (legacy link path)");
+        let director_in_movie =
+            crate::object::find_u64_field_in_raw(&movie_cover_bytes, "director");
+        assert_eq!(
+            director_in_movie,
+            Some(director.id),
+            "3-hop embed should kick in on the link() path too"
         );
     }
 
@@ -4029,7 +5597,9 @@ mod tests {
             db.create("User", f).unwrap();
         }
 
-        let gt = db.filter_scan("User", "age", CompareOp::Gt, 15, None).unwrap();
+        let gt = db
+            .filter_scan("User", "age", CompareOp::Gt, 15, None)
+            .unwrap();
         assert_eq!(gt.len(), 25, "should include 16..=40");
     }
 }

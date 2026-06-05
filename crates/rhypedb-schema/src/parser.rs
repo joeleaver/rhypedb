@@ -62,20 +62,16 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                 }
             }
 
-            // Validate @indexed is on an integer scalar field.
-            if field.is_indexed() {
-                let int_ok = matches!(
-                    field.field_type,
-                    FieldType::Scalar(
-                        ScalarType::U32 | ScalarType::U64 | ScalarType::I32 | ScalarType::I64
-                    )
-                );
-                if !int_ok {
-                    return Err(SchemaError::Validation(format!(
-                        "@indexed on '{}.{}' requires an integer scalar field (u32/u64/i32/i64)",
-                        type_def.name, field.name
-                    )));
-                }
+            // Validate @indexed is on a scalar field. All scalar types have
+            // sort-preserving encoders — ints (fixed-width), strings/bytes
+            // (variable-length escape + terminator), bools (1 byte padded
+            // to 8), floats (IEEE-754 sortable). Relation / Vector / Edge
+            // fields can't carry a value to index.
+            if field.is_indexed() && !matches!(field.field_type, FieldType::Scalar(_)) {
+                return Err(SchemaError::Validation(format!(
+                    "@indexed on '{}.{}' requires a scalar field",
+                    type_def.name, field.name
+                )));
             }
 
             // Validate @inverse references.
@@ -726,23 +722,37 @@ mod tests {
     }
 
     #[test]
-    fn reject_indexed_on_string_field() {
-        let result = parse_schema(
+    fn accept_indexed_on_scalar_fields() {
+        // Every scalar type has a sort-preserving encoder, so @indexed
+        // accepts string, bool, float, bytes, and integer columns alike.
+        let schema = parse_schema(
             r#"
             type Movie {
                 title: String @indexed
+                released: Bool @indexed
+                rating: f32 @indexed
+                year: u32 @indexed
+                cover: Bytes @indexed
             }
             "#,
-        );
-        assert!(matches!(result, Err(SchemaError::Validation(_))));
+        )
+        .unwrap();
+        let movie = schema.types.get("Movie").unwrap();
+        for f in &movie.fields {
+            assert!(f.is_indexed(), "{} should carry @indexed", f.name);
+        }
     }
 
     #[test]
-    fn reject_indexed_on_float_field() {
+    fn reject_indexed_on_relation_field() {
+        // Only scalar fields can be indexed — a relation has no value to
+        // encode into the index key.
         let result = parse_schema(
             r#"
+            type Movie { title: String }
             type Rating {
-                stars: f32 @indexed
+                stars: u32
+                movie: Movie @indexed
             }
             "#,
         );
