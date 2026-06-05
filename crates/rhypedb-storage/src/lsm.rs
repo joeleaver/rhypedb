@@ -995,13 +995,24 @@ impl Drop for LsmTree {
     /// mid-merge (it re-checks `shutdown` after each iteration). Joining
     /// here keeps the tree alive until the worker has released its
     /// `compaction_mutex` and stopped touching SST state.
+    ///
+    /// Self-join guard: the worker temporarily holds an `Arc<LsmTree>`
+    /// (upgraded from its `Weak`) while running `compact_inner`. If the
+    /// external holder drops their `Arc` during that window, the
+    /// worker's Arc becomes the last one — its end-of-scope drop fires
+    /// `LsmTree::drop` on the worker thread, where `handle.join()`
+    /// would deadlock against the current thread. Skip the join in that
+    /// case; the worker is already finishing and will exit on the next
+    /// condvar check (we just set `shutdown = true`).
     fn drop(&mut self) {
         {
             let mut guard = self.compaction_state.0.lock();
             guard.shutdown = true;
             self.compaction_state.1.notify_all();
         }
-        if let Some(handle) = self.compaction_handle.lock().take() {
+        if let Some(handle) = self.compaction_handle.lock().take()
+            && handle.thread().id() != std::thread::current().id()
+        {
             let _ = handle.join();
         }
     }

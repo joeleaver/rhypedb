@@ -189,24 +189,60 @@ fn execute_step(
                     ))
                 })?;
 
-            // Fusion fast path: input is an IdSetWithFields (came from an
-            // inverse traversal) AND we're now doing a forward-1:1 traversal
-            // whose target id was captured in those source covering bytes.
-            // Read it straight out via `find_u64_field_in_raw` — no HashMap
-            // build, no edge scan for this hop.
+            // Fusion fast path: input is either an IdSetWithFields (came
+            // from an inverse traversal) OR an Objects set whose items
+            // carry raw_fields (came from a previous fusion that landed
+            // on covered data). Either way, the next-hop's id is embedded
+            // in the input bytes, readable via `find_u64_field_in_raw`
+            // — no HashMap build, no edge scan for this hop.
             //
             // Second-degree win: when the covering ALSO carries
             // `<field>__cover` (the target object's own serialized fields,
-            // embedded at link time), we emit `IdSetWithFields` whose bytes
+            // embedded at link time), we emit Objects whose raw_fields
             // ARE the target's object data — terminal materialize then
             // constructs Objects directly without an LSM probe per id.
             // Avoids the 700-user `multi_get` on the 2-hop bench shape.
-            if is_one_to_one_forward
-                && let QueryOutput::IdSetWithFields { items, .. } = &current
-                && items
-                    .iter()
-                    .any(|(_, bytes)| find_u64_field_in_raw(bytes, field_name.as_str()).is_some())
-            {
+            //
+            // Third-degree (3-hop) win: when those Objects from a previous
+            // fusion step feed into ANOTHER forward-1:1, their raw_fields
+            // are the link-time cover, which `with_nested_forward_covers`
+            // augments with `<next>__cover`. Re-entering this fast path
+            // via the Objects branch extracts the 3rd-degree target from
+            // raw_fields without another LSM probe.
+            let fusion_input: Option<Vec<(u64, Bytes)>> = if is_one_to_one_forward {
+                match &current {
+                    QueryOutput::IdSetWithFields { items, .. }
+                        if items.iter().any(|(_, bytes)| {
+                            find_u64_field_in_raw(bytes, field_name.as_str()).is_some()
+                        }) =>
+                    {
+                        Some(items.clone())
+                    }
+                    QueryOutput::Objects(objs)
+                        if objs.iter().any(|o| {
+                            o.raw_fields
+                                .as_ref()
+                                .and_then(|b| {
+                                    find_u64_field_in_raw(b, field_name.as_str())
+                                })
+                                .is_some()
+                        }) =>
+                    {
+                        Some(
+                            objs.iter()
+                                .filter_map(|o| {
+                                    o.raw_fields.as_ref().map(|b| (o.id, b.clone()))
+                                })
+                                .collect(),
+                        )
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(items) = fusion_input {
+                let items = &items[..];
                 let cover_field_name = format!("{field_name}__cover");
                 let cover_v_field_name = format!("{field_name}__cover_v");
                 let mut seen: HashSet<u64> = HashSet::with_capacity(items.len());
@@ -1083,6 +1119,146 @@ mod tests {
             "fusion must fall through to a fresh probe when the embedded \
              cover_v is stale relative to the live generation counter"
         );
+    }
+
+    fn three_hop_db(dir: &std::path::Path) -> std::sync::Arc<Database> {
+        let schema = parse_schema(
+            r#"
+            type Director {
+                name: String
+            }
+            type Movie {
+                title: String
+                director: Director
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+            type User {
+                name: String
+                ratings: [Rating] @inverse(Rating.user)
+            }
+            type Rating {
+                stars: u32
+                user: User
+                movie: Movie
+            }
+            "#,
+        )
+        .unwrap();
+        Database::open(schema, dir).unwrap()
+    }
+
+    /// End-to-end 3-hop covering: `User.get(X).ratings.movie.director`.
+    ///
+    /// Pre-3-hop: hop 4 (`.director`) would fall through to a per-movie
+    /// LSM probe because the executor's fast-path only handles 2-hop. With
+    /// 3-hop covers embedded in rev_edge bytes, the second forward-1:1
+    /// hop also routes through the fusion path — the Object's raw_fields
+    /// carry the movie's serialized blob WITH `director` + `director__cover`
+    /// inline, so the executor extracts the director directly.
+    #[test]
+    fn execute_three_hop_traverse_via_cover_fusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = three_hop_db(dir.path());
+
+        let mut df = FieldMap::new();
+        df.insert("name".into(), Value::String("Scott".into()));
+        let director = db.create("Director", df).unwrap();
+
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        mf.insert("director".into(), Value::U64(director.id));
+        let movie = db.create("Movie", mf).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(user.id));
+        rf.insert("movie".into(), Value::U64(movie.id));
+        db.create("Rating", rf).unwrap();
+
+        let q = parse_query(&format!(
+            "User.get({}).ratings.movie.director",
+            user.id
+        ))
+        .unwrap();
+        let result =
+            execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+
+        match result {
+            QueryOutput::Objects(mut objs) => {
+                assert_eq!(objs.len(), 1, "should resolve to one director");
+                objs[0].ensure_fields_deserialized();
+                assert_eq!(objs[0].type_name, "Director");
+                assert_eq!(
+                    objs[0].fields.get("name"),
+                    Some(&Value::String("Scott".into())),
+                    "director name should round-trip through 3-hop cover"
+                );
+            }
+            other => panic!("expected Objects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_three_hop_cover_falls_through_on_stale_director() {
+        // Director's cover_v stamp is checked at extract time. After we
+        // update the director (bumping its generation), the embedded
+        // `director__cover_v` in the movie cover is stale; the executor
+        // routes through `get_many_lazy` to fetch the fresh director and
+        // still returns correct data. (Sweeper is on by default; we
+        // observe the slow-path fallback via a query that returns the
+        // post-update state.)
+        let dir = tempfile::tempdir().unwrap();
+        let db = three_hop_db(dir.path());
+
+        let mut df = FieldMap::new();
+        df.insert("name".into(), Value::String("Scott".into()));
+        let director = db.create("Director", df).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        mf.insert("director".into(), Value::U64(director.id));
+        let movie = db.create("Movie", mf).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(user.id));
+        rf.insert("movie".into(), Value::U64(movie.id));
+        db.create("Rating", rf).unwrap();
+
+        // Bump the director — embedded cover is now stale until the
+        // sweeper repairs OR a reader detects the cover_v mismatch.
+        let mut upd = FieldMap::new();
+        upd.insert("name".into(), Value::String("Renamed".into()));
+        db.update("Director", director.id, upd).unwrap();
+
+        let q = parse_query(&format!(
+            "User.get({}).ratings.movie.director",
+            user.id
+        ))
+        .unwrap();
+        let result =
+            execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+
+        match result {
+            QueryOutput::Objects(mut objs) => {
+                assert_eq!(objs.len(), 1);
+                objs[0].ensure_fields_deserialized();
+                // The post-update name must be reflected — either via
+                // sweeper repair (fast path) or cover_v fall-through
+                // (slow path). Both are correct outcomes.
+                assert_eq!(
+                    objs[0].fields.get("name"),
+                    Some(&Value::String("Renamed".into())),
+                    "stale director cover must be detected + replaced"
+                );
+            }
+            other => panic!("expected Objects, got {other:?}"),
+        }
     }
 
     #[test]

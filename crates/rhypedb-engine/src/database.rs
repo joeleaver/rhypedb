@@ -808,12 +808,14 @@ impl Database {
             ));
 
             let rev_value = build_inflight_cover(
+                self,
+                txn,
                 &scalar_fields,
                 field_name,
                 *target_id,
                 &links,
                 i,
-            );
+            )?;
             puts.push((
                 KeyBuilder::reverse_edge(*target_id, *rel_id, object_id),
                 rev_value,
@@ -2828,11 +2830,22 @@ impl Drop for Database {
     /// Tear down the cover-refresh worker. Dropping the sender closes the
     /// channel — the worker's blocked `recv()` returns `Err`, the loop
     /// breaks, the thread exits. We then join so this `Drop` doesn't
-    /// return while the worker is still touching the LSM (which is
-    /// already mid-drop too).
+    /// return while the worker is still touching the LSM.
+    ///
+    /// Self-join guard: the worker temporarily holds an `Arc<Database>`
+    /// during each iteration (via `Weak::upgrade`). If the external
+    /// holder drops their `Arc` while the worker is processing, the
+    /// worker's local Arc can become the last one — its end-of-scope
+    /// drop fires `Database::drop` on the worker thread itself, where
+    /// `handle.join()` would deadlock against the current thread. In
+    /// that case the worker is already finishing its iteration and will
+    /// exit naturally on the next `rx.recv()` (which now returns `Err`
+    /// because we just dropped the sender), so we just skip the join.
     fn drop(&mut self) {
         *self.cover_refresh_tx.lock() = None;
-        if let Some(handle) = self.cover_refresh_handle.lock().take() {
+        if let Some(handle) = self.cover_refresh_handle.lock().take()
+            && handle.thread().id() != std::thread::current().id()
+        {
             let _ = handle.join();
         }
     }
@@ -2883,13 +2896,15 @@ fn cover_refresh_worker(
 /// Returns `Bytes::new()` if there are no other 1:1 peers (matches the
 /// existing convention so the SST doesn't carry empty cover blobs).
 fn build_inflight_cover(
+    db: &Database,
+    txn: &rhypedb_storage::mvcc::Transaction,
     scalar_fields: &FieldMap,
     this_field: &str,
     this_target: u64,
     links: &[(String, u64, String, Bytes, u64, u64, bool)],
     this_idx: usize,
-) -> Bytes {
-    let mut other_1to1: Vec<&(String, u64, String, Bytes, u64, u64, bool)> = links
+) -> EngineResult<Bytes> {
+    let other_1to1: Vec<&(String, u64, String, Bytes, u64, u64, bool)> = links
         .iter()
         .enumerate()
         .filter_map(|(j, l)| {
@@ -2901,7 +2916,7 @@ fn build_inflight_cover(
         })
         .collect();
     if other_1to1.is_empty() {
-        return Bytes::new();
+        return Ok(Bytes::new());
     }
 
     let mut effective = scalar_fields.clone();
@@ -2909,17 +2924,21 @@ fn build_inflight_cover(
     for link in &other_1to1 {
         effective.insert(link.0.clone(), Value::U64(link.1));
     }
-    for link in &mut other_1to1 {
-        effective.insert(
-            format!("{}__cover", link.0),
-            Value::Bytes(link.3.clone()),
-        );
-        effective.insert(
-            format!("{}__cover_v", link.0),
-            Value::U64(link.4),
-        );
+    for link in &other_1to1 {
+        // Augment the in-memory target_data with 3rd-degree covers — same
+        // recursion as build_covering_rev_value does at link() time. The
+        // type of the link's target is stored as link.2.
+        let nested = with_nested_forward_covers(
+            db,
+            txn,
+            &link.2,
+            link.3.clone(),
+            link.1,
+        )?;
+        effective.insert(format!("{}__cover", link.0), Value::Bytes(nested));
+        effective.insert(format!("{}__cover_v", link.0), Value::U64(link.4));
     }
-    serialize_fields(&effective)
+    Ok(serialize_fields(&effective))
 }
 
 fn build_covering_rev_value(
@@ -2993,6 +3012,14 @@ fn build_covering_rev_value(
     // rev_edge was written) and fall back to a fresh LSM probe for that
     // specific target — instead of forcing an unbounded rev_edge rewrite
     // on every update to a hot key.
+    //
+    // Third-degree (3-hop) covering: when the other-target is itself the
+    // source of an outgoing 1:1 forward relation, that next-level target's
+    // data + cover_v stamp get embedded INSIDE the other-target's serialized
+    // form via `with_nested_forward_covers`. A query like `S.<other>.<next>`
+    // can then extract `next` straight from the rev_edge bytes — no LSM
+    // probe at either hop. Bounded by one extra storage.get per nested
+    // 1:1 forward field per other-target.
     if let Some(type_def) = db.schema.get_type(source_type) {
         for (name, tid) in &other_targets {
             let Some(field) = type_def.get_field(name) else {
@@ -3007,7 +3034,14 @@ fn build_covering_rev_value(
             };
             let target_key = KeyBuilder::object(target_type_id, *tid);
             if let Ok(Some(target_data)) = db.storage.get(txn, &target_key) {
-                effective.insert(format!("{name}__cover"), Value::Bytes(target_data));
+                let nested = with_nested_forward_covers(
+                    db,
+                    txn,
+                    &rel.target_type,
+                    target_data,
+                    *tid,
+                )?;
+                effective.insert(format!("{name}__cover"), Value::Bytes(nested));
                 let target_version = db.object_version(&rel.target_type, *tid);
                 effective.insert(
                     format!("{name}__cover_v"),
@@ -3017,6 +3051,87 @@ fn build_covering_rev_value(
         }
     }
 
+    Ok(serialize_fields(&effective))
+}
+
+/// Augment a target's serialized fields with 3rd-degree cover data: for
+/// each 1:1 forward (non-inverse, non-many) relation on `target_type`,
+/// fetch that next-hop target's data and embed under `<field>__cover` /
+/// `<field>__cover_v` directly inside the target's FieldMap before
+/// serialization. Also writes `<field>: Value::U64(next_tid)` so the
+/// executor's `find_u64_field_in_raw` can locate the next-hop id without
+/// a second edge scan.
+///
+/// This is the engine-side recursion that turns 2-hop covering into
+/// 3-hop covering. Depth is capped at one extra level — recursion would
+/// be unsound for cyclic 1:1 schemas (e.g. User.partner: User) without
+/// cycle detection, and the storage cost compounds. Bench schemas with
+/// chained 1:1 forward relations get the win; schemas without any
+/// outgoing 1:1 on the target (the existing Movie/User shape) get
+/// `target_data` back verbatim.
+fn with_nested_forward_covers(
+    db: &Database,
+    txn: &rhypedb_storage::mvcc::Transaction,
+    target_type: &str,
+    target_data: Bytes,
+    target_id: u64,
+) -> EngineResult<Bytes> {
+    let Some(type_def) = db.schema.get_type(target_type) else {
+        return Ok(target_data);
+    };
+
+    // Cheap pre-check: does this type even have any 1:1 forward outgoing
+    // relations? If not, skip the deserialize+reserialize round trip and
+    // return the original bytes (refcount-only, no copy).
+    let has_any_forward_1to1 = type_def.fields.iter().any(|f| {
+        matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many)
+            && f.inverse().is_none()
+    });
+    if !has_any_forward_1to1 {
+        return Ok(target_data);
+    }
+
+    let mut effective = deserialize_fields(&target_data);
+    let mut wrote_any = false;
+
+    for field in &type_def.fields {
+        let rel = match &field.field_type {
+            FieldType::Relation(r) => r,
+            _ => continue,
+        };
+        if rel.is_many || field.inverse().is_some() {
+            continue;
+        }
+        let rel_key = format!("{target_type}.{}", field.name);
+        let Some(rel_id) = db.rel_ids.get(&rel_key).copied() else {
+            continue;
+        };
+        // Find the next-hop target via the forward edge index.
+        let prefix = KeyBuilder::edge_prefix(target_id, rel_id);
+        let entries = db.scan_prefix(txn, &prefix)?;
+        let Some(&(next_tid, _)) = entries.first() else {
+            continue;
+        };
+        let Some(next_type_id) = db.type_ids.get(&rel.target_type).copied() else {
+            continue;
+        };
+        let next_key = KeyBuilder::object(next_type_id, next_tid);
+        let Ok(Some(next_data)) = db.storage.get(txn, &next_key) else {
+            continue;
+        };
+        wrote_any = true;
+        effective.insert(field.name.clone(), Value::U64(next_tid));
+        effective.insert(format!("{}__cover", field.name), Value::Bytes(next_data));
+        let next_v = db.object_version(&rel.target_type, next_tid);
+        effective.insert(format!("{}__cover_v", field.name), Value::U64(next_v));
+    }
+
+    if !wrote_any {
+        // No outgoing 1:1 edges actually populated (type has the fields
+        // but this instance hasn't been linked yet). Return original bytes
+        // unchanged so we don't pay reserialization cost for no benefit.
+        return Ok(target_data);
+    }
     Ok(serialize_fields(&effective))
 }
 
@@ -5300,6 +5415,179 @@ mod tests {
             read_movie_side_user_name(&db, mid).as_deref(),
             Some("Alice"),
             "no sweeper means embedded user.name must stay at the pre-update value"
+        );
+    }
+
+    /// Schema with a chained 1:1 forward relation: `Rating.movie` → Movie,
+    /// `Movie.director` → Director. Used by the 3-hop covering tests below
+    /// to verify the recursive cover embed.
+    fn three_hop_schema() -> Schema {
+        parse_schema(
+            r#"
+            type Director {
+                name: String
+            }
+            type Movie {
+                title: String
+                director: Director
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+            type User {
+                name: String
+                ratings: [Rating] @inverse(Rating.user)
+            }
+            type Rating {
+                stars: u32
+                user: User
+                movie: Movie
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// Verify the cover writer embeds the 3rd-degree target's data inside
+    /// the 2nd-degree cover blob. Inspecting the rev_edge bytes directly:
+    /// `r:user:rel:rating` value should carry `movie__cover` which itself
+    /// is a serialized FieldMap containing `director: U64(...)` and
+    /// `director__cover: Bytes(...)` with the director's data.
+    #[test]
+    fn three_hop_cover_embeds_director_inside_movie_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(three_hop_schema(), dir.path()).unwrap();
+
+        let mut df = FieldMap::new();
+        df.insert("name".into(), Value::String("Scott".into()));
+        let director = db.create("Director", df).unwrap();
+
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        mf.insert("director".into(), Value::U64(director.id));
+        let movie = db.create("Movie", mf).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(user.id));
+        rf.insert("movie".into(), Value::U64(movie.id));
+        db.create("Rating", rf).unwrap();
+
+        // Walk the user-side rev_edge → extract the movie_cover →
+        // extract director from inside that cover.
+        let groups = db.get_links_many("User", &[user.id], "ratings").unwrap();
+        let (_rid, rating_cover) = &groups[0][0];
+        let movie_cover_bytes =
+            crate::object::find_bytes_field_in_raw(rating_cover, "movie__cover")
+                .expect("rating rev_edge should embed movie__cover");
+        let director_in_movie =
+            crate::object::find_u64_field_in_raw(&movie_cover_bytes, "director")
+                .expect("movie__cover should carry director id (3-hop)");
+        assert_eq!(director_in_movie, director.id);
+        let director_cover_bytes =
+            crate::object::find_bytes_field_in_raw(&movie_cover_bytes, "director__cover")
+                .expect("movie__cover should carry director__cover (3-hop)");
+        let director_fields = deserialize_fields(&director_cover_bytes);
+        assert_eq!(
+            director_fields.get("name"),
+            Some(&Value::String("Scott".into()))
+        );
+        let stamp =
+            crate::object::find_u64_field_in_raw(&movie_cover_bytes, "director__cover_v")
+                .expect("movie__cover should carry director__cover_v stamp");
+        assert_eq!(stamp, 0, "fresh director has generation 0");
+    }
+
+    #[test]
+    fn three_hop_cover_omitted_when_target_has_no_forward_1to1() {
+        // The Movie-side rev_edge's `user__cover` should NOT carry any
+        // <next>__cover — User has no forward 1:1 relations to embed
+        // (only the @inverse `ratings`). Pre-check in
+        // `with_nested_forward_covers` should short-circuit and return
+        // the original target bytes unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(three_hop_schema(), dir.path()).unwrap();
+
+        let mut df = FieldMap::new();
+        df.insert("name".into(), Value::String("Scott".into()));
+        let director = db.create("Director", df).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        mf.insert("director".into(), Value::U64(director.id));
+        let movie = db.create("Movie", mf).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(user.id));
+        rf.insert("movie".into(), Value::U64(movie.id));
+        db.create("Rating", rf).unwrap();
+
+        // The Movie-side rev_edge contains user__cover. User has no
+        // forward 1:1 — that cover should be User's bare scalars.
+        let groups = db.get_links_many("Movie", &[movie.id], "ratings").unwrap();
+        let (_rid, rating_cover) = &groups[0][0];
+        let user_cover_bytes =
+            crate::object::find_bytes_field_in_raw(rating_cover, "user__cover")
+                .expect("movie-side rev_edge should embed user__cover");
+        let user_fields = deserialize_fields(&user_cover_bytes);
+        assert_eq!(
+            user_fields.get("name"),
+            Some(&Value::String("Alice".into()))
+        );
+        // No nested cover fields should appear since User has no outgoing 1:1.
+        assert!(
+            !user_fields
+                .keys()
+                .any(|k| k.ends_with("__cover") || k.ends_with("__cover_v")),
+            "user__cover should not embed any nested __cover entries"
+        );
+    }
+
+    #[test]
+    fn three_hop_cover_picked_up_after_separate_link_call() {
+        // Inline-relations create above goes through build_inflight_cover.
+        // The legacy `create + link` flow goes through build_covering_rev_value.
+        // Verify the 3-hop nesting works for that path too. Link order
+        // matters: the first link sees no peers and writes an empty
+        // rev_edge; the second link embeds the first link's target. So
+        // we link movie FIRST and user SECOND — the user-side rev_edge
+        // (the second one written) ends up with `movie__cover`, which
+        // is where 3-hop embeds `director` + `director__cover`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(three_hop_schema(), dir.path()).unwrap();
+
+        let mut df = FieldMap::new();
+        df.insert("name".into(), Value::String("Scott".into()));
+        let director = db.create("Director", df).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        let movie = db.create("Movie", mf).unwrap();
+        db.link("Movie", movie.id, "director", director.id, None).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        let rating = db.create("Rating", rf).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+        db.link("Rating", rating.id, "user", user.id, None).unwrap();
+
+        let groups = db.get_links_many("User", &[user.id], "ratings").unwrap();
+        let (_rid, rating_cover) = &groups[0][0];
+        let movie_cover_bytes =
+            crate::object::find_bytes_field_in_raw(rating_cover, "movie__cover")
+                .expect("rating rev_edge should embed movie__cover (legacy link path)");
+        let director_in_movie =
+            crate::object::find_u64_field_in_raw(&movie_cover_bytes, "director");
+        assert_eq!(
+            director_in_movie,
+            Some(director.id),
+            "3-hop embed should kick in on the link() path too"
         );
     }
 
