@@ -459,8 +459,7 @@ impl Vectorizer {
         if batch.is_empty() {
             return Ok(0);
         }
-        let mut embedders = self.embedders.lock();
-        self.process_batch(batch, &mut embedders)
+        self.process_batch(batch)
     }
 
     /// Atomically claim a batch of jobs from the queue.
@@ -507,11 +506,13 @@ impl Vectorizer {
             .collect())
     }
 
-    /// Process a claimed batch of jobs with the given embedders.
+    /// Process a claimed batch of jobs. Embedding uses the shared
+    /// `self.embedders` (one model instance across the worker and query paths,
+    /// ~124MB rather than one copy each), locked only for the embed call so it
+    /// doesn't block query-path embeds during the insert/commit phase.
     fn process_batch(
         &self,
         jobs: Vec<(VectorizeJob, u64)>,
-        embedders: &mut HashMap<String, Box<dyn Embedder>>,
     ) -> EngineResult<usize> {
         // Group by model.
         let mut jobs_by_model: HashMap<String, Vec<VectorizeJob>> = HashMap::new();
@@ -546,12 +547,18 @@ impl Vectorizer {
 
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
-            let embedder = embedders
-                .entry(model_name.clone())
-                .or_insert_with(|| {
-                    Box::new(FastEmbedder::new(model_name).expect("failed to load model"))
-                });
-            let embeddings = match embedder.embed(&text_refs) {
+            // Lock the shared embedder only for the embed; release before the
+            // insert/commit phase so concurrent query-path embeds don't block.
+            let embed_result = {
+                let mut embedders = self.embedders.lock();
+                let embedder = embedders
+                    .entry(model_name.clone())
+                    .or_insert_with(|| {
+                        Box::new(FastEmbedder::new(model_name).expect("failed to load model"))
+                    });
+                embedder.embed(&text_refs)
+            };
+            let embeddings = match embed_result {
                 Ok(e) => e,
                 Err(e) => {
                     self.mark_batch_failed(batch_jobs, &format!("{e}"))?;
@@ -761,8 +768,6 @@ impl Vectorizer {
         for worker_id in 0..num_workers {
             let vectorizer = Arc::clone(self);
             let handle = std::thread::spawn(move || {
-                let mut local_embedders: HashMap<String, Box<dyn Embedder>> =
-                    HashMap::new();
                 while vectorizer.running.load(Ordering::SeqCst) {
                     let batch = match vectorizer.claim_batch() {
                         Ok(b) => b,
@@ -778,7 +783,7 @@ impl Vectorizer {
                         continue;
                     }
 
-                    match vectorizer.process_batch(batch, &mut local_embedders) {
+                    match vectorizer.process_batch(batch) {
                         Ok(_) => {
                             vectorizer.save_snapshots();
                         }
