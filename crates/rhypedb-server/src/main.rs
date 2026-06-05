@@ -60,7 +60,7 @@ struct Cli {
 }
 
 struct AppState {
-    db: Database,
+    db: Arc<Database>,
     vectorizer: Option<Arc<Vectorizer>>,
     query_cache: QueryCache,
 }
@@ -375,6 +375,7 @@ async fn main() {
         &cli.data_dir,
         rhypedb_engine::database::OpenOptions {
             sync_on_commit: !cli.no_sync,
+            ..Default::default()
         },
     )
     .unwrap_or_else(|e| {

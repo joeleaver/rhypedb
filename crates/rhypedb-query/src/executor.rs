@@ -767,7 +767,7 @@ mod tests {
     use crate::parser::parse_query;
     use rhypedb_schema::parser::parse_schema;
 
-    fn test_db(dir: &std::path::Path) -> Database {
+    fn test_db(dir: &std::path::Path) -> std::sync::Arc<Database> {
         let schema = parse_schema(
             r#"
             type User {

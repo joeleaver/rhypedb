@@ -16,12 +16,17 @@ use crate::error::{EngineError, EngineResult};
 use crate::object::{deserialize_fields, serialize_fields, FieldMap, Object, Value};
 
 /// One row of the precomputed reverse-relation index used by cascade delete.
+/// `is_many` distinguishes forward 1:1 incoming relations (where the source's
+/// rev_edge cover embeds the target's data) from many-relations (where the
+/// target isn't embedded). The cover-refresh sweeper consults it to decide
+/// whether an incoming source S needs Phase 1 re-run after T is updated.
 #[derive(Debug, Clone)]
 struct IncomingRelation {
     source_type_id: u64,
     source_type: String,
     source_field: String,
     rel_id: u64,
+    is_many: bool,
     policy: OnDeletePolicy,
 }
 
@@ -214,6 +219,18 @@ pub struct Database {
     /// (insert + delete, no updates) this saves 100 RwLock acquires per
     /// User-delete at K=100. Updated alongside every map mutation.
     version_counter_count: std::sync::atomic::AtomicUsize,
+    /// Outbound channel to the cover-refresh worker. Each successful
+    /// `update()` pushes the bumped target's `(type_id, object_id)` here;
+    /// the worker scans `r:<target>:*` for incoming 1:1 forward sources
+    /// and re-runs Phase 1 for each (rewriting their outbound rev_edges
+    /// with the target's fresh cover).
+    ///
+    /// Wrapped in `Mutex<Option<...>>` so `Drop` can `take()` the sender,
+    /// closing the channel and prompting the worker to exit cleanly.
+    cover_refresh_tx: parking_lot::Mutex<Option<std::sync::mpsc::Sender<(u64, u64)>>>,
+    /// Join handle for the cover-refresh worker thread. Taken on drop.
+    cover_refresh_handle:
+        parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// One @indexed scalar field on a type, with everything the write path needs
@@ -252,19 +269,33 @@ pub struct OpenOptions {
     /// `fsync=off + synchronous_commit=off` mode for benchmarking, and
     /// is useful for bulk imports that accept the risk.
     pub sync_on_commit: bool,
+    /// `true` (default): spawn the cover-refresh worker thread. Every
+    /// `update()` that bumps an object's generation queues the target;
+    /// the worker scans for incoming 1:1 forward sources and rewrites
+    /// their outbound rev_edges so embedded `<name>__cover` blobs stay
+    /// current. Disable for benchmarks that don't want the background
+    /// CPU or for tests that need deterministic stale-cover state.
+    pub background_cover_refresh: bool,
 }
 
 impl Default for OpenOptions {
     fn default() -> Self {
         Self {
             sync_on_commit: true,
+            background_cover_refresh: true,
         }
     }
 }
 
 impl Database {
     /// Open a database with the given schema and data directory.
-    pub fn open(schema: Schema, data_dir: impl AsRef<Path>) -> EngineResult<Self> {
+    ///
+    /// Returns an `Arc<Database>` because the engine owns a background
+    /// cover-refresh worker thread that holds a `Weak<Database>` reference
+    /// — the Arc wrapper is required for the worker's lifetime to track
+    /// the database's. All callers can treat the `Arc` like a `Database`
+    /// directly thanks to deref.
+    pub fn open(schema: Schema, data_dir: impl AsRef<Path>) -> EngineResult<Arc<Self>> {
         Self::open_with_options(schema, data_dir, OpenOptions::default())
     }
 
@@ -276,7 +307,7 @@ impl Database {
         schema: Schema,
         data_dir: impl AsRef<Path>,
         options: OpenOptions,
-    ) -> EngineResult<Self> {
+    ) -> EngineResult<Arc<Self>> {
         let mut config = LsmConfig::new(data_dir);
         // Wire a zone-field extractor that pulls integer field values out of
         // object entries' FieldMap blobs at SST flush/compaction time. Lets
@@ -363,6 +394,7 @@ impl Database {
                             source_type: source_type.clone(),
                             source_field: field.name.clone(),
                             rel_id,
+                            is_many: rel.is_many,
                             policy,
                         });
                 }
@@ -477,7 +509,7 @@ impl Database {
         }
         drop(txn2);
 
-        Ok(Self {
+        let db = Arc::new(Self {
             schema,
             storage,
             type_ids,
@@ -491,7 +523,27 @@ impl Database {
             indexed_fields,
             version_counter_count: std::sync::atomic::AtomicUsize::new(version_counters.len()),
             version_counters: RwLock::new(version_counters),
-        })
+            cover_refresh_tx: parking_lot::Mutex::new(None),
+            cover_refresh_handle: parking_lot::Mutex::new(None),
+        });
+
+        // Spawn the cover-refresh worker now that `db` lives inside an Arc
+        // we can downgrade. The worker holds a `Weak<Database>` so it
+        // doesn't extend the database's lifetime — once external Arcs are
+        // dropped, our Drop impl closes the channel and joins. Skipped when
+        // the caller opts out via `OpenOptions::background_cover_refresh`.
+        if options.background_cover_refresh {
+            let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+            let weak = Arc::downgrade(&db);
+            let handle = std::thread::Builder::new()
+                .name("rhypedb-cover-refresh".into())
+                .spawn(move || cover_refresh_worker(rx, weak))
+                .map_err(|e| EngineError::Storage(rhypedb_storage::Error::Io(e)))?;
+            *db.cover_refresh_tx.lock() = Some(tx);
+            *db.cover_refresh_handle.lock() = Some(handle);
+        }
+
+        Ok(db)
     }
 
     /// Current generation of the object `(type_name, object_id)`. Returns 0
@@ -1754,49 +1806,14 @@ impl Database {
         // relations. (Phase 2 — refreshing this object's OWN cover in the
         // rev_edges that INCOMING references hold us under `__cover` — is
         // handled lazily via the per-object version + reader-side fall-
-        // through, since the count can be unbounded.)
-        if let Some(type_def) = self.schema.get_type(type_name) {
-            let has_forward_1to1 = type_def.fields.iter().any(|f| {
-                matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many)
-                    && f.inverse().is_none()
-            });
-            if has_forward_1to1 {
-                for field in &type_def.fields {
-                    if !matches!(field.field_type, FieldType::Relation(_)) {
-                        continue;
-                    }
-                    if field.inverse().is_some() {
-                        continue;
-                    }
-                    let rel_key = format!("{type_name}.{}", field.name);
-                    let Some(&rel_id) = self.rel_ids.get(&rel_key) else {
-                        continue;
-                    };
-                    let prefix = KeyBuilder::edge_prefix(object_id, rel_id);
-                    let entries = self.scan_prefix(&txn, &prefix)?;
-                    // Walk every linked target across both 1:1 and many
-                    // outbound relations: their rev_edge values all carry
-                    // source's covering fields and need refresh.
-                    for (target_id, _edge_value) in entries {
-                        let rev_value = build_covering_rev_value(
-                            self,
-                            &txn,
-                            type_name,
-                            object_id,
-                            Some(&serialized),
-                            &field.name,
-                            target_id,
-                        )?;
-                        let rev_key = KeyBuilder::reverse_edge(
-                            target_id,
-                            rel_id,
-                            object_id,
-                        );
-                        self.storage.put(&mut txn, &rev_key, rev_value)?;
-                    }
-                }
-            }
-        }
+        // through, plus a background sweeper that opportunistically rewrites
+        // stale embedded covers — see `cover_refresh_worker`.)
+        self.refresh_outbound_rev_edges(
+            &mut txn,
+            type_name,
+            object_id,
+            Some(&serialized),
+        )?;
 
         // Phase 2: bump this object's generation. Every rev_edge that
         // embedded us as `<name>__cover` earlier now has a stale snapshot;
@@ -1823,6 +1840,16 @@ impl Database {
                 other => EngineError::Storage(other),
             }
         })?;
+
+        // Enqueue cover refresh for this target. Every other rev_edge that
+        // embedded this object as `<name>__cover` (under a different source)
+        // now has a stale snapshot; the worker will scan `r:<target>:*` to
+        // find those sources and re-run Phase 1 for each. Send failure means
+        // the channel was closed (Drop in progress) — fall through, the
+        // next read still detects staleness via cover_v.
+        if let Some(tx) = self.cover_refresh_tx.lock().as_ref() {
+            let _ = tx.send((type_id, object_id));
+        }
 
         self.subscriptions.publish(ChangeEvent {
             version,
@@ -2659,6 +2686,177 @@ impl Database {
         let unique_key = KeyBuilder::unique_index(type_id, field_id, &value_bytes);
         self.storage.delete(txn, &unique_key)?;
         Ok(())
+    }
+
+    /// Rewrite every outbound rev_edge whose source is `(type_name, object_id)`.
+    /// For each forward (non-inverse) relation, walk every linked target in
+    /// the edge index and `put` a freshly built `build_covering_rev_value`
+    /// payload at `r:<target>:<rel>:<source>`. This is the Phase 1 work
+    /// `update()` does for the source-side cover refresh; the cover-refresh
+    /// worker calls the same code to repair stale covers in OTHER sources
+    /// after a target's data changes.
+    ///
+    /// `source_data` provides the source object's effective scalar bytes —
+    /// `Some(b)` for `update()` (where the new bytes haven't been committed
+    /// yet) and the current persisted bytes for the worker path.
+    fn refresh_outbound_rev_edges(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_name: &str,
+        object_id: u64,
+        source_data: Option<&[u8]>,
+    ) -> EngineResult<()> {
+        let Some(type_def) = self.schema.get_type(type_name) else {
+            return Ok(());
+        };
+        let has_forward_1to1 = type_def.fields.iter().any(|f| {
+            matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many)
+                && f.inverse().is_none()
+        });
+        if !has_forward_1to1 {
+            return Ok(());
+        }
+        for field in &type_def.fields {
+            if !matches!(field.field_type, FieldType::Relation(_)) {
+                continue;
+            }
+            if field.inverse().is_some() {
+                continue;
+            }
+            let rel_key = format!("{type_name}.{}", field.name);
+            let Some(&rel_id) = self.rel_ids.get(&rel_key) else {
+                continue;
+            };
+            let prefix = KeyBuilder::edge_prefix(object_id, rel_id);
+            let entries = self.scan_prefix(txn, &prefix)?;
+            for (target_id, _edge_value) in entries {
+                let rev_value = build_covering_rev_value(
+                    self,
+                    txn,
+                    type_name,
+                    object_id,
+                    source_data,
+                    &field.name,
+                    target_id,
+                )?;
+                let rev_key = KeyBuilder::reverse_edge(target_id, rel_id, object_id);
+                self.storage.put(txn, &rev_key, rev_value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh every stale embedded cover whose underlying target is
+    /// `(target_type_id, target_id)`. Used by the cover-refresh worker after
+    /// a target update has bumped its generation.
+    ///
+    /// Algorithm:
+    ///   1. Scan every incoming 1:1 forward rev_edge of the target —
+    ///      `r:<target>:<rel>:*` for each relation listed in
+    ///      `incoming_relations` whose source field is 1:1. Each match gives
+    ///      us a source object S that has the target embedded as one of S's
+    ///      other-target covers.
+    ///   2. For each S, re-run Phase 1 — `refresh_outbound_rev_edges` —
+    ///      which rewrites every outbound rev_edge of S with fresh covers
+    ///      pulled from each peer's current state (including the target's
+    ///      newly written data + bumped generation).
+    ///
+    /// All rewrites happen in one txn so partial work can't make the index
+    /// temporarily inconsistent. A commit failure (write conflict) is
+    /// surfaced; the next bump re-enqueues the target so retry is cheap.
+    fn refresh_covers_for_target(
+        &self,
+        target_type_id: u64,
+        target_id: u64,
+    ) -> EngineResult<()> {
+        let Some(incoming) = self.incoming_relations.get(&target_type_id) else {
+            return Ok(());
+        };
+
+        // Phase A: read pass — find every (S_type_id, S_id) that links to
+        // the target via a 1:1 forward relation. Done in a read-only scan
+        // outside the write txn so the prefix scan doesn't see in-flight
+        // writes from this same worker pass.
+        let read_txn = self.storage.begin_txn();
+        let mut sources: Vec<(u64, u64)> = Vec::new();
+        for inc in incoming {
+            if inc.is_many {
+                continue;
+            }
+            let rev_prefix = KeyBuilder::reverse_edge_prefix(target_id, inc.rel_id);
+            let entries = self.scan_prefix_raw(&read_txn, &rev_prefix)?;
+            for (source_id, _value) in entries {
+                sources.push((inc.source_type_id, source_id));
+            }
+        }
+        drop(read_txn);
+
+        if sources.is_empty() {
+            return Ok(());
+        }
+
+        // Phase B: write pass — for each source, re-run Phase 1 in a fresh
+        // txn so commit is atomic. We collect the source bytes inside the
+        // same txn that does the put so a concurrent S-update doesn't get
+        // overwritten with stale cover content.
+        let mut txn = self.storage.begin_txn();
+        for (s_type_id, s_id) in sources {
+            let Some(s_type_name) = self.type_name_by_id.get(&s_type_id) else {
+                continue;
+            };
+            let obj_key = KeyBuilder::object(s_type_id, s_id);
+            let Some(s_bytes) = self.storage.get(&txn, &obj_key)? else {
+                continue;
+            };
+            let s_type_name = s_type_name.clone();
+            self.refresh_outbound_rev_edges(
+                &mut txn,
+                &s_type_name,
+                s_id,
+                Some(&s_bytes),
+            )?;
+        }
+        self.storage.commit(&mut txn).map_err(|e| match e {
+            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+            other => EngineError::Storage(other),
+        })?;
+        Ok(())
+    }
+}
+
+impl Drop for Database {
+    /// Tear down the cover-refresh worker. Dropping the sender closes the
+    /// channel — the worker's blocked `recv()` returns `Err`, the loop
+    /// breaks, the thread exits. We then join so this `Drop` doesn't
+    /// return while the worker is still touching the LSM (which is
+    /// already mid-drop too).
+    fn drop(&mut self) {
+        *self.cover_refresh_tx.lock() = None;
+        if let Some(handle) = self.cover_refresh_handle.lock().take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Cover-refresh worker. Loops on the per-database channel, popping each
+/// target `(type_id, object_id)` that just had its generation bumped and
+/// asking the database to repair every embedded cover for that target.
+///
+/// Holds a `Weak<Database>` so the database's lifetime isn't extended by
+/// this thread — when external `Arc<Database>` refs all drop, our upgrade
+/// returns `None` and we exit. The channel-close signal from `Drop` covers
+/// the case where the worker is blocked in `recv()` at that moment.
+fn cover_refresh_worker(
+    rx: std::sync::mpsc::Receiver<(u64, u64)>,
+    weak: std::sync::Weak<Database>,
+) {
+    while let Ok((type_id, object_id)) = rx.recv() {
+        let Some(db) = weak.upgrade() else { break };
+        // Best-effort: a refresh failure (write conflict, IO error) is
+        // self-healing. The next update on the target re-enqueues it; the
+        // reader fall-through continues to detect staleness via cover_v
+        // in the meantime.
+        let _ = db.refresh_covers_for_target(type_id, object_id);
     }
 }
 
@@ -4610,7 +4808,7 @@ mod tests {
     /// Returns (db, user_id, movie_id, rating_id, tempdir).
     fn build_one_rating(
         schema: Schema,
-    ) -> (Database, u64, u64, u64, tempfile::TempDir) {
+    ) -> (Arc<Database>, u64, u64, u64, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(schema, dir.path()).unwrap();
 
@@ -4884,22 +5082,52 @@ mod tests {
         );
     }
 
+    /// Open the covering-schema database with the background cover-refresh
+    /// sweeper disabled. Used by tests that need to observe the cover_v
+    /// mismatch BEFORE the sweeper would otherwise repair it.
+    fn build_one_rating_no_sweeper(
+        schema: Schema,
+    ) -> (Arc<Database>, u64, u64, u64, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_with_options(
+            schema,
+            dir.path(),
+            OpenOptions {
+                background_cover_refresh: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Aliens".into()));
+        let movie = db.create("Movie", mf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        let rating = db.create("Rating", rf).unwrap();
+        db.link("Rating", rating.id, "user", user.id, None).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+        (db, user.id, movie.id, rating.id, dir)
+    }
+
     #[test]
     fn second_degree_cover_staleness_is_detectable_via_versions() {
-        // Phase 2 invalidation-tombstone design: User.update does NOT rewrite
-        // the millions of rev_edge values that embedded the user under
-        // `user__cover`. Instead it bumps an in-memory + persisted per-object
-        // generation counter. Cover writers stamp the target's version at
-        // write time into `<name>__cover_v`. Readers compare against the
-        // live counter and fall through to a fresh LSM probe when they
-        // disagree — bounded write cost regardless of fan-in.
+        // Phase 2 invalidation-tombstone design: User.update does NOT
+        // synchronously rewrite the rev_edge values that embedded the user
+        // under `user__cover`. Instead it bumps the per-object generation
+        // counter; cover writers stamp the target's version into
+        // `<name>__cover_v`. Readers compare against the live counter and
+        // fall through to a fresh LSM probe when they disagree — bounded
+        // write cost regardless of fan-in.
         //
-        // This test verifies the mechanism: the embedded `user__cover_v`
-        // value is the old (pre-update) generation, and the live counter is
-        // the new (post-update) generation, so the reader will detect the
-        // mismatch. The end-to-end query result is exercised in
-        // rhypedb-query's executor tests.
-        let (db, uid, mid, _rid, _dir) = build_one_rating(covering_schema());
+        // (Phase 3, the background cover-refresh sweeper, ASYNCHRONOUSLY
+        // repairs the stale covers later. This test runs with the sweeper
+        // disabled so the post-update inspection is deterministic.)
+        let (db, uid, mid, _rid, _dir) =
+            build_one_rating_no_sweeper(covering_schema());
 
         assert_eq!(
             db.object_version("User", uid),
@@ -4947,6 +5175,131 @@ mod tests {
         assert!(
             stamped_v < db.object_version("User", uid),
             "stamp < live counter triggers reader fall-through"
+        );
+    }
+
+    /// Helper: poll the `r:<movie>:movie:<rating>` rev_edge value and read
+    /// the embedded `user__cover_v` stamp. Returns the stamp or `None` if
+    /// the rev_edge isn't present or doesn't carry a cover.
+    fn read_movie_side_user_cover_v(
+        db: &Database,
+        movie_id: u64,
+    ) -> Option<u64> {
+        let groups = db.get_links_many("Movie", &[movie_id], "ratings").ok()?;
+        let group = groups.into_iter().next()?;
+        let (_rid, cover) = group.into_iter().next()?;
+        crate::object::find_u64_field_in_raw(&cover, "user__cover_v")
+    }
+
+    fn read_movie_side_user_name(db: &Database, movie_id: u64) -> Option<String> {
+        let groups = db.get_links_many("Movie", &[movie_id], "ratings").ok()?;
+        let group = groups.into_iter().next()?;
+        let (_rid, cover) = group.into_iter().next()?;
+        let inner = crate::object::find_bytes_field_in_raw(&cover, "user__cover")?;
+        let fields = deserialize_fields(&inner);
+        match fields.get("name")? {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// Poll predicate up to `attempts` × 10ms. Returns true if the predicate
+    /// held within the window. Used by sweeper tests to wait for the
+    /// background thread to repair a stale cover without sleeping for a
+    /// fixed (potentially flaky) duration.
+    fn poll_until(mut p: impl FnMut() -> bool, attempts: u32) -> bool {
+        for _ in 0..attempts {
+            if p() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        p()
+    }
+
+    #[test]
+    fn cover_refresh_worker_repairs_stale_user_cover() {
+        // End-to-end check that the background sweeper rewrites the
+        // movie-side rev_edge `user__cover` after the user updates. Verifies:
+        //   1. Pre-update: cover_v stamp == 0 (user never bumped).
+        //   2. Post-update + post-sweep: cover_v stamp matches the new
+        //      live generation AND the embedded cover bytes reflect the new
+        //      user.name.
+        let (db, uid, mid, _rid, _dir) = build_one_rating(covering_schema());
+
+        let stamp_before = read_movie_side_user_cover_v(&db, mid)
+            .expect("cover_v should be present pre-update");
+        assert_eq!(stamp_before, 0);
+
+        let mut upd = FieldMap::new();
+        upd.insert("name".into(), Value::String("Renamed".into()));
+        db.update("User", uid, upd).unwrap();
+        let new_v = db.object_version("User", uid);
+        assert_eq!(new_v, 1);
+
+        // Sweeper runs asynchronously; poll until repair lands or fail.
+        let repaired = poll_until(
+            || read_movie_side_user_cover_v(&db, mid) == Some(new_v),
+            200, // ≤ 2 seconds; sweeper should take micros
+        );
+        assert!(
+            repaired,
+            "cover-refresh worker did not stamp the new cover_v within 2s"
+        );
+
+        assert_eq!(
+            read_movie_side_user_name(&db, mid).as_deref(),
+            Some("Renamed"),
+            "embedded user__cover bytes must contain the post-update name"
+        );
+    }
+
+    #[test]
+    fn cover_refresh_idempotent_under_repeated_bumps() {
+        // Multiple updates in quick succession enqueue multiple sweeps.
+        // Each sweep is independently safe: the final rev_edge state still
+        // reflects the LAST update.
+        let (db, uid, mid, _rid, _dir) = build_one_rating(covering_schema());
+
+        for new_name in ["B", "C", "D", "E"] {
+            let mut upd = FieldMap::new();
+            upd.insert("name".into(), Value::String(new_name.into()));
+            db.update("User", uid, upd).unwrap();
+        }
+        let final_v = db.object_version("User", uid);
+
+        let landed = poll_until(
+            || {
+                read_movie_side_user_cover_v(&db, mid) == Some(final_v)
+                    && read_movie_side_user_name(&db, mid).as_deref() == Some("E")
+            },
+            200,
+        );
+        assert!(landed, "sweeper did not converge on the final state");
+    }
+
+    #[test]
+    fn cover_refresh_worker_disabled_leaves_cover_stale() {
+        // With the background sweeper opted out, an update never rewrites
+        // the embedded cover — the OnlyHand path is the reader's cover_v
+        // fall-through. This guards against the sweeper being silently
+        // re-enabled by future refactors.
+        let (db, uid, mid, _rid, _dir) =
+            build_one_rating_no_sweeper(covering_schema());
+
+        let mut upd = FieldMap::new();
+        upd.insert("name".into(), Value::String("Renamed".into()));
+        db.update("User", uid, upd).unwrap();
+
+        // Give a real sweeper a generous window to PROVE it isn't running.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let stamp = read_movie_side_user_cover_v(&db, mid).unwrap();
+        assert_eq!(stamp, 0, "no sweeper means cover_v stamp must stay at 0");
+        assert_eq!(
+            read_movie_side_user_name(&db, mid).as_deref(),
+            Some("Alice"),
+            "no sweeper means embedded user.name must stay at the pre-update value"
         );
     }
 
