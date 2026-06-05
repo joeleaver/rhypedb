@@ -727,13 +727,25 @@ fn try_filter_scan(
         CompareOp::Gt => StorageOp::Gt,
         CompareOp::Ge => StorageOp::Ge,
     };
-    // Only integer literals get the fast path. Strings, floats, bools, and
-    // null fall through.
-    let target = match value {
-        Literal::Int(i) => *i,
-        _ => return Ok(None),
-    };
-    Ok(Some(db.filter_scan(type_name, field_path, storage_op, target, limit)?))
+    // Every scalar-typed literal can route to a typed filter_scan; null
+    // falls through. Bytes-indexed predicates don't have a query-language
+    // form yet (no Bytes literal at the parser level) — engine API users
+    // call `Database::filter_scan_bytes` directly.
+    match value {
+        Literal::Int(i) => Ok(Some(db.filter_scan(
+            type_name, field_path, storage_op, *i, limit,
+        )?)),
+        Literal::String(s) => Ok(Some(db.filter_scan_str(
+            type_name, field_path, storage_op, s, limit,
+        )?)),
+        Literal::Bool(b) => Ok(Some(db.filter_scan_bool(
+            type_name, field_path, storage_op, *b, limit,
+        )?)),
+        Literal::Float(f) => Ok(Some(db.filter_scan_float(
+            type_name, field_path, storage_op, *f, limit,
+        )?)),
+        Literal::Null => Ok(None),
+    }
 }
 
 /// If the query's first step is a bare `.limit(N)` (no intervening filter,

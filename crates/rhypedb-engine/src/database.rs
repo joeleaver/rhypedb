@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 
 use bytes::Bytes;
 
-use rhypedb_schema::{FieldType, OnDeletePolicy, Schema};
+use rhypedb_schema::{FieldType, OnDeletePolicy, ScalarType, Schema};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::{LsmConfig, LsmTree};
 use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionHub};
@@ -88,6 +88,23 @@ impl TombstoneArena {
         object_id: u64,
     ) {
         let r = KeyBuilder::field_index_into(
+            &mut self.buf,
+            type_id,
+            field_hash,
+            encoded_value,
+            object_id,
+        );
+        self.ranges.push(r);
+    }
+
+    fn push_field_index_var(
+        &mut self,
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8],
+        object_id: u64,
+    ) {
+        let r = KeyBuilder::field_index_var_into(
             &mut self.buf,
             type_id,
             field_hash,
@@ -202,10 +219,26 @@ pub struct Database {
 /// One @indexed scalar field on a type, with everything the write path needs
 /// to emit/withdraw its `idx:` entry without re-resolving from the schema.
 /// `field_id` is the same stable per-`{Type.field}` u64 the unique index uses.
+/// `kind` decides which encoder + key layout the field uses:
+///
+///   * `Integer` / `Bool` / `Float` → fixed 8-byte sortable encoding,
+///     written into the legacy `KeyBuilder::field_index` layout.
+///   * `String` / `Bytes` → variable-length escape-encoded + NUL-NUL
+///     terminator, written into `KeyBuilder::field_index_var`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexedKind {
+    Integer,
+    Bool,
+    Float,
+    String,
+    Bytes,
+}
+
 #[derive(Debug, Clone)]
 struct IndexedField {
     name: String,
     field_id: u64,
+    kind: IndexedKind,
 }
 
 /// Operator-tunable knobs that don't depend on schema. Pass to
@@ -400,9 +433,19 @@ impl Database {
                 if field.is_indexed() {
                     let key = format!("{type_name}.{}", field.name);
                     let field_id = field_ids[&key];
+                    let kind = match &field.field_type {
+                        FieldType::Scalar(ScalarType::String) => IndexedKind::String,
+                        FieldType::Scalar(ScalarType::Bytes) => IndexedKind::Bytes,
+                        FieldType::Scalar(ScalarType::Bool) => IndexedKind::Bool,
+                        FieldType::Scalar(ScalarType::F32 | ScalarType::F64) => {
+                            IndexedKind::Float
+                        }
+                        _ => IndexedKind::Integer,
+                    };
                     list.push(IndexedField {
                         name: field.name.clone(),
                         field_id,
+                        kind,
                     });
                 }
             }
@@ -689,17 +732,10 @@ impl Database {
             for ifd in idx_fields {
                 if let Some(value) = scalar_fields.get(&ifd.name)
                     && !matches!(value, Value::Null)
-                    && let Some(encoded) = encode_int_for_zone(value)
+                    && let Some(key) =
+                        build_field_index_key(type_id, ifd.field_id, ifd.kind, value, object_id)
                 {
-                    puts.push((
-                        KeyBuilder::field_index(
-                            type_id,
-                            ifd.field_id,
-                            &encoded,
-                            object_id,
-                        ),
-                        serialized.clone(),
-                    ));
+                    puts.push((key, serialized.clone()));
                 }
             }
         }
@@ -988,7 +1024,6 @@ impl Database {
         target: i64,
         limit: Option<usize>,
     ) -> EngineResult<Vec<Object>> {
-        use rhypedb_schema::ScalarType;
         use rhypedb_storage::zone::{hash_field_name, FieldPredicate};
 
         let type_def = self
@@ -1235,6 +1270,353 @@ impl Database {
         Ok(out)
     }
 
+    /// Bool-valued filtered scan. Routes to the secondary index when the
+    /// field is `@indexed`; otherwise falls back to a typed scan + per-row
+    /// comparison.
+    pub fn filter_scan_bool(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: bool,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.type_ids[type_name];
+        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+            EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: field_name.into(),
+            }
+        })?;
+        if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bool)) {
+            return self.scan_type(type_name);
+        }
+
+        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+            && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
+            && ifd.kind == IndexedKind::Bool
+        {
+            let encoded = encode_bool_for_index(&Value::Bool(target)).unwrap();
+            return self.filter_scan_via_index(
+                type_name, type_id, ifd.field_id, op, &encoded, limit,
+            );
+        }
+        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+            Value::Bool(b) => Some(compare_bool(*b, op, target)),
+            _ => Some(false),
+        })
+    }
+
+    /// Float-valued filtered scan. `target` is interpreted as `f64`; both
+    /// `f32` and `f64` index entries share the same 8-byte sortable layout
+    /// (`f32` values widen on write).
+    pub fn filter_scan_float(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: f64,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.type_ids[type_name];
+        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+            EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: field_name.into(),
+            }
+        })?;
+        let is_float = matches!(
+            field_def.field_type,
+            FieldType::Scalar(ScalarType::F32 | ScalarType::F64)
+        );
+        if !is_float {
+            return self.scan_type(type_name);
+        }
+
+        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+            && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
+            && ifd.kind == IndexedKind::Float
+        {
+            let encoded = encode_f64_for_index(target);
+            return self.filter_scan_via_index(
+                type_name, type_id, ifd.field_id, op, &encoded, limit,
+            );
+        }
+        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+            Value::F64(f) => Some(compare_partial(*f, op, target)),
+            Value::F32(f) => Some(compare_partial(*f as f64, op, target)),
+            _ => Some(false),
+        })
+    }
+
+    /// Bytes-valued filtered scan. Mirrors `filter_scan_str` but for the
+    /// `Bytes` scalar — the encoder, key layout, and parsing are identical
+    /// (variable-length escape + `\x00\x00` terminator).
+    pub fn filter_scan_bytes(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: &[u8],
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.type_ids[type_name];
+        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+            EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: field_name.into(),
+            }
+        })?;
+        if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bytes)) {
+            return self.scan_type(type_name);
+        }
+
+        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+            && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
+            && ifd.kind == IndexedKind::Bytes
+        {
+            return self.filter_scan_via_index_var(
+                type_name,
+                type_id,
+                ifd.field_id,
+                op,
+                &encode_bytes_for_index(target),
+                limit,
+            );
+        }
+        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+            Value::Bytes(b) => Some(compare_ord(b.as_ref(), op, target)),
+            _ => Some(false),
+        })
+    }
+
+    /// String-valued filtered scan. Mirrors `filter_scan` but for `String`
+    /// scalars: pushes a single-field comparison against a string literal
+    /// down to the secondary index when one is declared on the field. The
+    /// fast path uses the variable-length encoded value layout
+    /// (`KeyBuilder::field_index_var`).
+    ///
+    /// Falls back to `scan_type` + per-row comparison when the field isn't
+    /// indexed or isn't a `String` scalar — strings have no zone-map
+    /// acceleration today, so the non-indexed path is a full scan.
+    pub fn filter_scan_str(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: &str,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.type_ids[type_name];
+        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+            EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: field_name.into(),
+            }
+        })?;
+
+        // Non-string scalar field — no point pretending the literal applies.
+        if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::String)) {
+            return self.scan_type(type_name);
+        }
+
+        // === Indexed fast path ===
+        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+            && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
+            && ifd.kind == IndexedKind::String
+        {
+            return self.filter_scan_via_index_var(
+                type_name,
+                type_id,
+                ifd.field_id,
+                op,
+                &encode_str_for_index(target),
+                limit,
+            );
+        }
+
+        // === Non-indexed fallback: full type scan, post-filter ===
+        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+            Value::String(s) => Some(compare_ord(s.as_str(), op, target)),
+            _ => Some(false),
+        })
+    }
+
+    /// Per-row fallback when no index serves the predicate. Walks every
+    /// object of the type via `scan_type` and applies `predicate` to the
+    /// field's value, capping at `limit` matches. `predicate` returns
+    /// `Some(bool)` (pass / fail) per value; `None` is treated as fail.
+    fn filter_scan_fallback<F>(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        limit: Option<usize>,
+        mut predicate: F,
+    ) -> EngineResult<Vec<Object>>
+    where
+        F: FnMut(&Value) -> Option<bool>,
+    {
+        let cap = limit.unwrap_or(usize::MAX);
+        let mut out = Vec::new();
+        for obj in self.scan_type(type_name)? {
+            if out.len() >= cap {
+                break;
+            }
+            let pass = obj.fields.get(field_name).and_then(&mut predicate).unwrap_or(false);
+            if pass {
+                out.push(obj);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Index-backed fast path for variable-length encoded values (String,
+    /// Bytes). The on-disk key layout is
+    /// `i:<type>:<field>:<escaped_value>\x00\x00<object_id>`. `target_encoded`
+    /// is the caller's value run through the same encoder used at write
+    /// time (`encode_bytes_for_index` / `encode_str_for_index`).
+    ///
+    /// Eq narrows to the value-prefix scan; range/Ne walk the field's full
+    /// prefix and compare encoded value bytes (which preserve sort order).
+    /// Covering payload semantics match the fixed-width variant — empty
+    /// value falls back to per-id `get_many` for legacy entries.
+    fn filter_scan_via_index_var(
+        &self,
+        type_name: &str,
+        type_id: u64,
+        field_id: u64,
+        op: rhypedb_storage::zone::CompareOp,
+        target_encoded: &[u8],
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        use rhypedb_storage::zone::CompareOp;
+
+        let snapshot = self.storage.read_snapshot();
+        let cap = limit.unwrap_or(usize::MAX);
+
+        // === Eq fast path — narrow value-prefix scan ===
+        if matches!(op, CompareOp::Eq) {
+            let prefix =
+                KeyBuilder::field_index_var_value_prefix(type_id, field_id, target_encoded);
+            let entries = if let Some(n) = limit {
+                self.storage.scan_prefix_at_limited(snapshot, &prefix, n)?
+            } else {
+                self.storage.scan_prefix_at(snapshot, &prefix)?
+            };
+            let mut out = Vec::with_capacity(entries.len().min(cap));
+            let mut fallback_ids: Vec<u64> = Vec::new();
+            for (key, value) in entries {
+                if out.len() + fallback_ids.len() >= cap {
+                    break;
+                }
+                if key.len() < 8 {
+                    continue;
+                }
+                let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+                let object_id = u64::from_be_bytes(id_bytes);
+                if value.is_empty() {
+                    fallback_ids.push(object_id);
+                } else {
+                    out.push(Object {
+                        type_name: type_name.into(),
+                        id: object_id,
+                        fields: deserialize_fields(&value),
+                        raw_fields: None,
+                    });
+                }
+            }
+            if !fallback_ids.is_empty() {
+                out.extend(self.get_many(type_name, &fallback_ids)?);
+            }
+            return Ok(out);
+        }
+
+        // === Range/Ne path — scan the whole field prefix ===
+        let prefix = KeyBuilder::field_index_prefix(type_id, field_id);
+        let plen = prefix.len();
+        let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
+
+        let mut out = Vec::with_capacity(entries.len().min(cap));
+        let mut fallback_ids: Vec<u64> = Vec::new();
+        for (key, value) in entries {
+            if out.len() + fallback_ids.len() >= cap {
+                break;
+            }
+            // Need plen + at least one 0x00 0x00 terminator + 8 byte id.
+            if key.len() < plen + 2 + 8 {
+                continue;
+            }
+            // Find the embedded `\x00\x00` terminator. Encoded values cannot
+            // contain it (every embedded NUL is followed by 0x01), so the
+            // first occurrence at or after `plen` is the boundary.
+            let mut term_at: Option<usize> = None;
+            let mut i = plen;
+            while i + 1 < key.len() - 8 {
+                if key[i] == 0 && key[i + 1] == 0 {
+                    term_at = Some(i);
+                    break;
+                }
+                i += 1;
+            }
+            let Some(term) = term_at else { continue };
+            // Encoded value (with terminator) for byte-wise compare; range
+            // checks compare against target_encoded which carries the same
+            // shape, so sort order is preserved.
+            let value_with_term = &key[plen..term + 2];
+            let cmp = value_with_term.cmp(target_encoded);
+            let pass = match op {
+                CompareOp::Lt => cmp.is_lt(),
+                CompareOp::Le => cmp.is_le(),
+                CompareOp::Gt => cmp.is_gt(),
+                CompareOp::Ge => cmp.is_ge(),
+                CompareOp::Ne => cmp.is_ne(),
+                CompareOp::Eq => unreachable!("Eq handled above"),
+            };
+            if !pass {
+                // The scan is sorted ascending by encoded value, so once
+                // Lt/Le starts failing we can stop. Gt/Ge fail at the
+                // start until they begin passing — can't short-circuit.
+                if matches!(op, CompareOp::Lt | CompareOp::Le) {
+                    break;
+                }
+                continue;
+            }
+            let id_bytes: [u8; 8] = key[term + 2..term + 10].try_into().unwrap();
+            let object_id = u64::from_be_bytes(id_bytes);
+            if value.is_empty() {
+                fallback_ids.push(object_id);
+            } else {
+                out.push(Object {
+                    type_name: type_name.into(),
+                    id: object_id,
+                    fields: deserialize_fields(&value),
+                    raw_fields: None,
+                });
+            }
+        }
+
+        if !fallback_ids.is_empty() {
+            out.extend(self.get_many(type_name, &fallback_ids)?);
+        }
+        Ok(out)
+    }
+
     /// Update an object's fields. Only the provided fields are updated;
     /// unmentioned fields are preserved.
     pub fn update(
@@ -1326,7 +1708,7 @@ impl Database {
                         && !matches!(old_v, Value::Null)
                     {
                         self.remove_field_index(
-                            &mut txn, type_id, ifd.field_id, old_v, object_id,
+                            &mut txn, type_id, ifd.field_id, ifd.kind, old_v, object_id,
                         )?;
                     }
                     if let Some(new_v) = &new_value_opt
@@ -1336,6 +1718,7 @@ impl Database {
                             &mut txn,
                             type_id,
                             ifd.field_id,
+                            ifd.kind,
                             new_v,
                             object_id,
                             serialized.clone(),
@@ -1351,6 +1734,7 @@ impl Database {
                             &mut txn,
                             type_id,
                             ifd.field_id,
+                            ifd.kind,
                             new_v,
                             object_id,
                             serialized.clone(),
@@ -1609,16 +1993,63 @@ impl Database {
                 }
                 if let Some(idx_fields) = type_idx_fields {
                     for ifd in idx_fields {
-                        if let Some(value) = fields.get(&ifd.name)
-                            && !matches!(value, Value::Null)
-                            && let Some(encoded) = encode_int_for_zone(value)
-                        {
-                            arena.push_field_index(
-                                type_id,
-                                ifd.field_id,
-                                &encoded,
-                                object_id,
-                            );
+                        let Some(value) = fields.get(&ifd.name) else { continue };
+                        if matches!(value, Value::Null) {
+                            continue;
+                        }
+                        match ifd.kind {
+                            IndexedKind::Integer => {
+                                if let Some(encoded) = encode_int_for_zone(value) {
+                                    arena.push_field_index(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
+                            IndexedKind::Bool => {
+                                if let Some(encoded) = encode_bool_for_index(value) {
+                                    arena.push_field_index(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
+                            IndexedKind::Float => {
+                                if let Some(encoded) = encode_float_for_index(value) {
+                                    arena.push_field_index(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
+                            IndexedKind::String => {
+                                if let Value::String(s) = value {
+                                    let encoded = encode_str_for_index(s);
+                                    arena.push_field_index_var(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
+                            IndexedKind::Bytes => {
+                                if let Value::Bytes(b) = value {
+                                    let encoded = encode_bytes_for_index(b);
+                                    arena.push_field_index_var(
+                                        type_id,
+                                        ifd.field_id,
+                                        &encoded,
+                                        object_id,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -2168,42 +2599,46 @@ impl Database {
         Ok(())
     }
 
-    /// Insert a non-unique secondary index entry: `i:<type>:<field>:<value>:<id>`.
+    /// Insert a non-unique secondary index entry. The on-disk shape depends
+    /// on `kind`:
+    ///
+    ///   * `Integer` → fixed-width `i:<type>:<field>:<8-byte encoded>:<id>`.
+    ///   * `String`  → variable-length `i:<type>:<field>:<escaped>\x00\x00<id>`.
+    ///
     /// The `covering` bytes get stored as the entry value — when non-empty,
     /// this is the source object's serialized FieldMap, which lets
     /// `filter_scan_via_index` reconstruct Objects without an extra `get_many`
     /// probe per match. Pass `Bytes::new()` for legacy / non-covering mode.
     ///
-    /// Caller must hold a write txn. Silently no-ops on non-integer or null
-    /// values — `encode_int_for_zone` returns `None` and there's nothing to
-    /// index.
+    /// Caller must hold a write txn. Silently no-ops on value-kind mismatches
+    /// (e.g. null, or wrong scalar type) — there's nothing to index.
     fn insert_field_index(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
         type_id: u64,
         field_id: u64,
+        kind: IndexedKind,
         value: &Value,
         object_id: u64,
         covering: Bytes,
     ) -> EngineResult<()> {
-        if let Some(encoded) = encode_int_for_zone(value) {
-            let key = KeyBuilder::field_index(type_id, field_id, &encoded, object_id);
+        if let Some(key) = build_field_index_key(type_id, field_id, kind, value, object_id) {
             self.storage.put(txn, &key, covering)?;
         }
         Ok(())
     }
 
-    /// Remove a secondary index entry. No-op on non-integer or null values.
+    /// Remove a secondary index entry. Same dispatch as `insert_field_index`.
     fn remove_field_index(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
         type_id: u64,
         field_id: u64,
+        kind: IndexedKind,
         value: &Value,
         object_id: u64,
     ) -> EngineResult<()> {
-        if let Some(encoded) = encode_int_for_zone(value) {
-            let key = KeyBuilder::field_index(type_id, field_id, &encoded, object_id);
+        if let Some(key) = build_field_index_key(type_id, field_id, kind, value, object_id) {
             self.storage.delete(txn, &key)?;
         }
         Ok(())
@@ -2427,8 +2862,6 @@ fn validate_value(
     field_def: &rhypedb_schema::FieldDef,
     value: &Value,
 ) -> EngineResult<()> {
-    use rhypedb_schema::ScalarType;
-
     if matches!(value, Value::Null) {
         return Ok(());
     }
@@ -2538,6 +2971,167 @@ pub(crate) fn entry_passes_int_predicate(
 /// positives; narrow types widen to 64 bits first. Returns `None` for non-
 /// integer values (strings, floats, bools, nulls, bytes) — those aren't
 /// zone-mapped.
+/// Sort-preserving variable-length encoding for `String` and `Bytes`
+/// secondary index entries.
+///
+/// Every byte is copied through with one escape rule — `0x00` becomes
+/// `0x00 0x01` — and a terminator `0x00 0x00` is appended. Properties:
+///
+///   * Byte-wise lexicographic order on the encoded form matches byte-wise
+///     order on the original. For UTF-8 strings this means code-point order
+///     for ASCII and raw byte order otherwise, matching PG's default `text`
+///     collation = `C`.
+///   * The terminator `0x00 0x00` can never appear inside a valid encoded
+///     value, because every embedded `0x00` is followed by `0x01`. So a
+///     prefix scan keyed by `encoded || 0x00 0x00` matches exactly the keys
+///     whose encoded value equals `encoded` — no false positives from
+///     longer values that share the prefix.
+///   * Empty values still produce two bytes (the terminator), so empties
+///     sort before any non-empty value starting with `0x00 0x01` and after
+///     every other value.
+pub(crate) fn encode_bytes_for_index(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len() + 2);
+    for &x in b {
+        if x == 0 {
+            out.push(0);
+            out.push(1);
+        } else {
+            out.push(x);
+        }
+    }
+    out.push(0);
+    out.push(0);
+    out
+}
+
+pub(crate) fn encode_str_for_index(s: &str) -> Vec<u8> {
+    encode_bytes_for_index(s.as_bytes())
+}
+
+/// Sort-preserving fixed-width encoding for IEEE-754 floats.
+///
+/// Both `f32` and `f64` widen to `f64` so they share one 8-byte slot in
+/// `KeyBuilder::field_index`. The bit transformation is the standard
+/// sortable-float trick:
+///
+///   * Positive (or +0): flip the sign bit. Positives now have a leading
+///     `1`, so they sort above negatives.
+///   * Negative (or -0): flip all bits. Negatives reverse their magnitude
+///     ordering so larger-magnitude negatives sort first.
+///
+/// After the transformation, byte-wise lexicographic order matches numeric
+/// order for every non-NaN value. NaN values map deterministically based on
+/// their bit pattern and sort at one end — fine for our index (we don't
+/// distinguish NaN from itself for Eq), but the exact NaN position isn't a
+/// stable API guarantee.
+pub(crate) fn encode_f64_for_index(v: f64) -> [u8; 8] {
+    let bits = v.to_bits();
+    let xform = if bits & 0x8000_0000_0000_0000 != 0 {
+        !bits
+    } else {
+        bits ^ 0x8000_0000_0000_0000
+    };
+    xform.to_be_bytes()
+}
+
+fn encode_float_for_index(value: &Value) -> Option<[u8; 8]> {
+    let v = match value {
+        Value::F32(v) => *v as f64,
+        Value::F64(v) => *v,
+        _ => return None,
+    };
+    Some(encode_f64_for_index(v))
+}
+
+fn encode_bool_for_index(value: &Value) -> Option<[u8; 8]> {
+    let Value::Bool(b) = value else { return None };
+    let mut out = [0u8; 8];
+    out[7] = u8::from(*b);
+    Some(out)
+}
+
+/// Apply a `CompareOp` to any pair of `Ord` values. Used by the
+/// non-indexed fallback for strings and bytes.
+fn compare_ord<T: Ord + ?Sized>(a: &T, op: rhypedb_storage::zone::CompareOp, b: &T) -> bool {
+    use rhypedb_storage::zone::CompareOp;
+    match op {
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
+        CompareOp::Lt => a < b,
+        CompareOp::Le => a <= b,
+        CompareOp::Gt => a > b,
+        CompareOp::Ge => a >= b,
+    }
+}
+
+/// Apply a `CompareOp` to `PartialOrd` values (i.e. floats). NaN
+/// comparisons return `false` for every op except `Ne`, matching IEEE 754
+/// and SQL semantics.
+fn compare_partial<T: PartialOrd>(a: T, op: rhypedb_storage::zone::CompareOp, b: T) -> bool {
+    use rhypedb_storage::zone::CompareOp;
+    match op {
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
+        CompareOp::Lt => a < b,
+        CompareOp::Le => a <= b,
+        CompareOp::Gt => a > b,
+        CompareOp::Ge => a >= b,
+    }
+}
+
+fn compare_bool(a: bool, op: rhypedb_storage::zone::CompareOp, b: bool) -> bool {
+    // false < true; defer to `compare_ord` via u8.
+    compare_ord(&u8::from(a), op, &u8::from(b))
+}
+
+/// Build the secondary-index key for one `(type_id, field_id, value, object_id)`
+/// tuple, picking the encoder + key layout that matches the indexed field's
+/// `kind`. Returns `None` when the value isn't representable in the chosen
+/// encoder (null, mismatched scalar type) — caller treats that as "nothing
+/// to index" and skips the write/delete.
+fn build_field_index_key(
+    type_id: u64,
+    field_id: u64,
+    kind: IndexedKind,
+    value: &Value,
+    object_id: u64,
+) -> Option<Bytes> {
+    match kind {
+        IndexedKind::Integer => {
+            let encoded = encode_int_for_zone(value)?;
+            Some(KeyBuilder::field_index(type_id, field_id, &encoded, object_id))
+        }
+        IndexedKind::Bool => {
+            let encoded = encode_bool_for_index(value)?;
+            Some(KeyBuilder::field_index(type_id, field_id, &encoded, object_id))
+        }
+        IndexedKind::Float => {
+            let encoded = encode_float_for_index(value)?;
+            Some(KeyBuilder::field_index(type_id, field_id, &encoded, object_id))
+        }
+        IndexedKind::String => {
+            let Value::String(s) = value else { return None };
+            let encoded = encode_str_for_index(s);
+            Some(KeyBuilder::field_index_var(
+                type_id,
+                field_id,
+                &encoded,
+                object_id,
+            ))
+        }
+        IndexedKind::Bytes => {
+            let Value::Bytes(b) = value else { return None };
+            let encoded = encode_bytes_for_index(b);
+            Some(KeyBuilder::field_index_var(
+                type_id,
+                field_id,
+                &encoded,
+                object_id,
+            ))
+        }
+    }
+}
+
 pub(crate) fn encode_int_for_zone(value: &Value) -> Option<[u8; 8]> {
     let bits: u64 = match value {
         Value::U32(v) => *v as u64,
@@ -3628,6 +4222,362 @@ mod tests {
             15,
             "should include 1955..=1969 across both flushed SST and active memtable"
         );
+    }
+
+    fn string_indexed_schema() -> Schema {
+        parse_schema(
+            r#"
+            type User {
+                name: String @indexed
+                bio: String
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn string_indexed_create_writes_index_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        assert_eq!(count_index_entries(&db), 0);
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        f.insert("bio".into(), Value::String("hi".into()));
+        db.create("User", f).unwrap();
+
+        assert_eq!(count_index_entries(&db), 1);
+    }
+
+    #[test]
+    fn string_indexed_filter_scan_eq_uses_index() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        for n in &["Alice", "Bob", "Carol", "Alice", "Dave"] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String((*n).into()));
+            db.create("User", f).unwrap();
+        }
+
+        let hits = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Alice", None)
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            assert_eq!(h.fields.get("name"), Some(&Value::String("Alice".into())));
+        }
+    }
+
+    #[test]
+    fn string_indexed_terminator_disambiguates_prefix() {
+        // "ab"'s value-prefix must NOT match keys for "abc" — the embedded
+        // \x00\x00 terminator is what makes the prefix unambiguous.
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        for n in &["ab", "abc", "abcd", "b"] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String((*n).into()));
+            db.create("User", f).unwrap();
+        }
+
+        let ab = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "ab", None)
+            .unwrap();
+        assert_eq!(ab.len(), 1);
+        assert_eq!(ab[0].fields.get("name"), Some(&Value::String("ab".into())));
+    }
+
+    #[test]
+    fn string_indexed_values_with_embedded_nul_roundtrip() {
+        // The escape rule (0x00 -> 0x00 0x01) is what keeps embedded NUL
+        // values distinct from the terminator. Verify both Eq lookup and
+        // sort order with embedded NULs.
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        let with_nul: String = "ab\0c".into();
+        let without_nul: String = "ab".into();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("name".into(), Value::String(with_nul.clone()));
+        db.create("User", f1).unwrap();
+
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String(without_nul.clone()));
+        db.create("User", f2).unwrap();
+
+        let hit = db
+            .filter_scan_str("User", "name", CompareOp::Eq, &with_nul, None)
+            .unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(
+            hit[0].fields.get("name"),
+            Some(&Value::String(with_nul.clone()))
+        );
+
+        // "ab" alone must NOT match the "ab\0c" entry.
+        let hit_short = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "ab", None)
+            .unwrap();
+        assert_eq!(hit_short.len(), 1);
+        assert_eq!(
+            hit_short[0].fields.get("name"),
+            Some(&Value::String(without_nul))
+        );
+    }
+
+    #[test]
+    fn string_indexed_filter_scan_range() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        for n in &["alice", "bob", "carol", "dave", "eve"] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String((*n).into()));
+            db.create("User", f).unwrap();
+        }
+
+        let lt = db
+            .filter_scan_str("User", "name", CompareOp::Lt, "carol", None)
+            .unwrap();
+        let mut lt_names: Vec<_> = lt
+            .iter()
+            .filter_map(|o| match o.fields.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        lt_names.sort();
+        assert_eq!(lt_names, vec!["alice".to_string(), "bob".into()]);
+
+        let ge = db
+            .filter_scan_str("User", "name", CompareOp::Ge, "carol", None)
+            .unwrap();
+        assert_eq!(ge.len(), 3);
+
+        let ne = db
+            .filter_scan_str("User", "name", CompareOp::Ne, "carol", None)
+            .unwrap();
+        assert_eq!(ne.len(), 4);
+
+        let lt_limited = db
+            .filter_scan_str("User", "name", CompareOp::Lt, "carol", Some(1))
+            .unwrap();
+        assert_eq!(lt_limited.len(), 1);
+    }
+
+    #[test]
+    fn string_indexed_update_updates_index_entry() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", f).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        let mut upd = FieldMap::new();
+        upd.insert("name".into(), Value::String("Bob".into()));
+        db.update("User", user.id, upd).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        let old = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Alice", None)
+            .unwrap();
+        assert_eq!(old.len(), 0);
+
+        let new = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Bob", None)
+            .unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].id, user.id);
+    }
+
+    #[test]
+    fn string_indexed_delete_removes_index_entry() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("name".into(), Value::String("Alice".into()));
+        let a = db.create("User", f1).unwrap();
+
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String("Alice".into()));
+        db.create("User", f2).unwrap();
+        assert_eq!(count_index_entries(&db), 2);
+
+        db.delete("User", a.id).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        let hits = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Alice", None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn string_indexed_covering_returns_full_fieldmap() {
+        // Covering: the filter_scan result must include all the source
+        // object's scalar fields, not just the indexed column.
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(string_indexed_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        f.insert("bio".into(), Value::String("hello world".into()));
+        db.create("User", f).unwrap();
+
+        let hits = db
+            .filter_scan_str("User", "name", CompareOp::Eq, "Alice", None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].fields.get("bio"),
+            Some(&Value::String("hello world".into())),
+            "covering payload must include non-indexed scalars"
+        );
+    }
+
+    fn multi_indexed_schema() -> Schema {
+        // One type with every indexable scalar type so the dispatch code
+        // gets exercised across all encoders in one place.
+        parse_schema(
+            r#"
+            type Item {
+                name: String @indexed
+                active: Bool @indexed
+                rating: f32 @indexed
+                weight: f64 @indexed
+                hash: Bytes @indexed
+                age: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bool_indexed_eq_uses_index() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(multi_indexed_schema(), dir.path()).unwrap();
+
+        for active in [true, true, false, true, false] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("x".into()));
+            f.insert("active".into(), Value::Bool(active));
+            f.insert("rating".into(), Value::F32(0.0));
+            f.insert("weight".into(), Value::F64(0.0));
+            f.insert("hash".into(), Value::Bytes(bytes::Bytes::from_static(b"")));
+            f.insert("age".into(), Value::U32(0));
+            db.create("Item", f).unwrap();
+        }
+
+        let actives = db
+            .filter_scan_bool("Item", "active", CompareOp::Eq, true, None)
+            .unwrap();
+        assert_eq!(actives.len(), 3);
+        for h in &actives {
+            assert_eq!(h.fields.get("active"), Some(&Value::Bool(true)));
+        }
+
+        let inactives = db
+            .filter_scan_bool("Item", "active", CompareOp::Eq, false, None)
+            .unwrap();
+        assert_eq!(inactives.len(), 2);
+    }
+
+    #[test]
+    fn float_indexed_range_preserves_order() {
+        // The sortable-float encoding must keep numeric order across the
+        // sign boundary (negatives sort below positives) AND within each
+        // sign (smaller magnitudes closer to zero).
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(multi_indexed_schema(), dir.path()).unwrap();
+
+        for r in [-3.5f32, -0.5, 0.0, 0.25, 1.5, 4.0] {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("x".into()));
+            f.insert("active".into(), Value::Bool(false));
+            f.insert("rating".into(), Value::F32(r));
+            f.insert("weight".into(), Value::F64(0.0));
+            f.insert("hash".into(), Value::Bytes(bytes::Bytes::from_static(b"")));
+            f.insert("age".into(), Value::U32(0));
+            db.create("Item", f).unwrap();
+        }
+
+        let lt0 = db
+            .filter_scan_float("Item", "rating", CompareOp::Lt, 0.0, None)
+            .unwrap();
+        assert_eq!(lt0.len(), 2, "values < 0.0 should match -3.5 and -0.5");
+
+        let ge_half = db
+            .filter_scan_float("Item", "rating", CompareOp::Ge, 0.5, None)
+            .unwrap();
+        assert_eq!(ge_half.len(), 2, "values >= 0.5 should match 1.5 and 4.0");
+
+        let eq_zero = db
+            .filter_scan_float("Item", "rating", CompareOp::Eq, 0.0, None)
+            .unwrap();
+        assert_eq!(eq_zero.len(), 1);
+    }
+
+    #[test]
+    fn bytes_indexed_eq_and_range() {
+        // Bytes uses the same variable-length escape encoding as String,
+        // including round-trip through 0x00 bytes.
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(multi_indexed_schema(), dir.path()).unwrap();
+
+        let payloads: &[&[u8]] =
+            &[b"\x00ab", b"abc", b"abcd", b"abc\x00xyz", b"zzz"];
+        for &p in payloads {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("x".into()));
+            f.insert("active".into(), Value::Bool(false));
+            f.insert("rating".into(), Value::F32(0.0));
+            f.insert("weight".into(), Value::F64(0.0));
+            f.insert("hash".into(), Value::Bytes(bytes::Bytes::copy_from_slice(p)));
+            f.insert("age".into(), Value::U32(0));
+            db.create("Item", f).unwrap();
+        }
+
+        // "abc" Eq should match only the exact "abc" payload — not "abcd"
+        // and not "abc\x00xyz".
+        let hits = db
+            .filter_scan_bytes("Item", "hash", CompareOp::Eq, b"abc", None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].fields.get("hash"),
+            Some(&Value::Bytes(bytes::Bytes::from_static(b"abc")))
+        );
+
+        // "abc" with embedded NUL should round-trip via Eq.
+        let with_nul = db
+            .filter_scan_bytes("Item", "hash", CompareOp::Eq, b"abc\x00xyz", None)
+            .unwrap();
+        assert_eq!(with_nul.len(), 1);
+
+        // Range: < "abc" should hit only "\x00ab".
+        let lt = db
+            .filter_scan_bytes("Item", "hash", CompareOp::Lt, b"abc", None)
+            .unwrap();
+        assert_eq!(lt.len(), 1);
     }
 
     fn covering_schema() -> Schema {

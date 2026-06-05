@@ -247,6 +247,57 @@ impl KeyBuilder {
         buf.freeze()
     }
 
+    /// Secondary field index key for variable-length encoded values:
+    /// `i:<type_id>:<field_hash>:<encoded_value><object_id>`.
+    ///
+    /// `encoded_value` is the caller-supplied sort-preserving encoding which
+    /// MUST embed its own end-of-value marker (e.g. the engine's string
+    /// encoder appends `\x00\x00`). No `:` separator sits between the
+    /// encoded value and the object_id — the embedded terminator already
+    /// disambiguates the value's end. Empty value payload, same as the
+    /// fixed-width variant; sorts ascending by encoded value then object_id.
+    pub fn field_index_var(
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8],
+        object_id: u64,
+    ) -> Bytes {
+        let mut buf =
+            BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + encoded_value.len() + 8);
+        buf.put_u8(KeyPrefix::FieldIndex as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_hash);
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(encoded_value);
+        buf.put_u64(object_id);
+        buf.freeze()
+    }
+
+    /// Equality-prefix for the variable-length secondary index:
+    /// `i:<type_id>:<field_hash>:<encoded_value>`. Used for `Eq` lookups —
+    /// matches every key whose encoded value equals the supplied bytes,
+    /// regardless of object_id. Because `encoded_value` carries its own
+    /// terminator, this prefix can't be confused with a longer value that
+    /// shares the same starting bytes.
+    pub fn field_index_var_value_prefix(
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8],
+    ) -> Bytes {
+        let mut buf =
+            BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + encoded_value.len());
+        buf.put_u8(KeyPrefix::FieldIndex as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_hash);
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(encoded_value);
+        buf.freeze()
+    }
+
     /// Vectorization queue entry: `q:<job_id>`
     /// Value contains the serialized job (type, object_id, source field, vector field, model).
     pub fn queue_entry(job_id: u64) -> Bytes {
@@ -397,6 +448,29 @@ impl KeyBuilder {
         (start, buf.len() as u32)
     }
 
+    /// Arena-style variant of `field_index_var`. Layout matches the owned
+    /// constructor exactly: `i:<type>:<field>:<encoded_value><object_id>` —
+    /// no separator between the value and id (the caller-supplied terminator
+    /// inside `encoded_value` already disambiguates the boundary).
+    pub fn field_index_var_into(
+        buf: &mut Vec<u8>,
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8],
+        object_id: u64,
+    ) -> (u32, u32) {
+        let start = buf.len() as u32;
+        buf.push(KeyPrefix::FieldIndex as u8);
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&type_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&field_hash.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(encoded_value);
+        buf.extend_from_slice(&object_id.to_be_bytes());
+        (start, buf.len() as u32)
+    }
+
     /// Prefix for scanning every per-object generation counter: `g:`.
     /// Used at `Database::open` to repopulate the in-memory counter map.
     pub fn object_version_prefix() -> Bytes {
@@ -469,6 +543,35 @@ mod tests {
         let prefix = KeyBuilder::field_index_value_prefix(7, 0xbeef, &value);
         let full = KeyBuilder::field_index(7, 0xbeef, &value, 1234);
         assert!(full.starts_with(&prefix));
+    }
+
+    #[test]
+    fn field_index_var_prefix_is_prefix_of_full_key() {
+        let value = b"hello\x00\x00";
+        let prefix = KeyBuilder::field_index_var_value_prefix(1, 0xdead, value);
+        let full = KeyBuilder::field_index_var(1, 0xdead, value, 99);
+        assert!(full.starts_with(&prefix));
+        // Object id occupies the last 8 bytes — no separator before it.
+        let id_bytes: [u8; 8] = full[full.len() - 8..].try_into().unwrap();
+        assert_eq!(u64::from_be_bytes(id_bytes), 99);
+    }
+
+    #[test]
+    fn field_index_var_keys_sort_by_value() {
+        // Encoded "abc" < encoded "abd" by byte-wise comparison.
+        let lo = KeyBuilder::field_index_var(1, 0xfeed, b"abc\x00\x00", 100);
+        let hi = KeyBuilder::field_index_var(1, 0xfeed, b"abd\x00\x00", 5);
+        assert!(lo < hi);
+    }
+
+    #[test]
+    fn field_index_var_value_prefix_disambiguates_via_terminator() {
+        // "abc\x00\x00" prefix must NOT match "abcd\x00\x00" — the embedded
+        // terminator is the disambiguator (without it, "abc" would prefix
+        // every value beginning with "abc").
+        let prefix = KeyBuilder::field_index_var_value_prefix(1, 0xfeed, b"abc\x00\x00");
+        let other = KeyBuilder::field_index_var(1, 0xfeed, b"abcd\x00\x00", 99);
+        assert!(!other.starts_with(&prefix));
     }
 
     #[test]
