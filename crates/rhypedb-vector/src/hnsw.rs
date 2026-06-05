@@ -1,10 +1,19 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Reverse;
+use std::io;
 
 use parking_lot::RwLock;
 use rand::Rng;
 
 use crate::distance::{compute_distance, Metric};
+
+const HNSW_MAGIC: &[u8; 4] = b"RHNS";
+const HNSW_VERSION: u32 = 1;
+
+use crate::serial::{
+    read_f32_vec, read_i64, read_u32, read_u64, read_u8, write_f32_slice, write_i64, write_u32,
+    write_u64, write_u8,
+};
 
 /// Configuration for HNSW index construction.
 #[derive(Debug, Clone)]
@@ -40,6 +49,12 @@ pub trait DistanceProvider: Send + Sync {
 
     /// Convert a full-precision vector into the stored representation.
     fn store(&self, vector: &[f32]) -> Self::Stored;
+
+    /// Serialize a stored vector to a writer.
+    fn write_stored(&self, stored: &Self::Stored, w: &mut dyn io::Write) -> io::Result<()>;
+
+    /// Deserialize a stored vector from a reader.
+    fn read_stored(&self, r: &mut dyn io::Read) -> io::Result<Self::Stored>;
 }
 
 /// Default distance provider using full-precision f32 vectors.
@@ -60,6 +75,16 @@ impl DistanceProvider for ExactDistance {
 
     fn store(&self, vector: &[f32]) -> Vec<f32> {
         vector.to_vec()
+    }
+
+    fn write_stored(&self, stored: &Vec<f32>, w: &mut dyn io::Write) -> io::Result<()> {
+        write_u32(w, stored.len() as u32)?;
+        write_f32_slice(w, stored)
+    }
+
+    fn read_stored(&self, r: &mut dyn io::Read) -> io::Result<Vec<f32>> {
+        let len = read_u32(r)? as usize;
+        read_f32_vec(r, len)
     }
 }
 
@@ -259,6 +284,125 @@ impl<D: DistanceProvider> HnswIndex<D> {
 
     pub fn active_count(&self) -> usize {
         self.nodes.read().iter().filter(|n| !n.deleted).count()
+    }
+
+    pub fn contains_id(&self, id: u64) -> bool {
+        self.id_to_idx.read().contains_key(&id)
+    }
+
+    pub fn distance(&self) -> &D {
+        &self.distance
+    }
+
+    pub fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
+        w.write_all(HNSW_MAGIC)?;
+        write_u32(w, HNSW_VERSION)?;
+
+        write_u32(w, self.config.m as u32)?;
+        write_u32(w, self.config.m_max0 as u32)?;
+        write_u32(w, self.config.ef_construction as u32)?;
+        write_u8(w, self.config.metric.to_u8())?;
+
+        let nodes = self.nodes.read();
+        let entry_point = *self.entry_point.read();
+        let max_layer = *self.max_layer.read();
+
+        write_u64(w, nodes.len() as u64)?;
+        write_i64(w, entry_point.map_or(-1, |ep| ep as i64))?;
+        write_u32(w, max_layer as u32)?;
+
+        for node in nodes.iter() {
+            write_u64(w, node.id)?;
+            write_u8(w, u8::from(node.deleted))?;
+            write_u32(w, node.neighbors.len() as u32)?;
+            for layer_neighbors in &node.neighbors {
+                write_u32(w, layer_neighbors.len() as u32)?;
+                for &neighbor_id in layer_neighbors {
+                    write_u64(w, neighbor_id)?;
+                }
+            }
+            self.distance.write_stored(&node.stored, w)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn load(r: &mut dyn io::Read, distance: D) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if magic != *HNSW_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HNSW snapshot magic",
+            ));
+        }
+        let version = read_u32(r)?;
+        if version != HNSW_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported HNSW snapshot version {version}"),
+            ));
+        }
+
+        let m = read_u32(r)? as usize;
+        let m_max0 = read_u32(r)? as usize;
+        let ef_construction = read_u32(r)? as usize;
+        let metric = Metric::from_u8(read_u8(r)?).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "unknown metric byte")
+        })?;
+        let config = HnswConfig {
+            m,
+            m_max0,
+            ef_construction,
+            metric,
+        };
+        let ml = 1.0 / (m as f64).ln();
+
+        let num_nodes = read_u64(r)? as usize;
+        let ep_val = read_i64(r)?;
+        let entry_point = if ep_val < 0 {
+            None
+        } else {
+            Some(ep_val as usize)
+        };
+        let max_layer = read_u32(r)? as usize;
+
+        let mut nodes = Vec::with_capacity(num_nodes);
+        let mut id_to_idx = std::collections::HashMap::with_capacity(num_nodes);
+
+        for idx in 0..num_nodes {
+            let id = read_u64(r)?;
+            let deleted = read_u8(r)? != 0;
+            let num_layers = read_u32(r)? as usize;
+            let mut neighbors = Vec::with_capacity(num_layers);
+            for _ in 0..num_layers {
+                let num_neighbors = read_u32(r)? as usize;
+                let mut layer_neighbors = Vec::with_capacity(num_neighbors);
+                for _ in 0..num_neighbors {
+                    layer_neighbors.push(read_u64(r)?);
+                }
+                neighbors.push(layer_neighbors);
+            }
+            let stored = distance.read_stored(r)?;
+
+            id_to_idx.insert(id, idx);
+            nodes.push(Node {
+                id,
+                stored,
+                neighbors,
+                deleted,
+            });
+        }
+
+        Ok(Self {
+            config,
+            distance,
+            nodes: RwLock::new(nodes),
+            id_to_idx: RwLock::new(id_to_idx),
+            entry_point: RwLock::new(entry_point),
+            max_layer: RwLock::new(max_layer),
+            ml,
+        })
     }
 
     fn random_level(&self) -> usize {
@@ -553,5 +697,123 @@ mod tests {
         assert_eq!(results[0].0, 0);
         assert_eq!(results[1].0, 1);
         assert_eq!(results[2].0, 2);
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            metric: Metric::L2,
+        };
+        let index = HnswIndex::new(config);
+
+        let vectors = random_vectors(200, 32);
+        for (id, vec) in &vectors {
+            index.insert(*id, vec);
+        }
+
+        let query = &vectors[0].1;
+        let original_results = index.search(query, 10, 50);
+
+        let mut buf = Vec::new();
+        index.save(&mut buf).unwrap();
+
+        let distance = ExactDistance { metric: Metric::L2 };
+        let loaded = HnswIndex::load(&mut &buf[..], distance).unwrap();
+
+        assert_eq!(loaded.len(), 200);
+        let loaded_results = loaded.search(query, 10, 50);
+        assert_eq!(original_results.len(), loaded_results.len());
+        for (orig, load) in original_results.iter().zip(loaded_results.iter()) {
+            assert_eq!(orig.0, load.0);
+            assert!((orig.1 - load.1).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn save_load_preserves_deletes() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            metric: Metric::L2,
+        };
+        let index = HnswIndex::new(config);
+
+        let vectors = random_vectors(50, 16);
+        for (id, vec) in &vectors {
+            index.insert(*id, vec);
+        }
+        index.delete(5);
+
+        let mut buf = Vec::new();
+        index.save(&mut buf).unwrap();
+
+        let distance = ExactDistance { metric: Metric::L2 };
+        let loaded = HnswIndex::load(&mut &buf[..], distance).unwrap();
+
+        assert_eq!(loaded.len(), 50);
+        assert_eq!(loaded.active_count(), 49);
+        let results = loaded.search(&vectors[0].1, 50, 100);
+        assert!(!results.iter().any(|(id, _)| *id == 5));
+    }
+
+    #[test]
+    fn save_load_empty_index() {
+        let config = HnswConfig::default();
+        let index = HnswIndex::new(config);
+
+        let mut buf = Vec::new();
+        index.save(&mut buf).unwrap();
+
+        let distance = ExactDistance {
+            metric: Metric::Cosine,
+        };
+        let loaded = HnswIndex::load(&mut &buf[..], distance).unwrap();
+        assert_eq!(loaded.len(), 0);
+        assert!(loaded.search(&[1.0, 2.0, 3.0], 5, 50).is_empty());
+    }
+
+    #[test]
+    fn load_rejects_bad_magic() {
+        let buf = b"BAD_MAGIC_AND_SOME_PADDING";
+        let distance = ExactDistance { metric: Metric::L2 };
+        let result = HnswIndex::load(&mut &buf[..], distance);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_load_insert_after_load() {
+        let config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            metric: Metric::L2,
+        };
+        let index = HnswIndex::new(config);
+
+        let vectors = random_vectors(50, 16);
+        for (id, vec) in &vectors {
+            index.insert(*id, vec);
+        }
+
+        let mut buf = Vec::new();
+        index.save(&mut buf).unwrap();
+
+        let distance = ExactDistance { metric: Metric::L2 };
+        let loaded = HnswIndex::load(&mut &buf[..], distance).unwrap();
+
+        // Insert more vectors after loading.
+        let mut rng = rand::rng();
+        for id in 50..60 {
+            let vec: Vec<f32> = (0..16).map(|_| rng.random_range(-1.0..1.0)).collect();
+            loaded.insert(id, &vec);
+        }
+
+        assert_eq!(loaded.len(), 60);
+        let results = loaded.search(&vectors[0].1, 5, 50);
+        assert_eq!(results.len(), 5);
     }
 }

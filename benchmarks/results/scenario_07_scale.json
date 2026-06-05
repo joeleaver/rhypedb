@@ -1,0 +1,192 @@
+[
+  {
+    "scenario": "1.7a unique_violation",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 55.829134,
+      "p50_ms": 57.29945,
+      "p95_ms": 57.776661,
+      "p99_ms": 57.776661,
+      "max_ms": 57.776661,
+      "mean_ms": 56.968415
+    },
+    "operation_stats": {
+      "n": 6000,
+      "min_us": 22.753,
+      "p50_us": 24.226,
+      "p95_us": 38.563,
+      "p99_us": 64.091,
+      "max_us": 1901.96,
+      "mean_us": 28.089098833333335,
+      "total_ms": 168.534593
+    },
+    "rss_cold_mb": 3.875,
+    "rss_post_load_mb": 3.875,
+    "rss_peak_mb": 3.875,
+    "rss_steady_mb": 3.875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "attempts_per_iter": 2000
+    }
+  },
+  {
+    "scenario": "1.7b unique_success",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 89.871413,
+      "p50_ms": 92.816482,
+      "p95_ms": 102.63177,
+      "p99_ms": 102.63177,
+      "max_ms": 102.63177,
+      "mean_ms": 95.106555
+    },
+    "operation_stats": {
+      "n": 6000,
+      "min_us": 34.305,
+      "p50_us": 44.473,
+      "p95_us": 63.27,
+      "p99_us": 97.805,
+      "max_us": 1005.318,
+      "mean_us": 46.857028166666666,
+      "total_ms": 281.14216899999997
+    },
+    "rss_cold_mb": 3.875,
+    "rss_post_load_mb": 3.875,
+    "rss_peak_mb": 3.875,
+    "rss_steady_mb": 3.875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "attempts_per_iter": 2000
+    }
+  },
+  {
+    "scenario": "1.7a unique_violation",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 264.270422,
+      "p50_ms": 267.298647,
+      "p95_ms": 320.700891,
+      "p99_ms": 320.700891,
+      "max_ms": 320.700891,
+      "mean_ms": 284.0899866666667
+    },
+    "operation_stats": {
+      "n": 6000,
+      "min_us": 100.73,
+      "p50_us": 133.142,
+      "p95_us": 196.842,
+      "p99_us": 250.533,
+      "max_us": 790.552,
+      "mean_us": 140.71326416666668,
+      "total_ms": 844.279585
+    },
+    "rss_cold_mb": 44.453125,
+    "rss_post_load_mb": 44.453125,
+    "rss_peak_mb": 44.453125,
+    "rss_steady_mb": 44.453125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "attempts_per_iter": 2000,
+      "mode": "idiomatic"
+    }
+  },
+  {
+    "scenario": "1.7b unique_success",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 188.204959,
+      "p50_ms": 193.310517,
+      "p95_ms": 203.052365,
+      "p99_ms": 203.052365,
+      "max_ms": 203.052365,
+      "mean_ms": 194.85594700000001
+    },
+    "operation_stats": {
+      "n": 6000,
+      "min_us": 69.501,
+      "p50_us": 94.128,
+      "p95_us": 138.862,
+      "p99_us": 193.284,
+      "max_us": 763.201,
+      "mean_us": 96.46105166666666,
+      "total_ms": 578.7663100000001
+    },
+    "rss_cold_mb": 44.453125,
+    "rss_post_load_mb": 44.453125,
+    "rss_peak_mb": 44.453125,
+    "rss_steady_mb": 44.453125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "attempts_per_iter": 2000,
+      "mode": "idiomatic"
+    }
+  },
+  {
+    "scenario": "1.7a unique_violation",
+    "implementation": "pg-optimal",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 219.083095,
+      "p50_ms": 222.03121,
+      "p95_ms": 233.843136,
+      "p99_ms": 233.843136,
+      "max_ms": 233.843136,
+      "mean_ms": 224.98581366666664
+    },
+    "operation_stats": {
+      "n": 6000,
+      "min_us": 86.884,
+      "p50_us": 109.296,
+      "p95_us": 145.755,
+      "p99_us": 190.429,
+      "max_us": 802.034,
+      "mean_us": 112.10842983333333,
+      "total_ms": 672.650579
+    },
+    "rss_cold_mb": 44.453125,
+    "rss_post_load_mb": 44.453125,
+    "rss_peak_mb": 44.453125,
+    "rss_steady_mb": 44.453125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "attempts_per_iter": 2000,
+      "mode": "optimal"
+    }
+  },
+  {
+    "scenario": "1.7b unique_success",
+    "implementation": "pg-optimal",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 263.134869,
+      "p50_ms": 264.835037,
+      "p95_ms": 272.169993,
+      "p99_ms": 272.169993,
+      "max_ms": 272.169993,
+      "mean_ms": 266.71329966666667
+    },
+    "operation_stats": {
+      "n": 6000,
+      "min_us": 97.664,
+      "p50_us": 125.287,
+      "p95_us": 185.15,
+      "p99_us": 244.081,
+      "max_us": 1065.732,
+      "mean_us": 132.417758,
+      "total_ms": 794.506548
+    },
+    "rss_cold_mb": 44.453125,
+    "rss_post_load_mb": 44.453125,
+    "rss_peak_mb": 44.453125,
+    "rss_steady_mb": 44.453125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "attempts_per_iter": 2000,
+      "mode": "optimal"
+    }
+  }
+]

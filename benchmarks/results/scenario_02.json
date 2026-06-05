@@ -1,0 +1,67 @@
+[
+  {
+    "scenario": "1.2 point_lookup_by_id",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 31.394541,
+      "p50_ms": 31.522392,
+      "p95_ms": 32.72419,
+      "p99_ms": 32.72419,
+      "max_ms": 32.72419,
+      "mean_ms": 31.880374333333332
+    },
+    "operation_stats": {
+      "n": 3000,
+      "min_us": 24.546,
+      "p50_us": 26.561,
+      "p95_us": 48.602,
+      "p99_us": 71.224,
+      "max_us": 1928.31,
+      "mean_us": 31.364117,
+      "total_ms": 94.092351
+    },
+    "rss_cold_mb": 3.8671875,
+    "rss_post_load_mb": 3.8671875,
+    "rss_peak_mb": 3.8671875,
+    "rss_steady_mb": 3.8671875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 1000,
+      "lookups_per_iter": 1000
+    }
+  },
+  {
+    "scenario": "1.2 point_lookup_by_id",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 100.381451,
+      "p50_ms": 105.746909,
+      "p95_ms": 108.322831,
+      "p99_ms": 108.322831,
+      "max_ms": 108.322831,
+      "mean_ms": 104.81706366666667
+    },
+    "operation_stats": {
+      "n": 3000,
+      "min_us": 82.456,
+      "p50_us": 100.569,
+      "p95_us": 145.344,
+      "p99_us": 182.514,
+      "max_us": 268.718,
+      "mean_us": 104.35457466666666,
+      "total_ms": 313.063724
+    },
+    "rss_cold_mb": 44.75,
+    "rss_post_load_mb": 44.75,
+    "rss_peak_mb": 44.75,
+    "rss_steady_mb": 44.75,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 1000,
+      "lookups_per_iter": 1000,
+      "note": "optimal == idiomatic for PK lookup"
+    }
+  }
+]

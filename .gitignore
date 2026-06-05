@@ -1,2 +1,5 @@
 /target
 .fastembed_cache/
+__pycache__/
+/rhypedb-data/
+/.venv-bench/

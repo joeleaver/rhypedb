@@ -424,6 +424,32 @@ impl<'a> Parser<'a> {
                 self.expect_char(')')?;
                 Ok(Source::Create { type_name, fields })
             }
+            "create_batch" => {
+                // Type.create_batch([{...}, {...}, ...])
+                self.expect_char('(')?;
+                self.skip_ws();
+                self.expect_char('[')?;
+                let mut rows = Vec::new();
+                self.skip_ws();
+                if self.peek() != Some(']') {
+                    rows.push(self.parse_object()?);
+                    self.skip_ws();
+                    while self.peek() == Some(',') {
+                        self.advance();
+                        self.skip_ws();
+                        // Allow a trailing comma before ']'.
+                        if self.peek() == Some(']') {
+                            break;
+                        }
+                        rows.push(self.parse_object()?);
+                        self.skip_ws();
+                    }
+                }
+                self.expect_char(']')?;
+                self.skip_ws();
+                self.expect_char(')')?;
+                Ok(Source::CreateBatch { type_name, rows })
+            }
             _ => {
                 // Not a source-level method — backtrack and treat as Type.traverse.
                 self.pos = saved;

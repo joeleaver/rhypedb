@@ -1,0 +1,87 @@
+[
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 43.132878,
+      "p50_ms": 43.256071,
+      "p95_ms": 45.654588,
+      "p99_ms": 45.654588,
+      "max_ms": 45.654588,
+      "mean_ms": 44.01451233333333
+    },
+    "operation_stats": {
+      "n": 3000,
+      "min_us": 30.809,
+      "p50_us": 41.188,
+      "p95_us": 56.066,
+      "p99_us": 97.474,
+      "max_us": 1006.61,
+      "mean_us": 43.234034,
+      "total_ms": 129.702102
+    },
+    "rss_cold_mb": 3.8671875,
+    "rss_post_load_mb": 3.8671875,
+    "rss_peak_mb": 3.8671875,
+    "rss_steady_mb": 3.8671875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 1000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 89.735986,
+      "p50_ms": 92.39742,
+      "p95_ms": 99.728749,
+      "p99_ms": 99.728749,
+      "max_ms": 99.728749,
+      "mean_ms": 93.95405166666666
+    },
+    "operation_stats": {
+      "n": 3000,
+      "min_us": 67.417,
+      "p50_us": 94.108,
+      "p95_us": 129.525,
+      "p99_us": 175.652,
+      "max_us": 779.491,
+      "mean_us": 93.51793033333334,
+      "total_ms": 280.55379100000005
+    },
+    "rss_cold_mb": 44.75,
+    "rss_post_load_mb": 44.75,
+    "rss_peak_mb": 44.75,
+    "rss_steady_mb": 44.75,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 1000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "pg-optimal",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 4.701054,
+      "p50_ms": 5.019464,
+      "p95_ms": 5.166562,
+      "p99_ms": 5.166562,
+      "max_ms": 5.166562,
+      "mean_ms": 4.96236
+    },
+    "operation_stats": {},
+    "rss_cold_mb": 44.75,
+    "rss_post_load_mb": 44.75,
+    "rss_peak_mb": 44.75,
+    "rss_steady_mb": 44.75,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 1000,
+      "note": "COPY: no per-row latency"
+    }
+  }
+]

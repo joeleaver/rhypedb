@@ -25,6 +25,14 @@ pub enum Source {
         fields: HashMap<String, Literal>,
     },
 
+    /// `Type.create_batch([{...}, {...}, ...])` — create N objects in one
+    /// transaction (single WAL append + commit). The COPY-shaped path for
+    /// bulk inserts.
+    CreateBatch {
+        type_name: String,
+        rows: Vec<HashMap<String, Literal>>,
+    },
+
     /// `Type` — reference to all objects of a type (for chaining).
     All { type_name: String },
 }

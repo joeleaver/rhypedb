@@ -1,0 +1,4 @@
+# Suite 1 Postgres comparison only — the rhypedb-side harness is pure stdlib.
+# Pinned to a recent psycopg 3 minor for reproducibility; binary wheel avoids
+# needing libpq-dev to build from source.
+psycopg[binary]>=3.3,<3.4

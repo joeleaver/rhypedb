@@ -1,0 +1,87 @@
+[
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 4131.864344,
+      "p50_ms": 4235.334166,
+      "p95_ms": 4272.093444,
+      "p99_ms": 4272.093444,
+      "max_ms": 4272.093444,
+      "mean_ms": 4213.097318
+    },
+    "operation_stats": {
+      "n": 300000,
+      "min_us": 30.868,
+      "p50_us": 34.696,
+      "p95_us": 57.048,
+      "p99_us": 86.513,
+      "max_us": 46367.073,
+      "mean_us": 41.40926013666667,
+      "total_ms": 12422.778041
+    },
+    "rss_cold_mb": 3.875,
+    "rss_post_load_mb": 3.875,
+    "rss_peak_mb": 3.875,
+    "rss_steady_mb": 3.875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 100000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 9310.741871,
+      "p50_ms": 9444.480639,
+      "p95_ms": 9527.425638,
+      "p99_ms": 9527.425638,
+      "max_ms": 9527.425638,
+      "mean_ms": 9427.549382666666
+    },
+    "operation_stats": {
+      "n": 300000,
+      "min_us": 68.54,
+      "p50_us": 92.385,
+      "p95_us": 127.902,
+      "p99_us": 166.745,
+      "max_us": 3355.634,
+      "mean_us": 93.87318371333333,
+      "total_ms": 28161.955114
+    },
+    "rss_cold_mb": 44.453125,
+    "rss_post_load_mb": 44.453125,
+    "rss_peak_mb": 44.453125,
+    "rss_steady_mb": 44.453125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 100000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "pg-optimal",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 267.441417,
+      "p50_ms": 272.574406,
+      "p95_ms": 285.488203,
+      "p99_ms": 285.488203,
+      "max_ms": 285.488203,
+      "mean_ms": 275.16800866666665
+    },
+    "operation_stats": {},
+    "rss_cold_mb": 44.453125,
+    "rss_post_load_mb": 44.453125,
+    "rss_peak_mb": 44.453125,
+    "rss_steady_mb": 44.453125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 100000,
+      "note": "COPY: no per-row latency"
+    }
+  }
+]

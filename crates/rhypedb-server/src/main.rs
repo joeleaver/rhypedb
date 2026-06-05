@@ -10,14 +10,19 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
 
 use rhypedb_engine::database::Database;
 use rhypedb_engine::object::{Object, Value};
 use rhypedb_engine::vectorizer::Vectorizer;
 use rhypedb_query::executor::{ExecContext, QueryOutput};
-use rhypedb_query::parser::parse_query;
 use rhypedb_schema::parser::parse_schema;
 use rhypedb_subscribe::{ChangeKind, SubscriptionFilter};
+
+mod protocol;
+mod query_cache;
+
+use query_cache::QueryCache;
 
 #[derive(Parser)]
 #[command(name = "rhypedb", about = "rhypedb database server")]
@@ -33,11 +38,16 @@ struct Cli {
     /// HTTP listen address.
     #[arg(long, default_value = "127.0.0.1:4200")]
     listen: String,
+
+    /// Binary TCP listen address.
+    #[arg(long, default_value = "127.0.0.1:4201")]
+    tcp_listen: String,
 }
 
 struct AppState {
     db: Database,
     vectorizer: Option<Arc<Vectorizer>>,
+    query_cache: QueryCache,
 }
 
 #[derive(Deserialize)]
@@ -99,7 +109,7 @@ async fn handle_query(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueryRequest>,
 ) -> (StatusCode, Json<QueryResponse>) {
-    let query = match parse_query(&req.query) {
+    let query = match state.query_cache.get_or_parse(&req.query) {
         Ok(q) => q,
         Err(e) => {
             return (
@@ -152,6 +162,11 @@ async fn handle_query(
                 ok: Some(true),
                 error: None,
             }),
+        ),
+        // IdSet is an internal traversal carrier; the executor materializes it
+        // before returning. Reaching this arm would be a bug in execute().
+        Ok(QueryOutput::IdSet { .. }) | Ok(QueryOutput::IdSetWithFields { .. }) => unreachable!(
+            "QueryOutput::IdSet variants should be materialized to Objects before leaving execute()"
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -310,20 +325,24 @@ async fn main() {
             )
             .unwrap(),
         );
-        v.start_worker();
+        v.start_worker(1);
         Some(v)
     } else {
         None
     };
 
-    let state = Arc::new(AppState { db, vectorizer });
+    let state = Arc::new(AppState {
+        db,
+        vectorizer,
+        query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
+    });
 
     let app = Router::new()
         .route("/query", post(handle_query))
         .route("/subscribe", get(handle_subscribe))
         .route("/status", get(handle_status))
         .route("/health", get(handle_health))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&cli.listen)
         .await
@@ -332,10 +351,293 @@ async fn main() {
             std::process::exit(1);
         });
 
-    println!("rhypedb listening on {}", cli.listen);
+    let tcp_listener = TcpListener::bind(&cli.tcp_listen)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("failed to bind {}: {e}", cli.tcp_listen);
+            std::process::exit(1);
+        });
+
+    println!("rhypedb HTTP listening on {}", cli.listen);
+    println!("rhypedb binary TCP listening on {}", cli.tcp_listen);
     println!("  POST /query     — execute queries");
     println!("  GET  /subscribe — WebSocket subscriptions");
     println!("  GET  /health    — health check");
 
+    // Spawn the binary TCP accept loop.
+    let tcp_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match tcp_listener.accept().await {
+                Ok((socket, _addr)) => {
+                    let conn_state = tcp_state.clone();
+                    tokio::spawn(async move {
+                        handle_tcp_connection(socket, conn_state).await;
+                    });
+                }
+                Err(e) => {
+                    eprintln!("tcp accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn handle_tcp_connection(socket: tokio::net::TcpStream, state: Arc<AppState>) {
+    let (read, write) = socket.into_split();
+    let mut reader = tokio::io::BufReader::new(read);
+    let mut writer = tokio::io::BufWriter::new(write);
+    handle_connection_stream(&mut reader, &mut writer, state).await;
+}
+
+async fn handle_connection_stream<R, W>(reader: &mut R, writer: &mut W, state: Arc<AppState>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let frame = match protocol::read_frame(reader).await {
+            Ok(f) => f,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    eprintln!("tcp read_frame error: {e}");
+                }
+                return;
+            }
+        };
+
+        match frame.kind {
+            protocol::REQ_PING => {
+                if let Err(e) =
+                    protocol::write_frame(writer, frame.req_id, protocol::RESP_PONG, &[]).await
+                {
+                    eprintln!("tcp pong write error: {e}");
+                    return;
+                }
+            }
+            protocol::REQ_QUERY => {
+                let query_text = match protocol::decode_query_payload(&frame.payload) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        let payload = protocol::encode_error_payload(&format!("decode: {e}"));
+                        let _ = protocol::write_frame(
+                            writer,
+                            frame.req_id,
+                            protocol::RESP_ERROR,
+                            &payload,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
+                let response = execute_query(&state, &query_text);
+                let (kind, payload) = match response {
+                    Ok(QueryOutput::Objects(objs)) => {
+                        (protocol::RESP_OBJECTS, protocol::encode_objects_payload(&objs))
+                    }
+                    Ok(QueryOutput::Single(obj)) => {
+                        if let Some(vectorizer) = &state.vectorizer {
+                            enqueue_vectorize(vectorizer, &state.db, &obj);
+                        }
+                        (protocol::RESP_SINGLE, protocol::encode_single_payload(&obj))
+                    }
+                    Ok(QueryOutput::Done) => (protocol::RESP_DONE, Vec::new()),
+                    Ok(QueryOutput::IdSet { .. })
+                    | Ok(QueryOutput::IdSetWithFields { .. }) => unreachable!(
+                        "QueryOutput::IdSet variants should be materialized to Objects before leaving execute()"
+                    ),
+                    Err(msg) => (protocol::RESP_ERROR, protocol::encode_error_payload(&msg)),
+                };
+
+                if let Err(e) =
+                    protocol::write_frame(writer, frame.req_id, kind, &payload).await
+                {
+                    eprintln!("tcp write_frame error: {e}");
+                    return;
+                }
+            }
+            other => {
+                let payload =
+                    protocol::encode_error_payload(&format!("unknown request type 0x{other:02x}"));
+                let _ = protocol::write_frame(
+                    writer,
+                    frame.req_id,
+                    protocol::RESP_ERROR,
+                    &payload,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Parse and execute a query, returning either the result or an error message.
+fn execute_query(state: &AppState, query_text: &str) -> Result<QueryOutput, String> {
+    let query = state
+        .query_cache
+        .get_or_parse(query_text)
+        .map_err(|e| format!("parse error: {e}"))?;
+    let ctx = ExecContext {
+        db: &state.db,
+        vectorizer: state.vectorizer.as_deref(),
+    };
+    rhypedb_query::executor::execute(&ctx, &query).map_err(|e| format!("{e}"))
+}
+
+#[cfg(test)]
+mod tcp_tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    fn test_state() -> Arc<AppState> {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                age: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        // Leak the tempdir — it will live for the test process lifetime.
+        std::mem::forget(dir);
+        Arc::new(AppState {
+            db,
+            vectorizer: None,
+            query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
+        })
+    }
+
+    #[tokio::test]
+    async fn ping_pong() {
+        let state = test_state();
+        let (mut client, server) = duplex(4096);
+
+        let handler = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut writer = tokio::io::BufWriter::new(write);
+            handle_connection_stream(&mut reader, &mut writer, state).await;
+        });
+
+        protocol::write_frame(&mut client, 1, protocol::REQ_PING, &[]).await.unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.req_id, 1);
+        assert_eq!(resp.kind, protocol::RESP_PONG);
+        assert!(resp.payload.is_empty());
+
+        drop(client);
+        let _ = handler.await;
+    }
+
+    #[tokio::test]
+    async fn create_and_get_via_tcp() {
+        let state = test_state();
+        let (mut client, server) = duplex(8192);
+
+        let handler = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut writer = tokio::io::BufWriter::new(write);
+            handle_connection_stream(&mut reader, &mut writer, state).await;
+        });
+
+        // Create a user via the binary protocol.
+        let create_payload = protocol::encode_query_payload(
+            r#"User.create({ name: "Alice", age: 30 })"#,
+        );
+        protocol::write_frame(&mut client, 1, protocol::REQ_QUERY, &create_payload)
+            .await
+            .unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.req_id, 1);
+        assert_eq!(resp.kind, protocol::RESP_SINGLE);
+        let created = protocol::decode_single_payload(&resp.payload).unwrap();
+        assert_eq!(created.type_name, "User");
+        let user_id = created.id;
+
+        // Now fetch it back — User.get returns Objects (list of 1).
+        let get_payload =
+            protocol::encode_query_payload(&format!("User.get({user_id})"));
+        protocol::write_frame(&mut client, 2, protocol::REQ_QUERY, &get_payload)
+            .await
+            .unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.req_id, 2);
+        assert_eq!(resp.kind, protocol::RESP_OBJECTS);
+        let objs = protocol::decode_objects_payload(&resp.payload).unwrap();
+        assert_eq!(objs.len(), 1);
+        let fetched = &objs[0];
+        assert_eq!(fetched.id, user_id);
+        assert_eq!(
+            fetched.fields.get("name"),
+            Some(&Value::String("Alice".into()))
+        );
+        assert_eq!(fetched.fields.get("age"), Some(&Value::U32(30)));
+
+        drop(client);
+        let _ = handler.await;
+    }
+
+    #[tokio::test]
+    async fn error_on_parse_failure() {
+        let state = test_state();
+        let (mut client, server) = duplex(4096);
+
+        let handler = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut writer = tokio::io::BufWriter::new(write);
+            handle_connection_stream(&mut reader, &mut writer, state).await;
+        });
+
+        let bad_query = protocol::encode_query_payload("THIS IS NOT VALID");
+        protocol::write_frame(&mut client, 7, protocol::REQ_QUERY, &bad_query)
+            .await
+            .unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.req_id, 7);
+        assert_eq!(resp.kind, protocol::RESP_ERROR);
+        let msg = protocol::decode_error_payload(&resp.payload).unwrap();
+        assert!(msg.contains("parse error"), "expected parse error, got {msg}");
+
+        drop(client);
+        let _ = handler.await;
+    }
+
+    #[tokio::test]
+    async fn many_queries_on_one_connection() {
+        let state = test_state();
+        let (mut client, server) = duplex(16384);
+
+        let handler = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut writer = tokio::io::BufWriter::new(write);
+            handle_connection_stream(&mut reader, &mut writer, state).await;
+        });
+
+        // Send 10 creates in sequence.
+        for i in 0..10u32 {
+            let payload = protocol::encode_query_payload(&format!(
+                r#"User.create({{ name: "User{i}", age: {} }})"#,
+                20 + i
+            ));
+            protocol::write_frame(&mut client, i, protocol::REQ_QUERY, &payload)
+                .await
+                .unwrap();
+            let resp = protocol::read_frame(&mut client).await.unwrap();
+            assert_eq!(resp.req_id, i);
+            assert_eq!(resp.kind, protocol::RESP_SINGLE);
+        }
+
+        drop(client);
+        let _ = handler.await;
+    }
 }

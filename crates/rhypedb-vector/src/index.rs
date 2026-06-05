@@ -1,6 +1,12 @@
+use std::io;
+
 use crate::distance::{self, Metric};
 use crate::hnsw::{DistanceProvider, HnswConfig, HnswIndex};
 use crate::quantize::{CompressedVector, TurboQuantConfig, TurboQuantizer};
+use crate::serial::{read_u8, write_u8};
+
+const QUANTIZED_INDEX_MAGIC: &[u8; 4] = b"RQNT";
+const QUANTIZED_INDEX_VERSION: u32 = 1;
 
 /// Distance provider that uses TurboQuant's unbiased estimator.
 /// All distance computations — during both graph construction and search —
@@ -26,6 +32,14 @@ impl DistanceProvider for TurboQuantDistance {
 
     fn store(&self, vector: &[f32]) -> CompressedVector {
         self.quantizer.compress(vector)
+    }
+
+    fn write_stored(&self, stored: &CompressedVector, w: &mut dyn io::Write) -> io::Result<()> {
+        stored.write_to(w)
+    }
+
+    fn read_stored(&self, r: &mut dyn io::Read) -> io::Result<CompressedVector> {
+        CompressedVector::read_from(r)
     }
 }
 
@@ -80,6 +94,45 @@ impl QuantizedIndex {
 
     pub fn metric(&self) -> Metric {
         self.metric
+    }
+
+    pub fn contains_id(&self, id: u64) -> bool {
+        self.hnsw.contains_id(id)
+    }
+
+    pub fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
+        w.write_all(QUANTIZED_INDEX_MAGIC)?;
+        crate::serial::write_u32(w, QUANTIZED_INDEX_VERSION)?;
+        write_u8(w, self.metric.to_u8())?;
+        self.hnsw.distance().quantizer.write_to(w)?;
+        self.hnsw.save(w)
+    }
+
+    pub fn load(r: &mut dyn io::Read) -> io::Result<Self> {
+        let mut magic = [0u8; 4];
+        r.read_exact(&mut magic)?;
+        if magic != *QUANTIZED_INDEX_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid quantized index snapshot magic",
+            ));
+        }
+        let version = crate::serial::read_u32(r)?;
+        if version != QUANTIZED_INDEX_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported quantized index snapshot version {version}"),
+            ));
+        }
+
+        let metric = Metric::from_u8(read_u8(r)?).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "unknown metric byte")
+        })?;
+        let quantizer = TurboQuantizer::read_from(r)?;
+        let distance = TurboQuantDistance { quantizer, metric };
+        let hnsw = HnswIndex::load(r, distance)?;
+
+        Ok(Self { hnsw, metric })
     }
 }
 
@@ -386,5 +439,113 @@ mod tests {
 
         eprintln!("cosine 4-bit NATIVE quantized recall@{k}: {recall:.3}");
         assert!(recall >= 0.3, "cosine recall {recall} too low");
+    }
+
+    #[test]
+    fn quantized_index_save_load_roundtrip() {
+        let dims = 32u32;
+        let n = 100;
+
+        let hnsw_config = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 50,
+            metric: Metric::L2,
+        };
+        let quant_config = TurboQuantConfig::new(dims, 3);
+        let index = QuantizedIndex::new(hnsw_config, quant_config);
+
+        let vectors = random_vectors(n, dims as usize);
+        for (id, vec) in &vectors {
+            index.insert(*id, vec);
+        }
+
+        let query = &vectors[0].1;
+        let original_results = index.search(query, 10, 50);
+
+        let mut buf = Vec::new();
+        index.save(&mut buf).unwrap();
+
+        let loaded = QuantizedIndex::load(&mut &buf[..]).unwrap();
+
+        assert_eq!(loaded.len(), n);
+        assert_eq!(loaded.metric(), Metric::L2);
+
+        let loaded_results = loaded.search(query, 10, 50);
+        assert_eq!(original_results.len(), loaded_results.len());
+        for (orig, load) in original_results.iter().zip(loaded_results.iter()) {
+            assert_eq!(orig.0, load.0);
+            assert!((orig.1 - load.1).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn quantized_index_save_load_preserves_recall() {
+        let dims = 64u32;
+        let n = 300;
+        let k = 10;
+
+        let index = QuantizedIndex::new(
+            HnswConfig {
+                m: 16,
+                m_max0: 32,
+                ef_construction: 100,
+                metric: Metric::L2,
+            },
+            TurboQuantConfig::new(dims, 4),
+        );
+
+        let vectors = random_vectors(n, dims as usize);
+        for (id, vec) in &vectors {
+            index.insert(*id, vec);
+        }
+
+        let query = &vectors[0].1;
+        let truth = brute_force_knn(query, &vectors, k, Metric::L2);
+        let original_recall = recall_at_k(&index.search(query, k, 100), &truth, k);
+
+        let mut buf = Vec::new();
+        index.save(&mut buf).unwrap();
+        let loaded = QuantizedIndex::load(&mut &buf[..]).unwrap();
+
+        let loaded_recall = recall_at_k(&loaded.search(query, k, 100), &truth, k);
+        assert_eq!(
+            original_recall, loaded_recall,
+            "recall changed after save/load"
+        );
+    }
+
+    #[test]
+    fn quantized_index_insert_after_load() {
+        let dims = 32u32;
+
+        let index = QuantizedIndex::new(
+            HnswConfig {
+                m: 8,
+                m_max0: 16,
+                ef_construction: 50,
+                metric: Metric::Cosine,
+            },
+            TurboQuantConfig::new(dims, 3),
+        );
+
+        let vectors = random_vectors(50, dims as usize);
+        for (id, vec) in &vectors {
+            index.insert(*id, vec);
+        }
+
+        let mut buf = Vec::new();
+        index.save(&mut buf).unwrap();
+        let loaded = QuantizedIndex::load(&mut &buf[..]).unwrap();
+
+        // Insert new vectors into the loaded index.
+        let extra = random_vectors(20, dims as usize);
+        for (id, vec) in &extra {
+            loaded.insert(50 + id, vec);
+        }
+
+        assert_eq!(loaded.len(), 70);
+        let results = loaded.search(&vectors[0].1, 5, 50);
+        assert_eq!(results.len(), 5);
     }
 }

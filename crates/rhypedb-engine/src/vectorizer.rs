@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -109,6 +110,8 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     Some(s)
 }
 
+const BATCH_SIZE: usize = 256;
+
 /// Manages vector indexes and the async vectorization pipeline.
 pub struct Vectorizer {
     storage: Arc<LsmTree>,
@@ -120,7 +123,8 @@ pub struct Vectorizer {
     reranker: parking_lot::Mutex<Option<Box<dyn Reranker>>>,
     next_job_id: AtomicU64,
     running: Arc<AtomicBool>,
-    worker_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    worker_handles: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    claim_mutex: parking_lot::Mutex<()>,
 }
 
 impl Vectorizer {
@@ -153,9 +157,9 @@ impl Vectorizer {
 
         // Recover next_job_id by scanning existing queue entries.
         let mut max_job_id = 0u64;
-        let txn = storage.begin_txn();
+        let snapshot = storage.read_snapshot();
         let prefix = KeyBuilder::queue_prefix();
-        if let Ok(entries) = storage.scan_prefix(&txn, &prefix) {
+        if let Ok(entries) = storage.scan_prefix_at(snapshot, &prefix) {
             for (key, _) in &entries {
                 if key.len() >= 10 {
                     let id_bytes: [u8; 8] = key[2..10].try_into().unwrap();
@@ -164,7 +168,6 @@ impl Vectorizer {
                 }
             }
         }
-        drop(txn);
 
         let vectorizer = Self {
             storage,
@@ -176,7 +179,8 @@ impl Vectorizer {
             reranker: parking_lot::Mutex::new(None),
             next_job_id: AtomicU64::new(max_job_id + 1),
             running: Arc::new(AtomicBool::new(false)),
-            worker_handle: parking_lot::Mutex::new(None),
+            worker_handles: parking_lot::Mutex::new(Vec::new()),
+            claim_mutex: parking_lot::Mutex::new(()),
         };
 
         vectorizer.rebuild_indexes()?;
@@ -184,83 +188,194 @@ impl Vectorizer {
         Ok(vectorizer)
     }
 
-    /// Rebuild HNSW indexes from persisted vectors in the LSM.
-    /// Called during startup to restore the in-memory HNSW graph from
-    /// vectors that were previously indexed and durably stored.
+    fn snapshot_path(&self, index_key: &str) -> std::path::PathBuf {
+        let sanitized = index_key.replace('.', "_");
+        self.storage.data_dir().join(format!("hnsw_{sanitized}.bin"))
+    }
+
+    /// Rebuild HNSW indexes from snapshots or persisted vectors.
+    /// Tries loading a serialized snapshot first (O(n) sequential read).
+    /// Falls back to full rebuild from f32 vectors in the LSM if no
+    /// snapshot exists or the snapshot is corrupt.
     fn rebuild_indexes(&self) -> EngineResult<()> {
-        let indexes = self.indexes.read();
+        let mut indexes = self.indexes.write();
         if indexes.is_empty() {
             return Ok(());
         }
 
-        // For each vectorize field, scan its persisted vectors and reinsert into HNSW.
-        for type_def in self.schema.types.values() {
-            for field in &type_def.fields {
-                if field.vectorize().is_none() {
-                    continue;
-                }
-                let index_key = format!("{}.{}", type_def.name, field.name);
-                let index = match indexes.get(&index_key) {
-                    Some(idx) => idx,
-                    None => continue,
-                };
+        let index_keys: Vec<String> = indexes.keys().cloned().collect();
 
-                let type_id = match self.type_ids.get(&type_def.name) {
-                    Some(&id) => id,
-                    None => continue,
-                };
-                let field_key = format!("{}.{}", type_def.name, field.name);
-                let field_id = match self.field_ids.get(&field_key) {
-                    Some(&id) => id,
-                    None => continue,
-                };
+        for index_key in &index_keys {
+            let snapshot_path = self.snapshot_path(index_key);
 
-                // Scan all vector entries for this type.
-                let prefix = KeyBuilder::vector_prefix(type_id);
-                let txn = self.storage.begin_txn();
-                let entries = self.storage.scan_prefix(&txn, &prefix)?;
-                drop(txn);
+            // Try loading from snapshot.
+            if snapshot_path.exists() {
+                match std::fs::File::open(&snapshot_path) {
+                    Ok(file) => {
+                        let mut reader = std::io::BufReader::new(file);
+                        match QuantizedIndex::load(&mut reader) {
+                            Ok(loaded) => {
+                                let loaded = Arc::new(loaded);
 
-                let mut count = 0usize;
-                for (key, data) in &entries {
-                    // Vector key: v:<type_id>:<object_id>:<field_id>
-                    // Extract object_id and field_id from the key.
-                    // Key structure after prefix: <object_id (8 bytes)>:<field_id (8 bytes)>
-                    if key.len() < 2 + 8 + 1 + 8 + 1 + 8 {
-                        continue;
+                                // Delta rebuild: insert any vectors in LSM missing from the snapshot.
+                                let delta = self.insert_delta_vectors(
+                                    index_key, &loaded,
+                                )?;
+
+                                indexes.insert(index_key.clone(), loaded);
+                                eprintln!(
+                                    "loaded HNSW snapshot for {index_key} ({} vectors, {delta} delta)",
+                                    indexes[index_key].len()
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "corrupt HNSW snapshot for {index_key}, rebuilding: {e}"
+                                );
+                            }
+                        }
                     }
-
-                    // Parse out the field_id from the last 8 bytes to verify it matches.
-                    let key_field_id_bytes: [u8; 8] =
-                        key[key.len() - 8..].try_into().unwrap();
-                    let key_field_id = u64::from_be_bytes(key_field_id_bytes);
-                    if key_field_id != field_id {
-                        continue;
-                    }
-
-                    // Extract object_id: 8 bytes before the separator + field_id.
-                    let obj_id_start = key.len() - 8 - 1 - 8;
-                    let obj_id_bytes: [u8; 8] =
-                        key[obj_id_start..obj_id_start + 8].try_into().unwrap();
-                    let object_id = u64::from_be_bytes(obj_id_bytes);
-
-                    // Deserialize the f32 vector.
-                    if let Some(vector) = deserialize_f32_vec(data) {
-                        index.insert(object_id, &vector);
-                        count += 1;
+                    Err(e) => {
+                        eprintln!("failed to open HNSW snapshot for {index_key}: {e}");
                     }
                 }
+            }
 
-                if count > 0 {
-                    eprintln!(
-                        "rebuilt HNSW index for {}.{}: {} vectors",
-                        type_def.name, field.name, count
-                    );
-                }
+            // Full rebuild from f32 vectors in LSM.
+            let index = indexes.get(index_key).unwrap();
+            let count = self.rebuild_index_from_lsm(index_key, index)?;
+
+            if count > 0 {
+                eprintln!("rebuilt HNSW index for {index_key}: {count} vectors");
+                self.save_single_snapshot(index_key, index);
             }
         }
 
         Ok(())
+    }
+
+    /// Insert any f32 vectors from the LSM that are missing from a loaded index.
+    /// Returns the number of delta vectors inserted.
+    fn insert_delta_vectors(
+        &self,
+        index_key: &str,
+        index: &QuantizedIndex,
+    ) -> EngineResult<usize> {
+        let (type_id, field_id) = match self.resolve_index_ids(index_key) {
+            Some(ids) => ids,
+            None => return Ok(0),
+        };
+
+        let vectors = self.scan_vectors_for_field(type_id, field_id)?;
+        let mut delta = 0usize;
+
+        for (object_id, vector) in &vectors {
+            if !index.contains_id(*object_id) {
+                index.insert(*object_id, vector);
+                delta += 1;
+            }
+        }
+
+        Ok(delta)
+    }
+
+    /// Rebuild an index fully from f32 vectors in the LSM.
+    /// Returns the number of vectors inserted.
+    fn rebuild_index_from_lsm(
+        &self,
+        index_key: &str,
+        index: &QuantizedIndex,
+    ) -> EngineResult<usize> {
+        let (type_id, field_id) = match self.resolve_index_ids(index_key) {
+            Some(ids) => ids,
+            None => return Ok(0),
+        };
+
+        let vectors = self.scan_vectors_for_field(type_id, field_id)?;
+        for (object_id, vector) in &vectors {
+            index.insert(*object_id, vector);
+        }
+
+        Ok(vectors.len())
+    }
+
+    fn resolve_index_ids(&self, index_key: &str) -> Option<(u64, u64)> {
+        let mut parts = index_key.splitn(2, '.');
+        let type_name = parts.next()?;
+        let type_id = *self.type_ids.get(type_name)?;
+        let field_id = *self.field_ids.get(index_key)?;
+        Some((type_id, field_id))
+    }
+
+    fn scan_vectors_for_field(
+        &self,
+        type_id: u64,
+        field_id: u64,
+    ) -> EngineResult<Vec<(u64, Vec<f32>)>> {
+        let prefix = KeyBuilder::vector_prefix(type_id);
+        let snapshot = self.storage.read_snapshot();
+        let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
+
+        let mut results = Vec::new();
+        for (key, data) in &entries {
+            if key.len() < 2 + 8 + 1 + 8 + 1 + 8 {
+                continue;
+            }
+            let key_field_id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let key_field_id = u64::from_be_bytes(key_field_id_bytes);
+            if key_field_id != field_id {
+                continue;
+            }
+            let obj_id_start = key.len() - 8 - 1 - 8;
+            let obj_id_bytes: [u8; 8] =
+                key[obj_id_start..obj_id_start + 8].try_into().unwrap();
+            let object_id = u64::from_be_bytes(obj_id_bytes);
+
+            if let Some(vector) = deserialize_f32_vec(data) {
+                results.push((object_id, vector));
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Save all HNSW index snapshots to disk.
+    pub fn save_snapshots(&self) {
+        let indexes = self.indexes.read();
+        for (index_key, index) in indexes.iter() {
+            self.save_single_snapshot(index_key, index);
+        }
+    }
+
+    fn save_single_snapshot(&self, index_key: &str, index: &QuantizedIndex) {
+        if index.is_empty() {
+            return;
+        }
+        let path = self.snapshot_path(index_key);
+        let tmp_path = path.with_extension("bin.tmp");
+        match std::fs::File::create(&tmp_path) {
+            Ok(file) => {
+                let mut writer = BufWriter::new(file);
+                if let Err(e) = index.save(&mut writer) {
+                    eprintln!("failed to write HNSW snapshot for {index_key}: {e}");
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+                if let Err(e) = std::io::Write::flush(&mut writer) {
+                    eprintln!("failed to flush HNSW snapshot for {index_key}: {e}");
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp_path, &path) {
+                    eprintln!("failed to rename HNSW snapshot for {index_key}: {e}");
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to create HNSW snapshot file for {index_key}: {e}");
+            }
+        }
     }
 
     /// Enqueue a vectorization job for an object.
@@ -303,8 +418,8 @@ impl Vectorizer {
         let field_id = self.field_ids[&field_key];
         let state_key = KeyBuilder::vector_state(type_id, object_id, field_id);
 
-        let txn = self.storage.begin_txn();
-        match self.storage.get(&txn, &state_key)? {
+        let snapshot = self.storage.read_snapshot();
+        match self.storage.get_at(snapshot, &state_key)? {
             Some(data) if !data.is_empty() => Ok(VectorState::from(data[0])),
             _ => Ok(VectorState::Pending),
         }
@@ -314,14 +429,13 @@ impl Vectorizer {
     /// vectors loaded in each HNSW index.
     pub fn status(&self) -> IndexingStatus {
         // Count pending jobs in the queue.
-        let txn = self.storage.begin_txn();
+        let snapshot = self.storage.read_snapshot();
         let prefix = KeyBuilder::queue_prefix();
         let pending = self
             .storage
-            .scan_prefix(&txn, &prefix)
+            .scan_prefix_at(snapshot, &prefix)
             .map(|e| e.len())
             .unwrap_or(0);
-        drop(txn);
 
         // Count vectors in each HNSW index.
         let indexes = self.indexes.read();
@@ -339,22 +453,30 @@ impl Vectorizer {
         }
     }
 
-    /// Process pending jobs in the queue in bounded batches.
-    /// Returns the number of jobs processed in this call.
+    /// Process pending jobs using the shared embedder (for single-threaded use / tests).
     pub fn process_pending(&self) -> EngineResult<usize> {
-        const BATCH_SIZE: usize = 64;
-
-        let txn = self.storage.begin_txn();
-        let prefix = KeyBuilder::queue_prefix();
-        let entries = self.storage.scan_prefix(&txn, &prefix)?;
-        drop(txn);
-
-        if entries.is_empty() {
+        let batch = self.claim_batch()?;
+        if batch.is_empty() {
             return Ok(0);
         }
+        let mut embedders = self.embedders.lock();
+        self.process_batch(batch, &mut embedders)
+    }
 
-        // Parse jobs, limit to BATCH_SIZE.
-        let mut jobs: Vec<(Bytes, VectorizeJob)> = entries
+    /// Atomically claim a batch of jobs from the queue.
+    /// Deletes queue entries upfront so parallel workers don't double-claim.
+    fn claim_batch(&self) -> EngineResult<Vec<(VectorizeJob, u64)>> {
+        let _lock = self.claim_mutex.lock();
+
+        let mut txn = self.storage.begin_txn();
+        let prefix = KeyBuilder::queue_prefix();
+        let entries = self.storage.scan_prefix(&txn, &prefix)?;
+
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let jobs: Vec<(Bytes, VectorizeJob)> = entries
             .into_iter()
             .filter_map(|(key, value)| {
                 let job = VectorizeJob::deserialize(&value)?;
@@ -364,16 +486,40 @@ impl Vectorizer {
             .collect();
 
         if jobs.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
-        // Group this batch by model.
-        let mut jobs_by_model: HashMap<String, Vec<(Bytes, VectorizeJob)>> = HashMap::new();
-        for (key, job) in jobs.drain(..) {
+        // Delete queue entries to claim them.
+        for (key, _) in &jobs {
+            self.storage.delete(&mut txn, key)?;
+        }
+        self.storage.commit(&mut txn).map_err(|e| match e {
+            rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
+            other => crate::EngineError::Storage(other),
+        })?;
+
+        Ok(jobs
+            .into_iter()
+            .map(|(_, job)| {
+                let object_id = job.object_id;
+                (job, object_id)
+            })
+            .collect())
+    }
+
+    /// Process a claimed batch of jobs with the given embedders.
+    fn process_batch(
+        &self,
+        jobs: Vec<(VectorizeJob, u64)>,
+        embedders: &mut HashMap<String, Box<dyn Embedder>>,
+    ) -> EngineResult<usize> {
+        // Group by model.
+        let mut jobs_by_model: HashMap<String, Vec<VectorizeJob>> = HashMap::new();
+        for (job, _) in jobs {
             jobs_by_model
                 .entry(job.model.clone())
                 .or_default()
-                .push((key, job));
+                .push(job);
         }
 
         let mut processed = 0;
@@ -381,11 +527,11 @@ impl Vectorizer {
         for (model_name, batch_jobs) in &jobs_by_model {
             let texts: Vec<String> = batch_jobs
                 .iter()
-                .filter_map(|(_, job)| {
+                .filter_map(|job| {
                     let type_id = self.type_ids.get(&job.type_name)?;
                     let obj_key = KeyBuilder::object(*type_id, job.object_id);
-                    let txn = self.storage.begin_txn();
-                    let data = self.storage.get(&txn, &obj_key).ok()??;
+                    let snapshot = self.storage.read_snapshot();
+                    let data = self.storage.get_at(snapshot, &obj_key).ok()??;
                     let fields = deserialize_fields(&data);
                     match fields.get(&job.source_field)? {
                         Value::String(s) => Some(s.clone()),
@@ -400,25 +546,20 @@ impl Vectorizer {
 
             let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
-            let embeddings = {
-                let mut embedders = self.embedders.lock();
-                let embedder = embedders
-                    .entry(model_name.clone())
-                    .or_insert_with(|| {
-                        Box::new(FastEmbedder::new(model_name).expect("failed to load model"))
-                    });
-                embedder.embed(&text_refs)
-            };
-
-            let embeddings = match embeddings {
+            let embedder = embedders
+                .entry(model_name.clone())
+                .or_insert_with(|| {
+                    Box::new(FastEmbedder::new(model_name).expect("failed to load model"))
+                });
+            let embeddings = match embedder.embed(&text_refs) {
                 Ok(e) => e,
                 Err(e) => {
-                    self.mark_jobs_failed(batch_jobs, &format!("{e}"))?;
+                    self.mark_batch_failed(batch_jobs, &format!("{e}"))?;
                     continue;
                 }
             };
 
-            for (emb_idx, (queue_key, job)) in batch_jobs.iter().enumerate() {
+            for (emb_idx, job) in batch_jobs.iter().enumerate() {
                 if emb_idx >= embeddings.len() {
                     break;
                 }
@@ -446,7 +587,6 @@ impl Vectorizer {
                     &state_key,
                     Bytes::from(vec![VectorState::Indexed as u8]),
                 )?;
-                self.storage.delete(&mut txn, queue_key)?;
                 self.storage.commit(&mut txn).map_err(|e| match e {
                     rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
                     other => crate::EngineError::Storage(other),
@@ -528,8 +668,8 @@ impl Vectorizer {
             if let Some(type_id) = type_id {
                 for (obj_id, _dist) in &candidates {
                     let obj_key = KeyBuilder::object(type_id, *obj_id);
-                    let txn = self.storage.begin_txn();
-                    if let Ok(Some(data)) = self.storage.get(&txn, &obj_key) {
+                    let snapshot = self.storage.read_snapshot();
+                    if let Ok(Some(data)) = self.storage.get_at(snapshot, &obj_key) {
                         let fields = deserialize_fields(&data);
                         if let Some(Value::String(text)) = fields.get(&source_field) {
                             candidate_texts.push((*obj_id, text.clone()));
@@ -592,40 +732,57 @@ impl Vectorizer {
         Ok(index.search(query_vec, k, ef))
     }
 
-    /// Start the background worker thread.
-    pub fn start_worker(self: &Arc<Self>) {
+    /// Start background worker threads for vectorization.
+    /// Each worker loads its own embedding model (~300MB per worker).
+    pub fn start_worker(self: &Arc<Self>, num_workers: usize) {
         if self.running.swap(true, Ordering::SeqCst) {
-            return; // already running
+            return;
         }
 
-        let vectorizer = Arc::clone(self);
-        let handle = std::thread::spawn(move || {
-            while vectorizer.running.load(Ordering::SeqCst) {
-                match vectorizer.process_pending() {
-                    Ok(0) => {
-                        // No work — sleep briefly before checking again.
+        let mut handles = self.worker_handles.lock();
+        for worker_id in 0..num_workers {
+            let vectorizer = Arc::clone(self);
+            let handle = std::thread::spawn(move || {
+                let mut local_embedders: HashMap<String, Box<dyn Embedder>> =
+                    HashMap::new();
+                while vectorizer.running.load(Ordering::SeqCst) {
+                    let batch = match vectorizer.claim_batch() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("vectorizer worker {worker_id} claim error: {e}");
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            continue;
+                        }
+                    };
+
+                    if batch.is_empty() {
                         std::thread::sleep(std::time::Duration::from_millis(100));
+                        continue;
                     }
-                    Ok(_) => {
-                        // Processed some jobs — immediately check for more.
-                    }
-                    Err(e) => {
-                        eprintln!("vectorizer worker error: {e}");
-                        std::thread::sleep(std::time::Duration::from_millis(500));
+
+                    match vectorizer.process_batch(batch, &mut local_embedders) {
+                        Ok(_) => {
+                            vectorizer.save_snapshots();
+                        }
+                        Err(e) => {
+                            eprintln!("vectorizer worker {worker_id} error: {e}");
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
                     }
                 }
-            }
-        });
-
-        *self.worker_handle.lock() = Some(handle);
+            });
+            handles.push(handle);
+        }
     }
 
-    /// Stop the background worker thread.
+    /// Stop all background worker threads and save index snapshots.
     pub fn stop_worker(&self) {
         self.running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.worker_handle.lock().take() {
+        let handles: Vec<_> = self.worker_handles.lock().drain(..).collect();
+        for handle in handles {
             let _ = handle.join();
         }
+        self.save_snapshots();
     }
 
     /// Check which types/fields have @vectorize configured.
@@ -645,12 +802,12 @@ impl Vectorizer {
         result
     }
 
-    fn mark_jobs_failed(
+    fn mark_batch_failed(
         &self,
-        jobs: &[(Bytes, VectorizeJob)],
+        jobs: &[VectorizeJob],
         _error: &str,
     ) -> EngineResult<()> {
-        for (queue_key, job) in jobs {
+        for job in jobs {
             let type_id = self.type_ids[&job.type_name];
             let field_key = format!("{}.{}", job.type_name, job.vector_field);
             let field_id = self.field_ids[&field_key];
@@ -662,7 +819,6 @@ impl Vectorizer {
                 &state_key,
                 Bytes::from(vec![VectorState::Failed as u8]),
             )?;
-            self.storage.delete(&mut txn, queue_key)?;
             self.storage.commit(&mut txn).map_err(|e| match e {
                 rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
                 other => crate::EngineError::Storage(other),
@@ -976,7 +1132,7 @@ mod tests {
             })
             .unwrap();
 
-        vectorizer.start_worker();
+        vectorizer.start_worker(1);
 
         // Wait for the worker to process the job.
         let mut attempts = 0;
@@ -991,5 +1147,154 @@ mod tests {
         }
 
         vectorizer.stop_worker();
+    }
+
+    #[test]
+    fn snapshot_speeds_up_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First run: index documents, save snapshot.
+        {
+            let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+            store_object(&storage, 1, 1, "machine learning and neural networks");
+            store_object(&storage, 1, 2, "cooking pasta with tomato sauce");
+            store_object(&storage, 1, 3, "deep learning for natural language processing");
+
+            let vectorizer = Vectorizer::new(
+                Arc::clone(&storage),
+                schema,
+                type_ids,
+                field_ids,
+            )
+            .unwrap();
+
+            for id in 1..=3 {
+                vectorizer
+                    .enqueue(VectorizeJob {
+                        type_name: "Post".into(),
+                        object_id: id,
+                        source_field: "body".into(),
+                        vector_field: "embedding".into(),
+                        model: "all-MiniLM-L6-v2".into(),
+                    })
+                    .unwrap();
+            }
+
+            vectorizer.process_pending().unwrap();
+            vectorizer.save_snapshots();
+
+            // Verify snapshot file was created.
+            let snapshot_path = dir.path().join("hnsw_Post_embedding.bin");
+            assert!(snapshot_path.exists(), "snapshot file should exist");
+            assert!(
+                snapshot_path.metadata().unwrap().len() > 0,
+                "snapshot file should not be empty"
+            );
+        }
+
+        // Second run: should load from snapshot.
+        {
+            let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+            let vectorizer = Vectorizer::new(
+                Arc::clone(&storage),
+                schema,
+                type_ids,
+                field_ids,
+            )
+            .unwrap();
+
+            let results = vectorizer
+                .search_text("Post", "embedding", "artificial intelligence", 2, 50)
+                .unwrap();
+            assert_eq!(results.len(), 2);
+            let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+            assert!(
+                ids.contains(&1) || ids.contains(&3),
+                "ML posts should rank high after snapshot restore, got {ids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_delta_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First run: index 2 docs, save snapshot.
+        {
+            let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+            store_object(&storage, 1, 1, "machine learning and neural networks");
+            store_object(&storage, 1, 2, "cooking pasta with tomato sauce");
+
+            let vectorizer = Vectorizer::new(
+                Arc::clone(&storage),
+                schema,
+                type_ids,
+                field_ids,
+            )
+            .unwrap();
+
+            for id in 1..=2 {
+                vectorizer
+                    .enqueue(VectorizeJob {
+                        type_name: "Post".into(),
+                        object_id: id,
+                        source_field: "body".into(),
+                        vector_field: "embedding".into(),
+                        model: "all-MiniLM-L6-v2".into(),
+                    })
+                    .unwrap();
+            }
+            vectorizer.process_pending().unwrap();
+            vectorizer.save_snapshots();
+        }
+
+        // Index a 3rd doc without saving a new snapshot.
+        {
+            let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+            store_object(&storage, 1, 3, "deep learning for NLP");
+
+            let vectorizer = Vectorizer::new(
+                Arc::clone(&storage),
+                schema,
+                type_ids,
+                field_ids,
+            )
+            .unwrap();
+
+            vectorizer
+                .enqueue(VectorizeJob {
+                    type_name: "Post".into(),
+                    object_id: 3,
+                    source_field: "body".into(),
+                    vector_field: "embedding".into(),
+                    model: "all-MiniLM-L6-v2".into(),
+                })
+                .unwrap();
+            vectorizer.process_pending().unwrap();
+            // Intentionally NOT saving snapshot.
+        }
+
+        // Third run: snapshot has 2, LSM has 3. Delta rebuild should pick up the 3rd.
+        {
+            let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+            let vectorizer = Vectorizer::new(
+                Arc::clone(&storage),
+                schema,
+                type_ids,
+                field_ids,
+            )
+            .unwrap();
+
+            let status = vectorizer.status();
+            let index_stat = status
+                .index_stats
+                .iter()
+                .find(|s| s.name == "Post.embedding")
+                .unwrap();
+            assert_eq!(
+                index_stat.vectors, 3,
+                "should have 3 vectors after delta rebuild"
+            );
+        }
     }
 }

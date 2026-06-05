@@ -6,6 +6,25 @@ pub enum Metric {
     DotProduct,
 }
 
+impl Metric {
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::L2 => 0,
+            Self::Cosine => 1,
+            Self::DotProduct => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::L2),
+            1 => Some(Self::Cosine),
+            2 => Some(Self::DotProduct),
+            _ => None,
+        }
+    }
+}
+
 /// Squared L2 (Euclidean) distance.
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());

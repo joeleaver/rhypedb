@@ -1,0 +1,198 @@
+[
+  {
+    "scenario": "1.4 traversal_1hop_user_to_movies",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 69.154373,
+      "p50_ms": 73.379287,
+      "p95_ms": 93.07105,
+      "p99_ms": 93.07105,
+      "max_ms": 93.07105,
+      "mean_ms": 78.53490333333333
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 95.33,
+      "p50_us": 145.685,
+      "p95_us": 233.841,
+      "p99_us": 299.405,
+      "max_us": 525.401,
+      "mean_us": 155.39887933333333,
+      "total_ms": 233.09831899999998
+    },
+    "rss_cold_mb": 3.8984375,
+    "rss_post_load_mb": 3.8984375,
+    "rss_peak_mb": 3.8984375,
+    "rss_steady_mb": 3.8984375,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "template": "User.get({uid}).ratings.movie"
+    }
+  },
+  {
+    "scenario": "1.4 traversal_1hop_user_to_movies",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 245.728255,
+      "p50_ms": 254.636207,
+      "p95_ms": 270.879361,
+      "p99_ms": 270.879361,
+      "max_ms": 270.879361,
+      "mean_ms": 257.08127433333334
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 321.217,
+      "p50_us": 456.181,
+      "p95_us": 682.127,
+      "p99_us": 1219.541,
+      "max_us": 19161.753,
+      "mean_us": 512.7842873333333,
+      "total_ms": 769.176431
+    },
+    "rss_cold_mb": 44.26171875,
+    "rss_post_load_mb": 44.26171875,
+    "rss_peak_mb": 44.26171875,
+    "rss_steady_mb": 44.26171875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "mode": "idiomatic",
+      "hop": 1
+    }
+  },
+  {
+    "scenario": "1.4 traversal_1hop_user_to_movies",
+    "implementation": "pg-optimal",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 209.274537,
+      "p50_ms": 215.460742,
+      "p95_ms": 230.336877,
+      "p99_ms": 230.336877,
+      "max_ms": 230.336877,
+      "mean_ms": 218.35738533333333
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 237.96,
+      "p50_us": 406.296,
+      "p95_us": 626.262,
+      "p99_us": 1409.259,
+      "max_us": 7242.729,
+      "mean_us": 435.3854113333333,
+      "total_ms": 653.078117
+    },
+    "rss_cold_mb": 44.26171875,
+    "rss_post_load_mb": 44.26171875,
+    "rss_peak_mb": 44.26171875,
+    "rss_steady_mb": 44.26171875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "mode": "optimal",
+      "hop": 1
+    }
+  },
+  {
+    "scenario": "1.5 traversal_2hop_user_to_users",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 2973.195105,
+      "p50_ms": 3002.870221,
+      "p95_ms": 3125.527648,
+      "p99_ms": 3125.527648,
+      "max_ms": 3125.527648,
+      "mean_ms": 3033.8643246666666
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 4579.803,
+      "p50_us": 5916.596,
+      "p95_us": 7444.851,
+      "p99_us": 9515.859,
+      "max_us": 17447.338,
+      "mean_us": 6059.086620666667,
+      "total_ms": 9088.629931
+    },
+    "rss_cold_mb": 3.8984375,
+    "rss_post_load_mb": 3.8984375,
+    "rss_peak_mb": 3.8984375,
+    "rss_steady_mb": 3.8984375,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "template": "User.get({uid}).ratings.movie.ratings.user"
+    }
+  },
+  {
+    "scenario": "1.5 traversal_2hop_user_to_users",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 2304.136172,
+      "p50_ms": 2318.57917,
+      "p95_ms": 2387.030977,
+      "p99_ms": 2387.030977,
+      "max_ms": 2387.030977,
+      "mean_ms": 2336.5821063333333
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 3169.271,
+      "p50_us": 4477.029,
+      "p95_us": 6162.199,
+      "p99_us": 7027.132,
+      "max_us": 64526.188,
+      "mean_us": 4670.430838,
+      "total_ms": 7005.646257
+    },
+    "rss_cold_mb": 44.26171875,
+    "rss_post_load_mb": 44.26171875,
+    "rss_peak_mb": 44.26171875,
+    "rss_steady_mb": 44.26171875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "mode": "idiomatic",
+      "hop": 2
+    }
+  },
+  {
+    "scenario": "1.5 traversal_2hop_user_to_users",
+    "implementation": "pg-optimal",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 1811.999478,
+      "p50_ms": 1836.535885,
+      "p95_ms": 1867.153399,
+      "p99_ms": 1867.153399,
+      "max_ms": 1867.153399,
+      "mean_ms": 1838.5629206666667
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 2407.734,
+      "p50_us": 3474.458,
+      "p95_us": 5401.394,
+      "p99_us": 6460.924,
+      "max_us": 8300.866,
+      "mean_us": 3674.363132,
+      "total_ms": 5511.544698
+    },
+    "rss_cold_mb": 44.26171875,
+    "rss_post_load_mb": 44.26171875,
+    "rss_peak_mb": 44.26171875,
+    "rss_steady_mb": 44.26171875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "mode": "optimal",
+      "hop": 2
+    }
+  }
+]

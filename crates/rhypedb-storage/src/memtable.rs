@@ -85,6 +85,25 @@ impl MemTable {
         None
     }
 
+    /// Batch point lookup. Returns one entry per input in the same order:
+    /// `None` for misses, `Some(value)` (where value is the put/tombstone) for hits.
+    /// Naive loop over `get` — skiplist seeks are cheap and the memtable is
+    /// bounded by the flush size, so per-key amortization isn't worth a cursor
+    /// implementation yet.
+    pub fn multi_get(&self, user_keys: &[&[u8]], version: u64) -> Vec<Option<MemValue>> {
+        user_keys.iter().map(|k| self.get(k, version)).collect()
+    }
+
+    /// Batch prefix scan. One inner Vec per input prefix, in input order.
+    /// Naive loop over `scan_prefix` — same rationale as `multi_get`.
+    pub fn multi_scan_prefix(
+        &self,
+        prefixes: &[&[u8]],
+        version: u64,
+    ) -> Vec<Vec<(Bytes, MemValue)>> {
+        prefixes.iter().map(|p| self.scan_prefix(p, version)).collect()
+    }
+
     /// Approximate size in bytes of all entries in this memtable.
     pub fn approximate_size(&self) -> usize {
         self.size_bytes

@@ -57,7 +57,7 @@ impl FastEmbedder {
         init_options.show_download_progress = false;
 
         let model = fastembed::TextEmbedding::try_new(init_options)
-        .map_err(|e| EmbedError::Model(e.to_string()))?;
+            .map_err(|e| EmbedError::Model(e.to_string()))?;
 
         Ok(Self {
             model,

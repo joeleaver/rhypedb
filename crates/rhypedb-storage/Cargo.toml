@@ -9,6 +9,7 @@ crc32fast = { workspace = true }
 crossbeam-skiplist = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

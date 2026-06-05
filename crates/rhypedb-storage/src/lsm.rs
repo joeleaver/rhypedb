@@ -16,6 +16,13 @@ const DEFAULT_MEMTABLE_FLUSH_SIZE: usize = 4 * 1024 * 1024; // 4MB
 pub struct LsmConfig {
     pub data_dir: PathBuf,
     pub memtable_flush_size: usize,
+    /// Optional closure that pulls zone-mapped integer field values out of
+    /// each SST entry's value bytes. Set by the engine at construction time
+    /// (it knows the schema and can decode FieldMaps). When `None`, SSTs are
+    /// written with an empty zone map (v4 format, zero overhead). When set,
+    /// every flushed SST captures per-block min/max bounds for opted-in
+    /// integer fields, enabling `scan_prefix_filtered_at` to skip blocks.
+    pub zone_extractor: Option<crate::zone::ZoneFieldExtractor>,
 }
 
 impl LsmConfig {
@@ -23,6 +30,7 @@ impl LsmConfig {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
             memtable_flush_size: DEFAULT_MEMTABLE_FLUSH_SIZE,
+            zone_extractor: None,
         }
     }
 }
@@ -126,12 +134,26 @@ impl LsmTree {
         self.txn_manager.begin()
     }
 
+    /// Take a snapshot for a read-only operation. Returns the latest committed
+    /// version as a `u64`. Pair with [`get_at`] / [`scan_prefix_at`] for the
+    /// read-only fast path that skips MVCC active-set registration.
+    ///
+    /// Use this for reads only. A transaction is still required for writes
+    /// because conflict detection depends on the active set.
+    pub fn read_snapshot(&self) -> u64 {
+        self.txn_manager.current_version()
+    }
+
     /// Read a user key at the transaction's snapshot version.
     ///
     /// Search order: active memtable → immutable memtables → SST files (newest first).
     pub fn get(&self, txn: &Transaction, user_key: &[u8]) -> Result<Option<Bytes>> {
-        let version = txn.snapshot();
+        self.get_at(txn.snapshot(), user_key)
+    }
 
+    /// Read a user key at the given snapshot version, without requiring a
+    /// `Transaction`. Used by the read-only fast path.
+    pub fn get_at(&self, version: u64, user_key: &[u8]) -> Result<Option<Bytes>> {
         // 1. Active memtable.
         let active = self.active_memtable.read().clone();
         if let Some(val) = active.get(user_key, version) {
@@ -166,6 +188,96 @@ impl LsmTree {
         Ok(None)
     }
 
+    /// Batch point lookup at the given snapshot version.
+    ///
+    /// Sorts the input keys once, then walks each layer (active memtable →
+    /// immutables newest-first → SSTs newest-first) with its batched primitive:
+    /// `MemTable::multi_get` / `SstReader::multi_get_versioned`. The SST path
+    /// is the meaningful win — sorted-batch + threshold-gallop turns N
+    /// independent sparse-index seeks into ~one block-read per ~6 dense
+    /// lookups. After each layer, needles that resolved (hit OR tombstone) are
+    /// pruned so older layers don't redo their work.
+    ///
+    /// Returns a `Vec<Option<Bytes>>` in the same order as `user_keys`. `None`
+    /// entries are misses (or tombstones — same observable result to callers).
+    pub fn multi_get_at(
+        &self,
+        version: u64,
+        user_keys: &[&[u8]],
+    ) -> Result<Vec<Option<Bytes>>> {
+        let n = user_keys.len();
+        let mut out: Vec<Option<Bytes>> = vec![None; n];
+        if n == 0 {
+            return Ok(out);
+        }
+
+        // Sort by user-key bytes, remembering original index for reordering.
+        let mut remaining: Vec<(usize, &[u8])> = user_keys.iter().copied().enumerate().collect();
+        remaining.sort_unstable_by(|a, b| a.1.cmp(b.1));
+
+        // Snapshot the memtable/SST handles once. Cheap (Arc clones); avoids
+        // re-acquiring the RwLock per layer iteration.
+        let active = self.active_memtable.read().clone();
+        let immutables = self.immutable_memtables.read().clone();
+        let ssts_guard = self.sst_files.read();
+
+        // Layer probe helper: takes a per-key lookup closure that returns
+        // `Option<MemValue>` (None=miss, Some(_) = hit-or-tombstone). Records
+        // hits/tombstones in `out` and prunes them from `remaining`.
+        macro_rules! probe_layer {
+            ($lookup:expr) => {{
+                let lookup = $lookup;
+                let keys: Vec<&[u8]> = remaining.iter().map(|(_, k)| *k).collect();
+                let vals: Vec<Option<crate::memtable::MemValue>> = lookup(&keys)?;
+                let mut next = Vec::with_capacity(remaining.len());
+                for ((orig_idx, key), val) in remaining.into_iter().zip(vals.into_iter()) {
+                    match val {
+                        // Hit (put) or tombstone: stop looking; tombstones
+                        // surface as `None` in the final output, matching the
+                        // single-key `get_at` semantics.
+                        Some(memval) => out[orig_idx] = memval,
+                        None => next.push((orig_idx, key)),
+                    }
+                }
+                remaining = next;
+            }};
+        }
+
+        probe_layer!(|keys: &[&[u8]]| -> Result<_> { Ok(active.multi_get(keys, version)) });
+
+        for mt in immutables.iter().rev() {
+            if remaining.is_empty() {
+                break;
+            }
+            probe_layer!(|keys: &[&[u8]]| -> Result<_> { Ok(mt.multi_get(keys, version)) });
+        }
+
+        for sst in ssts_guard.iter().rev() {
+            if remaining.is_empty() {
+                break;
+            }
+            // Range prune: skip SSTs whose [first_user_key, last_user_key]
+            // doesn't overlap the batch. For 20 SSTs created by sequential
+            // memtable flushes, most have non-overlapping ranges — pruning
+            // cuts ~90% of per-needle bloom calls on a typical traversal.
+            let keys: Vec<&[u8]> = remaining.iter().map(|(_, k)| *k).collect();
+            if !sst.range_overlaps_sorted(&keys) {
+                continue;
+            }
+            let vals = sst.multi_get_versioned(&keys, version)?;
+            let mut next = Vec::with_capacity(remaining.len());
+            for ((orig_idx, key), val) in remaining.into_iter().zip(vals.into_iter()) {
+                match val {
+                    Some(memval) => out[orig_idx] = memval,
+                    None => next.push((orig_idx, key)),
+                }
+            }
+            remaining = next;
+        }
+
+        Ok(out)
+    }
+
     /// Scan for all keys with the given prefix, visible at the transaction's snapshot.
     /// Returns `(user_key, value)` pairs. Tombstones are excluded from results.
     pub fn scan_prefix(
@@ -173,8 +285,149 @@ impl LsmTree {
         txn: &Transaction,
         prefix: &[u8],
     ) -> Result<Vec<(Bytes, Bytes)>> {
-        let version = txn.snapshot();
+        self.scan_prefix_at(txn.snapshot(), prefix)
+    }
 
+    /// Batched prefix scan: sorts the input prefixes once, then walks each
+    /// layer with its batched primitive (`MemTable::multi_scan_prefix` /
+    /// `SstReader::multi_scan_prefix_versioned`). The SST primitive is the
+    /// payoff — one cursor sweep with threshold gallop turns N independent
+    /// sparse-index seeks per SST into ~one block-read per ~6 dense prefixes,
+    /// the same shape that landed for point lookups.
+    ///
+    /// Layer-merge: SSTs oldest-first → immutable memtables oldest-first →
+    /// active memtable last. Per-prefix accumulator keeps the newest entry
+    /// per user_key; tombstones surface as `None` in the accumulator and
+    /// drop in the final filter. Input order restored at the end.
+    ///
+    /// Replaces the prior v1 implementation that only amortized RwLock
+    /// acquisitions across the batch.
+    pub fn multi_scan_prefix_at(
+        &self,
+        version: u64,
+        prefixes: &[&[u8]],
+    ) -> Result<Vec<Vec<(Bytes, Bytes)>>> {
+        let n = prefixes.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Sort prefixes by bytes, remember original index for output reordering.
+        let mut indexed: Vec<(usize, &[u8])> = prefixes.iter().copied().enumerate().collect();
+        indexed.sort_unstable_by(|a, b| a.1.cmp(b.1));
+        let sorted_prefixes: Vec<&[u8]> = indexed.iter().map(|(_, p)| *p).collect();
+
+        // Per-sorted-prefix accumulator. BTreeMap so the per-prefix output is
+        // returned in user-key order, matching `scan_prefix_at`.
+        let mut merged: Vec<std::collections::BTreeMap<Bytes, Option<Bytes>>> =
+            (0..n).map(|_| std::collections::BTreeMap::new()).collect();
+
+        let ssts_guard = self.sst_files.read();
+        let immutables = self.immutable_memtables.read().clone();
+        let active = self.active_memtable.read().clone();
+
+        // SSTs (oldest first). Newer entries overwrite older ones in the
+        // per-prefix accumulator. Range-prune SSTs that can't possibly match
+        // any prefix in the batch — same insight as `multi_get_at`, but the
+        // overlap predicate has to account for prefix-of-first-key cases.
+        for sst in ssts_guard.iter() {
+            if !sst.prefix_range_overlaps_sorted(&sorted_prefixes) {
+                continue;
+            }
+            let layer = sst.multi_scan_prefix_versioned(&sorted_prefixes, version);
+            for (sp_idx, entries) in layer.into_iter().enumerate() {
+                for (key, value) in entries {
+                    merged[sp_idx].insert(key, value);
+                }
+            }
+        }
+
+        // Immutable memtables (oldest first).
+        for mt in immutables.iter() {
+            let layer = mt.multi_scan_prefix(&sorted_prefixes, version);
+            for (sp_idx, entries) in layer.into_iter().enumerate() {
+                for (key, value) in entries {
+                    merged[sp_idx].insert(key, value);
+                }
+            }
+        }
+
+        // Active memtable (newest).
+        let layer = active.multi_scan_prefix(&sorted_prefixes, version);
+        for (sp_idx, entries) in layer.into_iter().enumerate() {
+            for (key, value) in entries {
+                merged[sp_idx].insert(key, value);
+            }
+        }
+
+        // Filter tombstones and restore input order.
+        let mut out: Vec<Vec<(Bytes, Bytes)>> = (0..n).map(|_| Vec::new()).collect();
+        for (sp_idx, (orig_idx, _)) in indexed.iter().enumerate() {
+            out[*orig_idx] = std::mem::take(&mut merged[sp_idx])
+                .into_iter()
+                .filter_map(|(k, v)| v.map(|val| (k, val)))
+                .collect();
+        }
+        Ok(out)
+    }
+
+    /// Filtered prefix scan: walks the same prefix as `scan_prefix_at` but
+    /// passes a `FieldPredicate` to each SST so blocks whose zone bounds
+    /// rule out a match can be skipped wholesale (no entry decode).
+    ///
+    /// **Caller still re-evaluates the predicate** on the returned entries —
+    /// zone maps are a coarse-grained pre-filter, not an exact one. For the
+    /// 100 K filter-scan bench, the typical pattern is "this block's max year
+    /// is 1985, predicate wants year > 2010 — skip 16 entries with one compare."
+    ///
+    /// Memtables don't have zone maps, so the active + immutable layers fall
+    /// back to the full `scan_prefix` path. The win comes entirely from the
+    /// SST layer where most data lives at scale.
+    pub fn scan_prefix_filtered_at(
+        &self,
+        version: u64,
+        prefix: &[u8],
+        predicate: &crate::zone::FieldPredicate,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
+            std::collections::BTreeMap::new();
+
+        // SSTs first (oldest), so newer entries overwrite.
+        let ssts = self.sst_files.read();
+        for sst in ssts.iter() {
+            for (key, value) in sst.scan_prefix_filtered(prefix, version, predicate) {
+                merged.insert(key, value);
+            }
+        }
+        drop(ssts);
+
+        // Immutable memtables (oldest first). No zone map — full scan_prefix.
+        let immutables = self.immutable_memtables.read().clone();
+        for mt in immutables.iter() {
+            for (key, value) in mt.scan_prefix(prefix, version) {
+                merged.insert(key, value);
+            }
+        }
+
+        // Active memtable (newest).
+        let active = self.active_memtable.read().clone();
+        for (key, value) in active.scan_prefix(prefix, version) {
+            merged.insert(key, value);
+        }
+
+        Ok(merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .collect())
+    }
+
+    /// Scan for all keys with the given prefix, visible at the given snapshot
+    /// version, without requiring a `Transaction`. Used by the read-only fast path.
+    pub fn scan_prefix_at(
+        &self,
+        version: u64,
+        prefix: &[u8],
+    ) -> Result<Vec<(Bytes, Bytes)>> {
         // Collect from all sources.
         let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
             std::collections::BTreeMap::new();
@@ -294,7 +547,10 @@ impl LsmTree {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sst_path = self.config.data_dir.join("sst").join(format!("{sst_id:08}.sst"));
 
-        let mut writer = SstWriter::new(&sst_path)?;
+        let mut writer = SstWriter::new_with_zone_extractor(
+            &sst_path,
+            self.config.zone_extractor.clone(),
+        )?;
         for (key, value) in old_memtable.iter() {
             writer.add(&key, &value)?;
         }
@@ -350,7 +606,10 @@ impl LsmTree {
             .join("sst")
             .join(format!("{sst_id:08}.sst"));
 
-        let mut writer = SstWriter::new(&sst_path)?;
+        let mut writer = SstWriter::new_with_zone_extractor(
+            &sst_path,
+            self.config.zone_extractor.clone(),
+        )?;
         let mut prev_user_key: Option<Vec<u8>> = None;
         let mut kept_latest_for_key = false;
 
@@ -423,6 +682,10 @@ impl LsmTree {
     pub fn sst_count(&self) -> usize {
         self.sst_files.read().len()
     }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.config.data_dir
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +697,7 @@ mod tests {
         LsmConfig {
             data_dir: dir.to_path_buf(),
             memtable_flush_size: 1024, // small for testing
+            zone_extractor: None,
         }
     }
 
@@ -781,5 +1045,427 @@ mod tests {
             let txn2 = tree.begin_txn();
             assert_eq!(tree.get(&txn2, b"key").unwrap(), Some(Bytes::from("v2")));
         }
+    }
+
+    #[test]
+    fn read_snapshot_sees_committed_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"key", Bytes::from("value")).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        assert_eq!(
+            tree.get_at(snapshot, b"key").unwrap(),
+            Some(Bytes::from("value"))
+        );
+    }
+
+    #[test]
+    fn read_snapshot_scan_prefix_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"a:1", Bytes::from("one")).unwrap();
+        tree.put(&mut txn, b"a:2", Bytes::from("two")).unwrap();
+        tree.put(&mut txn, b"b:1", Bytes::from("other")).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        let results = tree.scan_prefix_at(snapshot, b"a:").unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn read_snapshot_does_not_register_in_active_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let before = tree.txn_manager().min_active_snapshot();
+
+        let _snapshot = tree.read_snapshot();
+        let _snapshot2 = tree.read_snapshot();
+        let _snapshot3 = tree.read_snapshot();
+
+        // Read snapshots should NOT show up in active_snapshots.
+        // min_active_snapshot is u64::MAX when nothing is registered.
+        let after = tree.txn_manager().min_active_snapshot();
+        assert_eq!(before, after);
+    }
+
+    // --- multi_get_at (sorted-batch across layers) --------------------------
+
+    #[test]
+    fn multi_get_at_returns_input_order_with_unsorted_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"k:1", Bytes::from("v1")).unwrap();
+        tree.put(&mut txn, b"k:2", Bytes::from("v2")).unwrap();
+        tree.put(&mut txn, b"k:3", Bytes::from("v3")).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        // Pass keys out of order; output must still match input positions.
+        let inputs: Vec<&[u8]> = vec![b"k:3", b"k:1", b"k:2", b"k:missing"];
+        let results = tree.multi_get_at(snapshot, &inputs).unwrap();
+        assert_eq!(
+            results,
+            vec![
+                Some(Bytes::from("v3")),
+                Some(Bytes::from("v1")),
+                Some(Bytes::from("v2")),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_get_at_memtable_shadows_sst() {
+        // Write+flush a value to SST, then overwrite in memtable. The newer
+        // memtable entry must win for that key while the others come from SST.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"k:1", Bytes::from("old1")).unwrap();
+        tree.put(&mut txn, b"k:2", Bytes::from("old2")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+
+        let mut txn2 = tree.begin_txn();
+        tree.put(&mut txn2, b"k:1", Bytes::from("new1")).unwrap();
+        tree.commit(&mut txn2).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        let inputs: Vec<&[u8]> = vec![b"k:1", b"k:2"];
+        let results = tree.multi_get_at(snapshot, &inputs).unwrap();
+        assert_eq!(
+            results,
+            vec![Some(Bytes::from("new1")), Some(Bytes::from("old2"))]
+        );
+    }
+
+    #[test]
+    fn multi_get_at_tombstone_in_newer_layer_shadows_put_in_sst() {
+        // SST has a put; memtable has a tombstone for the same key. The
+        // tombstone must win — caller sees None, NOT the old SST value.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"alive", Bytes::from("a")).unwrap();
+        tree.put(&mut txn, b"dead", Bytes::from("rip")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+
+        let mut txn2 = tree.begin_txn();
+        tree.delete(&mut txn2, b"dead").unwrap();
+        tree.commit(&mut txn2).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        let inputs: Vec<&[u8]> = vec![b"alive", b"dead"];
+        let results = tree.multi_get_at(snapshot, &inputs).unwrap();
+        assert_eq!(results, vec![Some(Bytes::from("a")), None]);
+    }
+
+    #[test]
+    fn multi_get_at_empty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let snapshot = tree.read_snapshot();
+        let results = tree.multi_get_at(snapshot, &[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn multi_get_at_duplicate_keys_in_input() {
+        // Same key appears twice in input. Both output positions must receive
+        // the same value — the sort/reorder must not drop one.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"k", Bytes::from("v")).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        let inputs: Vec<&[u8]> = vec![b"k", b"missing", b"k"];
+        let results = tree.multi_get_at(snapshot, &inputs).unwrap();
+        assert_eq!(
+            results,
+            vec![Some(Bytes::from("v")), None, Some(Bytes::from("v"))]
+        );
+    }
+
+    // --- multi_scan_prefix_at (sorted-batch prefix across layers) ----------
+
+    #[test]
+    fn multi_scan_prefix_at_empty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let snapshot = tree.read_snapshot();
+        let results = tree.multi_scan_prefix_at(snapshot, &[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn multi_scan_prefix_at_returns_input_order_with_unsorted_prefixes() {
+        // Pass prefixes in non-sorted order; output positions must match input.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"a:1", Bytes::from("a1")).unwrap();
+        tree.put(&mut txn, b"b:1", Bytes::from("b1")).unwrap();
+        tree.put(&mut txn, b"b:2", Bytes::from("b2")).unwrap();
+        tree.put(&mut txn, b"c:1", Bytes::from("c1")).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        // Input order: c, a, b — sorted is a, b, c. Reordering must restore.
+        let prefixes: Vec<&[u8]> = vec![b"c:", b"a:", b"b:"];
+        let results = tree.multi_scan_prefix_at(snapshot, &prefixes).unwrap();
+
+        assert_eq!(results.len(), 3);
+        // results[0] corresponds to input "c:"
+        assert_eq!(results[0].len(), 1);
+        assert_eq!(results[0][0].1, Bytes::from("c1"));
+        // results[1] corresponds to input "a:"
+        assert_eq!(results[1].len(), 1);
+        assert_eq!(results[1][0].1, Bytes::from("a1"));
+        // results[2] corresponds to input "b:"
+        assert_eq!(results[2].len(), 2);
+    }
+
+    #[test]
+    fn multi_scan_prefix_at_memtable_overwrites_sst() {
+        // Write+flush a value to SST, then overwrite a same-prefix key in
+        // memtable. The memtable entry must win for that user key while
+        // siblings (same prefix, different key) still come from SST.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"p:1", Bytes::from("old1")).unwrap();
+        tree.put(&mut txn, b"p:2", Bytes::from("old2")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+
+        let mut txn2 = tree.begin_txn();
+        tree.put(&mut txn2, b"p:1", Bytes::from("new1")).unwrap();
+        tree.commit(&mut txn2).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        let prefixes: Vec<&[u8]> = vec![b"p:"];
+        let results = tree.multi_scan_prefix_at(snapshot, &prefixes).unwrap();
+
+        assert_eq!(results[0].len(), 2);
+        // BTreeMap output is user-key-sorted.
+        assert_eq!(results[0][0].0.as_ref(), b"p:1");
+        assert_eq!(results[0][0].1, Bytes::from("new1"));
+        assert_eq!(results[0][1].0.as_ref(), b"p:2");
+        assert_eq!(results[0][1].1, Bytes::from("old2"));
+    }
+
+    #[test]
+    fn multi_scan_prefix_at_tombstone_in_newer_layer_drops_sst_entry() {
+        // SST has p:1 = "v1" and p:2 = "v2". Memtable tombstones p:1. The
+        // prefix scan must return only p:2.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"p:1", Bytes::from("v1")).unwrap();
+        tree.put(&mut txn, b"p:2", Bytes::from("v2")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+
+        let mut txn2 = tree.begin_txn();
+        tree.delete(&mut txn2, b"p:1").unwrap();
+        tree.commit(&mut txn2).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        let prefixes: Vec<&[u8]> = vec![b"p:"];
+        let results = tree.multi_scan_prefix_at(snapshot, &prefixes).unwrap();
+
+        assert_eq!(results[0].len(), 1);
+        assert_eq!(results[0][0].0.as_ref(), b"p:2");
+        assert_eq!(results[0][0].1, Bytes::from("v2"));
+    }
+
+    #[test]
+    fn multi_scan_prefix_at_merges_across_multiple_ssts() {
+        // Two flushes → two SSTs. One prefix has entries split across both
+        // SSTs; the merge must union them without duplication.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"p:1", Bytes::from("v1")).unwrap();
+        tree.put(&mut txn, b"q:1", Bytes::from("q1")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+
+        let mut txn2 = tree.begin_txn();
+        tree.put(&mut txn2, b"p:2", Bytes::from("v2")).unwrap();
+        tree.put(&mut txn2, b"r:1", Bytes::from("r1")).unwrap();
+        tree.commit(&mut txn2).unwrap();
+        tree.flush().unwrap();
+
+        let snapshot = tree.read_snapshot();
+        let prefixes: Vec<&[u8]> = vec![b"p:", b"q:", b"r:"];
+        let results = tree.multi_scan_prefix_at(snapshot, &prefixes).unwrap();
+
+        // p: spans both SSTs (p:1 in older, p:2 in newer).
+        assert_eq!(results[0].len(), 2);
+        assert_eq!(results[1].len(), 1);
+        assert_eq!(results[2].len(), 1);
+    }
+
+    #[test]
+    fn multi_scan_prefix_at_spans_layers_with_overlapping_entries() {
+        // p:1 lives in SST. p:2 lives in active memtable.
+        // p:1 then has a fresh put in active memtable — that must overwrite the SST.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"p:1", Bytes::from("sst1")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+
+        let mut txn2 = tree.begin_txn();
+        tree.put(&mut txn2, b"p:1", Bytes::from("memnew")).unwrap();
+        tree.put(&mut txn2, b"p:2", Bytes::from("mem2")).unwrap();
+        tree.commit(&mut txn2).unwrap();
+
+        let snapshot = tree.read_snapshot();
+        let prefixes: Vec<&[u8]> = vec![b"p:"];
+        let results = tree.multi_scan_prefix_at(snapshot, &prefixes).unwrap();
+
+        assert_eq!(results[0].len(), 2);
+        assert_eq!(results[0][0].0.as_ref(), b"p:1");
+        assert_eq!(results[0][0].1, Bytes::from("memnew"));
+        assert_eq!(results[0][1].0.as_ref(), b"p:2");
+        assert_eq!(results[0][1].1, Bytes::from("mem2"));
+    }
+
+    #[test]
+    fn multi_get_at_correct_across_many_non_overlapping_ssts() {
+        // Make 10 SSTs whose key ranges don't overlap (sequential block of
+        // user keys per flush). Then look up a mix of present + absent keys
+        // that spans multiple SSTs. The range-pruning fast path must produce
+        // the same answer as the per-key scan would.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        for block in 0u64..10 {
+            let mut txn = tree.begin_txn();
+            for i in 0u64..10 {
+                let id = block * 100 + i; // ids 0..9, 100..109, 200..209, ...
+                let key = format!("k:{id:08}");
+                let val = format!("v{id}");
+                tree.put(&mut txn, key.as_bytes(), Bytes::from(val)).unwrap();
+            }
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+        }
+
+        let snapshot = tree.read_snapshot();
+
+        // Mix of present (one per block) + absent (gaps + above the top).
+        let present_ids: Vec<u64> = (0u64..10).map(|b| b * 100 + 5).collect();
+        let absent_ids: Vec<u64> = vec![50, 150, 250, 5000];
+        let mut all: Vec<String> = present_ids.iter().map(|i| format!("k:{i:08}")).collect();
+        all.extend(absent_ids.iter().map(|i| format!("k:{i:08}")));
+
+        let refs: Vec<&[u8]> = all.iter().map(|s| s.as_bytes()).collect();
+        let results = tree.multi_get_at(snapshot, &refs).unwrap();
+
+        for (i, id) in present_ids.iter().enumerate() {
+            assert_eq!(
+                results[i],
+                Some(Bytes::from(format!("v{id}"))),
+                "missing present id {id} at idx {i}"
+            );
+        }
+        for offset in 0..absent_ids.len() {
+            let idx = present_ids.len() + offset;
+            assert!(
+                results[idx].is_none(),
+                "absent id {} at idx {idx} unexpectedly returned {:?}",
+                absent_ids[offset],
+                results[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn multi_scan_prefix_at_correct_across_many_non_overlapping_ssts() {
+        // Similar shape, but for prefix scans. 5 SSTs, each holding a few
+        // distinct prefix-groups; queries hit a subset; range-prune path
+        // must produce the same answers.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        for block in 0u64..5 {
+            let mut txn = tree.begin_txn();
+            for sub in 0u64..5 {
+                // user_key format: "p:<block>:<sub>:item"
+                let key = format!("p:{block:02}:{sub:02}:item");
+                let val = format!("b{block}s{sub}");
+                tree.put(&mut txn, key.as_bytes(), Bytes::from(val)).unwrap();
+            }
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+        }
+
+        let snapshot = tree.read_snapshot();
+
+        // Scan three prefixes: one from block 1, one from block 3, one absent.
+        let prefixes: Vec<&[u8]> = vec![b"p:01:", b"p:03:", b"p:99:"];
+        let results = tree.multi_scan_prefix_at(snapshot, &prefixes).unwrap();
+
+        assert_eq!(results[0].len(), 5, "p:01: should yield 5 entries");
+        assert_eq!(results[1].len(), 5, "p:03: should yield 5 entries");
+        assert_eq!(results[2].len(), 0, "p:99: should yield nothing");
+    }
+
+    #[test]
+    fn multi_get_at_spans_multiple_ssts() {
+        // Two flushes → two SSTs. Newer SST has the winning version for one
+        // key, older SST is the only source for another. Batch must merge
+        // newest-first across SSTs.
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"a", Bytes::from("a-old")).unwrap();
+        tree.put(&mut txn, b"b", Bytes::from("b-only")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+
+        let mut txn2 = tree.begin_txn();
+        tree.put(&mut txn2, b"a", Bytes::from("a-new")).unwrap();
+        tree.put(&mut txn2, b"c", Bytes::from("c-only")).unwrap();
+        tree.commit(&mut txn2).unwrap();
+        tree.flush().unwrap();
+
+        let snapshot = tree.read_snapshot();
+        let inputs: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d"];
+        let results = tree.multi_get_at(snapshot, &inputs).unwrap();
+        assert_eq!(
+            results,
+            vec![
+                Some(Bytes::from("a-new")),
+                Some(Bytes::from("b-only")),
+                Some(Bytes::from("c-only")),
+                None,
+            ]
+        );
     }
 }

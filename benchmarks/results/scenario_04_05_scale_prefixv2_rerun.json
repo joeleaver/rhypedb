@@ -1,0 +1,66 @@
+[
+  {
+    "scenario": "1.4 traversal_1hop_user_to_movies",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 48.267856,
+      "p50_ms": 49.990285,
+      "p95_ms": 50.093089,
+      "p99_ms": 50.093089,
+      "max_ms": 50.093089,
+      "mean_ms": 49.45041
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 77.707,
+      "p50_us": 95.35,
+      "p95_us": 119.606,
+      "p99_us": 158.549,
+      "max_us": 262.264,
+      "mean_us": 97.744642,
+      "total_ms": 146.616963
+    },
+    "rss_cold_mb": 3.90625,
+    "rss_post_load_mb": 3.90625,
+    "rss_peak_mb": 3.90625,
+    "rss_steady_mb": 3.90625,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "template": "User.get({uid}).ratings.movie"
+    }
+  },
+  {
+    "scenario": "1.5 traversal_2hop_user_to_users",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 2121.528754,
+      "p50_ms": 2133.353366,
+      "p95_ms": 2239.003284,
+      "p99_ms": 2239.003284,
+      "max_ms": 2239.003284,
+      "mean_ms": 2164.628468
+    },
+    "operation_stats": {
+      "n": 1500,
+      "min_us": 3369.398,
+      "p50_us": 4146.804,
+      "p95_us": 5603.934,
+      "p99_us": 6669.554,
+      "max_us": 11226.383,
+      "mean_us": 4325.4039686666665,
+      "total_ms": 6488.105952999999
+    },
+    "rss_cold_mb": 3.90625,
+    "rss_post_load_mb": 3.90625,
+    "rss_peak_mb": 3.90625,
+    "rss_steady_mb": 3.90625,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 500,
+      "template": "User.get({uid}).ratings.movie.ratings.user"
+    }
+  }
+]

@@ -4,3 +4,10 @@ pub mod error;
 pub mod vectorizer;
 
 pub use error::{EngineError, EngineResult};
+
+// Re-export the storage-layer `CompareOp` so query callers can construct
+// `filter_scan` arguments without taking a direct dependency on the storage
+// crate. The enum lives in storage because that's where zone-map evaluation
+// happens, but the only thing query code does with it is forward query AST
+// comparison operators.
+pub use rhypedb_storage::zone::CompareOp;

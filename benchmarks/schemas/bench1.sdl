@@ -1,0 +1,18 @@
+type User {
+    name: String
+    email: String @unique
+    friends: [User] @on_delete(remove)
+    ratings: [Rating] @inverse(Rating.user)
+}
+
+type Movie {
+    title: String
+    year: u32
+    ratings: [Rating] @inverse(Rating.movie)
+}
+
+type Rating {
+    user: User @on_delete(cascade)
+    movie: Movie @on_delete(cascade)
+    stars: f32
+}

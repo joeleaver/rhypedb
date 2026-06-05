@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rhypedb_engine::database::Database;
 use rhypedb_engine::object::{FieldMap, Object, Value};
@@ -7,10 +7,25 @@ use rhypedb_engine::vectorizer::Vectorizer;
 use crate::ast::*;
 use crate::error::{QueryError, QueryResult};
 
-/// Result of executing a query.
+/// Result of executing a query (intermediate or terminal).
+///
+/// `IdSet` is the streaming traversal variant: between `Step::Traverse` hops we
+/// carry just (type, ids) and skip the per-object deserialize entirely. Every
+/// step that doesn't need field data (Update, Delete, Link, Unlink, Limit,
+/// Offset) consumes IdSet directly; only Filter materializes. The terminal
+/// `execute()` call collapses any remaining IdSet to Objects so server
+/// response code and tests see the same shape they always have.
+///
+/// `IdSetWithFields` extends IdSet for the inverse-traversal fusion path:
+/// the reverse-edge index in this DB stores the source object's effective
+/// fields as the entry value. After an inverse traversal we carry both the
+/// dedup'd source ids AND those carried FieldMaps. A subsequent forward-1:1
+/// `.field` traversal can then satisfy itself by reading the target id out
+/// of those FieldMaps — saving a per-source forward-edge prefix scan, which
+/// is the hot path that dominates multi-hop traversal at scale.
 #[derive(Debug)]
 pub enum QueryOutput {
-    /// A list of objects (from get, filter, traverse).
+    /// A list of objects (from get, filter, scan_type, materialized traversal).
     Objects(Vec<Object>),
 
     /// A single created/updated object.
@@ -18,6 +33,20 @@ pub enum QueryOutput {
 
     /// Void result (delete, link, unlink).
     Done,
+
+    /// A dedup'd set of (type_name, ids) carried between traversal hops. Never
+    /// reaches the wire — terminal-materialized in `execute()`.
+    IdSet { type_name: String, ids: Vec<u64> },
+
+    /// Like IdSet, but also carries per-id source fields produced by an
+    /// inverse traversal's covering reverse-edge values. Consumed by a
+    /// subsequent forward-1:1 traversal to skip the edge scan. Falls back
+    /// to plain IdSet semantics for any downstream step that doesn't take
+    /// advantage of the fields.
+    IdSetWithFields {
+        type_name: String,
+        items: Vec<(u64, rhypedb_engine::object::FieldMap)>,
+    },
 }
 
 /// Context for query execution.
@@ -34,6 +63,21 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
         result = execute_step(ctx, result, step, &query.source)?;
     }
 
+    // Streaming-traversal: if the pipeline ended on an `IdSet` or
+    // `IdSetWithFields`, materialize it to `Objects` so callers (server
+    // response, tests) see the historical shape. This is the only `get`
+    // cost we still pay for those IDs.
+    match result {
+        QueryOutput::IdSet { type_name, ids } => {
+            result = QueryOutput::Objects(materialize_ids(ctx.db, &type_name, &ids));
+        }
+        QueryOutput::IdSetWithFields { type_name, items } => {
+            let ids: Vec<u64> = items.into_iter().map(|(id, _)| id).collect();
+            result = QueryOutput::Objects(materialize_ids(ctx.db, &type_name, &ids));
+        }
+        _ => {}
+    }
+
     Ok(result)
 }
 
@@ -48,6 +92,13 @@ fn execute_source(db: &Database, source: &Source) -> QueryResult<QueryOutput> {
             type_name,
             predicate,
         } => {
+            // Zone-map fast path: single integer comparison gets pushed down
+            // to storage, which uses per-block min/max bounds to skip whole
+            // groups of entries before any decode. Complex predicates
+            // (And/Or, string compares, etc.) fall through to the full scan.
+            if let Some(objects) = try_filter_scan(db, type_name, predicate)? {
+                return Ok(QueryOutput::Objects(objects));
+            }
             let all = scan_all_objects(db, type_name)?;
             let filtered = all
                 .into_iter()
@@ -60,6 +111,15 @@ fn execute_source(db: &Database, source: &Source) -> QueryResult<QueryOutput> {
             let field_map = literal_map_to_field_map(fields)?;
             let obj = db.create(type_name, field_map)?;
             Ok(QueryOutput::Single(obj))
+        }
+
+        Source::CreateBatch { type_name, rows } => {
+            let field_maps: Vec<FieldMap> = rows
+                .iter()
+                .map(literal_map_to_field_map)
+                .collect::<QueryResult<_>>()?;
+            let objects = db.create_batch(type_name, field_maps)?;
+            Ok(QueryOutput::Objects(objects))
         }
 
         Source::All { type_name } => {
@@ -78,38 +138,112 @@ fn execute_step(
     let db = ctx.db;
     match step {
         Step::Traverse { field_name } => {
-            let objects = extract_objects(current)?;
-            let source_type = infer_type_from_objects(&objects, source);
-            let mut results = Vec::new();
+            // Extract the source type without consuming `current` yet — we
+            // need to peek at IdSetWithFields contents for the fusion path
+            // before falling through to ids_from_output.
+            let source_type_str = output_type_name(&current, source).ok_or_else(|| {
+                QueryError::InvalidArgument(format!(
+                    "no relation field {field_name}: unknown source type"
+                ))
+            })?;
 
-            for obj in &objects {
-                let type_name = source_type.as_deref().unwrap_or(&obj.type_name);
-                let links = db.get_links(type_name, obj.id, field_name)?;
+            let (target_type, is_inverse, is_one_to_one_forward) = db
+                .schema()
+                .get_type(&source_type_str)
+                .and_then(|td| td.get_field(field_name))
+                .and_then(|fd| match &fd.field_type {
+                    rhypedb_schema::FieldType::Relation(rel) => Some((
+                        rel.target_type.clone(),
+                        fd.inverse().is_some(),
+                        !rel.is_many && fd.inverse().is_none(),
+                    )),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    QueryError::InvalidArgument(format!(
+                        "no relation field {field_name} on {source_type_str}"
+                    ))
+                })?;
 
-                // Determine the target type from the schema.
-                let target_type = db
-                    .schema()
-                    .get_type(type_name)
-                    .and_then(|td| td.get_field(field_name))
-                    .and_then(|fd| match &fd.field_type {
-                        rhypedb_schema::FieldType::Relation(rel) => Some(rel.target_type.clone()),
-                        _ => None,
-                    });
+            // Fusion fast path: input is an IdSetWithFields (came from an
+            // inverse traversal) AND we're now doing a forward-1:1 traversal
+            // whose target id was captured in those source FieldMaps. Read it
+            // straight out — no edge scan needed for this whole hop.
+            if is_one_to_one_forward
+                && let QueryOutput::IdSetWithFields { items, .. } = &current
+                && items
+                    .iter()
+                    .any(|(_, f)| matches!(f.get(field_name.as_str()), Some(Value::U64(_))))
+            {
+                let mut seen: HashSet<u64> = HashSet::with_capacity(items.len());
+                let mut out: Vec<u64> = Vec::with_capacity(items.len());
+                for (_id, fields) in items {
+                    if let Some(Value::U64(tid)) = fields.get(field_name.as_str())
+                        && seen.insert(*tid)
+                    {
+                        out.push(*tid);
+                    }
+                }
+                return Ok(QueryOutput::IdSet {
+                    type_name: target_type,
+                    ids: out,
+                });
+            }
 
-                if let Some(target_type) = target_type {
-                    for (target_id, _edge_fields) in links {
-                        if let Ok(target_obj) = db.get(&target_type, target_id) {
-                            results.push(target_obj);
+            // Streaming path: extract (type, ids), walk links in one batched
+            // LSM pass.
+            let (source_type, source_ids) = ids_from_output(current, source)?;
+            let groups = db.get_links_many(&source_type, &source_ids, field_name)?;
+
+            // Inverse traversals: preserve the per-source FieldMaps that
+            // get_links_many returned (these now carry covering source-field
+            // data so the next forward-1:1 hop can fuse). Forward traversals
+            // just dedup IDs.
+            if is_inverse {
+                let mut seen: HashSet<u64> = HashSet::with_capacity(source_ids.len());
+                let mut items: Vec<(u64, FieldMap)> = Vec::new();
+                for group in groups {
+                    for (target_id, edge_fields) in group {
+                        if seen.insert(target_id) {
+                            items.push((target_id, edge_fields));
                         }
                     }
                 }
+                Ok(QueryOutput::IdSetWithFields {
+                    type_name: target_type,
+                    items,
+                })
+            } else {
+                let mut seen: HashSet<u64> = HashSet::with_capacity(source_ids.len());
+                let mut out: Vec<u64> = Vec::with_capacity(source_ids.len());
+                for group in groups {
+                    for (target_id, _edge_fields) in group {
+                        if seen.insert(target_id) {
+                            out.push(target_id);
+                        }
+                    }
+                }
+                Ok(QueryOutput::IdSet {
+                    type_name: target_type,
+                    ids: out,
+                })
             }
-
-            Ok(QueryOutput::Objects(results))
         }
 
         Step::Filter { predicate } => {
-            let objects = extract_objects(current)?;
+            // Filter is the one step that genuinely needs field data, so an
+            // IdSet input must materialize here. Subsequent traversals will
+            // re-collapse to IdSet via ids_from_output.
+            let objects = match current {
+                QueryOutput::IdSet { type_name, ids } => {
+                    materialize_ids(db, &type_name, &ids)
+                }
+                QueryOutput::IdSetWithFields { type_name, items } => {
+                    let ids: Vec<u64> = items.into_iter().map(|(id, _)| id).collect();
+                    materialize_ids(db, &type_name, &ids)
+                }
+                other => extract_objects(other)?,
+            };
             let filtered = objects
                 .into_iter()
                 .filter(|obj| evaluate_predicate(predicate, &obj.fields))
@@ -118,12 +252,12 @@ fn execute_step(
         }
 
         Step::Update { fields } => {
-            let objects = extract_objects(current)?;
+            // Update needs (type, id) only — work directly from IDs.
+            let (type_name, ids) = ids_from_output(current, source)?;
             let field_map = literal_map_to_field_map(fields)?;
-            let mut updated = Vec::new();
-            for obj in &objects {
-                let result = db.update(&obj.type_name, obj.id, field_map.clone())?;
-                updated.push(result);
+            let mut updated = Vec::with_capacity(ids.len());
+            for id in &ids {
+                updated.push(db.update(&type_name, *id, field_map.clone())?);
             }
             if updated.len() == 1 {
                 Ok(QueryOutput::Single(updated.remove(0)))
@@ -133,9 +267,9 @@ fn execute_step(
         }
 
         Step::Delete => {
-            let objects = extract_objects(current)?;
-            for obj in &objects {
-                db.delete(&obj.type_name, obj.id)?;
+            let (type_name, ids) = ids_from_output(current, source)?;
+            for id in ids {
+                db.delete(&type_name, id)?;
             }
             Ok(QueryOutput::Done)
         }
@@ -145,31 +279,18 @@ fn execute_step(
             target_id,
             edge_fields,
         } => {
-            let objects = extract_objects(current)?;
+            let (source_type, ids) = ids_from_output(current, source)?;
             let edge_map = if edge_fields.is_empty() {
                 None
             } else {
                 Some(literal_map_to_field_map(edge_fields)?)
             };
-
-            // The link step comes after a traverse step, so we need to figure out
-            // the relationship field name from the previous traverse. This is a
-            // limitation — for now, we need to look at the query context.
-            // The step itself needs the source type and field name.
-            // In practice, the traverse before link sets up this context.
-            //
-            // For now: the link operates on the source objects from the previous step.
-            // The field name was the traverse before this step.
-            for obj in &objects {
-                db.link(
-                    &obj.type_name,
-                    obj.id,
-                    target_type, // This is actually the relationship field name in the current design
-                    *target_id,
-                    edge_map.clone(),
-                )?;
+            // Resolve the relation field once — every source row has the
+            // same type at this point.
+            let field_name = resolve_relation_field(db, &source_type, target_type)?;
+            for id in ids {
+                db.link(&source_type, id, &field_name, *target_id, edge_map.clone())?;
             }
-
             Ok(QueryOutput::Done)
         }
 
@@ -177,9 +298,10 @@ fn execute_step(
             target_type,
             target_id,
         } => {
-            let objects = extract_objects(current)?;
-            for obj in &objects {
-                db.unlink(&obj.type_name, obj.id, target_type, *target_id)?;
+            let (source_type, ids) = ids_from_output(current, source)?;
+            let field_name = resolve_relation_field(db, &source_type, target_type)?;
+            for id in ids {
+                db.unlink(&source_type, id, &field_name, *target_id)?;
             }
             Ok(QueryOutput::Done)
         }
@@ -214,18 +336,103 @@ fn execute_step(
             Ok(QueryOutput::Objects(objects))
         }
 
-        Step::Limit { count } => {
-            let mut objects = extract_objects(current)?;
-            objects.truncate(*count);
-            Ok(QueryOutput::Objects(objects))
-        }
+        Step::Limit { count } => match current {
+            QueryOutput::IdSet { type_name, mut ids } => {
+                ids.truncate(*count);
+                Ok(QueryOutput::IdSet { type_name, ids })
+            }
+            QueryOutput::IdSetWithFields { type_name, mut items } => {
+                items.truncate(*count);
+                Ok(QueryOutput::IdSetWithFields { type_name, items })
+            }
+            other => {
+                let mut objects = extract_objects(other)?;
+                objects.truncate(*count);
+                Ok(QueryOutput::Objects(objects))
+            }
+        },
 
-        Step::Offset { count } => {
-            let objects = extract_objects(current)?;
-            let skipped = objects.into_iter().skip(*count).collect();
-            Ok(QueryOutput::Objects(skipped))
+        Step::Offset { count } => match current {
+            QueryOutput::IdSet { type_name, ids } => {
+                let ids: Vec<u64> = ids.into_iter().skip(*count).collect();
+                Ok(QueryOutput::IdSet { type_name, ids })
+            }
+            QueryOutput::IdSetWithFields { type_name, items } => {
+                let items: Vec<_> = items.into_iter().skip(*count).collect();
+                Ok(QueryOutput::IdSetWithFields { type_name, items })
+            }
+            other => {
+                let objects = extract_objects(other)?;
+                let skipped = objects.into_iter().skip(*count).collect();
+                Ok(QueryOutput::Objects(skipped))
+            }
+        },
+    }
+}
+
+/// Read the type_name from any QueryOutput shape, without consuming it.
+/// Used by `Step::Traverse` to look up schema metadata before deciding
+/// whether to take the fusion fast-path or the streaming path.
+fn output_type_name(output: &QueryOutput, source: &Source) -> Option<String> {
+    match output {
+        QueryOutput::IdSet { type_name, .. } => Some(type_name.clone()),
+        QueryOutput::IdSetWithFields { type_name, .. } => Some(type_name.clone()),
+        QueryOutput::Single(obj) => Some(obj.type_name.clone()),
+        QueryOutput::Objects(objs) => objs
+            .first()
+            .map(|o| o.type_name.clone())
+            .or_else(|| source_type_name(source)),
+        QueryOutput::Done => source_type_name(source),
+    }
+}
+
+/// Pull (type_name, ids) from any QueryOutput shape.
+///
+/// IdSet/IdSetWithFields: zero-copy. Objects/Single: extract `(type, id)`
+/// pairs without touching field data. Done: empty set, type derived from
+/// `source`.
+fn ids_from_output(
+    output: QueryOutput,
+    source: &Source,
+) -> QueryResult<(String, Vec<u64>)> {
+    match output {
+        QueryOutput::IdSet { type_name, ids } => Ok((type_name, ids)),
+        QueryOutput::IdSetWithFields { type_name, items } => {
+            Ok((type_name, items.into_iter().map(|(id, _)| id).collect()))
+        }
+        QueryOutput::Single(obj) => Ok((obj.type_name, vec![obj.id])),
+        QueryOutput::Objects(objs) => {
+            // Empty: derive type from source for a sensible error/no-op shape.
+            if objs.is_empty() {
+                let t = source_type_name(source).unwrap_or_default();
+                return Ok((t, Vec::new()));
+            }
+            let type_name = objs[0].type_name.clone();
+            let ids: Vec<u64> = objs.into_iter().map(|o| o.id).collect();
+            Ok((type_name, ids))
+        }
+        QueryOutput::Done => {
+            let t = source_type_name(source).unwrap_or_default();
+            Ok((t, Vec::new()))
         }
     }
+}
+
+fn source_type_name(source: &Source) -> Option<String> {
+    match source {
+        Source::Get { type_name, .. }
+        | Source::Filter { type_name, .. }
+        | Source::Create { type_name, .. }
+        | Source::CreateBatch { type_name, .. }
+        | Source::All { type_name } => Some(type_name.clone()),
+    }
+}
+
+/// Bulk materialize a list of IDs into Objects. Uses the engine's batched
+/// `get_many` so the whole set shares one read snapshot and the SSTs get
+/// probed in sorted-key order.
+fn materialize_ids(db: &Database, type_name: &str, ids: &[u64]) -> Vec<Object> {
+    db.get_many(type_name, ids).unwrap_or_default()
 }
 
 fn extract_objects(output: QueryOutput) -> QueryResult<Vec<Object>> {
@@ -233,6 +440,47 @@ fn extract_objects(output: QueryOutput) -> QueryResult<Vec<Object>> {
         QueryOutput::Objects(objs) => Ok(objs),
         QueryOutput::Single(obj) => Ok(vec![obj]),
         QueryOutput::Done => Ok(Vec::new()),
+        QueryOutput::IdSet { .. } | QueryOutput::IdSetWithFields { .. } => {
+            Err(QueryError::Type(
+                "internal: extract_objects called on IdSet variant — should have \
+                 been materialized first via ids_from_output or the terminal materialize"
+                    .into(),
+            ))
+        }
+    }
+}
+
+/// Find the relation field on `source_type` that points to `target_type`.
+/// Returns the field name if exactly one match; errors on zero or multiple matches.
+fn resolve_relation_field(
+    db: &Database,
+    source_type: &str,
+    target_type: &str,
+) -> QueryResult<String> {
+    let type_def = db
+        .schema()
+        .get_type(source_type)
+        .ok_or_else(|| crate::error::QueryError::Type(format!("unknown type {source_type}")))?;
+
+    let matches: Vec<&str> = type_def
+        .fields
+        .iter()
+        .filter_map(|f| match &f.field_type {
+            rhypedb_schema::FieldType::Relation(rel) if rel.target_type == target_type => {
+                Some(f.name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => Err(crate::error::QueryError::InvalidArgument(format!(
+            "no relation field on {source_type} points to {target_type}"
+        ))),
+        [single] => Ok((*single).to_string()),
+        many => Err(crate::error::QueryError::InvalidArgument(format!(
+            "ambiguous: {source_type} has multiple relation fields to {target_type}: {many:?}"
+        ))),
     }
 }
 
@@ -327,16 +575,49 @@ fn infer_type_from_objects(objects: &[Object], source: &Source) -> Option<String
     if let Some(first) = objects.first() {
         return Some(first.type_name.clone());
     }
-    match source {
-        Source::Get { type_name, .. }
-        | Source::Filter { type_name, .. }
-        | Source::Create { type_name, .. }
-        | Source::All { type_name } => Some(type_name.clone()),
-    }
+    source_type_name(source)
 }
 
 fn scan_all_objects(db: &Database, type_name: &str) -> QueryResult<Vec<Object>> {
     Ok(db.scan_type(type_name)?)
+}
+
+/// Recognize the shape `Filter(Compare { int_field, op, int_literal })` and
+/// push it down to `Database::filter_scan` so storage can zone-prune blocks.
+/// Returns `Ok(Some(objects))` on match, `Ok(None)` if the predicate is too
+/// complex for the fast path (And/Or, string compare, missing field, etc.) —
+/// in which case the caller falls back to the full scan + filter.
+fn try_filter_scan(
+    db: &Database,
+    type_name: &str,
+    predicate: &Predicate,
+) -> QueryResult<Option<Vec<Object>>> {
+    let Predicate::Compare { field_path, op, value } = predicate else {
+        return Ok(None);
+    };
+    // No nested field paths for now — only top-level field.
+    if field_path.contains('.') {
+        return Ok(None);
+    }
+    // Alias to disambiguate from the query crate's CompareOp imported via
+    // `use crate::ast::*`. The engine re-exports the storage enum so this
+    // crate doesn't need to depend on storage directly.
+    use rhypedb_engine::CompareOp as StorageOp;
+    let storage_op = match op {
+        CompareOp::Eq => StorageOp::Eq,
+        CompareOp::Ne => StorageOp::Ne,
+        CompareOp::Lt => StorageOp::Lt,
+        CompareOp::Le => StorageOp::Le,
+        CompareOp::Gt => StorageOp::Gt,
+        CompareOp::Ge => StorageOp::Ge,
+    };
+    // Only integer literals get the zone-map fast path. Strings, floats,
+    // bools, and null fall through.
+    let target = match value {
+        Literal::Int(i) => *i,
+        _ => return Ok(None),
+    };
+    Ok(Some(db.filter_scan(type_name, field_path, storage_op, target)?))
 }
 
 #[cfg(test)]
@@ -392,6 +673,44 @@ mod tests {
                 );
             }
             _ => panic!("expected Objects"),
+        }
+    }
+
+    #[test]
+    fn execute_create_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(dir.path());
+
+        let q = parse_query(
+            r#"User.create_batch([
+                { name: "Alice", age: 25, active: true },
+                { name: "Bob", age: 30, active: true },
+                { name: "Carol", age: 35, active: false }
+            ])"#,
+        )
+        .unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let objs = match result {
+            QueryOutput::Objects(objs) => objs,
+            other => panic!("expected Objects, got {other:?}"),
+        };
+        assert_eq!(objs.len(), 3);
+        let names: Vec<_> = objs
+            .iter()
+            .map(|o| o.fields.get("name").cloned().unwrap())
+            .collect();
+        assert!(names.contains(&Value::String("Alice".into())));
+        assert!(names.contains(&Value::String("Bob".into())));
+        assert!(names.contains(&Value::String("Carol".into())));
+
+        // Round-trip: confirm we can read each back.
+        for o in &objs {
+            let q = parse_query(&format!("User.get({})", o.id)).unwrap();
+            let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+            match result {
+                QueryOutput::Objects(o2) => assert_eq!(o2.len(), 1),
+                _ => panic!("expected Objects"),
+            }
         }
     }
 
@@ -479,6 +798,29 @@ mod tests {
             }
             _ => panic!("expected Objects"),
         }
+    }
+
+    #[test]
+    fn execute_link_via_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(dir.path());
+
+        let alice = create_user(&db, "Alice", 25);
+        let bob = create_user(&db, "Bob", 30);
+
+        // Link via the query language — resolver finds the friends field automatically.
+        let q = parse_query(&format!(
+            "User.get({}).link(User.get({}))",
+            alice.id, bob.id
+        ))
+        .unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        assert!(matches!(result, QueryOutput::Done));
+
+        // Verify the link landed via direct db query.
+        let links = db.get_links("User", alice.id, "friends").unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].0, bob.id);
     }
 
     #[test]

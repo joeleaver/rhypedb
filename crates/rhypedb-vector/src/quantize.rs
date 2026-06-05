@@ -1,4 +1,11 @@
+use std::io;
+
 use rand::Rng;
+
+use crate::serial::{
+    read_byte_vec, read_f32, read_f32_vec, read_u32, read_u8, write_byte_vec, write_f32,
+    write_f32_slice, write_u32, write_u8,
+};
 
 /// Sample from N(0,1) via Box-Muller transform.
 fn sample_normal(rng: &mut impl Rng) -> f32 {
@@ -218,6 +225,30 @@ impl TurboQuantizer {
     pub fn config(&self) -> &TurboQuantConfig {
         &self.config
     }
+
+    pub fn write_to(&self, w: &mut dyn io::Write) -> io::Result<()> {
+        write_u32(w, self.config.dimensions)?;
+        write_u8(w, self.config.bits)?;
+        write_f32_slice(w, &self.rotation_matrix)?;
+        self.codebook.write_to(w)?;
+        write_f32_slice(w, &self.qjl_matrix)
+    }
+
+    pub fn read_from(r: &mut dyn io::Read) -> io::Result<Self> {
+        let dimensions = read_u32(r)?;
+        let bits = read_u8(r)?;
+        let config = TurboQuantConfig::new(dimensions, bits);
+        let dims = dimensions as usize;
+        let rotation_matrix = read_f32_vec(r, dims * dims)?;
+        let codebook = Codebook::read_from(r)?;
+        let qjl_matrix = read_f32_vec(r, dims * dims)?;
+        Ok(Self {
+            config,
+            rotation_matrix,
+            codebook,
+            qjl_matrix,
+        })
+    }
 }
 
 /// A compressed vector with all components needed for the unbiased estimator.
@@ -233,9 +264,46 @@ impl CompressedVector {
     pub fn total_bytes(&self) -> usize {
         self.data.len() + self.qjl_signs.len() + 8 // + 2 f32 norms
     }
+
+    pub fn write_to(&self, w: &mut dyn io::Write) -> io::Result<()> {
+        write_byte_vec(w, &self.data)?;
+        write_byte_vec(w, &self.qjl_signs)?;
+        write_f32(w, self.norm)?;
+        write_f32(w, self.residual_norm)
+    }
+
+    pub fn read_from(r: &mut dyn io::Read) -> io::Result<Self> {
+        let data = read_byte_vec(r)?;
+        let qjl_signs = read_byte_vec(r)?;
+        let norm = read_f32(r)?;
+        let residual_norm = read_f32(r)?;
+        Ok(Self {
+            data,
+            qjl_signs,
+            norm,
+            residual_norm,
+        })
+    }
 }
 
 impl Codebook {
+    fn write_to(&self, w: &mut dyn io::Write) -> io::Result<()> {
+        write_u32(w, self.centroids.len() as u32)?;
+        write_f32_slice(w, &self.centroids)?;
+        write_f32_slice(w, &self.boundaries)
+    }
+
+    fn read_from(r: &mut dyn io::Read) -> io::Result<Self> {
+        let num_centroids = read_u32(r)? as usize;
+        let centroids = read_f32_vec(r, num_centroids)?;
+        let num_boundaries = num_centroids.saturating_sub(1);
+        let boundaries = read_f32_vec(r, num_boundaries)?;
+        Ok(Self {
+            centroids,
+            boundaries,
+        })
+    }
+
     fn quantize(&self, value: f32) -> usize {
         // Binary search on decision boundaries.
         match self
@@ -668,5 +736,63 @@ mod tests {
         // TurboQuant codebook is analytical — no samples required.
         let config = TurboQuantConfig::new(128, 3);
         let _quantizer = TurboQuantizer::new(config);
+    }
+
+    #[test]
+    fn compressed_vector_serialization_roundtrip() {
+        let dims = 64;
+        let config = TurboQuantConfig::new(dims, 4);
+        let quantizer = TurboQuantizer::new(config);
+
+        let mut rng = rand::rng();
+        let original: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let compressed = quantizer.compress(&original);
+
+        let mut buf = Vec::new();
+        compressed.write_to(&mut buf).unwrap();
+        let restored = CompressedVector::read_from(&mut &buf[..]).unwrap();
+
+        assert_eq!(compressed.data, restored.data);
+        assert_eq!(compressed.qjl_signs, restored.qjl_signs);
+        assert_eq!(compressed.norm, restored.norm);
+        assert_eq!(compressed.residual_norm, restored.residual_norm);
+    }
+
+    #[test]
+    fn quantizer_serialization_roundtrip() {
+        let dims = 32;
+        let config = TurboQuantConfig::new(dims, 3);
+        let quantizer = TurboQuantizer::new(config);
+
+        let mut buf = Vec::new();
+        quantizer.write_to(&mut buf).unwrap();
+        let restored = TurboQuantizer::read_from(&mut &buf[..]).unwrap();
+
+        assert_eq!(quantizer.config.dimensions, restored.config.dimensions);
+        assert_eq!(quantizer.config.bits, restored.config.bits);
+        assert_eq!(quantizer.rotation_matrix, restored.rotation_matrix);
+        assert_eq!(quantizer.qjl_matrix, restored.qjl_matrix);
+        assert_eq!(quantizer.codebook.centroids, restored.codebook.centroids);
+        assert_eq!(quantizer.codebook.boundaries, restored.codebook.boundaries);
+    }
+
+    #[test]
+    fn quantizer_roundtrip_preserves_distances() {
+        let dims = 32;
+        let config = TurboQuantConfig::new(dims, 3);
+        let quantizer = TurboQuantizer::new(config);
+
+        let mut buf = Vec::new();
+        quantizer.write_to(&mut buf).unwrap();
+        let restored = TurboQuantizer::read_from(&mut &buf[..]).unwrap();
+
+        let mut rng = rand::rng();
+        let query: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let target: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
+
+        let compressed = quantizer.compress(&target);
+        let ip_original = quantizer.inner_product_estimate(&query, &compressed);
+        let ip_restored = restored.inner_product_estimate(&query, &compressed);
+        assert_eq!(ip_original, ip_restored);
     }
 }

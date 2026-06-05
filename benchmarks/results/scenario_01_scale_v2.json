@@ -1,0 +1,119 @@
+[
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 4235.368051,
+      "p50_ms": 4417.733046,
+      "p95_ms": 4595.591878,
+      "p99_ms": 4595.591878,
+      "max_ms": 4595.591878,
+      "mean_ms": 4416.230991666667
+    },
+    "operation_stats": {
+      "n": 300000,
+      "min_us": 30.688,
+      "p50_us": 36.319,
+      "p95_us": 62.307,
+      "p99_us": 102.343,
+      "max_us": 47738.045,
+      "mean_us": 43.36680884,
+      "total_ms": 13010.042652
+    },
+    "rss_cold_mb": 3.875,
+    "rss_post_load_mb": 3.875,
+    "rss_peak_mb": 3.875,
+    "rss_steady_mb": 3.875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 100000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "rhypedb-tcp-batch",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 1354.63603,
+      "p50_ms": 1376.326775,
+      "p95_ms": 1596.661816,
+      "p99_ms": 1596.661816,
+      "max_ms": 1596.661816,
+      "mean_ms": 1442.5415403333334
+    },
+    "operation_stats": {
+      "n": 300,
+      "min_us": 8892.275,
+      "p50_us": 11600.829,
+      "p95_us": 24621.678,
+      "p99_us": 60176.975,
+      "max_us": 114856.713,
+      "mean_us": 14172.795826666666,
+      "total_ms": 4251.838748
+    },
+    "rss_cold_mb": 3.875,
+    "rss_post_load_mb": 3.875,
+    "rss_peak_mb": 3.875,
+    "rss_steady_mb": 3.875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 100000,
+      "batch_size": 1000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 9703.330244,
+      "p50_ms": 9802.541474,
+      "p95_ms": 10165.242376,
+      "p99_ms": 10165.242376,
+      "max_ms": 10165.242376,
+      "mean_ms": 9890.371364666667
+    },
+    "operation_stats": {
+      "n": 300000,
+      "min_us": 67.457,
+      "p50_us": 96.241,
+      "p95_us": 138.511,
+      "p99_us": 183.146,
+      "max_us": 3426.468,
+      "mean_us": 98.47768599666666,
+      "total_ms": 29543.305798999998
+    },
+    "rss_cold_mb": 43.9765625,
+    "rss_post_load_mb": 43.9765625,
+    "rss_peak_mb": 43.9765625,
+    "rss_steady_mb": 43.9765625,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 100000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "pg-optimal",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 264.788185,
+      "p50_ms": 275.055136,
+      "p95_ms": 290.656016,
+      "p99_ms": 290.656016,
+      "max_ms": 290.656016,
+      "mean_ms": 276.83311233333336
+    },
+    "operation_stats": {},
+    "rss_cold_mb": 43.9765625,
+    "rss_post_load_mb": 43.9765625,
+    "rss_peak_mb": 43.9765625,
+    "rss_steady_mb": 43.9765625,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 100000,
+      "note": "COPY: no per-row latency"
+    }
+  }
+]

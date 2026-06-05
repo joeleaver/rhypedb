@@ -860,7 +860,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2450,6 +2450,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "parking_lot",
  "rhypedb-embed",
  "rhypedb-engine",
  "rhypedb-query",
@@ -2459,6 +2460,7 @@ dependencies = [
  "rhypedb-vector",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -2472,6 +2474,7 @@ dependencies = [
  "parking_lot",
  "tempfile",
  "thiserror",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3726,6 +3729,12 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "y4m"
