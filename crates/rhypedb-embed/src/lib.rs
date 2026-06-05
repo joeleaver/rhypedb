@@ -124,13 +124,81 @@ pub struct FastReranker {
 
 impl FastReranker {
     pub fn new() -> EmbedResult<Self> {
-        let mut init_options = fastembed::RerankInitOptions::default();
-        init_options.show_download_progress = false;
-
-        let model = fastembed::TextRerank::try_new(init_options)
-            .map_err(|e| EmbedError::Model(e.to_string()))?;
+        // Reranker selection:
+        //   - RHYPEDB_RERANKER_DIR=<dir>: load a user-supplied reranker
+        //     (model.onnx + the four tokenizer files) from a local directory.
+        //     Used by bundled deployments that ship their own model and must not
+        //     touch the network.
+        //   - RHYPEDB_RERANKER_FP32 set: the full-precision bge-reranker-base
+        //     (~1.1GB) — an escape hatch.
+        //   - otherwise (DEFAULT): the int8-quantized bge-reranker-base (~280MB,
+        //     equivalent quality, ~4x smaller and lower memory), downloaded and
+        //     cached on first use.
+        let model = if let Some(dir) = std::env::var_os("RHYPEDB_RERANKER_DIR") {
+            Self::load_from_dir(std::path::Path::new(&dir))?
+        } else if std::env::var_os("RHYPEDB_RERANKER_FP32").is_some() {
+            let mut init_options = fastembed::RerankInitOptions::default();
+            init_options.show_download_progress = false;
+            fastembed::TextRerank::try_new(init_options).map_err(|e| EmbedError::Model(e.to_string()))?
+        } else {
+            Self::load_quantized_default()?
+        };
 
         Ok(Self { model })
+    }
+
+    /// Load a user-defined reranker (model.onnx + tokenizer files) from a dir.
+    fn load_from_dir(dir: &std::path::Path) -> EmbedResult<fastembed::TextRerank> {
+        let read = |name: &str| {
+            std::fs::read(dir.join(name))
+                .map_err(|e| EmbedError::Model(format!("reranker file '{name}': {e}")))
+        };
+        let tokenizer_files = fastembed::TokenizerFiles {
+            tokenizer_file: read("tokenizer.json")?,
+            config_file: read("config.json")?,
+            special_tokens_map_file: read("special_tokens_map.json")?,
+            tokenizer_config_file: read("tokenizer_config.json")?,
+        };
+        Self::build(fastembed::OnnxSource::File(dir.join("model.onnx")), tokenizer_files)
+    }
+
+    /// Default reranker: the int8-quantized bge-reranker-base, fetched from the
+    /// HuggingFace hub (Xenova/bge-reranker-base) and cached alongside the
+    /// embedding models. ~280MB vs the 1.1GB fp32 build, equivalent quality.
+    fn load_quantized_default() -> EmbedResult<fastembed::TextRerank> {
+        use hf_hub::api::sync::ApiBuilder;
+        let api = ApiBuilder::new()
+            .with_cache_dir(std::path::PathBuf::from(fastembed::get_cache_dir()))
+            .with_progress(false)
+            .build()
+            .map_err(|e| EmbedError::Model(format!("hf-hub init: {e}")))?;
+        let repo = api.model("Xenova/bge-reranker-base".to_string());
+        let fetch = |name: &str| {
+            repo.get(name)
+                .map_err(|e| EmbedError::Model(format!("download '{name}': {e}")))
+        };
+        let read = |name: &str| -> EmbedResult<Vec<u8>> {
+            std::fs::read(fetch(name)?).map_err(|e| EmbedError::Model(format!("read '{name}': {e}")))
+        };
+        let tokenizer_files = fastembed::TokenizerFiles {
+            tokenizer_file: read("tokenizer.json")?,
+            config_file: read("config.json")?,
+            special_tokens_map_file: read("special_tokens_map.json")?,
+            tokenizer_config_file: read("tokenizer_config.json")?,
+        };
+        Self::build(fastembed::OnnxSource::File(fetch("onnx/model_quantized.onnx")?), tokenizer_files)
+    }
+
+    fn build(
+        onnx: fastembed::OnnxSource,
+        tokenizer_files: fastembed::TokenizerFiles,
+    ) -> EmbedResult<fastembed::TextRerank> {
+        let user_model = fastembed::UserDefinedRerankingModel::new(onnx, tokenizer_files);
+        fastembed::TextRerank::try_new_from_user_defined(
+            user_model,
+            fastembed::RerankInitOptionsUserDefined::default(),
+        )
+        .map_err(|e| EmbedError::Model(e.to_string()))
     }
 }
 

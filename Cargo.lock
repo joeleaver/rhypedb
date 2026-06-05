@@ -2415,6 +2415,7 @@ name = "rhypedb-embed"
 version = "0.1.0"
 dependencies = [
  "fastembed",
+ "hf-hub",
  "thiserror",
 ]
 

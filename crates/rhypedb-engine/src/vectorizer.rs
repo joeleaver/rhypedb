@@ -647,8 +647,26 @@ impl Vectorizer {
             return Ok(Vec::new());
         }
 
-        // Over-retrieve: get more candidates than k for reranking.
-        let retrieval_k = k * 10;
+        // Whether cross-encoder reranking is active. RHYPEDB_DISABLE_RERANK
+        // turns it off entirely (no reranker model is loaded) — raw HNSW
+        // results, much faster and a far smaller memory/image footprint.
+        let rerank_disabled = std::env::var_os("RHYPEDB_DISABLE_RERANK").is_some();
+
+        // How many HNSW candidates to retrieve. With reranking off we only need
+        // the top k. With it on we over-retrieve a *bounded* pool to feed the
+        // cross-encoder — it runs one forward pass per candidate, so this is the
+        // dominant query cost. Capped (overridable via RHYPEDB_RERANK_CANDIDATES)
+        // rather than the old uncapped `k * 10`, which reranked ~120 verses for
+        // a 12-result query.
+        let retrieval_k = if rerank_disabled {
+            k
+        } else {
+            std::env::var("RHYPEDB_RERANK_CANDIDATES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or((k * 3).min(48))
+                .max(k)
+        };
         let candidates = index.search(&query_vec[0], retrieval_k, ef.max(retrieval_k));
 
         // Find the source field for this vector field.
@@ -659,8 +677,8 @@ impl Vectorizer {
             .and_then(|fd| fd.vectorize())
             .map(|v| v.source_field.clone());
 
-        // Rerank if we have a reranker and can read the source text.
-        if let Some(source_field) = source_field {
+        // Rerank if enabled and we can read the source text.
+        if let Some(source_field) = source_field.filter(|_| !rerank_disabled) {
             let type_id = self.type_ids.get(type_name).copied();
 
             // Fetch original text for each candidate.
