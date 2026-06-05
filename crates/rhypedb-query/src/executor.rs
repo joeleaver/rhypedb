@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+use bytes::Bytes;
 use rhypedb_engine::database::Database;
-use rhypedb_engine::object::{FieldMap, Object, Value};
+use rhypedb_engine::object::{
+    find_bytes_field_in_raw, find_u64_field_in_raw, FieldMap, Object, Value,
+};
 use rhypedb_engine::vectorizer::Vectorizer;
 
 use crate::ast::*;
@@ -38,14 +41,17 @@ pub enum QueryOutput {
     /// reaches the wire — terminal-materialized in `execute()`.
     IdSet { type_name: String, ids: Vec<u64> },
 
-    /// Like IdSet, but also carries per-id source fields produced by an
-    /// inverse traversal's covering reverse-edge values. Consumed by a
-    /// subsequent forward-1:1 traversal to skip the edge scan. Falls back
-    /// to plain IdSet semantics for any downstream step that doesn't take
-    /// advantage of the fields.
+    /// Like IdSet, but also carries per-id source fields (as raw
+    /// serialized-FieldMap bytes) produced by an inverse traversal's
+    /// covering reverse-edge values. Consumed by a subsequent forward-1:1
+    /// traversal to skip the edge scan — the fusion path extracts the next
+    /// hop's target id via `find_u64_field_in_raw` without building a
+    /// HashMap. Falls back to plain IdSet semantics for any downstream step
+    /// that doesn't take advantage of the fields; `Filter` / terminal
+    /// materialize call `deserialize_fields` lazily.
     IdSetWithFields {
         type_name: String,
-        items: Vec<(u64, rhypedb_engine::object::FieldMap)>,
+        items: Vec<(u64, Bytes)>,
     },
 }
 
@@ -57,7 +63,7 @@ pub struct ExecContext<'a> {
 
 /// Execute a parsed query against the database.
 pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput> {
-    let mut result = execute_source(ctx.db, &query.source)?;
+    let mut result = execute_source(ctx.db, &query.source, &query.steps)?;
 
     for step in &query.steps {
         result = execute_step(ctx, result, step, &query.source)?;
@@ -72,6 +78,9 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
             result = QueryOutput::Objects(materialize_ids(ctx.db, &type_name, &ids));
         }
         QueryOutput::IdSetWithFields { type_name, items } => {
+            // Terminal materialize: ignore the carried raw bytes (would only
+            // hold edge_fields, not the target's object fields) and probe the
+            // LSM for the full Object data.
             let ids: Vec<u64> = items.into_iter().map(|(id, _)| id).collect();
             result = QueryOutput::Objects(materialize_ids(ctx.db, &type_name, &ids));
         }
@@ -81,7 +90,11 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
     Ok(result)
 }
 
-fn execute_source(db: &Database, source: &Source) -> QueryResult<QueryOutput> {
+fn execute_source(
+    db: &Database,
+    source: &Source,
+    steps: &[Step],
+) -> QueryResult<QueryOutput> {
     match source {
         Source::Get { type_name, id } => {
             let obj = db.get(type_name, *id)?;
@@ -92,14 +105,25 @@ fn execute_source(db: &Database, source: &Source) -> QueryResult<QueryOutput> {
             type_name,
             predicate,
         } => {
-            // Zone-map fast path: single integer comparison gets pushed down
-            // to storage, which uses per-block min/max bounds to skip whole
-            // groups of entries before any decode. Complex predicates
-            // (And/Or, string compares, etc.) fall through to the full scan.
-            if let Some(objects) = try_filter_scan(db, type_name, predicate)? {
+            // Index / zone-map fast path: single integer comparison gets
+            // pushed down to storage along with an effective limit (if the
+            // next step is a bare `.limit(N)` we can stop scanning once N
+            // matches land). Complex predicates (And/Or, string compares,
+            // etc.) fall through to the full scan.
+            let pushed_limit = leading_limit(steps);
+            if let Some(mut objects) = try_filter_scan(db, type_name, predicate, pushed_limit)? {
+                // Fast-path objects may carry `raw_fields` — if a downstream
+                // step inspects them via `obj.fields`, eagerly populate now.
+                // No-op when raw_fields is None.
+                for obj in &mut objects {
+                    obj.ensure_fields_deserialized();
+                }
                 return Ok(QueryOutput::Objects(objects));
             }
-            let all = scan_all_objects(db, type_name)?;
+            let mut all = scan_all_objects(db, type_name)?;
+            for obj in &mut all {
+                obj.ensure_fields_deserialized();
+            }
             let filtered = all
                 .into_iter()
                 .filter(|obj| evaluate_predicate(predicate, &obj.fields))
@@ -167,23 +191,60 @@ fn execute_step(
 
             // Fusion fast path: input is an IdSetWithFields (came from an
             // inverse traversal) AND we're now doing a forward-1:1 traversal
-            // whose target id was captured in those source FieldMaps. Read it
-            // straight out — no edge scan needed for this whole hop.
+            // whose target id was captured in those source covering bytes.
+            // Read it straight out via `find_u64_field_in_raw` — no HashMap
+            // build, no edge scan for this hop.
+            //
+            // Second-degree win: when the covering ALSO carries
+            // `<field>__cover` (the target object's own serialized fields,
+            // embedded at link time), we emit `IdSetWithFields` whose bytes
+            // ARE the target's object data — terminal materialize then
+            // constructs Objects directly without an LSM probe per id.
+            // Avoids the 700-user `multi_get` on the 2-hop bench shape.
             if is_one_to_one_forward
                 && let QueryOutput::IdSetWithFields { items, .. } = &current
                 && items
                     .iter()
-                    .any(|(_, f)| matches!(f.get(field_name.as_str()), Some(Value::U64(_))))
+                    .any(|(_, bytes)| find_u64_field_in_raw(bytes, field_name.as_str()).is_some())
             {
+                let cover_field_name = format!("{field_name}__cover");
                 let mut seen: HashSet<u64> = HashSet::with_capacity(items.len());
-                let mut out: Vec<u64> = Vec::with_capacity(items.len());
-                for (_id, fields) in items {
-                    if let Some(Value::U64(tid)) = fields.get(field_name.as_str())
-                        && seen.insert(*tid)
+                let mut covered_items: Vec<(u64, Bytes)> = Vec::with_capacity(items.len());
+                let mut id_only: Vec<u64> = Vec::new();
+                let mut any_covered = false;
+                for (_id, bytes) in items {
+                    if let Some(tid) = find_u64_field_in_raw(bytes, field_name.as_str())
+                        && seen.insert(tid)
                     {
-                        out.push(*tid);
+                        if let Some(cover) = find_bytes_field_in_raw(bytes, &cover_field_name) {
+                            any_covered = true;
+                            covered_items.push((tid, cover));
+                        } else {
+                            id_only.push(tid);
+                        }
                     }
                 }
+                if any_covered && id_only.is_empty() {
+                    // Every dedup'd target carried its own fields in the
+                    // covering — construct full Objects right now (with
+                    // `raw_fields` populated for zero-copy wire encoding)
+                    // and skip the terminal `multi_get` entirely. This is
+                    // the single biggest 2-hop win: the 700-user point
+                    // lookup pass at the end vanishes.
+                    let objects: Vec<Object> = covered_items
+                        .into_iter()
+                        .map(|(tid, cover)| {
+                            Object::from_raw(target_type.clone(), tid, cover)
+                        })
+                        .collect();
+                    return Ok(QueryOutput::Objects(objects));
+                }
+                // Some targets weren't covered — fall back to id-only.
+                let mut out = Vec::with_capacity(covered_items.len() + id_only.len());
+                for (tid, _) in covered_items {
+                    out.push(tid);
+                }
+                out.extend(id_only);
                 return Ok(QueryOutput::IdSet {
                     type_name: target_type,
                     ids: out,
@@ -195,17 +256,17 @@ fn execute_step(
             let (source_type, source_ids) = ids_from_output(current, source)?;
             let groups = db.get_links_many(&source_type, &source_ids, field_name)?;
 
-            // Inverse traversals: preserve the per-source FieldMaps that
-            // get_links_many returned (these now carry covering source-field
-            // data so the next forward-1:1 hop can fuse). Forward traversals
-            // just dedup IDs.
+            // Inverse traversals: preserve the per-source covering bytes that
+            // get_links_many returned (these carry the source's effective
+            // fields so the next forward-1:1 hop can fuse via
+            // `find_u64_field_in_raw`). Forward traversals just dedup IDs.
             if is_inverse {
                 let mut seen: HashSet<u64> = HashSet::with_capacity(source_ids.len());
-                let mut items: Vec<(u64, FieldMap)> = Vec::new();
+                let mut items: Vec<(u64, Bytes)> = Vec::new();
                 for group in groups {
-                    for (target_id, edge_fields) in group {
+                    for (target_id, edge_bytes) in group {
                         if seen.insert(target_id) {
-                            items.push((target_id, edge_fields));
+                            items.push((target_id, edge_bytes));
                         }
                     }
                 }
@@ -217,7 +278,7 @@ fn execute_step(
                 let mut seen: HashSet<u64> = HashSet::with_capacity(source_ids.len());
                 let mut out: Vec<u64> = Vec::with_capacity(source_ids.len());
                 for group in groups {
-                    for (target_id, _edge_fields) in group {
+                    for (target_id, _edge_bytes) in group {
                         if seen.insert(target_id) {
                             out.push(target_id);
                         }
@@ -234,7 +295,13 @@ fn execute_step(
             // Filter is the one step that genuinely needs field data, so an
             // IdSet input must materialize here. Subsequent traversals will
             // re-collapse to IdSet via ids_from_output.
-            let objects = match current {
+            //
+            // For IdSetWithFields we still go through `materialize_ids`
+            // rather than deserialize the carried covering bytes — those
+            // hold the SOURCE object's fields (the previous hop), not the
+            // current type's fields. The Filter predicate is against the
+            // current type, so a fresh LSM probe is required.
+            let mut objects = match current {
                 QueryOutput::IdSet { type_name, ids } => {
                     materialize_ids(db, &type_name, &ids)
                 }
@@ -244,6 +311,11 @@ fn execute_step(
                 }
                 other => extract_objects(other)?,
             };
+            // get_many emits Objects with raw_fields populated for the wire
+            // shortcut — predicate evaluation needs the decoded FieldMap.
+            for obj in &mut objects {
+                obj.ensure_fields_deserialized();
+            }
             let filtered = objects
                 .into_iter()
                 .filter(|obj| evaluate_predicate(predicate, &obj.fields))
@@ -429,10 +501,14 @@ fn source_type_name(source: &Source) -> Option<String> {
 }
 
 /// Bulk materialize a list of IDs into Objects. Uses the engine's batched
-/// `get_many` so the whole set shares one read snapshot and the SSTs get
-/// probed in sorted-key order.
+/// `get_many_lazy` so each Object carries `raw_fields = Some(bytes)` — the
+/// wire encoder ships the stored payload directly, skipping
+/// `deserialize_fields` + HashMap construction + drop for objects that flow
+/// straight from LSM to the TCP response. Consumers that read `obj.fields`
+/// (Filter predicate, HTTP/JSON path) call `ensure_fields_deserialized`
+/// first.
 fn materialize_ids(db: &Database, type_name: &str, ids: &[u64]) -> Vec<Object> {
-    db.get_many(type_name, ids).unwrap_or_default()
+    db.get_many_lazy(type_name, ids).unwrap_or_default()
 }
 
 fn extract_objects(output: QueryOutput) -> QueryResult<Vec<Object>> {
@@ -583,14 +659,19 @@ fn scan_all_objects(db: &Database, type_name: &str) -> QueryResult<Vec<Object>> 
 }
 
 /// Recognize the shape `Filter(Compare { int_field, op, int_literal })` and
-/// push it down to `Database::filter_scan` so storage can zone-prune blocks.
-/// Returns `Ok(Some(objects))` on match, `Ok(None)` if the predicate is too
-/// complex for the fast path (And/Or, string compare, missing field, etc.) —
-/// in which case the caller falls back to the full scan + filter.
+/// push it down to `Database::filter_scan` so storage can use the secondary
+/// index (when available) or zone-prune blocks (when not). Returns
+/// `Ok(Some(objects))` on match, `Ok(None)` if the predicate is too complex
+/// for the fast path (And/Or, string compare, missing field, etc.) — in
+/// which case the caller falls back to the full scan + filter.
+///
+/// `limit` is the caller's request to stop after N matches (typically
+/// extracted from a trailing `.limit(N)` step). Best-effort.
 fn try_filter_scan(
     db: &Database,
     type_name: &str,
     predicate: &Predicate,
+    limit: Option<usize>,
 ) -> QueryResult<Option<Vec<Object>>> {
     let Predicate::Compare { field_path, op, value } = predicate else {
         return Ok(None);
@@ -611,13 +692,26 @@ fn try_filter_scan(
         CompareOp::Gt => StorageOp::Gt,
         CompareOp::Ge => StorageOp::Ge,
     };
-    // Only integer literals get the zone-map fast path. Strings, floats,
-    // bools, and null fall through.
+    // Only integer literals get the fast path. Strings, floats, bools, and
+    // null fall through.
     let target = match value {
         Literal::Int(i) => *i,
         _ => return Ok(None),
     };
-    Ok(Some(db.filter_scan(type_name, field_path, storage_op, target)?))
+    Ok(Some(db.filter_scan(type_name, field_path, storage_op, target, limit)?))
+}
+
+/// If the query's first step is a bare `.limit(N)` (no intervening filter,
+/// traverse, or offset that could reorder/expand results), return `Some(N)`
+/// so we can push it into the storage scan. Filter→limit on a non-pushed
+/// predicate is also safe — the caller's outer filter walk will obey the
+/// same cap. Anything else (offset, traverse, etc.) makes the limit
+/// non-equivalent at storage layer; we return `None` for safety.
+fn leading_limit(steps: &[Step]) -> Option<usize> {
+    match steps.first()? {
+        Step::Limit { count } => Some(*count),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -789,8 +883,12 @@ mod tests {
         let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
 
         match result {
-            QueryOutput::Objects(objs) => {
+            QueryOutput::Objects(mut objs) => {
                 assert_eq!(objs.len(), 1);
+                // Terminal materialize uses `get_many_lazy` — the wire path
+                // would emit `raw_fields` directly. Direct in-memory readers
+                // call `ensure_fields_deserialized` to populate `fields`.
+                objs[0].ensure_fields_deserialized();
                 assert_eq!(
                     objs[0].fields.get("name"),
                     Some(&Value::String("Bob".into()))

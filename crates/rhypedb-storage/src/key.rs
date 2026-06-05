@@ -10,6 +10,11 @@ pub enum KeyPrefix {
     Unique = b'u',
     Queue = b'q',
     VectorState = b's',
+    /// Non-unique scalar secondary index: `i:<type_id>:<field_hash>:<encoded_value>:<object_id>`.
+    /// Empty value payload — the data is the key itself. Encoded value uses
+    /// the same byte-order-preserving rules as zone maps so a prefix scan
+    /// returns ids in ascending field-value order.
+    FieldIndex = b'i',
 }
 
 pub const SEPARATOR: u8 = b':';
@@ -174,6 +179,60 @@ impl KeyBuilder {
         buf.freeze()
     }
 
+    /// Secondary field index key: `i:<type_id>:<field_hash>:<encoded_value>:<object_id>`.
+    /// `encoded_value` is the 8-byte byte-order-preserving encoding from the
+    /// engine; `object_id` is big-endian u64. Empty value payload.
+    pub fn field_index(
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8; 8],
+        object_id: u64,
+    ) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + 8 + 1 + 8);
+        buf.put_u8(KeyPrefix::FieldIndex as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_hash);
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(encoded_value);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(object_id);
+        buf.freeze()
+    }
+
+    /// Prefix for scanning every entry of one type's indexed field, sorted
+    /// ascending by encoded value: `i:<type_id>:<field_hash>:`.
+    pub fn field_index_prefix(type_id: u64, field_hash: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1);
+        buf.put_u8(KeyPrefix::FieldIndex as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_hash);
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Prefix for scanning every entry of one type's indexed field matching a
+    /// specific value (equality lookup): `i:<type_id>:<field_hash>:<encoded_value>:`.
+    pub fn field_index_value_prefix(
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8; 8],
+    ) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + 8 + 1);
+        buf.put_u8(KeyPrefix::FieldIndex as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_hash);
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(encoded_value);
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
     /// Vectorization queue entry: `q:<job_id>`
     /// Value contains the serialized job (type, object_id, source field, vector field, model).
     pub fn queue_entry(job_id: u64) -> Bytes {
@@ -247,5 +306,41 @@ mod tests {
         let prefix = KeyBuilder::edge_prefix(10, 20);
         let full = KeyBuilder::edge(10, 20, 30);
         assert!(full.starts_with(&prefix));
+    }
+
+    #[test]
+    fn field_index_key_structure() {
+        let key = KeyBuilder::field_index(1, 0xdead_beef, &[0; 8], 42);
+        assert_eq!(key[0], b'i');
+        assert_eq!(key[1], b':');
+    }
+
+    #[test]
+    fn field_index_prefix_is_prefix_of_full_key() {
+        let prefix = KeyBuilder::field_index_prefix(1, 0xdead);
+        let full = KeyBuilder::field_index(1, 0xdead, &[1, 2, 3, 4, 5, 6, 7, 8], 99);
+        assert!(full.starts_with(&prefix));
+    }
+
+    #[test]
+    fn field_index_value_prefix_is_prefix_of_full_key() {
+        let value: [u8; 8] = [9, 8, 7, 6, 5, 4, 3, 2];
+        let prefix = KeyBuilder::field_index_value_prefix(7, 0xbeef, &value);
+        let full = KeyBuilder::field_index(7, 0xbeef, &value, 1234);
+        assert!(full.starts_with(&prefix));
+    }
+
+    #[test]
+    fn field_index_keys_sort_by_value_then_id() {
+        // Same type+field, two different encoded values: the lower value's
+        // key must sort before the higher value's, regardless of id.
+        let lo = KeyBuilder::field_index(1, 0xfeed, &10u64.to_be_bytes(), 100);
+        let hi = KeyBuilder::field_index(1, 0xfeed, &20u64.to_be_bytes(), 5);
+        assert!(lo < hi);
+
+        // Same encoded value, two different ids: ascending by id.
+        let id1 = KeyBuilder::field_index(1, 0xfeed, &10u64.to_be_bytes(), 1);
+        let id2 = KeyBuilder::field_index(1, 0xfeed, &10u64.to_be_bytes(), 2);
+        assert!(id1 < id2);
     }
 }

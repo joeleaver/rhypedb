@@ -76,7 +76,10 @@ struct ObjectJson {
 }
 
 impl From<Object> for ObjectJson {
-    fn from(obj: Object) -> Self {
+    fn from(mut obj: Object) -> Self {
+        // HTTP/JSON response needs the decoded FieldMap; honor the lazy-
+        // deserialize shortcut populated by `Database::get_many`.
+        obj.ensure_fields_deserialized();
         let fields = obj
             .fields
             .into_iter()
@@ -206,6 +209,53 @@ async fn handle_health(
         "ok (subscriptions: {})",
         state.db.subscriptions().subscription_count()
     )
+}
+
+/// Force-flush the active memtable + compact all SST files into one.
+/// Operational only — no auth, no admin gating. For benchmarking and
+/// manual triggering during development. Auto-compaction is the proper
+/// long-term answer.
+async fn handle_admin_compact(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let storage = state.db.storage();
+    let t0 = std::time::Instant::now();
+    let flush_result = tokio::task::spawn_blocking({
+        let storage = storage.clone();
+        move || storage.flush()
+    })
+    .await;
+    let flush_ms = t0.elapsed().as_millis();
+
+    let t1 = std::time::Instant::now();
+    let compact_result = tokio::task::spawn_blocking({
+        let storage = storage.clone();
+        move || storage.compact()
+    })
+    .await;
+    let compact_ms = t1.elapsed().as_millis();
+
+    let flush_ok = matches!(&flush_result, Ok(Ok(_)));
+    let compact_ok = matches!(&compact_result, Ok(Ok(_)));
+    let flush_err = match &flush_result {
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(e) => Some(e.to_string()),
+        Ok(Ok(_)) => None,
+    };
+    let compact_err = match &compact_result {
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(e) => Some(e.to_string()),
+        Ok(Ok(_)) => None,
+    };
+
+    Json(serde_json::json!({
+        "flush_ok": flush_ok,
+        "flush_ms": flush_ms,
+        "flush_error": flush_err,
+        "compact_ok": compact_ok,
+        "compact_ms": compact_ms,
+        "compact_error": compact_err,
+    }))
 }
 
 async fn handle_status(
@@ -342,6 +392,7 @@ async fn main() {
         .route("/subscribe", get(handle_subscribe))
         .route("/status", get(handle_status))
         .route("/health", get(handle_health))
+        .route("/admin/compact", post(handle_admin_compact))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&cli.listen)
@@ -398,6 +449,12 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    // Per-connection response buffer. Holds the entire wire frame (header +
+    // payload) and gets cleared between responses. Eliminates the per-query
+    // `Vec::new()` for the response payload and lets the encode + write
+    // collapse to one `write_all` instead of four.
+    let mut response_buf: Vec<u8> = Vec::with_capacity(4 * 1024);
+
     loop {
         let frame = match protocol::read_frame(reader).await {
             Ok(f) => f,
@@ -411,8 +468,14 @@ where
 
         match frame.kind {
             protocol::REQ_PING => {
-                if let Err(e) =
-                    protocol::write_frame(writer, frame.req_id, protocol::RESP_PONG, &[]).await
+                if let Err(e) = protocol::write_frame_buffered(
+                    writer,
+                    &mut response_buf,
+                    frame.req_id,
+                    protocol::RESP_PONG,
+                    |_| {},
+                )
+                .await
                 {
                     eprintln!("tcp pong write error: {e}");
                     return;
@@ -422,12 +485,13 @@ where
                 let query_text = match protocol::decode_query_payload(&frame.payload) {
                     Ok(q) => q,
                     Err(e) => {
-                        let payload = protocol::encode_error_payload(&format!("decode: {e}"));
-                        let _ = protocol::write_frame(
+                        let msg = format!("decode: {e}");
+                        let _ = protocol::write_frame_buffered(
                             writer,
+                            &mut response_buf,
                             frame.req_id,
                             protocol::RESP_ERROR,
-                            &payload,
+                            |buf| protocol::encode_error_payload_into(&msg, buf),
                         )
                         .await;
                         continue;
@@ -435,39 +499,65 @@ where
                 };
 
                 let response = execute_query(&state, &query_text);
-                let (kind, payload) = match response {
+                let write_result = match response {
                     Ok(QueryOutput::Objects(objs)) => {
-                        (protocol::RESP_OBJECTS, protocol::encode_objects_payload(&objs))
+                        protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            frame.req_id,
+                            protocol::RESP_OBJECTS,
+                            |buf| protocol::encode_objects_payload_into(&objs, buf),
+                        )
+                        .await
                     }
                     Ok(QueryOutput::Single(obj)) => {
                         if let Some(vectorizer) = &state.vectorizer {
                             enqueue_vectorize(vectorizer, &state.db, &obj);
                         }
-                        (protocol::RESP_SINGLE, protocol::encode_single_payload(&obj))
+                        protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            frame.req_id,
+                            protocol::RESP_SINGLE,
+                            |buf| protocol::encode_object(&obj, buf),
+                        )
+                        .await
                     }
-                    Ok(QueryOutput::Done) => (protocol::RESP_DONE, Vec::new()),
+                    Ok(QueryOutput::Done) => protocol::write_frame_buffered(
+                        writer,
+                        &mut response_buf,
+                        frame.req_id,
+                        protocol::RESP_DONE,
+                        |_| {},
+                    )
+                    .await,
                     Ok(QueryOutput::IdSet { .. })
                     | Ok(QueryOutput::IdSetWithFields { .. }) => unreachable!(
                         "QueryOutput::IdSet variants should be materialized to Objects before leaving execute()"
                     ),
-                    Err(msg) => (protocol::RESP_ERROR, protocol::encode_error_payload(&msg)),
+                    Err(msg) => protocol::write_frame_buffered(
+                        writer,
+                        &mut response_buf,
+                        frame.req_id,
+                        protocol::RESP_ERROR,
+                        |buf| protocol::encode_error_payload_into(&msg, buf),
+                    )
+                    .await,
                 };
 
-                if let Err(e) =
-                    protocol::write_frame(writer, frame.req_id, kind, &payload).await
-                {
+                if let Err(e) = write_result {
                     eprintln!("tcp write_frame error: {e}");
                     return;
                 }
             }
             other => {
-                let payload =
-                    protocol::encode_error_payload(&format!("unknown request type 0x{other:02x}"));
-                let _ = protocol::write_frame(
+                let msg = format!("unknown request type 0x{other:02x}");
+                let _ = protocol::write_frame_buffered(
                     writer,
+                    &mut response_buf,
                     frame.req_id,
                     protocol::RESP_ERROR,
-                    &payload,
+                    |buf| protocol::encode_error_payload_into(&msg, buf),
                 )
                 .await;
             }

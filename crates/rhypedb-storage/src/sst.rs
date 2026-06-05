@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -272,10 +272,23 @@ impl SstReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
-        let mut reader = BufReader::new(file);
-        let mut data_buf = Vec::new();
-        reader.read_to_end(&mut data_buf)?;
-        let data: Bytes = data_buf.into();
+        // mmap the file contents instead of read-to-end. The kernel page cache
+        // owns the actual memory; cold pages can be evicted under pressure.
+        // Wrapping in `Bytes::from_owner` lets the hot-path `data.slice(..)`
+        // calls keep returning zero-copy refcounted views — when the last
+        // `Bytes` ref drops, the `Mmap` (and its mapping) is released.
+        //
+        // SAFETY: SST files are written-once via `SstWriter::finish()` to a
+        // fresh path before the SstReader opens them; no path ever has both
+        // an active writer and reader, and we never truncate / modify a file
+        // that's been opened for reading. Mapping a written-once file is the
+        // canonical safe use of `Mmap::map`.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // Hint random access — bloom-then-seek scans don't benefit from the
+        // kernel's read-ahead heuristic, and on big SSTs the read-ahead can
+        // waste page cache and disk bandwidth.
+        let _ = mmap.advise(memmap2::Advice::Random);
+        let data: Bytes = Bytes::from_owner(mmap);
 
         if data.len() < SST_MAGIC.len() + 4 + FOOTER_V1_SIZE {
             return Err(Error::SstCorrupted("file too small".into()));
@@ -1150,6 +1163,114 @@ impl SstReader {
     /// Uses the sparse index to jump directly to the relevant byte range
     /// instead of scanning from the start of the file.
     pub fn scan_prefix(&self, prefix: &[u8], version: u64) -> Vec<(Bytes, Option<Bytes>)> {
+        self.scan_prefix_impl(prefix, version, usize::MAX)
+    }
+
+    /// Seek-then-scan variant of `scan_prefix_max`: skip entries whose
+    /// user_key is less than `start_user_key`, then emit at most
+    /// `max_distinct` distinct user keys within the `prefix` range. Powers
+    /// `Gt` / `Ge` range queries on a secondary index, where the lower
+    /// bound is the predicate's target value (not the field prefix itself).
+    pub fn scan_from_max(
+        &self,
+        prefix: &[u8],
+        start_user_key: &[u8],
+        version: u64,
+        max_distinct: usize,
+    ) -> Vec<(Bytes, Option<Bytes>)> {
+        if max_distinct == 0 || !start_user_key.starts_with(prefix) {
+            return Vec::new();
+        }
+
+        let mut results = Vec::new();
+        let mut last_user_key: Option<Vec<u8>> = None;
+
+        // The sparse-index binary search uses the lowest-version-tagged
+        // internal-key form of the seek point — same trick as
+        // `prefix_start_offset`.
+        let start_offset = self.user_key_start_offset(start_user_key);
+
+        for (key, value) in self.iter_from(start_offset) {
+            if key.len() < 8 {
+                continue;
+            }
+            let user_key = &key[..key.len() - 8];
+
+            if user_key < start_user_key {
+                continue;
+            }
+            if !user_key.starts_with(prefix) {
+                break;
+            }
+
+            let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let entry_version = !u64::from_be_bytes(ver_bytes);
+            if entry_version > version {
+                continue;
+            }
+
+            let same_key = last_user_key
+                .as_ref()
+                .is_some_and(|prev| prev.as_slice() == user_key);
+            if same_key {
+                continue;
+            }
+
+            last_user_key = Some(user_key.to_vec());
+            let user_key_len = key.len() - 8;
+            results.push((key.slice(..user_key_len), value));
+            if results.len() >= max_distinct {
+                break;
+            }
+        }
+
+        results
+    }
+
+    /// Binary-search the sparse index for the byte offset of the block that
+    /// could contain `start_user_key`. Sibling of `prefix_start_offset` for
+    /// the case where the caller has a full user key (not just a prefix).
+    fn user_key_start_offset(&self, start_user_key: &[u8]) -> usize {
+        let header_size = SST_MAGIC.len() + 4;
+        if self.index.is_empty() {
+            return header_size;
+        }
+        let mut search_key = Vec::with_capacity(start_user_key.len() + 8);
+        search_key.extend_from_slice(start_user_key);
+        search_key.extend_from_slice(&[0u8; 8]);
+        let block_idx = match self
+            .index
+            .binary_search_by(|e| e.key.as_ref().cmp(&search_key))
+        {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        };
+        self.index[block_idx].offset as usize
+    }
+
+    /// Bounded variant: stop after collecting `max_distinct` user keys. Used
+    /// by the LSM bounded range-scan primitive that powers secondary-index
+    /// `LIMIT N` push-down — cuts an O(prefix_size) per-SST walk down to
+    /// O(N).
+    pub fn scan_prefix_max(
+        &self,
+        prefix: &[u8],
+        version: u64,
+        max_distinct: usize,
+    ) -> Vec<(Bytes, Option<Bytes>)> {
+        self.scan_prefix_impl(prefix, version, max_distinct)
+    }
+
+    fn scan_prefix_impl(
+        &self,
+        prefix: &[u8],
+        version: u64,
+        max_distinct: usize,
+    ) -> Vec<(Bytes, Option<Bytes>)> {
+        if max_distinct == 0 {
+            return Vec::new();
+        }
         let mut results = Vec::new();
         let mut last_user_key: Option<Vec<u8>> = None;
 
@@ -1190,6 +1311,9 @@ impl SstReader {
             // shares the SstReader's data refcount).
             let user_key_len = key.len() - 8;
             results.push((key.slice(..user_key_len), value));
+            if results.len() >= max_distinct {
+                break;
+            }
         }
 
         results

@@ -41,6 +41,19 @@ pub struct Database {
     /// delete skip the storage.get + unique-index walk for types that don't
     /// need it (e.g. Rating in the bench schema has no unique fields).
     types_with_unique: std::collections::HashSet<String>,
+    /// type_name → list of @indexed scalar fields, with their pre-resolved
+    /// (field_name, field_hash). Cached so the create/update/delete write
+    /// paths don't re-traverse the schema per object.
+    indexed_fields: HashMap<String, Vec<IndexedField>>,
+}
+
+/// One @indexed scalar field on a type, with everything the write path needs
+/// to emit/withdraw its `idx:` entry without re-resolving from the schema.
+/// `field_id` is the same stable per-`{Type.field}` u64 the unique index uses.
+#[derive(Debug, Clone)]
+struct IndexedField {
+    name: String,
+    field_id: u64,
 }
 
 impl Database {
@@ -136,6 +149,27 @@ impl Database {
             })
             .collect();
 
+        // Precompute the @indexed scalar fields per type. Each entry resolves
+        // to the same `{Type.field}` → u64 ID we use for unique indexes so
+        // write-path code can build idx: keys without re-traversing the schema.
+        let mut indexed_fields: HashMap<String, Vec<IndexedField>> = HashMap::new();
+        for (type_name, type_def) in &schema.types {
+            let mut list = Vec::new();
+            for field in &type_def.fields {
+                if field.is_indexed() {
+                    let key = format!("{type_name}.{}", field.name);
+                    let field_id = field_ids[&key];
+                    list.push(IndexedField {
+                        name: field.name.clone(),
+                        field_id,
+                    });
+                }
+            }
+            if !list.is_empty() {
+                indexed_fields.insert(type_name.clone(), list);
+            }
+        }
+
         Ok(Self {
             schema,
             storage,
@@ -146,6 +180,7 @@ impl Database {
             subscriptions: SubscriptionHub::new(),
             incoming_relations,
             types_with_unique,
+            indexed_fields,
         })
     }
 
@@ -184,6 +219,26 @@ impl Database {
             }
         }
 
+        // Write secondary index entries for any @indexed fields with a value.
+        // The serialized FieldMap doubles as the covering payload so a later
+        // filter_scan can hand back full Objects without a per-id LSM probe.
+        if let Some(idx_fields) = self.indexed_fields.get(type_name) {
+            for ifd in idx_fields {
+                if let Some(value) = fields.get(&ifd.name)
+                    && !matches!(value, Value::Null)
+                {
+                    self.insert_field_index(
+                        &mut txn,
+                        type_id,
+                        ifd.field_id,
+                        value,
+                        object_id,
+                        serialized.clone(),
+                    )?;
+                }
+            }
+        }
+
         self.storage.put(&mut txn, &key, serialized)?;
         let version = self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
@@ -202,6 +257,7 @@ impl Database {
             type_name: type_name.into(),
             id: object_id,
             fields,
+            raw_fields: None,
         })
     }
 
@@ -260,6 +316,26 @@ impl Database {
                 }
             }
 
+            // Secondary index entries for any @indexed fields. Covering value
+            // = serialized object fields (same payload that lands at the
+            // object key) so the read path can skip the per-id materialize.
+            if let Some(idx_fields) = self.indexed_fields.get(type_name) {
+                for ifd in idx_fields {
+                    if let Some(value) = fields.get(&ifd.name)
+                        && !matches!(value, Value::Null)
+                    {
+                        self.insert_field_index(
+                            &mut txn,
+                            type_id,
+                            ifd.field_id,
+                            value,
+                            object_id,
+                            serialized.clone(),
+                        )?;
+                    }
+                }
+            }
+
             self.storage.put(&mut txn, &key, serialized)?;
             object_ids.push(object_id);
         }
@@ -283,6 +359,7 @@ impl Database {
                 type_name: type_name.into(),
                 id,
                 fields,
+                raw_fields: None,
             });
         }
         Ok(out)
@@ -309,6 +386,7 @@ impl Database {
             type_name: type_name.into(),
             id: object_id,
             fields,
+            raw_fields: None,
         })
     }
 
@@ -342,6 +420,8 @@ impl Database {
         let snapshot = self.storage.read_snapshot();
         let values = self.storage.multi_get_at(snapshot, &key_refs)?;
 
+        // Public API: return Objects with `fields` populated. Callers that
+        // accept the lazy shortcut should use `get_many_lazy` instead.
         let mut out = Vec::with_capacity(sorted.len());
         for (id, value) in sorted.into_iter().zip(values.into_iter()) {
             if let Some(data) = value {
@@ -349,7 +429,46 @@ impl Database {
                     type_name: type_name.into(),
                     id,
                     fields: deserialize_fields(&data),
+                    raw_fields: None,
                 });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Lazy variant of `get_many`: returns Objects with `raw_fields = Some(bytes)`
+    /// and `fields` empty. The wire encoder (`encode_object`) can ship the
+    /// stored payload directly — no `deserialize_fields` + HashMap + drop
+    /// cycle. Consumers that read `obj.fields` (predicates, vectorize hook,
+    /// HTTP/JSON path) must call `ensure_fields_deserialized` first.
+    ///
+    /// Used by the executor's terminal materialize, where Objects flow
+    /// straight from the LSM to the TCP response without intermediate
+    /// inspection. Saves ~50% of per-object materialize cost at 50+ objects
+    /// per query (2-hop traversal terminal, filter scan covering path).
+    pub fn get_many_lazy(&self, type_name: &str, ids: &[u64]) -> EngineResult<Vec<Object>> {
+        let type_id = *self
+            .type_ids
+            .get(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let key_bufs: Vec<_> = sorted
+            .iter()
+            .map(|id| KeyBuilder::object(type_id, *id))
+            .collect();
+        let key_refs: Vec<&[u8]> = key_bufs.iter().map(|k| k.as_ref()).collect();
+
+        let snapshot = self.storage.read_snapshot();
+        let values = self.storage.multi_get_at(snapshot, &key_refs)?;
+
+        let mut out = Vec::with_capacity(sorted.len());
+        for (id, value) in sorted.into_iter().zip(values.into_iter()) {
+            if let Some(data) = value {
+                out.push(Object::from_raw(type_name.into(), id, data));
             }
         }
         Ok(out)
@@ -381,25 +500,34 @@ impl Database {
                 type_name: type_name.into(),
                 id: object_id,
                 fields,
+                raw_fields: None,
             });
         }
 
         Ok(objects)
     }
 
-    /// Filtered scan: like `scan_type` but pushes a single-field integer
-    /// comparison down to storage so SST blocks whose zone bounds rule out
-    /// the predicate skip whole groups of entries without decode.
+    /// Filtered scan: pushes a single-field integer comparison down to storage.
+    ///
+    /// Two fast paths are layered:
+    ///   1. **Secondary index (`@indexed` field)** — prefix scan on the
+    ///      `i:<type>:<field>:` key range yields `(encoded_value, id)` pairs
+    ///      directly from the key. For `Eq` we further narrow to the
+    ///      value-specific prefix; for ranges we filter encoded_values from
+    ///      the field prefix. No object decode happens for non-matching ids.
+    ///   2. **Zone-map fallback** — the field isn't indexed. Walks the
+    ///      object-key prefix and skips SST blocks whose per-field min/max
+    ///      bounds rule out the predicate, then re-evaluates per entry.
     ///
     /// `target` is the raw query-level integer; this method looks up the
     /// field's schema type (U32 / U64 / I32 / I64) and re-encodes the target
     /// to match the on-disk byte-order encoding. Out-of-range targets (e.g.,
-    /// negative literal against a U32 field with `<` op) take a fast-path
-    /// degenerate result rather than scanning.
+    /// negative literal against a U32 field with `<` op) fall back to a
+    /// `scan_type` for safety.
     ///
-    /// The caller still gets back only objects matching the predicate — the
-    /// post-block decode loop re-evaluates the comparison since zone maps
-    /// are a coarse-grained pre-filter.
+    /// `limit` is best-effort early termination: once `limit` ids match, the
+    /// per-entry walk stops. Storage still returns the full prefix-scan
+    /// result set; the win is skipping object materialization beyond the limit.
     ///
     /// Returns `Err(FieldNotFound)` for unknown fields and falls back to
     /// `scan_type` for non-integer field types.
@@ -409,6 +537,7 @@ impl Database {
         field_name: &str,
         op: rhypedb_storage::zone::CompareOp,
         target: i64,
+        limit: Option<usize>,
     ) -> EngineResult<Vec<Object>> {
         use rhypedb_schema::ScalarType;
         use rhypedb_storage::zone::{hash_field_name, FieldPredicate};
@@ -449,10 +578,24 @@ impl Database {
             _ => return self.scan_type(type_name),
         };
 
-        // Safe to unwrap: just dispatched on int types above.
         let target_bytes = encode_int_for_zone(&target_value).unwrap();
         let target_u64 = u64::from_be_bytes(target_bytes);
 
+        // === Secondary-index fast path ===
+        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+            && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
+        {
+            return self.filter_scan_via_index(
+                type_name,
+                type_id,
+                ifd.field_id,
+                op,
+                &target_bytes,
+                limit,
+            );
+        }
+
+        // === Zone-map fallback ===
         let predicate = FieldPredicate {
             field_hash: hash_field_name(field_name.as_bytes()),
             op,
@@ -466,8 +609,14 @@ impl Database {
             .scan_prefix_filtered_at(snapshot, &prefix, &predicate)?;
 
         // Re-evaluate the predicate per entry (zone maps are block-level).
+        // Stop accumulating once we've hit the caller's limit — the scan
+        // can't terminate early but we can at least skip the object copy.
+        let cap = limit.unwrap_or(usize::MAX);
         let mut objects = Vec::new();
         for (key, data) in entries {
+            if objects.len() >= cap {
+                break;
+            }
             if key.len() < 8 {
                 continue;
             }
@@ -480,11 +629,161 @@ impl Database {
                     type_name: type_name.into(),
                     id: object_id,
                     fields,
+                    raw_fields: None,
                 });
             }
         }
 
         Ok(objects)
+    }
+
+    /// Walk the `i:<type>:<field>:` index range for a single integer-op
+    /// predicate and emit up to `limit` matching objects, reading their
+    /// fields straight from the covering index entry value — no per-id LSM
+    /// probe for materialization.
+    ///
+    /// Three storage shapes, in increasing scan-size order:
+    ///
+    /// * **Eq** — narrow prefix scan on `i:<type>:<field>:<target>:`. Every
+    ///   returned key is a match. O(matches).
+    /// * **Ge/Gt with `limit`** — seek-then-scan from the smallest passing
+    ///   key, bounded by the limit. O(limit).
+    /// * **Lt/Le/Ne or no limit** — bounded prefix scan from the field's
+    ///   natural start. Lt/Le's matches cluster at the start of the prefix,
+    ///   so a bounded scan still serves the limit in O(limit) work. Without
+    ///   a limit we fall through to the full prefix scan.
+    ///
+    /// **Covering index.** Each `i:` entry's value is the source object's
+    /// serialized FieldMap, written at create/update time. The materialize
+    /// step is just a per-entry `deserialize_fields` + Object construction —
+    /// no `get_many` call into the LSM, no bloom probes, no per-id snapshot
+    /// reads. Entries with empty values (legacy / non-covering) fall back to
+    /// the historical id-collect + `get_many` path so older databases stay
+    /// readable.
+    fn filter_scan_via_index(
+        &self,
+        type_name: &str,
+        type_id: u64,
+        field_id: u64,
+        op: rhypedb_storage::zone::CompareOp,
+        target_bytes: &[u8; 8],
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        use rhypedb_storage::zone::CompareOp;
+
+        let snapshot = self.storage.read_snapshot();
+        let cap = limit.unwrap_or(usize::MAX);
+        let target_u64 = u64::from_be_bytes(*target_bytes);
+
+        // === Eq fast path — narrow value-prefix scan ===
+        if matches!(op, CompareOp::Eq) {
+            let prefix = KeyBuilder::field_index_value_prefix(type_id, field_id, target_bytes);
+            let entries = if let Some(n) = limit {
+                self.storage.scan_prefix_at_limited(snapshot, &prefix, n)?
+            } else {
+                self.storage.scan_prefix_at(snapshot, &prefix)?
+            };
+            let mut out = Vec::with_capacity(entries.len().min(cap));
+            let mut fallback_ids: Vec<u64> = Vec::new();
+            for (key, value) in entries {
+                if out.len() + fallback_ids.len() >= cap {
+                    break;
+                }
+                if key.len() < 8 {
+                    continue;
+                }
+                let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+                let object_id = u64::from_be_bytes(id_bytes);
+                if value.is_empty() {
+                    fallback_ids.push(object_id);
+                } else {
+                    out.push(Object {
+                        type_name: type_name.into(),
+                        id: object_id,
+                        fields: deserialize_fields(&value),
+                        raw_fields: None,
+                    });
+                }
+            }
+            if !fallback_ids.is_empty() {
+                out.extend(self.get_many(type_name, &fallback_ids)?);
+            }
+            return Ok(out);
+        }
+
+        let prefix = KeyBuilder::field_index_prefix(type_id, field_id);
+        let plen = prefix.len();
+
+        // === Bounded range path: seek-then-scan for Gt/Ge, bounded prefix
+        //     scan for Lt/Le. Skipped when no limit was pushed down. ===
+        let entries = match (op, limit) {
+            (CompareOp::Gt, Some(n)) => {
+                if target_u64 == u64::MAX {
+                    return Ok(Vec::new());
+                }
+                let seek_bytes = (target_u64 + 1).to_be_bytes();
+                let mut start_key =
+                    bytes::BytesMut::with_capacity(prefix.len() + 8);
+                start_key.extend_from_slice(&prefix);
+                start_key.extend_from_slice(&seek_bytes);
+                self.storage.scan_from_at_limited(snapshot, &prefix, &start_key, n)?
+            }
+            (CompareOp::Ge, Some(n)) => {
+                let mut start_key =
+                    bytes::BytesMut::with_capacity(prefix.len() + 8);
+                start_key.extend_from_slice(&prefix);
+                start_key.extend_from_slice(target_bytes);
+                self.storage.scan_from_at_limited(snapshot, &prefix, &start_key, n)?
+            }
+            (CompareOp::Lt, Some(n)) | (CompareOp::Le, Some(n)) => {
+                self.storage.scan_prefix_at_limited(snapshot, &prefix, n)?
+            }
+            _ => self.storage.scan_prefix_at(snapshot, &prefix)?,
+        };
+
+        let mut out = Vec::with_capacity(entries.len().min(cap));
+        let mut fallback_ids: Vec<u64> = Vec::new();
+        for (key, value) in entries {
+            if out.len() + fallback_ids.len() >= cap {
+                break;
+            }
+            if key.len() != plen + 8 + 1 + 8 {
+                continue;
+            }
+            let value_slice = &key[plen..plen + 8];
+            let value_u64 = u64::from_be_bytes(value_slice.try_into().unwrap());
+            let pass = match op {
+                CompareOp::Lt => value_u64 < target_u64,
+                CompareOp::Le => value_u64 <= target_u64,
+                CompareOp::Gt => value_u64 > target_u64,
+                CompareOp::Ge => value_u64 >= target_u64,
+                CompareOp::Ne => value_u64 != target_u64,
+                CompareOp::Eq => unreachable!("Eq handled above"),
+            };
+            if !pass {
+                if matches!(op, CompareOp::Lt | CompareOp::Le) {
+                    break;
+                }
+                continue;
+            }
+            let id_bytes: [u8; 8] = key[plen + 9..plen + 17].try_into().unwrap();
+            let object_id = u64::from_be_bytes(id_bytes);
+            if value.is_empty() {
+                fallback_ids.push(object_id);
+            } else {
+                out.push(Object {
+                    type_name: type_name.into(),
+                    id: object_id,
+                    fields: deserialize_fields(&value),
+                    raw_fields: None,
+                });
+            }
+        }
+
+        if !fallback_ids.is_empty() {
+            out.extend(self.get_many(type_name, &fallback_ids)?);
+        }
+        Ok(out)
     }
 
     /// Update an object's fields. Only the provided fields are updated;
@@ -539,11 +838,79 @@ impl Database {
             }
         }
 
+        // Build the NEW field set by merging updates into the old fields.
+        // We need both the old values (to look up index entries to remove)
+        // and the merged set (to build the covering payload AND the new
+        // object entry).
+        let old_indexed_snapshot: Vec<Option<Value>> =
+            if let Some(idx_fields) = self.indexed_fields.get(type_name) {
+                idx_fields
+                    .iter()
+                    .map(|ifd| fields.get(&ifd.name).cloned())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        let any_update = !updates.is_empty();
         for (k, v) in updates {
             fields.insert(k, v);
         }
 
         let serialized = serialize_fields(&fields);
+
+        // Maintain secondary index entries for any @indexed fields. Covering
+        // value = the new serialized fields, so subsequent filter_scans can
+        // read full Objects from the index without per-id LSM probes.
+        //
+        // Three sub-cases per indexed field:
+        //   * Value changed (old != new): delete old entry, insert new (with covering).
+        //   * Value unchanged but ANY field changed: re-write the entry's
+        //     covering payload (same key, fresh value bytes).
+        //   * No update at all: nothing to do (skipped at the outer level).
+        if let Some(idx_fields) = self.indexed_fields.get(type_name) {
+            for (ifd, old_value_opt) in idx_fields.iter().zip(old_indexed_snapshot.iter()) {
+                let new_value_opt = fields.get(&ifd.name).cloned();
+                let value_changed = old_value_opt != &new_value_opt;
+                if value_changed {
+                    if let Some(old_v) = old_value_opt
+                        && !matches!(old_v, Value::Null)
+                    {
+                        self.remove_field_index(
+                            &mut txn, type_id, ifd.field_id, old_v, object_id,
+                        )?;
+                    }
+                    if let Some(new_v) = &new_value_opt
+                        && !matches!(new_v, Value::Null)
+                    {
+                        self.insert_field_index(
+                            &mut txn,
+                            type_id,
+                            ifd.field_id,
+                            new_v,
+                            object_id,
+                            serialized.clone(),
+                        )?;
+                    }
+                } else if any_update {
+                    if let Some(new_v) = &new_value_opt
+                        && !matches!(new_v, Value::Null)
+                    {
+                        // Same key — `put` overwrites the value with the new
+                        // covering payload.
+                        self.insert_field_index(
+                            &mut txn,
+                            type_id,
+                            ifd.field_id,
+                            new_v,
+                            object_id,
+                            serialized.clone(),
+                        )?;
+                    }
+                }
+            }
+        }
+
         self.storage.put(&mut txn, &key, serialized)?;
         let version = self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
@@ -562,6 +929,7 @@ impl Database {
             type_name: type_name.into(),
             id: object_id,
             fields,
+            raw_fields: None,
         })
     }
 
@@ -619,12 +987,14 @@ impl Database {
 
         let obj_key = KeyBuilder::object(type_id, object_id);
 
-        // Unique-index cleanup. We can skip the storage.get + deserialize
-        // entirely if this type has no @unique fields — saves one LSM probe
-        // per cascading row (huge at scale where most cascaded rows are
-        // edge-only types like Rating).
+        // Unique-index + secondary-index cleanup. We can skip the storage.get
+        // + deserialize entirely if this type has no @unique fields AND no
+        // @indexed fields — saves one LSM probe per cascading row (huge at
+        // scale where most cascaded rows are edge-only types like Rating).
         let type_has_unique = self.types_with_unique.contains(type_name);
-        if type_has_unique || verify_exists {
+        let type_idx_fields = self.indexed_fields.get(type_name);
+        let type_has_indexed = type_idx_fields.is_some();
+        if type_has_unique || type_has_indexed || verify_exists {
             let obj_data = self.storage.get(txn, &obj_key)?;
             if obj_data.is_none() {
                 if verify_exists {
@@ -636,9 +1006,11 @@ impl Database {
                 // Cascade-recursive call against an object that's already
                 // gone (e.g. a circular cascade chain). Continue silently.
             }
-            if type_has_unique && let Some(data) = &obj_data {
+            if let Some(data) = &obj_data {
                 let fields = deserialize_fields(data);
-                if let Some(type_def) = self.schema.get_type(type_name) {
+                if type_has_unique
+                    && let Some(type_def) = self.schema.get_type(type_name)
+                {
                     for field_def in &type_def.fields {
                         if field_def.is_unique()
                             && let Some(value) = fields.get(&field_def.name)
@@ -650,6 +1022,17 @@ impl Database {
                                         KeyBuilder::unique_index(type_id, field_id, &value_bytes);
                                     self.storage.delete(txn, &unique_key)?;
                                 }
+                    }
+                }
+                if let Some(idx_fields) = type_idx_fields {
+                    for ifd in idx_fields {
+                        if let Some(value) = fields.get(&ifd.name)
+                            && !matches!(value, Value::Null)
+                        {
+                            self.remove_field_index(
+                                txn, type_id, ifd.field_id, value, object_id,
+                            )?;
+                        }
                     }
                 }
             }
@@ -935,7 +1318,7 @@ impl Database {
         source_type: &str,
         source_ids: &[u64],
         field_name: &str,
-    ) -> EngineResult<Vec<Vec<(u64, FieldMap)>>> {
+    ) -> EngineResult<Vec<Vec<(u64, Bytes)>>> {
         if source_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -992,7 +1375,26 @@ impl Database {
         let snapshot = self.storage.read_snapshot();
         let raw = self.storage.multi_scan_prefix_at(snapshot, &prefix_refs)?;
 
-        Ok(raw.into_iter().map(Self::decode_edge_entries).collect())
+        // Return raw (id, value-bytes) pairs — no FieldMap construction. The
+        // executor either hands the bytes to the fusion path's
+        // `find_u64_field_in_raw` (forward-1:1 next hop) or to
+        // `deserialize_fields` lazily (Filter / terminal materialize). For
+        // 2-hop at 1M ratings this avoids ~1000 FieldMap allocations per
+        // query.
+        Ok(raw
+            .into_iter()
+            .map(|entries| {
+                let mut out = Vec::with_capacity(entries.len());
+                for (key, value) in entries {
+                    if key.len() < 8 {
+                        continue;
+                    }
+                    let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+                    out.push((u64::from_be_bytes(id_bytes), value));
+                }
+                out
+            })
+            .collect())
     }
 
     /// Scan for keys with a given prefix within a transaction (used by
@@ -1092,6 +1494,47 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a non-unique secondary index entry: `i:<type>:<field>:<value>:<id>`.
+    /// The `covering` bytes get stored as the entry value — when non-empty,
+    /// this is the source object's serialized FieldMap, which lets
+    /// `filter_scan_via_index` reconstruct Objects without an extra `get_many`
+    /// probe per match. Pass `Bytes::new()` for legacy / non-covering mode.
+    ///
+    /// Caller must hold a write txn. Silently no-ops on non-integer or null
+    /// values — `encode_int_for_zone` returns `None` and there's nothing to
+    /// index.
+    fn insert_field_index(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_id: u64,
+        field_id: u64,
+        value: &Value,
+        object_id: u64,
+        covering: Bytes,
+    ) -> EngineResult<()> {
+        if let Some(encoded) = encode_int_for_zone(value) {
+            let key = KeyBuilder::field_index(type_id, field_id, &encoded, object_id);
+            self.storage.put(txn, &key, covering)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a secondary index entry. No-op on non-integer or null values.
+    fn remove_field_index(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_id: u64,
+        field_id: u64,
+        value: &Value,
+        object_id: u64,
+    ) -> EngineResult<()> {
+        if let Some(encoded) = encode_int_for_zone(value) {
+            let key = KeyBuilder::field_index(type_id, field_id, &encoded, object_id);
+            self.storage.delete(txn, &key)?;
+        }
+        Ok(())
+    }
+
     /// Remove a unique index entry.
     fn remove_unique_index(
         &self,
@@ -1166,15 +1609,45 @@ fn build_covering_rev_value(
     }
 
     // Otherwise, serialize source's explicit fields + this link's target +
-    // each discovered other forward target.
+    // each discovered other forward target. Each other target also has its
+    // OBJECT FIELDS embedded under `<name>__cover` — second-degree covering.
+    // A subsequent traversal that hops *through* this source to one of those
+    // other targets (e.g. 2-hop `movie.ratings.user`) can extract the
+    // target's fields straight from the covering and skip the per-id LSM
+    // probe at terminal materialize.
+    //
+    // Cost: one extra `storage.get` per other_target at link() time. For the
+    // bench's setup (1M ratings × 1 extra probe per second link), that's
+    // ~30 seconds added to load — paid once, amortized across every read.
     let mut effective = match source_data {
         Some(bytes) => deserialize_fields(bytes),
         None => FieldMap::new(),
     };
     effective.insert(field_name.to_string(), Value::U64(target_id));
-    for (name, tid) in other_targets {
-        effective.insert(name, Value::U64(tid));
+    for (name, tid) in &other_targets {
+        effective.insert(name.clone(), Value::U64(*tid));
     }
+
+    // Look up each other_target's object fields and embed under `__cover`.
+    if let Some(type_def) = db.schema.get_type(source_type) {
+        for (name, tid) in &other_targets {
+            let Some(field) = type_def.get_field(name) else {
+                continue;
+            };
+            let rel = match &field.field_type {
+                FieldType::Relation(r) => r,
+                _ => continue,
+            };
+            let Some(target_type_id) = db.type_ids.get(&rel.target_type).copied() else {
+                continue;
+            };
+            let target_key = KeyBuilder::object(target_type_id, *tid);
+            if let Ok(Some(target_data)) = db.storage.get(txn, &target_key) {
+                effective.insert(format!("{name}__cover"), Value::Bytes(target_data));
+            }
+        }
+    }
+
     Ok(serialize_fields(&effective))
 }
 
@@ -2075,7 +2548,7 @@ mod tests {
             db.create("User", f).unwrap();
         }
 
-        let gt = db.filter_scan("User", "age", CompareOp::Gt, 30).unwrap();
+        let gt = db.filter_scan("User", "age", CompareOp::Gt, 30, None).unwrap();
         assert_eq!(gt.len(), 20, "age > 30 should match users with age 31..=50");
         for u in &gt {
             match u.fields.get("age") {
@@ -2084,12 +2557,323 @@ mod tests {
             }
         }
 
-        let eq = db.filter_scan("User", "age", CompareOp::Eq, 25).unwrap();
+        let eq = db.filter_scan("User", "age", CompareOp::Eq, 25, None).unwrap();
         assert_eq!(eq.len(), 1);
         assert!(matches!(eq[0].fields.get("age"), Some(Value::U32(25))));
 
-        let lt = db.filter_scan("User", "age", CompareOp::Lt, 5).unwrap();
+        let lt = db.filter_scan("User", "age", CompareOp::Lt, 5, None).unwrap();
         assert_eq!(lt.len(), 4, "age < 5 should match users 1..=4");
+    }
+
+    fn indexed_schema() -> Schema {
+        parse_schema(
+            r#"
+            type Movie {
+                title: String
+                year: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// Count the `i:` (secondary-index) entries currently visible in the LSM.
+    /// Walks the global field-index prefix; used to verify create/update/
+    /// delete maintain the index without leaking entries.
+    fn count_index_entries(db: &Database) -> usize {
+        // Field-index prefix is just `i:` — works regardless of type/field.
+        let snapshot = db.storage().read_snapshot();
+        let entries = db
+            .storage()
+            .scan_prefix_at(snapshot, b"i:")
+            .unwrap();
+        entries.len()
+    }
+
+    #[test]
+    fn indexed_field_create_writes_index_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(indexed_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("title".into(), Value::String("Alien".into()));
+        f.insert("year".into(), Value::U32(1979));
+        db.create("Movie", f).unwrap();
+
+        assert_eq!(count_index_entries(&db), 1);
+    }
+
+    #[test]
+    fn indexed_field_filter_scan_eq_uses_index() {
+        use rhypedb_storage::zone::CompareOp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(indexed_schema(), dir.path()).unwrap();
+
+        // Three at 2000, two at 1990, one at 2010.
+        for _ in 0..3 {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String("M".into()));
+            f.insert("year".into(), Value::U32(2000));
+            db.create("Movie", f).unwrap();
+        }
+        for _ in 0..2 {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String("M".into()));
+            f.insert("year".into(), Value::U32(1990));
+            db.create("Movie", f).unwrap();
+        }
+        let mut f = FieldMap::new();
+        f.insert("title".into(), Value::String("M".into()));
+        f.insert("year".into(), Value::U32(2010));
+        db.create("Movie", f).unwrap();
+
+        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 2000, None).unwrap();
+        assert_eq!(hits.len(), 3);
+        for h in &hits {
+            assert_eq!(h.fields.get("year"), Some(&Value::U32(2000)));
+        }
+    }
+
+    #[test]
+    fn indexed_field_filter_scan_range_with_limit() {
+        use rhypedb_storage::zone::CompareOp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(indexed_schema(), dir.path()).unwrap();
+
+        for y in 1950u32..=2020 {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(format!("M{y}")));
+            f.insert("year".into(), Value::U32(y));
+            db.create("Movie", f).unwrap();
+        }
+
+        let gt = db.filter_scan("Movie", "year", CompareOp::Gt, 2010, None).unwrap();
+        assert_eq!(gt.len(), 10, "years 2011..=2020 should match");
+
+        let gt_limited = db.filter_scan("Movie", "year", CompareOp::Gt, 2010, Some(3)).unwrap();
+        assert_eq!(gt_limited.len(), 3);
+
+        let lt = db.filter_scan("Movie", "year", CompareOp::Lt, 1955, None).unwrap();
+        assert_eq!(lt.len(), 5, "years 1950..=1954 should match");
+
+        let le = db.filter_scan("Movie", "year", CompareOp::Le, 1952, None).unwrap();
+        assert_eq!(le.len(), 3, "years 1950..=1952 should match");
+    }
+
+    #[test]
+    fn indexed_field_update_updates_index_entry() {
+        use rhypedb_storage::zone::CompareOp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(indexed_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("title".into(), Value::String("M".into()));
+        f.insert("year".into(), Value::U32(1979));
+        let movie = db.create("Movie", f).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        // Update the year — old idx entry drops, new one appears.
+        let mut upd = FieldMap::new();
+        upd.insert("year".into(), Value::U32(1986));
+        db.update("Movie", movie.id, upd).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        let old = db.filter_scan("Movie", "year", CompareOp::Eq, 1979, None).unwrap();
+        assert_eq!(old.len(), 0, "old year value should no longer be indexed");
+
+        let new = db.filter_scan("Movie", "year", CompareOp::Eq, 1986, None).unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].id, movie.id);
+    }
+
+    #[test]
+    fn indexed_field_delete_removes_index_entry() {
+        use rhypedb_storage::zone::CompareOp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(indexed_schema(), dir.path()).unwrap();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("title".into(), Value::String("A".into()));
+        f1.insert("year".into(), Value::U32(2000));
+        let a = db.create("Movie", f1).unwrap();
+
+        let mut f2 = FieldMap::new();
+        f2.insert("title".into(), Value::String("B".into()));
+        f2.insert("year".into(), Value::U32(2000));
+        db.create("Movie", f2).unwrap();
+
+        assert_eq!(count_index_entries(&db), 2);
+
+        db.delete("Movie", a.id).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 2000, None).unwrap();
+        assert_eq!(hits.len(), 1, "deleted entry must not reappear via the index");
+    }
+
+    #[test]
+    fn indexed_field_cascade_delete_removes_index_entries() {
+        use rhypedb_storage::zone::CompareOp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User { name: String }
+            type Movie {
+                title: String
+                year: u32 @indexed
+                owner: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        for y in [1979u32, 1986, 1993] {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(format!("M{y}")));
+            f.insert("year".into(), Value::U32(y));
+            let m = db.create("Movie", f).unwrap();
+            db.link("Movie", m.id, "owner", alice.id, None).unwrap();
+        }
+        assert_eq!(count_index_entries(&db), 3);
+
+        db.delete("User", alice.id).unwrap();
+        assert_eq!(
+            count_index_entries(&db),
+            0,
+            "cascade-deleted movies must also drop their secondary-index entries"
+        );
+
+        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 1986, None).unwrap();
+        assert_eq!(hits.len(), 0);
+    }
+
+    #[test]
+    fn indexed_field_batch_writes_index_entries() {
+        use rhypedb_storage::zone::CompareOp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(indexed_schema(), dir.path()).unwrap();
+
+        let rows: Vec<FieldMap> = (1950u32..1960)
+            .map(|y| {
+                let mut f = FieldMap::new();
+                f.insert("title".into(), Value::String(format!("M{y}")));
+                f.insert("year".into(), Value::U32(y));
+                f
+            })
+            .collect();
+        db.create_batch("Movie", rows).unwrap();
+
+        assert_eq!(count_index_entries(&db), 10);
+
+        let mid = db.filter_scan("Movie", "year", CompareOp::Eq, 1955, None).unwrap();
+        assert_eq!(mid.len(), 1);
+    }
+
+    #[test]
+    fn indexed_field_covering_returns_full_fieldmap() {
+        // Covering index: filter_scan should return Movies with their full
+        // FieldMap (title + year) populated from the index entry value,
+        // without doing a per-id get_many probe.
+        use rhypedb_storage::zone::CompareOp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(indexed_schema(), dir.path()).unwrap();
+
+        for y in 2010u32..=2015 {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(format!("Movie of {y}")));
+            f.insert("year".into(), Value::U32(y));
+            db.create("Movie", f).unwrap();
+        }
+
+        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 2013, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].fields.get("year"), Some(&Value::U32(2013)));
+        assert_eq!(
+            hits[0].fields.get("title"),
+            Some(&Value::String("Movie of 2013".into())),
+            "covering index must surface the title field, not just the indexed value"
+        );
+
+        let range = db.filter_scan("Movie", "year", CompareOp::Gt, 2012, Some(3)).unwrap();
+        assert_eq!(range.len(), 3);
+        for h in &range {
+            assert!(h.fields.contains_key("title"));
+            assert!(h.fields.contains_key("year"));
+        }
+    }
+
+    #[test]
+    fn indexed_field_covering_value_refreshes_on_non_indexed_update() {
+        // Covering value is the full FieldMap. An update to a NON-indexed
+        // field (title) must also rewrite the covering value, otherwise the
+        // filter_scan reads back stale data.
+        use rhypedb_storage::zone::CompareOp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(indexed_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("title".into(), Value::String("Old Title".into()));
+        f.insert("year".into(), Value::U32(1999));
+        let movie = db.create("Movie", f).unwrap();
+
+        // Update the title; year stays the same.
+        let mut upd = FieldMap::new();
+        upd.insert("title".into(), Value::String("New Title".into()));
+        db.update("Movie", movie.id, upd).unwrap();
+
+        // filter_scan via index should see the NEW title, not the stale Old Title.
+        let hits = db.filter_scan("Movie", "year", CompareOp::Eq, 1999, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].fields.get("title"),
+            Some(&Value::String("New Title".into())),
+            "covering value must be refreshed even when only a non-indexed field changed"
+        );
+    }
+
+    #[test]
+    fn indexed_field_correct_after_flush() {
+        // SST + memtable path: half the data is on disk, half is in memory.
+        // Both layers must contribute index entries to the prefix scan.
+        use rhypedb_storage::zone::CompareOp;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(indexed_schema(), dir.path()).unwrap();
+
+        for y in 1950u32..1960 {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(format!("M{y}")));
+            f.insert("year".into(), Value::U32(y));
+            db.create("Movie", f).unwrap();
+        }
+        db.storage().flush().unwrap();
+
+        for y in 1960u32..1970 {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(format!("M{y}")));
+            f.insert("year".into(), Value::U32(y));
+            db.create("Movie", f).unwrap();
+        }
+
+        let gt = db.filter_scan("Movie", "year", CompareOp::Gt, 1954, None).unwrap();
+        assert_eq!(
+            gt.len(),
+            15,
+            "should include 1955..=1969 across both flushed SST and active memtable"
+        );
     }
 
     #[test]
@@ -2121,7 +2905,7 @@ mod tests {
             db.create("User", f).unwrap();
         }
 
-        let gt = db.filter_scan("User", "age", CompareOp::Gt, 15).unwrap();
+        let gt = db.filter_scan("User", "age", CompareOp::Gt, 15, None).unwrap();
         assert_eq!(gt.len(), 25, "should include 16..=40");
     }
 }

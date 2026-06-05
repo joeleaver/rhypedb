@@ -62,6 +62,22 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                 }
             }
 
+            // Validate @indexed is on an integer scalar field.
+            if field.is_indexed() {
+                let int_ok = matches!(
+                    field.field_type,
+                    FieldType::Scalar(
+                        ScalarType::U32 | ScalarType::U64 | ScalarType::I32 | ScalarType::I64
+                    )
+                );
+                if !int_ok {
+                    return Err(SchemaError::Validation(format!(
+                        "@indexed on '{}.{}' requires an integer scalar field (u32/u64/i32/i64)",
+                        type_def.name, field.name
+                    )));
+                }
+            }
+
             // Validate @inverse references.
             if let Some(inv) = field.inverse() {
                 let target_type = schema
@@ -322,6 +338,8 @@ impl<'a> Parser<'a> {
 
         match name.as_str() {
             "unique" => Ok(Directive::Unique),
+
+            "indexed" => Ok(Directive::Indexed),
 
             "on_delete" => {
                 self.expect('(')?;
@@ -685,6 +703,50 @@ mod tests {
         assert_eq!(idx.quantization, Some(QuantizationType::TurboQuant3Bit));
         assert_eq!(idx.m, Some(16));
         assert_eq!(idx.ef_construction, Some(200));
+    }
+
+    #[test]
+    fn parse_indexed_directive() {
+        let schema = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                year: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap();
+
+        let movie = schema.get_type("Movie").unwrap();
+        let year = movie.get_field("year").unwrap();
+        assert!(year.is_indexed());
+
+        let title = movie.get_field("title").unwrap();
+        assert!(!title.is_indexed());
+    }
+
+    #[test]
+    fn reject_indexed_on_string_field() {
+        let result = parse_schema(
+            r#"
+            type Movie {
+                title: String @indexed
+            }
+            "#,
+        );
+        assert!(matches!(result, Err(SchemaError::Validation(_))));
+    }
+
+    #[test]
+    fn reject_indexed_on_float_field() {
+        let result = parse_schema(
+            r#"
+            type Rating {
+                stars: f32 @indexed
+            }
+            "#,
+        );
+        assert!(matches!(result, Err(SchemaError::Validation(_))));
     }
 
     #[test]

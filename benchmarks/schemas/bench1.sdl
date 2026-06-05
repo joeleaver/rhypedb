@@ -7,7 +7,7 @@ type User {
 
 type Movie {
     title: String
-    year: u32
+    year: u32 @indexed
     ratings: [Rating] @inverse(Rating.movie)
 }
 

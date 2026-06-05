@@ -39,7 +39,7 @@ use std::io;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use rhypedb_engine::object::{deserialize_fields, serialize_fields, Object};
+use rhypedb_engine::object::{deserialize_fields, serialize_fields_into, Object};
 
 /// Maximum payload size per frame (16 MB). Defensive limit to prevent
 /// runaway allocations from malformed clients.
@@ -98,7 +98,13 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<F
     })
 }
 
-/// Write one frame to an async writer.
+/// Write one frame to an async writer. Issues 4 successive `write_all` calls
+/// which the underlying BufWriter coalesces before flushing.
+///
+/// Hot callers should prefer `write_frame_buffered` so the entire frame —
+/// header + payload — is built in one contiguous buffer and shipped with a
+/// single `write_all`, sidestepping the BufWriter's intermediate state
+/// machine.
 pub async fn write_frame<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     req_id: u32,
@@ -114,14 +120,60 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Build a complete frame (header + payload) in the provided buffer and ship
+/// it with one `write_all` + `flush`. The buffer is reused across responses
+/// — caller is responsible for clearing it before the next call. Avoids
+/// per-response allocation AND turns the 4-write-all-then-flush sequence
+/// into a single syscall path through the BufWriter.
+///
+/// `payload_builder` writes the response payload (the bytes after the 5-byte
+/// header) into the buffer. The header is prepended by this function.
+pub async fn write_frame_buffered<W, F>(
+    writer: &mut W,
+    buf: &mut Vec<u8>,
+    req_id: u32,
+    kind: u8,
+    payload_builder: F,
+) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+    F: FnOnce(&mut Vec<u8>),
+{
+    buf.clear();
+    // Frame layout on the wire: [len:4][req_id:4][kind:1][payload].
+    // We reserve the 9-byte header up front; once the payload is built we
+    // backfill `len` (= 5 + payload_len, matching the existing protocol
+    // where the length excludes itself).
+    buf.extend_from_slice(&[0u8; 9]);
+    payload_builder(buf);
+
+    let payload_len = buf.len() - 9;
+    let total_len = (5 + payload_len) as u32;
+    buf[0..4].copy_from_slice(&total_len.to_be_bytes());
+    buf[4..8].copy_from_slice(&req_id.to_be_bytes());
+    buf[8] = kind;
+
+    writer.write_all(buf).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 /// Encode a single Object to bytes (for inclusion in Objects / Single responses).
+/// Writes directly into `out` — no intermediate Bytes allocation. If the
+/// Object carries `raw_fields` (came straight from an LSM read via
+/// `Object::from_raw`), the wire emits those bytes verbatim and skips the
+/// `serialize_fields_into` pass — the on-disk format and the wire FieldMap
+/// format are identical, so no transformation is needed.
 pub fn encode_object(obj: &Object, out: &mut Vec<u8>) {
     let type_bytes = obj.type_name.as_bytes();
     out.extend_from_slice(&(type_bytes.len() as u16).to_be_bytes());
     out.extend_from_slice(type_bytes);
     out.extend_from_slice(&obj.id.to_be_bytes());
-    let fields_bytes = serialize_fields(&obj.fields);
-    out.extend_from_slice(&fields_bytes);
+    if let Some(raw) = &obj.raw_fields {
+        out.extend_from_slice(raw);
+    } else {
+        serialize_fields_into(&obj.fields, out);
+    }
 }
 
 /// Decode a single Object starting at `pos`. Returns the decoded object and
@@ -163,6 +215,7 @@ pub fn decode_object(data: &[u8], mut pos: usize) -> io::Result<(Object, usize)>
             type_name,
             id,
             fields,
+            raw_fields: None,
         },
         pos,
     ))
@@ -224,13 +277,24 @@ fn read_u32_len(data: &[u8], pos: &mut usize) -> io::Result<usize> {
     Ok(len)
 }
 
-/// Encode an Objects response payload.
+/// Encode an Objects response payload into `out`. Caller can pre-size the
+/// buffer or reuse it across responses to avoid per-query allocation.
+pub fn encode_objects_payload_into(objects: &[Object], out: &mut Vec<u8>) {
+    // Heuristic pre-size: ~64 bytes per object (typical small objects with
+    // a few small fields). Saves the first 2-3 Vec::reserve doublings on
+    // the hot 50-object response shape.
+    out.reserve(4 + objects.len() * 64);
+    out.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    for obj in objects {
+        encode_object(obj, out);
+    }
+}
+
+/// Convenience wrapper. Hot callers should pre-allocate and call
+/// `encode_objects_payload_into`.
 pub fn encode_objects_payload(objects: &[Object]) -> Vec<u8> {
     let mut buf = Vec::new();
-    buf.extend_from_slice(&(objects.len() as u32).to_be_bytes());
-    for obj in objects {
-        encode_object(obj, &mut buf);
-    }
+    encode_objects_payload_into(objects, &mut buf);
     buf
 }
 
@@ -288,11 +352,17 @@ pub fn decode_query_payload(data: &[u8]) -> io::Result<String> {
 
 /// Encode an Error response payload: length-prefixed UTF-8 message.
 pub fn encode_error_payload(msg: &str) -> Vec<u8> {
-    let bytes = msg.as_bytes();
-    let mut buf = Vec::with_capacity(4 + bytes.len());
-    buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-    buf.extend_from_slice(bytes);
+    let mut buf = Vec::with_capacity(4 + msg.len());
+    encode_error_payload_into(msg, &mut buf);
     buf
+}
+
+/// Encode an Error response into a caller-provided buffer.
+pub fn encode_error_payload_into(msg: &str, out: &mut Vec<u8>) {
+    let bytes = msg.as_bytes();
+    out.reserve(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(bytes);
 }
 
 /// Decode an Error response payload.
@@ -324,6 +394,7 @@ mod tests {
             type_name: "User".into(),
             id: 42,
             fields,
+            raw_fields: None,
         }
     }
 

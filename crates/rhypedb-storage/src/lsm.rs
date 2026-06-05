@@ -11,11 +11,16 @@ use crate::wal::{RecordType, Wal, WalRecord};
 use crate::Result;
 
 const DEFAULT_MEMTABLE_FLUSH_SIZE: usize = 4 * 1024 * 1024; // 4MB
+const DEFAULT_COMPACT_TRIGGER_SSTS: usize = 4;
 
 /// Configuration for the LSM-tree storage engine.
 pub struct LsmConfig {
     pub data_dir: PathBuf,
     pub memtable_flush_size: usize,
+    /// Auto-compact when the SST count reaches this many. Compaction merges
+    /// all SSTs into a single file; reduces read amplification (fewer bloom
+    /// checks, fewer cross-layer BTreeMap merges per scan).
+    pub compact_trigger_ssts: usize,
     /// Optional closure that pulls zone-mapped integer field values out of
     /// each SST entry's value bytes. Set by the engine at construction time
     /// (it knows the schema and can decode FieldMaps). When `None`, SSTs are
@@ -30,6 +35,7 @@ impl LsmConfig {
         Self {
             data_dir: data_dir.as_ref().to_path_buf(),
             memtable_flush_size: DEFAULT_MEMTABLE_FLUSH_SIZE,
+            compact_trigger_ssts: DEFAULT_COMPACT_TRIGGER_SSTS,
             zone_extractor: None,
         }
     }
@@ -421,6 +427,103 @@ impl LsmTree {
             .collect())
     }
 
+    /// Bounded prefix scan: returns at most `max_distinct` user keys, each
+    /// the latest visible version. Designed for `LIMIT N` push-down on
+    /// secondary indexes where the result set is sorted by (encoded_value,
+    /// object_id) and the caller only wants the first N matches.
+    ///
+    /// **Per-layer scan cap.** Each layer is asked for up to `max_distinct`
+    /// user keys. For workloads where the same key is rarely tombstoned, the
+    /// merged set already contains the first `max_distinct` results — the
+    /// per-layer walk stops after ~N entries instead of scanning the full
+    /// prefix. For workloads where the top layer tombstones the first N
+    /// entries of a lower layer, the merged result may contain fewer than
+    /// `max_distinct` live entries. Callers tolerant of that (secondary
+    /// indexes on append-mostly data) should prefer this; transactional
+    /// reads should not.
+    pub fn scan_prefix_at_limited(
+        &self,
+        version: u64,
+        prefix: &[u8],
+        max_distinct: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        if max_distinct == 0 {
+            return Ok(Vec::new());
+        }
+        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
+            std::collections::BTreeMap::new();
+
+        let ssts = self.sst_files.read();
+        for sst in ssts.iter() {
+            for (key, value) in sst.scan_prefix_max(prefix, version, max_distinct) {
+                merged.insert(key, value);
+            }
+        }
+        drop(ssts);
+
+        let immutables = self.immutable_memtables.read().clone();
+        for mt in immutables.iter() {
+            for (key, value) in mt.scan_prefix_max(prefix, version, max_distinct) {
+                merged.insert(key, value);
+            }
+        }
+
+        let active = self.active_memtable.read().clone();
+        for (key, value) in active.scan_prefix_max(prefix, version, max_distinct) {
+            merged.insert(key, value);
+        }
+
+        Ok(merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .take(max_distinct)
+            .collect())
+    }
+
+    /// Seek-then-scan bounded range scan. Skip everything below
+    /// `start_user_key`, then emit at most `max_distinct` live user keys
+    /// from within the `prefix` range. Same tombstone-shadow caveat as
+    /// `scan_prefix_at_limited`.
+    pub fn scan_from_at_limited(
+        &self,
+        version: u64,
+        prefix: &[u8],
+        start_user_key: &[u8],
+        max_distinct: usize,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
+        if max_distinct == 0 {
+            return Ok(Vec::new());
+        }
+        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
+            std::collections::BTreeMap::new();
+
+        let ssts = self.sst_files.read();
+        for sst in ssts.iter() {
+            for (key, value) in sst.scan_from_max(prefix, start_user_key, version, max_distinct) {
+                merged.insert(key, value);
+            }
+        }
+        drop(ssts);
+
+        let immutables = self.immutable_memtables.read().clone();
+        for mt in immutables.iter() {
+            for (key, value) in mt.scan_from_max(prefix, start_user_key, version, max_distinct) {
+                merged.insert(key, value);
+            }
+        }
+
+        let active = self.active_memtable.read().clone();
+        for (key, value) in active.scan_from_max(prefix, start_user_key, version, max_distinct) {
+            merged.insert(key, value);
+        }
+
+        Ok(merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .take(max_distinct)
+            .collect())
+    }
+
     /// Scan for all keys with the given prefix, visible at the given snapshot
     /// version, without requiring a `Transaction`. Used by the read-only fast path.
     pub fn scan_prefix_at(
@@ -516,11 +619,21 @@ impl LsmTree {
         self.txn_manager.abort(txn);
     }
 
-    /// Check if the active memtable is large enough to flush.
+    /// Check if the active memtable is large enough to flush. If a flush
+    /// happens and the SST count crosses the auto-compaction threshold, also
+    /// run a compaction. Both are cheap to skip when the thresholds aren't
+    /// crossed (just an atomic-ish read).
     fn maybe_flush(&self) -> Result<()> {
         let size = self.active_memtable.read().approximate_size();
         if size >= self.config.memtable_flush_size {
             self.flush()?;
+            // Trigger compaction when SSTs pile up. The cost is per-flush
+            // (rare), but it pays back on every read path that probes blooms
+            // and merges across layers. Keeps the read amplification flat.
+            let sst_count = self.sst_files.read().len();
+            if sst_count >= self.config.compact_trigger_ssts {
+                self.compact()?;
+            }
         }
         Ok(())
     }
@@ -697,6 +810,10 @@ mod tests {
         LsmConfig {
             data_dir: dir.to_path_buf(),
             memtable_flush_size: 1024, // small for testing
+            // Don't auto-compact in unit tests — they assert against specific
+            // SST counts mid-flow. Tests that want compaction call it
+            // explicitly via `tree.compact()`.
+            compact_trigger_ssts: usize::MAX,
             zone_extractor: None,
         }
     }

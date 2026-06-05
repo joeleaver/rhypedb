@@ -120,6 +120,121 @@ impl MemTable {
         self.map.iter().map(|e| (e.key().clone(), e.value().clone()))
     }
 
+    /// Like `scan_prefix_max`, but begins emitting at the first user_key
+    /// `>= start_user_key` (within the `prefix` range) instead of at the
+    /// prefix's natural start. Powers seek-then-scan range queries on a
+    /// secondary index: skip everything below the predicate's lower bound,
+    /// then take the next N matches.
+    ///
+    /// `start_user_key` must itself begin with `prefix`; if it doesn't the
+    /// scan returns nothing.
+    pub fn scan_from_max(
+        &self,
+        prefix: &[u8],
+        start_user_key: &[u8],
+        version: u64,
+        max_distinct: usize,
+    ) -> Vec<(Bytes, MemValue)> {
+        if max_distinct == 0 || !start_user_key.starts_with(prefix) {
+            return Vec::new();
+        }
+        // Same skip-list seek trick as scan_prefix_max — version u64::MAX
+        // gives the lowest sort position for `start_user_key`.
+        let scan_start = InternalKey::new(start_user_key, u64::MAX);
+        let scan_bytes = Bytes::copy_from_slice(scan_start.as_bytes());
+
+        let mut results = Vec::new();
+        let mut last_user_key: Option<Vec<u8>> = None;
+
+        for entry in self.map.range(scan_bytes..) {
+            let key = entry.key();
+            if key.len() < 8 {
+                continue;
+            }
+            let user_key = &key[..key.len() - 8];
+
+            if !user_key.starts_with(prefix) {
+                break;
+            }
+
+            let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let entry_version = !u64::from_be_bytes(ver_bytes);
+            if entry_version > version {
+                continue;
+            }
+
+            let same_key = last_user_key
+                .as_ref()
+                .is_some_and(|prev| prev.as_slice() == user_key);
+            if same_key {
+                continue;
+            }
+
+            last_user_key = Some(user_key.to_vec());
+            results.push((Bytes::copy_from_slice(user_key), entry.value().clone()));
+            if results.len() >= max_distinct {
+                break;
+            }
+        }
+
+        results
+    }
+
+    /// Same as `scan_prefix` but stops after collecting `max_distinct` user
+    /// keys. Used by bounded range scans for `LIMIT N` push-down — capping
+    /// per-layer emission turns an O(prefix_size) walk into O(N) without
+    /// breaking layer-merge correctness when the caller can tolerate
+    /// occasional shadow effects (e.g. secondary-index workloads where
+    /// updates are rare relative to the prefix size).
+    pub fn scan_prefix_max(
+        &self,
+        prefix: &[u8],
+        version: u64,
+        max_distinct: usize,
+    ) -> Vec<(Bytes, MemValue)> {
+        if max_distinct == 0 {
+            return Vec::new();
+        }
+        let scan_start = InternalKey::new(prefix, u64::MAX);
+        let scan_bytes = Bytes::copy_from_slice(scan_start.as_bytes());
+
+        let mut results = Vec::new();
+        let mut last_user_key: Option<Vec<u8>> = None;
+
+        for entry in self.map.range(scan_bytes..) {
+            let key = entry.key();
+            if key.len() < 8 {
+                continue;
+            }
+            let user_key = &key[..key.len() - 8];
+
+            if !user_key.starts_with(prefix) {
+                break;
+            }
+
+            let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let entry_version = !u64::from_be_bytes(ver_bytes);
+            if entry_version > version {
+                continue;
+            }
+
+            let same_key = last_user_key
+                .as_ref()
+                .is_some_and(|prev| prev.as_slice() == user_key);
+            if same_key {
+                continue;
+            }
+
+            last_user_key = Some(user_key.to_vec());
+            results.push((Bytes::copy_from_slice(user_key), entry.value().clone()));
+            if results.len() >= max_distinct {
+                break;
+            }
+        }
+
+        results
+    }
+
     /// Scan for all entries whose user key starts with `prefix`, visible at `version`.
     /// Returns (user_key, value) pairs, deduplicated to the latest visible version per key.
     pub fn scan_prefix(&self, prefix: &[u8], version: u64) -> Vec<(Bytes, MemValue)> {

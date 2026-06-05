@@ -54,6 +54,10 @@ impl FieldDef {
         self.directives.iter().any(|d| matches!(d, Directive::Unique))
     }
 
+    pub fn is_indexed(&self) -> bool {
+        self.directives.iter().any(|d| matches!(d, Directive::Indexed))
+    }
+
     pub fn on_delete(&self) -> Option<&OnDeletePolicy> {
         self.directives.iter().find_map(|d| match d {
             Directive::OnDelete(policy) => Some(policy),
@@ -121,6 +125,10 @@ pub struct VectorType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Directive {
     Unique,
+    /// Non-unique secondary index on a scalar integer field. Enables
+    /// `Type.filter(.field op N)` to skip the full type scan in favor of an
+    /// `idx:` prefix scan that returns matching object IDs directly.
+    Indexed,
     OnDelete(OnDeletePolicy),
     Inverse(InverseDef),
     Index(IndexDef),
