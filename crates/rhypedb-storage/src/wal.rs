@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 
 use crate::{Error, Result};
 
@@ -49,22 +49,28 @@ const HEADER_SIZE: usize = 4 + 8 + 1 + 4 + 4; // 21 bytes
 
 impl WalRecord {
     fn encode(&self) -> Bytes {
-        let total = HEADER_SIZE + self.key.len() + self.value.len();
-        let mut buf = BytesMut::with_capacity(total);
+        let mut buf = Vec::with_capacity(HEADER_SIZE + self.key.len() + self.value.len());
+        self.encode_into(&mut buf);
+        Bytes::from(buf)
+    }
 
+    /// Append the on-disk record to an existing buffer instead of
+    /// allocating a fresh `BytesMut` per call. Lets the batch writer
+    /// concatenate N records into ONE allocation — at K=100 cascade
+    /// that's ~500 BytesMut allocations dropped per User-delete.
+    fn encode_into(&self, buf: &mut Vec<u8>) {
+        let start = buf.len();
         // Placeholder for CRC — filled after encoding the rest.
-        buf.put_u32(0);
-        buf.put_u64(self.version);
-        buf.put_u8(self.record_type as u8);
-        buf.put_u32(self.key.len() as u32);
-        buf.put_u32(self.value.len() as u32);
-        buf.put_slice(&self.key);
-        buf.put_slice(&self.value);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&self.version.to_be_bytes());
+        buf.push(self.record_type as u8);
+        buf.extend_from_slice(&(self.key.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&(self.value.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.key);
+        buf.extend_from_slice(&self.value);
 
-        let crc = crc32fast::hash(&buf[4..]);
-        buf[0..4].copy_from_slice(&crc.to_be_bytes());
-
-        buf.freeze()
+        let crc = crc32fast::hash(&buf[start + 4..]);
+        buf[start..start + 4].copy_from_slice(&crc.to_be_bytes());
     }
 
     fn decode(data: &[u8]) -> Result<(Self, usize)> {
@@ -128,6 +134,95 @@ impl Wal {
     pub fn append(&mut self, record: &WalRecord) -> Result<()> {
         let encoded = record.encode();
         self.writer.write_all(&encoded)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Append N records as a single `write_all` + flush pair. The on-disk
+    /// layout is identical to N back-to-back `append` calls (replay walks
+    /// fixed-size records and stops on truncation), so this is purely a
+    /// syscall-amortization optimization for batched writers (cascade
+    /// delete, `create_batch`, etc.) and changes no recovery semantics.
+    /// `encode_into` writes each record directly into the shared buffer —
+    /// one allocation total instead of one per record.
+    pub fn append_batch(&mut self, records: &[WalRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let total: usize = records
+            .iter()
+            .map(|r| HEADER_SIZE + r.key.len() + r.value.len())
+            .sum();
+        let mut buf = Vec::with_capacity(total);
+        for record in records {
+            record.encode_into(&mut buf);
+        }
+        self.writer.write_all(&buf)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Append a homogeneous batch directly from `(key, value)` slices —
+    /// callers don't need to materialize a `Vec<WalRecord>` first. Used by
+    /// `LsmTree::put_batch` / `delete_batch` to skip ~500 transient
+    /// `WalRecord` clones per cascade User-delete at K=100. All records
+    /// share `record_type` and `version`.
+    pub fn append_batch_inline(
+        &mut self,
+        record_type: RecordType,
+        entries: &[(Bytes, Bytes)],
+        version: u64,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let total: usize = entries
+            .iter()
+            .map(|(k, v)| HEADER_SIZE + k.len() + v.len())
+            .sum();
+        let mut buf = Vec::with_capacity(total);
+        for (key, value) in entries {
+            let start = buf.len();
+            buf.extend_from_slice(&0u32.to_be_bytes());
+            buf.extend_from_slice(&version.to_be_bytes());
+            buf.push(record_type as u8);
+            buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(value);
+            let crc = crc32fast::hash(&buf[start + 4..]);
+            buf[start..start + 4].copy_from_slice(&crc.to_be_bytes());
+        }
+        self.writer.write_all(&buf)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Keys-only variant for `delete_batch` (value bytes are empty for
+    /// every tombstone).
+    pub fn append_batch_keys(
+        &mut self,
+        record_type: RecordType,
+        keys: &[Bytes],
+        version: u64,
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let total: usize = keys.iter().map(|k| HEADER_SIZE + k.len()).sum();
+        let mut buf = Vec::with_capacity(total);
+        for key in keys {
+            let start = buf.len();
+            buf.extend_from_slice(&0u32.to_be_bytes());
+            buf.extend_from_slice(&version.to_be_bytes());
+            buf.push(record_type as u8);
+            buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&0u32.to_be_bytes()); // value_len = 0
+            buf.extend_from_slice(key);
+            let crc = crc32fast::hash(&buf[start + 4..]);
+            buf[start..start + 4].copy_from_slice(&crc.to_be_bytes());
+        }
+        self.writer.write_all(&buf)?;
         self.writer.flush()?;
         Ok(())
     }

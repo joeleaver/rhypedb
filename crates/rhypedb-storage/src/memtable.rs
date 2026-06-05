@@ -30,22 +30,27 @@ impl MemTable {
         }
     }
 
-    /// Insert a versioned key-value pair.
+    /// Insert a versioned key-value pair. `InternalKey::into_bytes` hands
+    /// off the owned `Bytes` to the skiplist so the insert is one
+    /// allocation instead of two (the previous code did
+    /// `Bytes::copy_from_slice(ik.as_bytes())` which copied the buffer
+    /// we'd just built).
     pub fn put(&self, user_key: &[u8], version: u64, value: Bytes) {
         let ik = InternalKey::new(user_key, version);
-        let added = ik.as_bytes().len() + value.len();
-        self.map
-            .insert(Bytes::copy_from_slice(ik.as_bytes()), Some(value));
+        let key_bytes = ik.into_bytes();
+        let added = key_bytes.len() + value.len();
+        self.map.insert(key_bytes, Some(value));
         self.size_bytes
             .fetch_add(added, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Insert a tombstone for a versioned key.
+    /// Insert a tombstone for a versioned key. See `put` for the
+    /// `into_bytes` allocation-reuse note.
     pub fn delete(&self, user_key: &[u8], version: u64) {
         let ik = InternalKey::new(user_key, version);
-        let added = ik.as_bytes().len();
-        self.map
-            .insert(Bytes::copy_from_slice(ik.as_bytes()), None);
+        let key_bytes = ik.into_bytes();
+        let added = key_bytes.len();
+        self.map.insert(key_bytes, None);
         self.size_bytes
             .fetch_add(added, std::sync::atomic::Ordering::Relaxed);
     }

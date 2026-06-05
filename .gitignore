@@ -4,3 +4,4 @@ __pycache__/
 /rhypedb-data/
 /.venv-bench/
 /.playwright-mcp/
+/.claude/

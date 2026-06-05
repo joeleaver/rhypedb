@@ -28,6 +28,14 @@ pub struct LsmConfig {
     /// every flushed SST captures per-block min/max bounds for opted-in
     /// integer fields, enabling `scan_prefix_filtered_at` to skip blocks.
     pub zone_extractor: Option<crate::zone::ZoneFieldExtractor>,
+    /// `true` (default): every `LsmTree::commit` calls `fsync(2)` on the WAL,
+    /// guaranteeing the writes survive a power loss. `false`: skip the
+    /// fsync — the kernel still gets the bytes via `write(2)` so a clean
+    /// process crash is recoverable from the WAL, but a power loss can
+    /// silently drop the last N writes. Matches Postgres's `fsync=off`
+    /// mode for apples-to-apples benchmarking (and is occasionally useful
+    /// for bulk imports where the operator accepts the risk).
+    pub sync_on_commit: bool,
 }
 
 impl LsmConfig {
@@ -37,6 +45,7 @@ impl LsmConfig {
             memtable_flush_size: DEFAULT_MEMTABLE_FLUSH_SIZE,
             compact_trigger_ssts: DEFAULT_COMPACT_TRIGGER_SSTS,
             zone_extractor: None,
+            sync_on_commit: true,
         }
     }
 }
@@ -607,10 +616,87 @@ impl LsmTree {
         Ok(())
     }
 
-    /// Commit a transaction, checking for write-write conflicts.
+    /// Batched put within a transaction. Equivalent to calling `put` N times
+    /// but takes the WAL mutex and the memtable read-lock exactly once and
+    /// collapses the N WAL `write_all` syscalls into one. Used by paths that
+    /// know they're about to issue many writes back-to-back (`create_batch`,
+    /// link cascades), where per-call lock acquire + syscall overhead
+    /// dominates the actual storage work.
+    pub fn put_batch(
+        &self,
+        txn: &mut Transaction,
+        entries: &[(Bytes, Bytes)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let version = self.txn_manager.current_version() + 1;
+
+        for (key, _) in entries {
+            txn.record_write(key.clone());
+        }
+
+        // `append_batch_inline` encodes straight from `entries` — no
+        // intermediate `Vec<WalRecord>` clone-fest.
+        self.wal
+            .lock()
+            .append_batch_inline(RecordType::Put, entries, version)?;
+
+        let mt = self.active_memtable.read();
+        for (k, v) in entries {
+            mt.put(k, version, v.clone());
+        }
+        drop(mt);
+
+        self.maybe_flush()?;
+        Ok(())
+    }
+
+    /// Batched delete within a transaction. Mirrors `put_batch`: one WAL
+    /// mutex acquire + one `write_all` syscall for the whole tombstone
+    /// batch, one memtable read-lock acquire for the inserts. Used by the
+    /// cascade-delete path where a User-delete at K=100 ratings issues
+    /// ~1,000 single deletes today — the per-call WAL + memtable lock
+    /// overhead dominates, not the actual tombstone work.
+    pub fn delete_batch(
+        &self,
+        txn: &mut Transaction,
+        keys: &[Bytes],
+    ) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let version = self.txn_manager.current_version() + 1;
+
+        for key in keys {
+            txn.record_write(key.clone());
+        }
+
+        self.wal
+            .lock()
+            .append_batch_keys(RecordType::Delete, keys, version)?;
+
+        let mt = self.active_memtable.read();
+        for key in keys {
+            mt.delete(key, version);
+        }
+        drop(mt);
+
+        self.maybe_flush()?;
+        Ok(())
+    }
+
+    /// Commit a transaction, checking for write-write conflicts. With the
+    /// default `sync_on_commit = true` config, also fsyncs the WAL before
+    /// returning — guarantees the writes survive a power loss. When the
+    /// config opts out, the bytes still reach the kernel via the WAL's
+    /// `write_all` (so a clean crash is recoverable) but no fsync syscall
+    /// runs; matches Postgres's `fsync=off` mode.
     pub fn commit(&self, txn: &mut Transaction) -> Result<u64> {
         let version = self.txn_manager.commit(txn)?;
-        self.wal.lock().sync()?;
+        if self.config.sync_on_commit {
+            self.wal.lock().sync()?;
+        }
         Ok(version)
     }
 
@@ -815,6 +901,7 @@ mod tests {
             // explicitly via `tree.compact()`.
             compact_trigger_ssts: usize::MAX,
             zone_extractor: None,
+            sync_on_commit: true,
         }
     }
 
@@ -1584,5 +1671,121 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn put_batch_matches_individual_puts() {
+        // Differential test: same N writes via the batch primitive vs N
+        // single-call puts must land the same logical state. Catches any
+        // version-stamp / write-set mismatch between the two paths.
+        let dir_a = tempfile::tempdir().unwrap();
+        let tree_a = LsmTree::open(test_config(dir_a.path())).unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let tree_b = LsmTree::open(test_config(dir_b.path())).unwrap();
+
+        let entries: Vec<(Bytes, Bytes)> = (0..50u64)
+            .map(|i| {
+                (
+                    Bytes::from(format!("k{i:03}")),
+                    Bytes::from(format!("v{i:03}-pad")),
+                )
+            })
+            .collect();
+
+        // Tree A: single-op loop.
+        let mut txn_a = tree_a.begin_txn();
+        for (k, v) in &entries {
+            tree_a.put(&mut txn_a, k, v.clone()).unwrap();
+        }
+        tree_a.commit(&mut txn_a).unwrap();
+
+        // Tree B: one put_batch call.
+        let mut txn_b = tree_b.begin_txn();
+        tree_b.put_batch(&mut txn_b, &entries).unwrap();
+        tree_b.commit(&mut txn_b).unwrap();
+
+        let snap_a = tree_a.read_snapshot();
+        let snap_b = tree_b.read_snapshot();
+        for (k, v) in &entries {
+            assert_eq!(tree_a.get_at(snap_a, k).unwrap(), Some(v.clone()));
+            assert_eq!(tree_b.get_at(snap_b, k).unwrap(), Some(v.clone()));
+        }
+    }
+
+    #[test]
+    fn delete_batch_matches_individual_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        // Seed 30 keys.
+        let mut txn = tree.begin_txn();
+        let entries: Vec<(Bytes, Bytes)> = (0..30u64)
+            .map(|i| {
+                (
+                    Bytes::from(format!("k{i:03}")),
+                    Bytes::from(format!("v{i:03}")),
+                )
+            })
+            .collect();
+        for (k, v) in &entries {
+            tree.put(&mut txn, k, v.clone()).unwrap();
+        }
+        tree.commit(&mut txn).unwrap();
+
+        // Delete the first 10 single-op and the next 10 via delete_batch;
+        // last 10 stay live.
+        let mut txn = tree.begin_txn();
+        for (k, _) in &entries[..10] {
+            tree.delete(&mut txn, k).unwrap();
+        }
+        let batch_keys: Vec<Bytes> = entries[10..20].iter().map(|(k, _)| k.clone()).collect();
+        tree.delete_batch(&mut txn, &batch_keys).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        let snap = tree.read_snapshot();
+        for (k, _) in &entries[..20] {
+            assert_eq!(tree.get_at(snap, k).unwrap(), None, "should be tombstoned: {k:?}");
+        }
+        for (k, v) in &entries[20..] {
+            assert_eq!(
+                tree.get_at(snap, k).unwrap(),
+                Some(v.clone()),
+                "should remain live: {k:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_writes_survive_replay() {
+        // WAL replay path: a crash after batch writes (no flush) must
+        // restore exactly the keys/values the batch staged.
+        let dir = tempfile::tempdir().unwrap();
+        let entries: Vec<(Bytes, Bytes)> = (0..20u64)
+            .map(|i| (Bytes::from(format!("k{i}")), Bytes::from(format!("v{i}"))))
+            .collect();
+
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            let mut txn = tree.begin_txn();
+            tree.put_batch(&mut txn, &entries).unwrap();
+            tree.commit(&mut txn).unwrap();
+            // Drop without flush — WAL replay must rebuild memtable state.
+        }
+
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let snap = tree.read_snapshot();
+        for (k, v) in &entries {
+            assert_eq!(tree.get_at(snap, k).unwrap(), Some(v.clone()));
+        }
+    }
+
+    #[test]
+    fn batch_empty_input_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let mut txn = tree.begin_txn();
+        tree.put_batch(&mut txn, &[]).unwrap();
+        tree.delete_batch(&mut txn, &[]).unwrap();
+        tree.commit(&mut txn).unwrap();
     }
 }

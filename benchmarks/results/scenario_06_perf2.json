@@ -1,0 +1,34 @@
+[
+  {
+    "scenario": "1.6 cascade_delete_user",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 30.932524,
+      "p50_ms": 33.389149,
+      "p95_ms": 60.226938,
+      "p99_ms": 60.226938,
+      "max_ms": 60.226938,
+      "mean_ms": 41.51620366666667
+    },
+    "operation_stats": {
+      "n": 300,
+      "min_us": 266.963,
+      "p50_us": 306.217,
+      "p95_us": 469.807,
+      "p99_us": 590.143,
+      "max_us": 26853.999,
+      "mean_us": 414.6139,
+      "total_ms": 124.38417
+    },
+    "rss_cold_mb": 3.8984375,
+    "rss_post_load_mb": 3.8984375,
+    "rss_peak_mb": 3.8984375,
+    "rss_steady_mb": 3.8984375,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_deletes": 100,
+      "ratings_per_user": 100
+    }
+  }
+]

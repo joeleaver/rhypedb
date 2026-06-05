@@ -2,6 +2,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// Swap the global allocator. mimalloc consistently beats glibc malloc on
+// small-object workloads (~20-30% faster on 24-32 byte allocs from the
+// cascade hot path) without giving up determinism. `secure` feature is
+// off — we're not on a hostile-input boundary inside the process.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -42,6 +49,14 @@ struct Cli {
     /// Binary TCP listen address.
     #[arg(long, default_value = "127.0.0.1:4201")]
     tcp_listen: String,
+
+    /// Skip the WAL fsync at commit time — kernel still has the bytes via
+    /// write_all, so clean process crashes are recoverable, but a power
+    /// loss can drop the last N writes. Matches Postgres's
+    /// `fsync=off + synchronous_commit=off` mode (used by the bench
+    /// harness). Off by default for safety.
+    #[arg(long)]
+    no_sync: bool,
 }
 
 struct AppState {
@@ -355,10 +370,23 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let db = Database::open(schema.clone(), &cli.data_dir).unwrap_or_else(|e| {
+    let db = Database::open_with_options(
+        schema.clone(),
+        &cli.data_dir,
+        rhypedb_engine::database::OpenOptions {
+            sync_on_commit: !cli.no_sync,
+        },
+    )
+    .unwrap_or_else(|e| {
         eprintln!("failed to open database: {e}");
         std::process::exit(1);
     });
+    if cli.no_sync {
+        eprintln!(
+            "WARNING: --no-sync is on. WAL writes will not fsync; power loss can drop \
+             the last N records. Equivalent to Postgres fsync=off."
+        );
+    }
 
     let has_vectorize = schema
         .types

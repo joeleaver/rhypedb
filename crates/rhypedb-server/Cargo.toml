@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 rhypedb-storage = { workspace = true }
 rhypedb-schema = { workspace = true }
 rhypedb-engine = { workspace = true }

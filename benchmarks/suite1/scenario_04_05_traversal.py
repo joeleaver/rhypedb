@@ -54,17 +54,11 @@ def setup_rhypedb_graph(ds: data.Dataset, tcp_host: str, tcp_port: int) -> list:
         for r in ds.ratings:
             uid = user_ids[r.user_idx]
             mid = movie_ids[r.movie_idx]
-            resp = client.query(f"Rating.create({{ stars: {r.stars} }})")
+            resp = client.query(
+                f"Rating.create({{ stars: {r.stars}, user: {uid}, movie: {mid} }})"
+            )
             if "error" in resp and resp.get("error"):
                 raise RuntimeError(f"rating insert failed: {resp['error']}")
-            rating_id = resp["object"]["id"]
-            for q in (
-                f"Rating.get({rating_id}).link(User.get({uid}))",
-                f"Rating.get({rating_id}).link(Movie.get({mid}))",
-            ):
-                resp = client.query(q)
-                if "error" in resp and resp.get("error"):
-                    raise RuntimeError(f"link failed: {resp['error']}")
 
         return list(user_ids.values())
     finally:

@@ -208,6 +208,7 @@ fn execute_step(
                     .any(|(_, bytes)| find_u64_field_in_raw(bytes, field_name.as_str()).is_some())
             {
                 let cover_field_name = format!("{field_name}__cover");
+                let cover_v_field_name = format!("{field_name}__cover_v");
                 let mut seen: HashSet<u64> = HashSet::with_capacity(items.len());
                 let mut covered_items: Vec<(u64, Bytes)> = Vec::with_capacity(items.len());
                 let mut id_only: Vec<u64> = Vec::new();
@@ -216,21 +217,33 @@ fn execute_step(
                     if let Some(tid) = find_u64_field_in_raw(bytes, field_name.as_str())
                         && seen.insert(tid)
                     {
-                        if let Some(cover) = find_bytes_field_in_raw(bytes, &cover_field_name) {
+                        // Cover staleness check: the cover writer stamped
+                        // the target's generation at write time under
+                        // `<field>__cover_v`. If the target has been updated
+                        // since then, its current generation is higher; we
+                        // route the id through the `id_only` bucket so a
+                        // fresh probe replaces the stale blob.
+                        let cover = find_bytes_field_in_raw(bytes, &cover_field_name);
+                        let embedded_v =
+                            find_u64_field_in_raw(bytes, cover_v_field_name.as_str())
+                                .unwrap_or(0);
+                        let live_v = db.object_version(target_type.as_str(), tid);
+                        if let Some(c) = cover
+                            && embedded_v == live_v
+                        {
                             any_covered = true;
-                            covered_items.push((tid, cover));
+                            covered_items.push((tid, c));
                         } else {
                             id_only.push(tid);
                         }
                     }
                 }
                 if any_covered && id_only.is_empty() {
-                    // Every dedup'd target carried its own fields in the
-                    // covering — construct full Objects right now (with
-                    // `raw_fields` populated for zero-copy wire encoding)
-                    // and skip the terminal `multi_get` entirely. This is
-                    // the single biggest 2-hop win: the 700-user point
-                    // lookup pass at the end vanishes.
+                    // Every dedup'd target carried fresh covering data —
+                    // construct full Objects right now (with `raw_fields`
+                    // populated for zero-copy wire encoding) and skip the
+                    // terminal `multi_get` entirely. The single biggest
+                    // 2-hop win: the 700-user point lookup pass vanishes.
                     let objects: Vec<Object> = covered_items
                         .into_iter()
                         .map(|(tid, cover)| {
@@ -239,7 +252,29 @@ fn execute_step(
                         .collect();
                     return Ok(QueryOutput::Objects(objects));
                 }
-                // Some targets weren't covered — fall back to id-only.
+                if any_covered {
+                    // Mixed case: some targets are fresh-covered, some are
+                    // stale or never-covered. Build Objects directly for
+                    // the fresh ones, and probe the LSM only for the
+                    // remaining bucket — keeps the fast-path benefit for
+                    // everything that's still good without rebuilding all
+                    // rev_edges synchronously on the writer side.
+                    let mut objects: Vec<Object> =
+                        Vec::with_capacity(covered_items.len() + id_only.len());
+                    for (tid, cover) in covered_items {
+                        objects.push(Object::from_raw(target_type.clone(), tid, cover));
+                    }
+                    if !id_only.is_empty() {
+                        let probed = db
+                            .get_many_lazy(target_type.as_str(), &id_only)
+                            .map_err(|e| QueryError::InvalidArgument(e.to_string()))?;
+                        objects.extend(probed);
+                    }
+                    return Ok(QueryOutput::Objects(objects));
+                }
+                // Nothing covered (or every cover was stale) — emit id-only
+                // and let the downstream materialize_ids/multi_get handle
+                // the lookup. Same as pre-covering behaviour.
                 let mut out = Vec::with_capacity(covered_items.len() + id_only.len());
                 for (tid, _) in covered_items {
                     out.push(tid);
@@ -938,6 +973,104 @@ mod tests {
             }
             _ => panic!("expected Objects"),
         }
+    }
+
+    #[test]
+    fn fusion_returns_fresh_target_after_second_degree_update() {
+        // End-to-end: bench-shape graph (User ↔ Rating ↔ Movie) and a 2-hop
+        // covered fusion. The rev_edge on Movie's side embeds User's
+        // serialized fields as `user__cover` plus a `user__cover_v` stamp.
+        // Updating User.name afterwards bumps the per-object generation
+        // counter; the next time we run the 2-hop fusion query, the
+        // executor's `<field>__cover_v` vs `db.object_version(...)` check
+        // detects mismatch and falls through to a fresh LSM probe via
+        // `get_many_lazy`. The returned User must reflect the new name.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                ratings: [Rating] @inverse(Rating.user)
+            }
+
+            type Movie {
+                title: String
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+
+            type Rating {
+                stars: u32
+                user: User
+                movie: Movie
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Aliens".into()));
+        let movie = db.create("Movie", mf).unwrap();
+
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        let rating = db.create("Rating", rf).unwrap();
+
+        db.link("Rating", rating.id, "user", alice.id, None).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+
+        // Baseline: fusion should return Alice as-is via the fast covered
+        // path (no LSM probe).
+        let q = parse_query(&format!(
+            "Movie.get({}).ratings.user",
+            movie.id
+        ))
+        .unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let objs = match result {
+            QueryOutput::Objects(objs) => objs,
+            other => panic!("expected Objects, got {other:?}"),
+        };
+        assert_eq!(objs.len(), 1);
+        let mut returned = objs.into_iter().next().unwrap();
+        returned.ensure_fields_deserialized();
+        assert_eq!(
+            returned.fields.get("name"),
+            Some(&Value::String("Alice".into()))
+        );
+
+        // Mutate Alice. The rev_edge on Movie's side still carries her
+        // old serialized blob — only the per-object generation moves.
+        let mut upd = FieldMap::new();
+        upd.insert("name".into(), Value::String("Renamed".into()));
+        db.update("User", alice.id, upd).unwrap();
+
+        // Re-run the same fusion. Cover_v < live counter, so the executor
+        // routes Alice through `get_many_lazy` instead of using the stale
+        // cover — the returned name must be the post-update value.
+        let q = parse_query(&format!(
+            "Movie.get({}).ratings.user",
+            movie.id
+        ))
+        .unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let objs = match result {
+            QueryOutput::Objects(objs) => objs,
+            other => panic!("expected Objects, got {other:?}"),
+        };
+        assert_eq!(objs.len(), 1);
+        let mut returned = objs.into_iter().next().unwrap();
+        returned.ensure_fields_deserialized();
+        assert_eq!(
+            returned.fields.get("name"),
+            Some(&Value::String("Renamed".into())),
+            "fusion must fall through to a fresh probe when the embedded \
+             cover_v is stale relative to the live generation counter"
+        );
     }
 
     #[test]

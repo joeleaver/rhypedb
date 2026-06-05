@@ -1,0 +1,119 @@
+[
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 43.603197,
+      "p50_ms": 46.085992,
+      "p95_ms": 46.299375,
+      "p99_ms": 46.299375,
+      "max_ms": 46.299375,
+      "mean_ms": 45.32952133333333
+    },
+    "operation_stats": {
+      "n": 3000,
+      "min_us": 33.173,
+      "p50_us": 38.503,
+      "p95_us": 71.135,
+      "p99_us": 107.633,
+      "max_us": 832.411,
+      "mean_us": 44.54185966666667,
+      "total_ms": 133.625579
+    },
+    "rss_cold_mb": 3.85546875,
+    "rss_post_load_mb": 3.85546875,
+    "rss_peak_mb": 3.85546875,
+    "rss_steady_mb": 3.85546875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 1000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "rhypedb-tcp-batch",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 9.25822,
+      "p50_ms": 9.317722,
+      "p95_ms": 9.367866,
+      "p99_ms": 9.367866,
+      "max_ms": 9.367866,
+      "mean_ms": 9.314602666666666
+    },
+    "operation_stats": {
+      "n": 3,
+      "min_us": 8922.857,
+      "p50_us": 9037.042,
+      "p95_us": 9065.997,
+      "p99_us": 9065.997,
+      "max_us": 9065.997,
+      "mean_us": 9008.632,
+      "total_ms": 27.025896
+    },
+    "rss_cold_mb": 3.85546875,
+    "rss_post_load_mb": 3.85546875,
+    "rss_peak_mb": 3.85546875,
+    "rss_steady_mb": 3.85546875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 1000,
+      "batch_size": 1000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 93.828129,
+      "p50_ms": 100.111706,
+      "p95_ms": 101.253571,
+      "p99_ms": 101.253571,
+      "max_ms": 101.253571,
+      "mean_ms": 98.397802
+    },
+    "operation_stats": {
+      "n": 3000,
+      "min_us": 71.846,
+      "p50_us": 97.865,
+      "p95_us": 131.428,
+      "p99_us": 175.321,
+      "max_us": 832.421,
+      "mean_us": 97.940413,
+      "total_ms": 293.821239
+    },
+    "rss_cold_mb": 33.25390625,
+    "rss_post_load_mb": 33.25390625,
+    "rss_peak_mb": 33.25390625,
+    "rss_steady_mb": 33.25390625,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 1000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "pg-optimal",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 4.585903,
+      "p50_ms": 5.263532,
+      "p95_ms": 5.593585,
+      "p99_ms": 5.593585,
+      "max_ms": 5.593585,
+      "mean_ms": 5.1476733333333335
+    },
+    "operation_stats": {},
+    "rss_cold_mb": 33.25390625,
+    "rss_post_load_mb": 33.25390625,
+    "rss_peak_mb": 33.25390625,
+    "rss_steady_mb": 33.25390625,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 1000,
+      "note": "COPY: no per-row latency"
+    }
+  }
+]

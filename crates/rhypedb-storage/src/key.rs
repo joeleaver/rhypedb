@@ -15,6 +15,13 @@ pub enum KeyPrefix {
     /// the same byte-order-preserving rules as zone maps so a prefix scan
     /// returns ids in ascending field-value order.
     FieldIndex = b'i',
+    /// Per-object monotonic version counter: `g:<type_id>:<object_id>` →
+    /// 8-byte big-endian u64. Bumped on every successful `Database::update`.
+    /// The cover writer stamps each `<name>__cover` entry with the target's
+    /// generation-at-write-time; the reader (executor fusion) compares
+    /// against the current generation to detect stale covers and fall
+    /// through to a fresh LSM probe for those targets.
+    Generation = b'g',
 }
 
 pub const SEPARATOR: u8 = b':';
@@ -50,6 +57,13 @@ impl InternalKey {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    /// Consume the wrapper and return the inner `Bytes` — lets callers
+    /// hand off the owned allocation (e.g. memtable insert) without a
+    /// `Bytes::copy_from_slice` second allocation.
+    pub fn into_bytes(self) -> Bytes {
+        self.data
     }
 }
 
@@ -262,6 +276,133 @@ impl KeyBuilder {
         buf.put_u64(object_id);
         buf.put_u8(SEPARATOR);
         buf.put_u64(field_id);
+        buf.freeze()
+    }
+
+    /// Per-object generation counter: `g:<type_id>:<object_id>` → u64 BE.
+    pub fn object_version(type_id: u64, object_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8);
+        buf.put_u8(KeyPrefix::Generation as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(object_id);
+        buf.freeze()
+    }
+
+    // ---------------------------------------------------------------
+    // Arena-style key encoders for the cascade-delete hot path.
+    //
+    // Hot loops that produce ~500 tombstone keys per User-delete used to
+    // do one `BytesMut::with_capacity` malloc per key. The `*_into`
+    // variants append to a single caller-owned `Vec<u8>` and return the
+    // (start, end) range of the bytes they wrote — the caller wraps the
+    // buffer in `Bytes::from` once and `.slice(range)` each key (refcount
+    // only, no further allocations). Drops ~500 small mallocs per
+    // User-delete at K=100.
+    // ---------------------------------------------------------------
+
+    pub fn object_into(buf: &mut Vec<u8>, type_id: u64, object_id: u64) -> (u32, u32) {
+        let start = buf.len() as u32;
+        buf.push(KeyPrefix::Object as u8);
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&type_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&object_id.to_be_bytes());
+        (start, buf.len() as u32)
+    }
+
+    pub fn edge_into(
+        buf: &mut Vec<u8>,
+        source_id: u64,
+        rel_id: u64,
+        target_id: u64,
+    ) -> (u32, u32) {
+        let start = buf.len() as u32;
+        buf.push(KeyPrefix::Edge as u8);
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&source_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&rel_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&target_id.to_be_bytes());
+        (start, buf.len() as u32)
+    }
+
+    pub fn reverse_edge_into(
+        buf: &mut Vec<u8>,
+        target_id: u64,
+        rel_id: u64,
+        source_id: u64,
+    ) -> (u32, u32) {
+        let start = buf.len() as u32;
+        buf.push(KeyPrefix::ReverseEdge as u8);
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&target_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&rel_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&source_id.to_be_bytes());
+        (start, buf.len() as u32)
+    }
+
+    pub fn object_version_into(
+        buf: &mut Vec<u8>,
+        type_id: u64,
+        object_id: u64,
+    ) -> (u32, u32) {
+        let start = buf.len() as u32;
+        buf.push(KeyPrefix::Generation as u8);
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&type_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&object_id.to_be_bytes());
+        (start, buf.len() as u32)
+    }
+
+    pub fn unique_index_into(
+        buf: &mut Vec<u8>,
+        type_id: u64,
+        field_hash: u64,
+        value_bytes: &[u8],
+    ) -> (u32, u32) {
+        let start = buf.len() as u32;
+        buf.push(KeyPrefix::Unique as u8);
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&type_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&field_hash.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(value_bytes);
+        (start, buf.len() as u32)
+    }
+
+    pub fn field_index_into(
+        buf: &mut Vec<u8>,
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8; 8],
+        object_id: u64,
+    ) -> (u32, u32) {
+        let start = buf.len() as u32;
+        buf.push(KeyPrefix::FieldIndex as u8);
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&type_id.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&field_hash.to_be_bytes());
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(encoded_value);
+        buf.push(SEPARATOR);
+        buf.extend_from_slice(&object_id.to_be_bytes());
+        (start, buf.len() as u32)
+    }
+
+    /// Prefix for scanning every per-object generation counter: `g:`.
+    /// Used at `Database::open` to repopulate the in-memory counter map.
+    pub fn object_version_prefix() -> Bytes {
+        let mut buf = BytesMut::with_capacity(2);
+        buf.put_u8(KeyPrefix::Generation as u8);
+        buf.put_u8(SEPARATOR);
         buf.freeze()
     }
 }

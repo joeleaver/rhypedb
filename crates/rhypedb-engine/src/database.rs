@@ -3,6 +3,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
 use bytes::Bytes;
 
 use rhypedb_schema::{FieldType, OnDeletePolicy, Schema};
@@ -16,10 +18,142 @@ use crate::object::{deserialize_fields, serialize_fields, FieldMap, Object, Valu
 /// One row of the precomputed reverse-relation index used by cascade delete.
 #[derive(Debug, Clone)]
 struct IncomingRelation {
+    source_type_id: u64,
     source_type: String,
     source_field: String,
     rel_id: u64,
     policy: OnDeletePolicy,
+}
+
+/// Arena for tombstone keys produced by a single `delete` cascade walk.
+/// All key bytes go into ONE owned `Vec<u8>` and each push records the
+/// `(start, end)` byte range. When the cascade walk is done, the caller
+/// freezes the buffer into a `Bytes` and slices each range into a
+/// refcount-only view to hand to `storage.delete_batch`.
+///
+/// Replaces the historical `Vec<Bytes>` accumulator where every key was
+/// a separate small `BytesMut::with_capacity` allocation — at K=100
+/// cascading ratings that's ~500 mallocs per User-delete swapped for a
+/// single buffer allocation.
+struct TombstoneArena {
+    buf: Vec<u8>,
+    ranges: Vec<(u32, u32)>,
+}
+
+impl TombstoneArena {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(16 * 1024),
+            ranges: Vec::with_capacity(512),
+        }
+    }
+
+    fn push_object(&mut self, type_id: u64, object_id: u64) {
+        let r = KeyBuilder::object_into(&mut self.buf, type_id, object_id);
+        self.ranges.push(r);
+    }
+
+    fn push_edge(&mut self, source_id: u64, rel_id: u64, target_id: u64) {
+        let r = KeyBuilder::edge_into(&mut self.buf, source_id, rel_id, target_id);
+        self.ranges.push(r);
+    }
+
+    fn push_reverse_edge(&mut self, target_id: u64, rel_id: u64, source_id: u64) {
+        let r =
+            KeyBuilder::reverse_edge_into(&mut self.buf, target_id, rel_id, source_id);
+        self.ranges.push(r);
+    }
+
+    fn push_object_version(&mut self, type_id: u64, object_id: u64) {
+        let r = KeyBuilder::object_version_into(&mut self.buf, type_id, object_id);
+        self.ranges.push(r);
+    }
+
+    fn push_unique_index(
+        &mut self,
+        type_id: u64,
+        field_hash: u64,
+        value_bytes: &[u8],
+    ) {
+        let r =
+            KeyBuilder::unique_index_into(&mut self.buf, type_id, field_hash, value_bytes);
+        self.ranges.push(r);
+    }
+
+    fn push_field_index(
+        &mut self,
+        type_id: u64,
+        field_hash: u64,
+        encoded_value: &[u8; 8],
+        object_id: u64,
+    ) {
+        let r = KeyBuilder::field_index_into(
+            &mut self.buf,
+            type_id,
+            field_hash,
+            encoded_value,
+            object_id,
+        );
+        self.ranges.push(r);
+    }
+
+    fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Reserve capacity for `n` additional ranges. Used at points where
+    /// we know the inbound scan size to avoid Vec doublings.
+    fn reserve(&mut self, n: usize) {
+        self.ranges.reserve(n);
+    }
+
+    /// Roll back to a previous range count — used when a deny violation
+    /// aborts mid-cascade and we need the parent's earlier-staged keys
+    /// to remain but our own to disappear. Truncating the byte buffer to
+    /// match keeps the arena tight even on the error path.
+    fn truncate(&mut self, ranges_len: usize) {
+        let new_buf_len = if ranges_len == 0 {
+            0
+        } else {
+            self.ranges[ranges_len - 1].1 as usize
+        };
+        self.ranges.truncate(ranges_len);
+        self.buf.truncate(new_buf_len);
+    }
+
+    /// Consume the arena and produce one `Bytes` per recorded range.
+    /// `Bytes::from(buf)` is O(1) (owns the Vec) and `.slice(range)` is
+    /// refcount-only — no per-key heap allocation.
+    fn into_keys(self) -> Vec<Bytes> {
+        let buf_bytes = Bytes::from(self.buf);
+        self.ranges
+            .iter()
+            .map(|&(s, e)| buf_bytes.slice(s as usize..e as usize))
+            .collect()
+    }
+}
+
+/// Pre-resolved per-type metadata the cascade hot path consults to avoid
+/// `format!("Type.field")` + `HashMap::get` per relation per cascaded
+/// object. For a User-delete at K=100 ratings, the bench used to do ~10
+/// HashMap lookups + 4-6 `format!` allocations × 100 cascaded Ratings =
+/// ~1000 hot-path allocations. With this struct each cascade call does
+/// one `HashMap::get(&type_id)` and iterates a contiguous `Vec<ForwardRelMeta>`.
+#[derive(Debug, Clone)]
+struct CascadeMeta {
+    type_name: String,
+    has_unique: bool,
+    has_indexed: bool,
+    /// Forward (non-inverse) relations on this type, with rel_id pre-
+    /// resolved. Used by the outbound-tombstone walk.
+    forward_relations: Vec<ForwardRelMeta>,
+}
+
+#[derive(Debug, Clone)]
+struct ForwardRelMeta {
+    field_name: String,
+    rel_id: u64,
+    is_many: bool,
 }
 
 /// The rhypedb database engine.
@@ -34,17 +168,35 @@ pub struct Database {
     field_ids: HashMap<String, u64>,
     next_object_id: AtomicU64,
     subscriptions: SubscriptionHub,
-    /// target_type → list of relations that point at it. Built once at open()
-    /// so cascade delete doesn't iterate the whole schema per recursive call.
-    incoming_relations: HashMap<String, Vec<IncomingRelation>>,
-    /// Set of type names that have at least one @unique field. Lets cascade
-    /// delete skip the storage.get + unique-index walk for types that don't
-    /// need it (e.g. Rating in the bench schema has no unique fields).
-    types_with_unique: std::collections::HashSet<String>,
+    /// target_type_id → list of relations that point at it. Built once at
+    /// open() so cascade delete doesn't iterate the whole schema per
+    /// recursive call. Keyed by type_id to skip a String-keyed lookup on
+    /// every cascade call.
+    incoming_relations: HashMap<u64, Vec<IncomingRelation>>,
+    /// type_id → per-type cascade metadata used by `delete_inner` to
+    /// avoid repeated schema walks + `format!()` calls per relation per
+    /// cascaded object.
+    cascade_meta_by_id: HashMap<u64, CascadeMeta>,
+    /// type_id → type name. Reverse of `type_ids`, used by cascade to
+    /// resolve names for subscription events without consulting the schema.
+    type_name_by_id: HashMap<u64, String>,
     /// type_name → list of @indexed scalar fields, with their pre-resolved
     /// (field_name, field_hash). Cached so the create/update/delete write
     /// paths don't re-traverse the schema per object.
     indexed_fields: HashMap<String, Vec<IndexedField>>,
+    /// Per-object monotonic generation counter, bumped on every successful
+    /// `update`. Lives in-memory for cheap reads (cover-write stamps the
+    /// target's current generation into `<name>__cover_v`; executor fusion
+    /// compares against the live generation to detect stale covers). Backed
+    /// by `g:<type_id>:<object_id>` keys for restart durability — the map is
+    /// repopulated by scanning that prefix in `open()`.
+    version_counters: RwLock<HashMap<(u64, u64), u64>>,
+    /// Cheap lockless "is `version_counters` non-empty?" check. Cascade
+    /// delete uses it to skip the per-cascaded-object `version_counters.read()
+    /// .contains_key()` when no object has ever been updated. For the bench
+    /// (insert + delete, no updates) this saves 100 RwLock acquires per
+    /// User-delete at K=100. Updated alongside every map mutation.
+    version_counter_count: std::sync::atomic::AtomicUsize,
 }
 
 /// One @indexed scalar field on a type, with everything the write path needs
@@ -56,15 +208,49 @@ struct IndexedField {
     field_id: u64,
 }
 
+/// Operator-tunable knobs that don't depend on schema. Pass to
+/// `Database::open_with_options` to override per-deployment behaviour.
+#[derive(Debug, Clone)]
+pub struct OpenOptions {
+    /// `true` (default): every commit fsyncs the WAL — durable against
+    /// power loss. `false`: skip the fsync syscall — the kernel still has
+    /// the bytes, so a clean process crash is recoverable, but a hard
+    /// power loss can drop the last N writes. Matches Postgres's
+    /// `fsync=off + synchronous_commit=off` mode for benchmarking, and
+    /// is useful for bulk imports that accept the risk.
+    pub sync_on_commit: bool,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            sync_on_commit: true,
+        }
+    }
+}
+
 impl Database {
     /// Open a database with the given schema and data directory.
     pub fn open(schema: Schema, data_dir: impl AsRef<Path>) -> EngineResult<Self> {
+        Self::open_with_options(schema, data_dir, OpenOptions::default())
+    }
+
+    /// Open with explicit options. The engine still owns the
+    /// `zone_extractor` wiring (it needs schema-aware decoding); options
+    /// carries the durability + throughput knobs that operators / bench
+    /// harnesses tune from the outside.
+    pub fn open_with_options(
+        schema: Schema,
+        data_dir: impl AsRef<Path>,
+        options: OpenOptions,
+    ) -> EngineResult<Self> {
         let mut config = LsmConfig::new(data_dir);
         // Wire a zone-field extractor that pulls integer field values out of
         // object entries' FieldMap blobs at SST flush/compaction time. Lets
         // `filter_scan` skip blocks whose min/max bounds rule out the
         // predicate without per-entry decode + compare.
         config.zone_extractor = Some(Arc::new(extract_zone_fields));
+        config.sync_on_commit = options.sync_on_commit;
         let storage = Arc::new(LsmTree::open(config)?);
 
         // Assign stable numeric IDs to types and relationships.
@@ -112,11 +298,22 @@ impl Database {
 
         // Precompute the reverse-relation index used by cascade delete.
         // Without this, every delete_inner call walks the entire schema
-        // looking for inbound edges.
-        let mut incoming_relations: HashMap<String, Vec<IncomingRelation>> = HashMap::new();
+        // looking for inbound edges. We deliberately skip @inverse fields:
+        // those don't allocate their own forward edges (reads route through
+        // the underlying forward field's rev_edges), so a cascade-time
+        // `scan_prefix(r:<id>:<inverse_rel_id>:)` is guaranteed to return
+        // empty and pay only bloom/sparse-index overhead. For the bench
+        // schema that's two wasted scans per cascaded Rating (User.ratings
+        // and Movie.ratings), or ~200 wasted scans per User-delete at
+        // K=100 cascading ratings — a measurable cascade tax.
+        let mut incoming_relations: HashMap<u64, Vec<IncomingRelation>> = HashMap::new();
         for (source_type, type_def) in &schema.types {
+            let source_type_id = type_ids[source_type];
             for field in &type_def.fields {
                 if let FieldType::Relation(rel) = &field.field_type {
+                    if field.inverse().is_some() {
+                        continue;
+                    }
                     let rel_key = format!("{source_type}.{}", field.name);
                     let rel_id = rel_ids[&rel_key];
                     let policy = field.on_delete().cloned().unwrap_or(if rel.is_many {
@@ -124,10 +321,12 @@ impl Database {
                     } else {
                         OnDeletePolicy::Deny
                     });
+                    let target_type_id = type_ids[&rel.target_type];
                     incoming_relations
-                        .entry(rel.target_type.clone())
+                        .entry(target_type_id)
                         .or_default()
                         .push(IncomingRelation {
+                            source_type_id,
                             source_type: source_type.clone(),
                             source_field: field.name.clone(),
                             rel_id,
@@ -148,6 +347,48 @@ impl Database {
                 }
             })
             .collect();
+
+        // type_id → name reverse map (for subscription publish + error
+        // messages without re-walking type_ids each time).
+        let mut type_name_by_id: HashMap<u64, String> = HashMap::new();
+        for (name, id) in &type_ids {
+            type_name_by_id.insert(*id, name.clone());
+        }
+
+        // Per-type cascade metadata. Lets `delete_inner` iterate a Vec of
+        // pre-resolved (field_name, rel_id, is_many) tuples instead of
+        // walking the schema + format!()-ing field keys + HashMap-looking-up
+        // rel_ids on every cascade call. For K=100 cascading Ratings this
+        // cuts ~6 allocations + ~10 HashMap lookups per Rating cascade →
+        // ~1,600 fewer ops per User delete.
+        let mut cascade_meta_by_id: HashMap<u64, CascadeMeta> = HashMap::new();
+        for (name, type_def) in &schema.types {
+            let type_id = type_ids[name];
+            let mut forward_relations = Vec::new();
+            for field in &type_def.fields {
+                if let FieldType::Relation(rel) = &field.field_type {
+                    if field.inverse().is_some() {
+                        continue;
+                    }
+                    let rel_key = format!("{name}.{}", field.name);
+                    let rel_id = rel_ids[&rel_key];
+                    forward_relations.push(ForwardRelMeta {
+                        field_name: field.name.clone(),
+                        rel_id,
+                        is_many: rel.is_many,
+                    });
+                }
+            }
+            cascade_meta_by_id.insert(
+                type_id,
+                CascadeMeta {
+                    type_name: name.clone(),
+                    has_unique: types_with_unique.contains(name),
+                    has_indexed: type_def.fields.iter().any(|f| f.is_indexed()),
+                    forward_relations,
+                },
+            );
+        }
 
         // Precompute the @indexed scalar fields per type. Each entry resolves
         // to the same `{Type.field}` → u64 ID we use for unique indexes so
@@ -170,6 +411,29 @@ impl Database {
             }
         }
 
+        // Repopulate the per-object generation counter from `g:` keys. Cost
+        // is one prefix scan at startup proportional to the number of
+        // never-yet-updated objects, then HashMap lookups for every cover-
+        // write and every fusion check. Counters for objects that have
+        // never been updated stay absent (read-side defaults to 0).
+        let mut version_counters: HashMap<(u64, u64), u64> = HashMap::new();
+        let txn2 = storage.begin_txn();
+        if let Ok(entries) = storage.scan_prefix(&txn2, &KeyBuilder::object_version_prefix()) {
+            for (key, value) in entries {
+                if key.len() < 1 + 1 + 8 + 1 + 8 || value.len() != 8 {
+                    continue;
+                }
+                let type_id_bytes: [u8; 8] = key[2..10].try_into().unwrap();
+                let obj_id_bytes: [u8; 8] = key[11..19].try_into().unwrap();
+                let v_bytes: [u8; 8] = value[..].try_into().unwrap();
+                version_counters.insert(
+                    (u64::from_be_bytes(type_id_bytes), u64::from_be_bytes(obj_id_bytes)),
+                    u64::from_be_bytes(v_bytes),
+                );
+            }
+        }
+        drop(txn2);
+
         Ok(Self {
             schema,
             storage,
@@ -179,12 +443,76 @@ impl Database {
             next_object_id: AtomicU64::new(max_object_id + 1),
             subscriptions: SubscriptionHub::new(),
             incoming_relations,
-            types_with_unique,
+            cascade_meta_by_id,
+            type_name_by_id,
             indexed_fields,
+            version_counter_count: std::sync::atomic::AtomicUsize::new(version_counters.len()),
+            version_counters: RwLock::new(version_counters),
         })
     }
 
+    /// Current generation of the object `(type_name, object_id)`. Returns 0
+    /// when the object has never been updated (no entry in the counter map).
+    /// Public so the query executor can compare against `<name>__cover_v`
+    /// embedded in rev_edge values without pulling more `Database` internals.
+    pub fn object_version(&self, type_name: &str, object_id: u64) -> u64 {
+        let Some(&type_id) = self.type_ids.get(type_name) else {
+            return 0;
+        };
+        self.version_counters
+            .read()
+            .get(&(type_id, object_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn bump_version(&self, type_id: u64, object_id: u64) -> u64 {
+        let mut map = self.version_counters.write();
+        let inserted = !map.contains_key(&(type_id, object_id));
+        let entry = map.entry((type_id, object_id)).or_insert(0);
+        *entry += 1;
+        let v = *entry;
+        if inserted {
+            self.version_counter_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        v
+    }
+
+    fn rollback_version(&self, type_id: u64, object_id: u64) {
+        let mut map = self.version_counters.write();
+        if let Some(v) = map.get_mut(&(type_id, object_id)) {
+            if *v > 0 {
+                *v -= 1;
+            }
+            if *v == 0 {
+                map.remove(&(type_id, object_id));
+                self.version_counter_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn forget_version(&self, type_id: u64, object_id: u64) {
+        if self
+            .version_counters
+            .write()
+            .remove(&(type_id, object_id))
+            .is_some()
+        {
+            self.version_counter_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Create a new object of the given type.
+    ///
+    /// `fields` may include forward (non-inverse) relation fields whose
+    /// value is an integer target id — the engine then writes the forward
+    /// edge AND rev_edge as part of the same txn, with symmetric covers
+    /// built from the in-memory FieldMap (no per-link `scan_prefix` for
+    /// other targets, no extra commits). This collapses the historical
+    /// `Type.create + link + link` 3-txn dance into one batched txn.
     pub fn create(&self, type_name: &str, fields: FieldMap) -> EngineResult<Object> {
         let type_def = self
             .schema
@@ -193,53 +521,20 @@ impl Database {
         let type_id = self.type_ids[type_name];
         let object_id = self.next_object_id.fetch_add(1, Ordering::SeqCst);
 
-        // Validate fields against schema.
-        for (field_name, value) in &fields {
-            let field_def = type_def.get_field(field_name).ok_or_else(|| {
-                EngineError::FieldNotFound {
-                    type_name: type_name.into(),
-                    field: field_name.clone(),
-                }
-            })?;
-            validate_value(field_def, value)?;
-        }
-
-        let key = KeyBuilder::object(type_id, object_id);
-        let serialized = serialize_fields(&fields);
-
         let mut txn = self.storage.begin_txn();
+        let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
 
-        // Check and write unique index entries.
-        for (field_name, value) in &fields {
-            let field_def = type_def.get_field(field_name).unwrap();
-            if field_def.is_unique() && !matches!(value, Value::Null) {
-                self.check_unique_and_insert(
-                    &mut txn, type_name, type_id, field_name, value, object_id,
-                )?;
-            }
-        }
+        let scalar_fields = self.stage_create_writes(
+            &mut txn,
+            type_name,
+            type_def,
+            type_id,
+            object_id,
+            &fields,
+            &mut puts,
+        )?;
 
-        // Write secondary index entries for any @indexed fields with a value.
-        // The serialized FieldMap doubles as the covering payload so a later
-        // filter_scan can hand back full Objects without a per-id LSM probe.
-        if let Some(idx_fields) = self.indexed_fields.get(type_name) {
-            for ifd in idx_fields {
-                if let Some(value) = fields.get(&ifd.name)
-                    && !matches!(value, Value::Null)
-                {
-                    self.insert_field_index(
-                        &mut txn,
-                        type_id,
-                        ifd.field_id,
-                        value,
-                        object_id,
-                        serialized.clone(),
-                    )?;
-                }
-            }
-        }
-
-        self.storage.put(&mut txn, &key, serialized)?;
+        self.storage.put_batch(&mut txn, &puts)?;
         let version = self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
             other => EngineError::Storage(other),
@@ -250,15 +545,194 @@ impl Database {
             kind: ChangeKind::Create,
             type_name: type_name.into(),
             object_id,
-            fields: Some(fields_to_json(&fields)),
+            fields: Some(fields_to_json(&scalar_fields)),
         });
 
         Ok(Object {
             type_name: type_name.into(),
             id: object_id,
-            fields,
+            fields: scalar_fields,
             raw_fields: None,
         })
+    }
+
+    /// Stage all writes for one create-with-inline-relations row.
+    ///
+    /// Splits `fields` into scalar fields (which form the object payload)
+    /// and relation fields (which expand into forward edge + rev_edge
+    /// writes). For every forward 1:1 relation being set in this row we
+    /// fetch the target's serialized data so the rev_edge's `<name>__cover`
+    /// can be populated symmetrically — both sides of a pair of 1:1 links
+    /// land with full covers, instead of the historical sequence-dependent
+    /// "second link gets a cover, first stays empty" pattern. Cover_v
+    /// stamps are read from the in-memory `version_counters` map (defaults
+    /// to 0 for never-updated targets).
+    ///
+    /// Unique-index puts are issued inline (the next row in `create_batch`
+    /// must see them through MVCC to detect intra-batch dup values). All
+    /// other writes accumulate into `puts` for the caller to flush via
+    /// `put_batch`. Returns the scalar-only `FieldMap` for the response.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_create_writes(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_name: &str,
+        type_def: &rhypedb_schema::TypeDef,
+        type_id: u64,
+        object_id: u64,
+        fields: &FieldMap,
+        puts: &mut Vec<(Bytes, Bytes)>,
+    ) -> EngineResult<FieldMap> {
+        // First pass: validate, split scalars from relations.
+        let mut scalar_fields = FieldMap::new();
+        // (field_name, target_id, target_type, target_data, target_version, rel_id, is_1to1_forward)
+        let mut links: Vec<(String, u64, String, Bytes, u64, u64, bool)> = Vec::new();
+
+        for (field_name, value) in fields {
+            let field_def = type_def.get_field(field_name).ok_or_else(|| {
+                EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.clone(),
+                }
+            })?;
+            validate_value(field_def, value)?;
+
+            match &field_def.field_type {
+                FieldType::Relation(rel) => {
+                    if field_def.inverse().is_some() {
+                        // Inverse relations are virtual — they don't have
+                        // their own forward edges, so a value here would
+                        // have no place to land.
+                        return Err(EngineError::TypeMismatch {
+                            field: field_def.name.clone(),
+                            expected: "scalar (inverse fields are virtual)".into(),
+                            got: value.type_name().into(),
+                        });
+                    }
+                    if matches!(value, Value::Null) {
+                        continue;
+                    }
+                    let target_id: u64 = match value {
+                        Value::U64(v) => *v,
+                        Value::U32(v) => *v as u64,
+                        Value::I32(v) if *v >= 0 => *v as u64,
+                        Value::I64(v) if *v >= 0 => *v as u64,
+                        _ => {
+                            // validate_value already rejected non-integer
+                            // values for Relation; this arm only fires on
+                            // negative signed integers.
+                            return Err(EngineError::TypeMismatch {
+                                field: field_def.name.clone(),
+                                expected: "relation target id (non-negative integer)".into(),
+                                got: value.type_name().into(),
+                            });
+                        }
+                    };
+                    let target_type_id =
+                        *self.type_ids.get(&rel.target_type).ok_or_else(|| {
+                            EngineError::TypeNotFound(rel.target_type.clone())
+                        })?;
+                    let target_key = KeyBuilder::object(target_type_id, target_id);
+                    let target_data = self.storage.get(txn, &target_key)?.ok_or_else(|| {
+                        EngineError::ObjectNotFound {
+                            type_name: rel.target_type.clone(),
+                            object_id: target_id,
+                        }
+                    })?;
+                    let target_version = self.object_version(&rel.target_type, target_id);
+                    let rel_key = format!("{type_name}.{field_name}");
+                    let rel_id = *self.rel_ids.get(&rel_key).ok_or_else(|| {
+                        EngineError::FieldNotFound {
+                            type_name: type_name.into(),
+                            field: field_name.clone(),
+                        }
+                    })?;
+                    let is_1to1_forward = !rel.is_many;
+                    links.push((
+                        field_name.clone(),
+                        target_id,
+                        rel.target_type.clone(),
+                        target_data,
+                        target_version,
+                        rel_id,
+                        is_1to1_forward,
+                    ));
+                }
+                FieldType::Scalar(_) => {
+                    scalar_fields.insert(field_name.clone(), value.clone());
+                }
+                FieldType::Vector(_) => {
+                    return Err(EngineError::TypeMismatch {
+                        field: field_def.name.clone(),
+                        expected: "scalar or relation".into(),
+                        got: value.type_name().into(),
+                    });
+                }
+            }
+        }
+
+        let serialized = serialize_fields(&scalar_fields);
+
+        // Unique-index writes for scalar fields (inline — required for
+        // cross-row uniqueness detection inside a single `create_batch`).
+        for (field_name, value) in &scalar_fields {
+            let field_def = type_def.get_field(field_name).unwrap();
+            if field_def.is_unique() && !matches!(value, Value::Null) {
+                self.check_unique_and_insert(
+                    txn, type_name, type_id, field_name, value, object_id,
+                )?;
+            }
+        }
+
+        // Secondary index entries — covering payload = serialized scalars.
+        if let Some(idx_fields) = self.indexed_fields.get(type_name) {
+            for ifd in idx_fields {
+                if let Some(value) = scalar_fields.get(&ifd.name)
+                    && !matches!(value, Value::Null)
+                    && let Some(encoded) = encode_int_for_zone(value)
+                {
+                    puts.push((
+                        KeyBuilder::field_index(
+                            type_id,
+                            ifd.field_id,
+                            &encoded,
+                            object_id,
+                        ),
+                        serialized.clone(),
+                    ));
+                }
+            }
+        }
+
+        // Object key.
+        puts.push((KeyBuilder::object(type_id, object_id), serialized.clone()));
+
+        // Forward edges + rev_edges with in-memory-built covers. The set
+        // of "other forward-1:1 targets" is just the other entries in
+        // `links` (no LSM scan_prefix). Symmetric: every rev_edge for this
+        // row carries the full peer set, instead of the historical
+        // "first link empty, second link covers" asymmetry.
+        for (i, link) in links.iter().enumerate() {
+            let (field_name, target_id, _, _, _, rel_id, _) = link;
+            puts.push((
+                KeyBuilder::edge(object_id, *rel_id, *target_id),
+                Bytes::new(),
+            ));
+
+            let rev_value = build_inflight_cover(
+                &scalar_fields,
+                field_name,
+                *target_id,
+                &links,
+                i,
+            );
+            puts.push((
+                KeyBuilder::reverse_edge(*target_id, *rel_id, object_id),
+                rev_value,
+            ));
+        }
+
+        Ok(scalar_fields)
     }
 
     /// Bulk-create N objects in ONE transaction (one WAL append + commit).
@@ -287,58 +761,31 @@ impl Database {
 
         let mut txn = self.storage.begin_txn();
         let mut object_ids: Vec<u64> = Vec::with_capacity(rows.len());
+        // Every put across the whole batch — object payload, secondary
+        // index entries, forward + rev edges — accumulates here and
+        // flushes via one `put_batch` at the end. Unique-index puts stay
+        // inline because the next row's uniqueness check inside the same
+        // txn must see them. Per-row scalar FieldMaps are reconstructed
+        // post-batch for the published events / returned Objects.
+        let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(rows.len() * 2);
+        let mut scalar_rows: Vec<FieldMap> = Vec::with_capacity(rows.len());
 
         for fields in &rows {
-            // Validate fields against schema.
-            for (field_name, value) in fields {
-                let field_def = type_def.get_field(field_name).ok_or_else(|| {
-                    EngineError::FieldNotFound {
-                        type_name: type_name.into(),
-                        field: field_name.clone(),
-                    }
-                })?;
-                validate_value(field_def, value)?;
-            }
-
             let object_id = self.next_object_id.fetch_add(1, Ordering::SeqCst);
-            let key = KeyBuilder::object(type_id, object_id);
-            let serialized = serialize_fields(fields);
-
-            // Unique-index writes for this row. Within one txn, a second row
-            // with the same unique value will see the first via MVCC and
-            // fail with a unique violation — same semantics as N serial creates.
-            for (field_name, value) in fields {
-                let field_def = type_def.get_field(field_name).unwrap();
-                if field_def.is_unique() && !matches!(value, Value::Null) {
-                    self.check_unique_and_insert(
-                        &mut txn, type_name, type_id, field_name, value, object_id,
-                    )?;
-                }
-            }
-
-            // Secondary index entries for any @indexed fields. Covering value
-            // = serialized object fields (same payload that lands at the
-            // object key) so the read path can skip the per-id materialize.
-            if let Some(idx_fields) = self.indexed_fields.get(type_name) {
-                for ifd in idx_fields {
-                    if let Some(value) = fields.get(&ifd.name)
-                        && !matches!(value, Value::Null)
-                    {
-                        self.insert_field_index(
-                            &mut txn,
-                            type_id,
-                            ifd.field_id,
-                            value,
-                            object_id,
-                            serialized.clone(),
-                        )?;
-                    }
-                }
-            }
-
-            self.storage.put(&mut txn, &key, serialized)?;
+            let scalar_fields = self.stage_create_writes(
+                &mut txn,
+                type_name,
+                type_def,
+                type_id,
+                object_id,
+                fields,
+                &mut puts,
+            )?;
+            scalar_rows.push(scalar_fields);
             object_ids.push(object_id);
         }
+
+        self.storage.put_batch(&mut txn, &puts)?;
 
         let version = self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
@@ -346,19 +793,21 @@ impl Database {
         })?;
 
         // Build the returned Objects + publish events after commit.
-        let mut out = Vec::with_capacity(rows.len());
-        for (id, fields) in object_ids.into_iter().zip(rows.into_iter()) {
+        // Events report only the scalar fields (relation values went into
+        // the edge index, not the object payload).
+        let mut out = Vec::with_capacity(scalar_rows.len());
+        for (id, scalar_fields) in object_ids.into_iter().zip(scalar_rows.into_iter()) {
             self.subscriptions.publish(ChangeEvent {
                 version,
                 kind: ChangeKind::Create,
                 type_name: type_name.into(),
                 object_id: id,
-                fields: Some(fields_to_json(&fields)),
+                fields: Some(fields_to_json(&scalar_fields)),
             });
             out.push(Object {
                 type_name: type_name.into(),
                 id,
-                fields,
+                fields: scalar_fields,
                 raw_fields: None,
             });
         }
@@ -911,10 +1360,84 @@ impl Database {
             }
         }
 
+        // Phase 1: refresh covering reverse-edges on THIS object's own
+        // outbound forward relations. The rev_edge value stored at each
+        // linked target carries the source object's effective fields (and
+        // covers for OTHER forward-1:1 targets) — both go stale when the
+        // source updates. Bounded cost: number of outbound relation
+        // endpoints, which is at most the schema-declared field count for
+        // forward-1:1 relations and total linked-target count for many
+        // relations. (Phase 2 — refreshing this object's OWN cover in the
+        // rev_edges that INCOMING references hold us under `__cover` — is
+        // handled lazily via the per-object version + reader-side fall-
+        // through, since the count can be unbounded.)
+        if let Some(type_def) = self.schema.get_type(type_name) {
+            let has_forward_1to1 = type_def.fields.iter().any(|f| {
+                matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many)
+                    && f.inverse().is_none()
+            });
+            if has_forward_1to1 {
+                for field in &type_def.fields {
+                    if !matches!(field.field_type, FieldType::Relation(_)) {
+                        continue;
+                    }
+                    if field.inverse().is_some() {
+                        continue;
+                    }
+                    let rel_key = format!("{type_name}.{}", field.name);
+                    let Some(&rel_id) = self.rel_ids.get(&rel_key) else {
+                        continue;
+                    };
+                    let prefix = KeyBuilder::edge_prefix(object_id, rel_id);
+                    let entries = self.scan_prefix(&txn, &prefix)?;
+                    // Walk every linked target across both 1:1 and many
+                    // outbound relations: their rev_edge values all carry
+                    // source's covering fields and need refresh.
+                    for (target_id, _edge_value) in entries {
+                        let rev_value = build_covering_rev_value(
+                            self,
+                            &txn,
+                            type_name,
+                            object_id,
+                            Some(&serialized),
+                            &field.name,
+                            target_id,
+                        )?;
+                        let rev_key = KeyBuilder::reverse_edge(
+                            target_id,
+                            rel_id,
+                            object_id,
+                        );
+                        self.storage.put(&mut txn, &rev_key, rev_value)?;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: bump this object's generation. Every rev_edge that
+        // embedded us as `<name>__cover` earlier now has a stale snapshot;
+        // the executor's fusion path detects mismatch via a HashMap lookup
+        // against this counter and falls through to a fresh LSM probe for
+        // those specific targets. Bounded write cost (one in-memory bump +
+        // one persisted `g:` put) regardless of how many incoming
+        // references this object has — that fan-in could be millions.
+        let new_version = self.bump_version(type_id, object_id);
+        self.storage.put(
+            &mut txn,
+            &KeyBuilder::object_version(type_id, object_id),
+            Bytes::copy_from_slice(&new_version.to_be_bytes()),
+        )?;
+
         self.storage.put(&mut txn, &key, serialized)?;
-        let version = self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
-            other => EngineError::Storage(other),
+        let version = self.storage.commit(&mut txn).map_err(|e| {
+            // The commit didn't land — undo the in-memory bump so future
+            // updates don't skip a generation and so the stamped versions
+            // in existing rev_edges still match a successful next write.
+            self.rollback_version(type_id, object_id);
+            match e {
+                rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                other => EngineError::Storage(other),
+            }
         })?;
 
         self.subscriptions.publish(ChangeEvent {
@@ -937,21 +1460,61 @@ impl Database {
     /// Cascades are recursive — if deleting A cascades to B, and B has its own
     /// cascade relationships, those are followed too.
     pub fn delete(&self, type_name: &str, object_id: u64) -> EngineResult<()> {
+        let type_id = *self
+            .type_ids
+            .get(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+
         let mut txn = self.storage.begin_txn();
-        let mut deleted = std::collections::HashSet::new();
+        // type_id keyed instead of (String, u64) — drops a String alloc
+        // per cascaded object. At K=100 that's 100 fewer allocations per
+        // User delete.
+        let mut deleted: std::collections::HashSet<(u64, u64)> =
+            std::collections::HashSet::with_capacity(128);
+        // Arena instead of `Vec<Bytes>` — every tombstone key lives in one
+        // pre-sized buffer; `into_keys` produces refcount-only slices
+        // when we hand them to `delete_batch`. At K=100 that's ~500
+        // mallocs replaced by ONE.
+        let mut arena = TombstoneArena::new();
+
         // Top-level delete: verify existence (per public API contract).
-        self.delete_inner(&mut txn, type_name, object_id, true, &mut deleted)?;
+        // Pass `None` for the cascade context — there's no parent rev_edge
+        // value to extract peer targets from.
+        self.delete_inner(
+            &mut txn,
+            type_id,
+            object_id,
+            true,
+            &mut deleted,
+            &mut arena,
+            None,
+        )?;
+
+        let tombstones = arena.into_keys();
+        self.storage.delete_batch(&mut txn, &tombstones)?;
 
         let version = self.storage.commit(&mut txn).map_err(|e| match e {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
             other => EngineError::Storage(other),
         })?;
 
-        for (del_type, del_id) in &deleted {
+        // Drop the in-memory version-counter entries for everything the
+        // commit just removed. The persisted `g:` keys were already
+        // tombstoned inside the txn.
+        for (del_type_id, del_id) in &deleted {
+            self.forget_version(*del_type_id, *del_id);
+        }
+
+        for (del_type_id, del_id) in &deleted {
+            let type_name = self
+                .type_name_by_id
+                .get(del_type_id)
+                .cloned()
+                .unwrap_or_default();
             self.subscriptions.publish(ChangeEvent {
                 version,
                 kind: ChangeKind::Delete,
-                type_name: del_type.clone(),
+                type_name,
                 object_id: *del_id,
                 fields: None,
             });
@@ -967,39 +1530,56 @@ impl Database {
     /// existence check. Cascade-recursive calls receive IDs from the
     /// reverse-edge scan we just did — those objects provably exist, so the
     /// LSM probe is pure waste.
+    /// `cascade_ctx` carries the (parent_rel_id, source_cover_bytes) pair
+    /// captured by the parent's inbound scan. When present:
+    ///   * `parent_rel_id` is the relation the parent used to find us
+    ///     (e.g. `Rating.user` when cascading from User → Rating). The
+    ///     parent already staged tombstones for both directions of that
+    ///     edge, so this call must NOT re-stage them.
+    ///   * The cover bytes are the rev_edge value the parent's scan
+    ///     returned. With symmetric covers (inline-relations create or
+    ///     update-time refresh), this blob carries every OTHER forward 1:1
+    ///     target id directly — extract via `find_u64_field_in_raw` and
+    ///     stage tombstones without a per-relation `scan_prefix`. At
+    ///     K=100 cascading Ratings this drops 200 LSM scans per User
+    ///     delete.
     fn delete_inner(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
-        type_name: &str,
+        type_id: u64,
         object_id: u64,
         verify_exists: bool,
-        deleted: &mut std::collections::HashSet<(String, u64)>,
+        deleted: &mut std::collections::HashSet<(u64, u64)>,
+        arena: &mut TombstoneArena,
+        cascade_ctx: Option<(u64, Bytes)>,
     ) -> EngineResult<()> {
-        let delete_key = (type_name.to_string(), object_id);
-        if !deleted.insert(delete_key) {
+        if !deleted.insert((type_id, object_id)) {
             return Ok(()); // already deleted in this cascade chain
         }
 
-        let type_id = *self
-            .type_ids
-            .get(type_name)
-            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        // One HashMap lookup → all the per-type schema info the cascade
+        // walk needs. Saves repeated `schema.get_type` / `rel_ids.get` /
+        // `format!("Type.field")` per cascaded object.
+        let meta = self.cascade_meta_by_id.get(&type_id).ok_or_else(|| {
+            EngineError::TypeNotFound(
+                self.type_name_by_id
+                    .get(&type_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("type_id={type_id}")),
+            )
+        })?;
 
-        let obj_key = KeyBuilder::object(type_id, object_id);
-
-        // Unique-index + secondary-index cleanup. We can skip the storage.get
-        // + deserialize entirely if this type has no @unique fields AND no
-        // @indexed fields — saves one LSM probe per cascading row (huge at
-        // scale where most cascaded rows are edge-only types like Rating).
-        let type_has_unique = self.types_with_unique.contains(type_name);
-        let type_idx_fields = self.indexed_fields.get(type_name);
-        let type_has_indexed = type_idx_fields.is_some();
-        if type_has_unique || type_has_indexed || verify_exists {
+        // Unique-index + secondary-index cleanup. Skipped entirely when the
+        // type has neither — for edge-only types (Rating in the bench) the
+        // cascade never touches the object payload.
+        let type_idx_fields = self.indexed_fields.get(&meta.type_name);
+        if meta.has_unique || meta.has_indexed || verify_exists {
+            let obj_key = KeyBuilder::object(type_id, object_id);
             let obj_data = self.storage.get(txn, &obj_key)?;
             if obj_data.is_none() {
                 if verify_exists {
                     return Err(EngineError::ObjectNotFound {
-                        type_name: type_name.into(),
+                        type_name: meta.type_name.clone(),
                         object_id,
                     });
                 }
@@ -1008,19 +1588,22 @@ impl Database {
             }
             if let Some(data) = &obj_data {
                 let fields = deserialize_fields(data);
-                if type_has_unique
-                    && let Some(type_def) = self.schema.get_type(type_name)
+                if meta.has_unique
+                    && let Some(type_def) = self.schema.get_type(&meta.type_name)
                 {
                     for field_def in &type_def.fields {
                         if field_def.is_unique()
                             && let Some(value) = fields.get(&field_def.name)
                                 && !matches!(value, Value::Null) {
-                                    let field_key = format!("{type_name}.{}", field_def.name);
+                                    let field_key =
+                                        format!("{}.{}", meta.type_name, field_def.name);
                                     let field_id = self.field_ids[&field_key];
                                     let value_bytes = value_to_index_bytes(value);
-                                    let unique_key =
-                                        KeyBuilder::unique_index(type_id, field_id, &value_bytes);
-                                    self.storage.delete(txn, &unique_key)?;
+                                    arena.push_unique_index(
+                                        type_id,
+                                        field_id,
+                                        &value_bytes,
+                                    );
                                 }
                     }
                 }
@@ -1028,93 +1611,161 @@ impl Database {
                     for ifd in idx_fields {
                         if let Some(value) = fields.get(&ifd.name)
                             && !matches!(value, Value::Null)
+                            && let Some(encoded) = encode_int_for_zone(value)
                         {
-                            self.remove_field_index(
-                                txn, type_id, ifd.field_id, value, object_id,
-                            )?;
+                            arena.push_field_index(
+                                type_id,
+                                ifd.field_id,
+                                &encoded,
+                                object_id,
+                            );
                         }
                     }
                 }
             }
         }
 
-        // Process inbound relationships (other objects pointing at this one).
-        // Uses the precomputed reverse-relation index instead of walking the
-        // whole schema per call.
-        let mut deny_violations = Vec::new();
-        let mut edges_to_remove = Vec::new();
-        let mut objects_to_cascade = Vec::new();
+        // Inbound relationships. `scan_prefix_raw` returns rev_edge values
+        // verbatim so the cover blob can ride along to the recursive call.
+        // Stage tombstones directly into the arena as we scan — historical
+        // `edges_to_remove` Vec was a 200-element intermediate at K=100,
+        // paid for by Vec doublings + a second loop that just copied the
+        // same tuples. Tracking `arena_start` lets us truncate on a deny
+        // violation.
+        let arena_start = arena.len();
+        // (source_type_id, source_id, source_rel_id, source_cover_bytes)
+        let mut objects_to_cascade: Vec<(u64, u64, u64, Bytes)> = Vec::new();
+        let mut deny_info: Option<(String, String)> = None;
 
-        if let Some(incoming) = self.incoming_relations.get(type_name) {
-            for inc in incoming {
+        if let Some(incoming) = self.incoming_relations.get(&type_id) {
+            'incoming: for inc in incoming {
                 let rev_prefix = KeyBuilder::reverse_edge_prefix(object_id, inc.rel_id);
-                let reverse_edges = self.scan_prefix(txn, &rev_prefix)?;
+                let reverse_edges = self.scan_prefix_raw(txn, &rev_prefix)?;
                 if reverse_edges.is_empty() {
                     continue;
                 }
-                for (source_id, _) in reverse_edges {
-                    match inc.policy {
-                        OnDeletePolicy::Deny => {
-                            deny_violations
-                                .push((inc.source_type.clone(), inc.source_field.clone()));
+                match inc.policy {
+                    OnDeletePolicy::Deny => {
+                        deny_info =
+                            Some((inc.source_type.clone(), inc.source_field.clone()));
+                        break 'incoming;
+                    }
+                    OnDeletePolicy::Remove => {
+                        arena.reserve(2 * reverse_edges.len());
+                        for (source_id, _) in reverse_edges {
+                            arena.push_edge(source_id, inc.rel_id, object_id);
+                            arena.push_reverse_edge(object_id, inc.rel_id, source_id);
                         }
-                        OnDeletePolicy::Remove => {
-                            edges_to_remove.push((source_id, inc.rel_id, object_id));
-                        }
-                        OnDeletePolicy::Cascade => {
-                            edges_to_remove.push((source_id, inc.rel_id, object_id));
-                            objects_to_cascade.push((inc.source_type.clone(), source_id));
+                    }
+                    OnDeletePolicy::Cascade => {
+                        arena.reserve(2 * reverse_edges.len());
+                        objects_to_cascade.reserve(reverse_edges.len());
+                        for (source_id, source_cover) in reverse_edges {
+                            arena.push_edge(source_id, inc.rel_id, object_id);
+                            arena.push_reverse_edge(object_id, inc.rel_id, source_id);
+                            objects_to_cascade.push((
+                                inc.source_type_id,
+                                source_id,
+                                inc.rel_id,
+                                source_cover,
+                            ));
                         }
                     }
                 }
             }
         }
 
-        // Check deny violations first (before any mutations).
-        if let Some((ref_type, ref_field)) = deny_violations.into_iter().next() {
+        if let Some((ref_type, ref_field)) = deny_info {
+            arena.truncate(arena_start);
             return Err(EngineError::DeleteDenied {
-                type_name: type_name.into(),
+                type_name: meta.type_name.clone(),
                 object_id,
                 referencing_type: ref_type,
                 referencing_field: ref_field,
             });
         }
 
-        // Remove inbound edges.
-        for (source_id, rel_id, target_id) in &edges_to_remove {
-            let edge_key = KeyBuilder::edge(*source_id, *rel_id, *target_id);
-            let rev_key = KeyBuilder::reverse_edge(*target_id, *rel_id, *source_id);
-            self.storage.delete(txn, &edge_key)?;
-            self.storage.delete(txn, &rev_key)?;
-        }
-
         // Recursively delete cascade targets. The IDs came from a reverse-
         // edge scan we just did inside this same txn, so they provably
-        // exist — skip the existence check on the recursive call.
-        for (cascade_type, cascade_id) in objects_to_cascade {
-            self.delete_inner(txn, &cascade_type, cascade_id, false, deleted)?;
+        // exist — skip the existence check on the recursive call. The
+        // rev_edge value (cover blob) goes with each child, paired with
+        // the rel_id that walked us there.
+        for (cascade_type_id, cascade_id, cascade_rel_id, cascade_cover) in
+            objects_to_cascade
+        {
+            self.delete_inner(
+                txn,
+                cascade_type_id,
+                cascade_id,
+                false,
+                deleted,
+                arena,
+                Some((cascade_rel_id, cascade_cover)),
+            )?;
         }
 
-        // Delete outbound edges from this object.
-        if let Some(type_def) = self.schema.get_type(type_name) {
-            for field in &type_def.fields {
-                if let FieldType::Relation(_) = &field.field_type {
-                    let rel_key_name = format!("{type_name}.{}", field.name);
-                    let rel_id = self.rel_ids[&rel_key_name];
-                    let edge_prefix = KeyBuilder::edge_prefix(object_id, rel_id);
-                    let outbound = self.scan_prefix(txn, &edge_prefix)?;
-                    for (target_id, _) in &outbound {
-                        let edge_key = KeyBuilder::edge(object_id, rel_id, *target_id);
-                        let rev_key = KeyBuilder::reverse_edge(*target_id, rel_id, object_id);
-                        self.storage.delete(txn, &edge_key)?;
-                        self.storage.delete(txn, &rev_key)?;
+        // Outbound edge tombstones. Two halves:
+        //   1) Cover-extract: pull every forward 1:1 peer target id out
+        //      of the parent-supplied cover blob via
+        //      `find_u64_field_in_raw`. Skip parent's rel_id (handled
+        //      above). Mark covered.
+        //   2) Fallback `scan_prefix_raw` for relations not covered
+        //      (many-relations always; forward 1:1 with no peer at the
+        //      cover-write time).
+        // Tiny Vec — typical type has ≤ 4 forward relations, linear-scan
+        // `contains` is faster than a HashSet at that size.
+        let mut covered_rel_ids: Vec<u64> = Vec::with_capacity(4);
+        if let Some((parent_rel_id, ref cover)) = cascade_ctx {
+            covered_rel_ids.push(parent_rel_id);
+            if !cover.is_empty() {
+                for rel in &meta.forward_relations {
+                    if rel.is_many || rel.rel_id == parent_rel_id {
+                        continue;
+                    }
+                    if let Some(target_id) =
+                        crate::object::find_u64_field_in_raw(cover, &rel.field_name)
+                    {
+                        arena.push_edge(object_id, rel.rel_id, target_id);
+                        arena.push_reverse_edge(target_id, rel.rel_id, object_id);
+                        covered_rel_ids.push(rel.rel_id);
                     }
                 }
             }
         }
 
-        // Delete the object itself.
-        self.storage.delete(txn, &obj_key)?;
+        for rel in &meta.forward_relations {
+            if covered_rel_ids.contains(&rel.rel_id) {
+                continue;
+            }
+            let edge_prefix = KeyBuilder::edge_prefix(object_id, rel.rel_id);
+            let outbound = self.scan_prefix_raw(txn, &edge_prefix)?;
+            for (target_id, _) in &outbound {
+                arena.push_edge(object_id, rel.rel_id, *target_id);
+                arena.push_reverse_edge(*target_id, rel.rel_id, object_id);
+            }
+        }
+
+        // Stage the object's own tombstone.
+        arena.push_object(type_id, object_id);
+
+        // Drop the persisted generation counter. The `g:` key only exists
+        // for objects that have been updated at least once; tombstoning a
+        // non-existent key is pure WAL+memtable bloat. The atomic
+        // `version_counter_count` lets us skip the RwLock acquire entirely
+        // when nothing has ever been updated (the bench case).
+        if self
+            .version_counter_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+        {
+            let has_version = self
+                .version_counters
+                .read()
+                .contains_key(&(type_id, object_id));
+            if has_version {
+                arena.push_object_version(type_id, object_id);
+            }
+        }
 
         Ok(())
     }
@@ -1408,6 +2059,29 @@ impl Database {
         Ok(Self::decode_edge_entries(entries))
     }
 
+    /// Like `scan_prefix` but returns the raw entry value bytes instead of
+    /// a decoded `FieldMap`. Used by cascade delete: each rev_edge value
+    /// carries the source object's covering blob, and the cascade only
+    /// needs to pull a few `u64` fields out of it via the byte-level
+    /// `find_u64_field_in_raw` helper — way cheaper than running
+    /// `deserialize_fields` on every blob just to read two u64s.
+    fn scan_prefix_raw(
+        &self,
+        txn: &rhypedb_storage::mvcc::Transaction,
+        prefix: &[u8],
+    ) -> EngineResult<Vec<(u64, Bytes)>> {
+        let entries = self.storage.scan_prefix(txn, prefix)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            if key.len() < 8 {
+                continue;
+            }
+            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            out.push((u64::from_be_bytes(id_bytes), value));
+        }
+        Ok(out)
+    }
+
     /// Scan for keys with a given prefix at a snapshot version (used by the
     /// read-only fast path).
     fn scan_prefix_at(
@@ -1564,6 +2238,57 @@ impl Database {
 /// The cost is a few extra (cheap) edge prefix scans per link() call. The
 /// payoff is that an inverse traversal can now satisfy a subsequent
 /// forward-1:1 hop without scanning the forward edge index at all.
+/// Build a rev_edge covering value from in-memory state — used by the
+/// inline-relations create path where every forward 1:1 target's data is
+/// already on hand from the txn's existence checks. Mirrors what
+/// `build_covering_rev_value` does at link() time, but skips the
+/// `scan_prefix` for "other forward 1:1 targets" because the in-memory
+/// `links` slice already enumerates the full peer set.
+///
+/// `this_idx` is the offset of THIS rev_edge's link in `links`; everything
+/// else in the slice that's `is_1to1_forward` becomes a covered peer.
+/// Returns `Bytes::new()` if there are no other 1:1 peers (matches the
+/// existing convention so the SST doesn't carry empty cover blobs).
+fn build_inflight_cover(
+    scalar_fields: &FieldMap,
+    this_field: &str,
+    this_target: u64,
+    links: &[(String, u64, String, Bytes, u64, u64, bool)],
+    this_idx: usize,
+) -> Bytes {
+    let mut other_1to1: Vec<&(String, u64, String, Bytes, u64, u64, bool)> = links
+        .iter()
+        .enumerate()
+        .filter_map(|(j, l)| {
+            if j == this_idx || !l.6 {
+                None
+            } else {
+                Some(l)
+            }
+        })
+        .collect();
+    if other_1to1.is_empty() {
+        return Bytes::new();
+    }
+
+    let mut effective = scalar_fields.clone();
+    effective.insert(this_field.to_string(), Value::U64(this_target));
+    for link in &other_1to1 {
+        effective.insert(link.0.clone(), Value::U64(link.1));
+    }
+    for link in &mut other_1to1 {
+        effective.insert(
+            format!("{}__cover", link.0),
+            Value::Bytes(link.3.clone()),
+        );
+        effective.insert(
+            format!("{}__cover_v", link.0),
+            Value::U64(link.4),
+        );
+    }
+    serialize_fields(&effective)
+}
+
 fn build_covering_rev_value(
     db: &Database,
     txn: &rhypedb_storage::mvcc::Transaction,
@@ -1629,6 +2354,12 @@ fn build_covering_rev_value(
     }
 
     // Look up each other_target's object fields and embed under `__cover`.
+    // Alongside the blob, stamp the target's current generation under
+    // `<name>__cover_v` so the executor's fusion path can detect when the
+    // embedded snapshot is stale (target has been updated since this
+    // rev_edge was written) and fall back to a fresh LSM probe for that
+    // specific target — instead of forcing an unbounded rev_edge rewrite
+    // on every update to a hot key.
     if let Some(type_def) = db.schema.get_type(source_type) {
         for (name, tid) in &other_targets {
             let Some(field) = type_def.get_field(name) else {
@@ -1644,6 +2375,11 @@ fn build_covering_rev_value(
             let target_key = KeyBuilder::object(target_type_id, *tid);
             if let Ok(Some(target_data)) = db.storage.get(txn, &target_key) {
                 effective.insert(format!("{name}__cover"), Value::Bytes(target_data));
+                let target_version = db.object_version(&rel.target_type, *tid);
+                effective.insert(
+                    format!("{name}__cover_v"),
+                    Value::U64(target_version),
+                );
             }
         }
     }
@@ -1719,7 +2455,24 @@ fn validate_value(
                 });
             }
         }
-        FieldType::Relation(_) | FieldType::Vector(_) => {
+        FieldType::Relation(_) => {
+            // Relation values at create/update time encode the target object
+            // id — accept any unsigned integer literal that fits in u64.
+            // Inline-relation creates use this path so the engine can stage
+            // edges + rev_edges in the same txn as the object put.
+            let ok = matches!(
+                value,
+                Value::U64(_) | Value::U32(_) | Value::I32(_) | Value::I64(_)
+            );
+            if !ok {
+                return Err(EngineError::TypeMismatch {
+                    field: field_def.name.clone(),
+                    expected: "relation target id (integer)".into(),
+                    got: value.type_name().into(),
+                });
+            }
+        }
+        FieldType::Vector(_) => {
             return Err(EngineError::TypeMismatch {
                 field: field_def.name.clone(),
                 expected: "scalar".into(),
@@ -1803,6 +2556,7 @@ pub(crate) fn encode_int_for_zone(value: &Value) -> Option<[u8; 8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::find_bytes_field_in_raw;
     use rhypedb_schema::parser::parse_schema;
 
     fn test_schema() -> Schema {
@@ -2873,6 +3627,376 @@ mod tests {
             gt.len(),
             15,
             "should include 1955..=1969 across both flushed SST and active memtable"
+        );
+    }
+
+    fn covering_schema() -> Schema {
+        // Bench-shape: Rating has two forward 1:1 relations (user, movie).
+        // Inverse fields on User/Movie let `get_links_many` surface the
+        // covering reverse-edge values directly so a test can inspect them.
+        parse_schema(
+            r#"
+            type User {
+                name: String
+                ratings: [Rating] @inverse(Rating.user)
+            }
+
+            type Movie {
+                title: String
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+
+            type Rating {
+                stars: u32
+                user: User
+                movie: Movie
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// Set up one User u, one Movie m, one Rating r linked to both.
+    /// Returns (db, user_id, movie_id, rating_id, tempdir).
+    fn build_one_rating(
+        schema: Schema,
+    ) -> (Database, u64, u64, u64, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Aliens".into()));
+        let movie = db.create("Movie", mf).unwrap();
+
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        let rating = db.create("Rating", rf).unwrap();
+
+        // Link order matters: first link writes empty rev_edge cover,
+        // second link writes the cover with the other-target's data.
+        db.link("Rating", rating.id, "user", user.id, None).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+
+        (db, user.id, movie.id, rating.id, dir)
+    }
+
+    #[test]
+    fn inline_relations_at_create_skip_separate_link_calls() {
+        // The whole point of accepting relation fields in `create`: writing
+        // Rating + its forward edges to User and Movie happens in ONE txn,
+        // and `get_links` round-trips show the edges landed.
+        let (db, uid, mid, rid, _dir) = {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::open(covering_schema(), dir.path()).unwrap();
+            let mut uf = FieldMap::new();
+            uf.insert("name".into(), Value::String("Alice".into()));
+            let user = db.create("User", uf).unwrap();
+            let mut mf = FieldMap::new();
+            mf.insert("title".into(), Value::String("Aliens".into()));
+            let movie = db.create("Movie", mf).unwrap();
+            let mut rf = FieldMap::new();
+            rf.insert("stars".into(), Value::U32(5));
+            rf.insert("user".into(), Value::U64(user.id));
+            rf.insert("movie".into(), Value::U64(movie.id));
+            let rating = db.create("Rating", rf).unwrap();
+            (db, user.id, movie.id, rating.id, dir)
+        };
+
+        // Rating object only carries scalars (relations went to edge index).
+        let fetched = db.get("Rating", rid).unwrap();
+        assert_eq!(fetched.fields.get("stars"), Some(&Value::U32(5)));
+        assert!(!fetched.fields.contains_key("user"));
+        assert!(!fetched.fields.contains_key("movie"));
+
+        // Forward edges visible to get_links.
+        let user_links = db.get_links("Rating", rid, "user").unwrap();
+        assert_eq!(user_links.len(), 1);
+        assert_eq!(user_links[0].0, uid);
+
+        let movie_links = db.get_links("Rating", rid, "movie").unwrap();
+        assert_eq!(movie_links.len(), 1);
+        assert_eq!(movie_links[0].0, mid);
+    }
+
+    #[test]
+    fn inline_relations_yield_symmetric_covers() {
+        // Sequential link() writes asymmetric covers: only the second link
+        // gets a `<peer>__cover` blob. Inline-relations at create build
+        // covers from in-memory state, so BOTH rev_edges land with full
+        // peer covers. Test verifies the user-side rev_edge now carries
+        // `movie__cover` (which the historical flow left empty).
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(covering_schema(), dir.path()).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Aliens".into()));
+        let movie = db.create("Movie", mf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(user.id));
+        rf.insert("movie".into(), Value::U64(movie.id));
+        db.create("Rating", rf).unwrap();
+
+        let user_side = db
+            .get_links_many("User", &[user.id], "ratings")
+            .unwrap();
+        assert_eq!(user_side[0].len(), 1);
+        let (_rid, user_side_cover) = &user_side[0][0];
+        // movie__cover should be present in user-side rev_edge cover.
+        let movie_cover = find_bytes_field_in_raw(user_side_cover, "movie__cover")
+            .expect(
+                "inline-relations create should write symmetric covers — \
+                 movie__cover missing from user-side rev_edge",
+            );
+        let movie_fields = deserialize_fields(&movie_cover);
+        assert_eq!(
+            movie_fields.get("title"),
+            Some(&Value::String("Aliens".into()))
+        );
+
+        // Movie-side rev_edge should also carry user__cover.
+        let movie_side = db
+            .get_links_many("Movie", &[movie.id], "ratings")
+            .unwrap();
+        let (_rid, movie_side_cover) = &movie_side[0][0];
+        let user_cover = find_bytes_field_in_raw(movie_side_cover, "user__cover")
+            .expect("user__cover missing from movie-side rev_edge");
+        let user_fields = deserialize_fields(&user_cover);
+        assert_eq!(user_fields.get("name"), Some(&Value::String("Alice".into())));
+    }
+
+    #[test]
+    fn inline_relations_reject_inverse_field() {
+        // Inverse fields are virtual — setting one at create time would
+        // have no edge index to land in. Engine must reject before any
+        // mutation.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(covering_schema(), dir.path()).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        // User.ratings is @inverse(Rating.user) — virtual.
+        uf.insert("ratings".into(), Value::U64(42));
+        let result = db.create("User", uf);
+        assert!(matches!(result, Err(EngineError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn inline_relations_reject_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(covering_schema(), dir.path()).unwrap();
+        // Reference a User that doesn't exist.
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(99_999));
+        let result = db.create("Rating", rf);
+        assert!(matches!(result, Err(EngineError::ObjectNotFound { .. })));
+    }
+
+    #[test]
+    fn cascade_extracts_peer_targets_from_cover_blob() {
+        // Cover-extract optimization: when cascading from User → Rating,
+        // the parent's inbound scan returns the rev_edge value which
+        // (with symmetric covers from inline-relations) embeds the
+        // movie target id. The recursive delete extracts it without a
+        // forward-edge `scan_prefix` and tombstones the movie-side rev
+        // edge. Test verifies the Movie's rev_edge for the Rating is
+        // gone after the User cascade — proves the cover-extract path
+        // staged the right keys.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                email: String @unique
+                ratings: [Rating] @inverse(Rating.user)
+            }
+            type Movie {
+                title: String
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+            type Rating {
+                stars: u32
+                user: User @on_delete(cascade)
+                movie: Movie @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        uf.insert("email".into(), Value::String("alice@x".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Aliens".into()));
+        let movie = db.create("Movie", mf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(user.id));
+        rf.insert("movie".into(), Value::U64(movie.id));
+        let rating = db.create("Rating", rf).unwrap();
+
+        // Sanity: Movie has the Rating in its rev_edge index.
+        let before = db.get_links_many("Movie", &[movie.id], "ratings").unwrap();
+        assert_eq!(before[0].len(), 1, "rating should be linked to movie");
+
+        // Cascade-delete the User. Rating cascades. The Movie's rev_edge
+        // entry for the rating should be tombstoned via the cover-extract
+        // path (not via an outbound scan, but the bench observable is the
+        // same: gone).
+        db.delete("User", user.id).unwrap();
+
+        let after = db.get_links_many("Movie", &[movie.id], "ratings").unwrap();
+        assert!(
+            after[0].is_empty(),
+            "Movie's rev_edge to the cascaded Rating must be tombstoned \
+             after the User cascade (cover-extract path)"
+        );
+        // Rating itself must be gone.
+        assert!(db.get("Rating", rating.id).is_err());
+    }
+
+    #[test]
+    fn create_batch_inline_relations_lands_all_edges() {
+        // create_batch with inline relations: 3 ratings in one txn each
+        // linking to the same user + movie; verify each rating's forward
+        // edges resolve correctly via get_links.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(covering_schema(), dir.path()).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Aliens".into()));
+        let movie = db.create("Movie", mf).unwrap();
+
+        let rows: Vec<FieldMap> = (1u32..=3)
+            .map(|s| {
+                let mut r = FieldMap::new();
+                r.insert("stars".into(), Value::U32(s));
+                r.insert("user".into(), Value::U64(user.id));
+                r.insert("movie".into(), Value::U64(movie.id));
+                r
+            })
+            .collect();
+        let ratings = db.create_batch("Rating", rows).unwrap();
+        assert_eq!(ratings.len(), 3);
+
+        // Three rev_edges hanging off the movie.
+        let movie_side = db
+            .get_links_many("Movie", &[movie.id], "ratings")
+            .unwrap();
+        assert_eq!(movie_side[0].len(), 3);
+
+        // Each rating's forward edge to the user.
+        for r in &ratings {
+            let user_links = db.get_links("Rating", r.id, "user").unwrap();
+            assert_eq!(user_links.len(), 1);
+            assert_eq!(user_links[0].0, user.id);
+        }
+    }
+
+    #[test]
+    fn covered_rev_edge_refreshes_after_source_field_update() {
+        // Phase 1 staleness: the rev_edge stored on Movie's side for this
+        // Rating carries the Rating's effective fields verbatim (stars=5).
+        // Updating Rating.stars must rewrite that rev_edge value, or a
+        // downstream consumer reading the source covering sees stale data.
+        let (db, _uid, mid, rid, _dir) = build_one_rating(covering_schema());
+
+        let mut upd = FieldMap::new();
+        upd.insert("stars".into(), Value::U32(1));
+        db.update("Rating", rid, upd).unwrap();
+
+        let groups = db
+            .get_links_many("Movie", &[mid], "ratings")
+            .unwrap();
+        let group = &groups[0];
+        assert_eq!(group.len(), 1);
+        let (got_rid, cover) = &group[0];
+        assert_eq!(*got_rid, rid);
+
+        // Decode the rev_edge value (it's a serialized FieldMap carrying the
+        // Rating's effective fields) and assert stars reflects the update.
+        let cover_fields = deserialize_fields(cover);
+        assert_eq!(
+            cover_fields.get("stars"),
+            Some(&Value::U32(1)),
+            "Phase 1: source object's update must propagate to its own \
+             covering rev_edge values"
+        );
+    }
+
+    #[test]
+    fn second_degree_cover_staleness_is_detectable_via_versions() {
+        // Phase 2 invalidation-tombstone design: User.update does NOT rewrite
+        // the millions of rev_edge values that embedded the user under
+        // `user__cover`. Instead it bumps an in-memory + persisted per-object
+        // generation counter. Cover writers stamp the target's version at
+        // write time into `<name>__cover_v`. Readers compare against the
+        // live counter and fall through to a fresh LSM probe when they
+        // disagree — bounded write cost regardless of fan-in.
+        //
+        // This test verifies the mechanism: the embedded `user__cover_v`
+        // value is the old (pre-update) generation, and the live counter is
+        // the new (post-update) generation, so the reader will detect the
+        // mismatch. The end-to-end query result is exercised in
+        // rhypedb-query's executor tests.
+        let (db, uid, mid, _rid, _dir) = build_one_rating(covering_schema());
+
+        assert_eq!(
+            db.object_version("User", uid),
+            0,
+            "freshly-created object should have generation 0"
+        );
+
+        let mut upd = FieldMap::new();
+        upd.insert("name".into(), Value::String("Renamed".into()));
+        db.update("User", uid, upd).unwrap();
+
+        assert_eq!(
+            db.object_version("User", uid),
+            1,
+            "successful update must bump the per-object generation"
+        );
+
+        let groups = db
+            .get_links_many("Movie", &[mid], "ratings")
+            .unwrap();
+        let group = &groups[0];
+        assert_eq!(group.len(), 1);
+        let (_rid, cover) = &group[0];
+
+        // The cover bytes still contain the OLD user data (we did not
+        // rewrite the rev_edge — that's the whole point of the tombstone).
+        let user_cover_bytes = find_bytes_field_in_raw(cover, "user__cover")
+            .expect("user__cover should be embedded in the rev_edge");
+        let user_fields = deserialize_fields(&user_cover_bytes);
+        assert_eq!(
+            user_fields.get("name"),
+            Some(&Value::String("Alice".into())),
+            "rev_edge value is not rewritten on a Phase 2 source-target update"
+        );
+
+        // …but the stamped `user__cover_v` is below the live counter,
+        // which is exactly the signal the executor uses to fall through.
+        let stamped_v =
+            crate::object::find_u64_field_in_raw(cover, "user__cover_v")
+                .expect("cover_v stamp should be present");
+        assert_eq!(
+            stamped_v, 0,
+            "stamp records the target's generation as of cover-write time"
+        );
+        assert!(
+            stamped_v < db.object_version("User", uid),
+            "stamp < live counter triggers reader fall-through"
         );
     }
 
