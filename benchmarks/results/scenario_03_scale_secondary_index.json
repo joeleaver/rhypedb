@@ -1,0 +1,33 @@
+[
+  {
+    "scenario": "1.3 filter_scan_movies",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 2553.094286,
+      "p50_ms": 2561.27594,
+      "p95_ms": 2576.075319,
+      "p99_ms": 2576.075319,
+      "max_ms": 2576.075319,
+      "mean_ms": 2563.4818483333333
+    },
+    "operation_stats": {
+      "n": 300,
+      "min_us": 24563.376,
+      "p50_us": 25396.607,
+      "p95_us": 26956.638,
+      "p99_us": 31005.662,
+      "max_us": 35769.883,
+      "mean_us": 25633.459676666665,
+      "total_ms": 7690.037903
+    },
+    "rss_cold_mb": 45.953125,
+    "rss_post_load_mb": 57.55859375,
+    "rss_peak_mb": 57.55859375,
+    "rss_steady_mb": 57.55859375,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 100
+    }
+  }
+]

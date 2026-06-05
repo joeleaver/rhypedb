@@ -1,0 +1,65 @@
+[
+  {
+    "scenario": "1.3 filter_scan_movies",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 19.838615,
+      "p50_ms": 21.161,
+      "p95_ms": 24.470052,
+      "p99_ms": 24.470052,
+      "max_ms": 24.470052,
+      "mean_ms": 21.823222333333334
+    },
+    "operation_stats": {
+      "n": 300,
+      "min_us": 44.844,
+      "p50_us": 196.992,
+      "p95_us": 327.057,
+      "p99_us": 450.68,
+      "max_us": 594.742,
+      "mean_us": 217.74863333333334,
+      "total_ms": 65.32459
+    },
+    "rss_cold_mb": 254.8359375,
+    "rss_post_load_mb": 254.83984375,
+    "rss_peak_mb": 254.83984375,
+    "rss_steady_mb": 254.83984375,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 100
+    }
+  },
+  {
+    "scenario": "1.3 filter_scan_movies",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 57.06381,
+      "p50_ms": 62.513059,
+      "p95_ms": 108.693688,
+      "p99_ms": 108.693688,
+      "max_ms": 108.693688,
+      "mean_ms": 76.09018566666666
+    },
+    "operation_stats": {
+      "n": 300,
+      "min_us": 88.757,
+      "p50_us": 116.58,
+      "p95_us": 236.075,
+      "p99_us": 43857.165,
+      "max_us": 94821.548,
+      "mean_us": 760.0877766666666,
+      "total_ms": 228.026333
+    },
+    "rss_cold_mb": 9.60546875,
+    "rss_post_load_mb": 9.60546875,
+    "rss_peak_mb": 9.60546875,
+    "rss_steady_mb": 9.60546875,
+    "disk_mb": 0.0,
+    "metadata": {
+      "queries_per_iter": 100,
+      "note": "optimal == idiomatic for single-table WHERE + LIMIT"
+    }
+  }
+]

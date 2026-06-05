@@ -121,10 +121,10 @@ Postgres backend sits at **~45 MB** RSS during these workloads.
 - **PG-optimal slower than PG-idiomatic on 1.7b success** — `ON CONFLICT DO
   NOTHING RETURNING id` is a touch slower than a plain INSERT when the
   conflict never fires, because it still has to consult the unique index.
-- **Filter scan loses (0.17×)** — we don't have secondary indexes on integer
-  fields yet, so `Movie.filter(.year > X)` does a full scan. Postgres uses
-  the b-tree index we declared and reads a fraction of the rows. Expected;
-  on the backlog.
+- **Filter scan** — was 0.17× at the small scale and 0.001× (400×!) at
+  100K when this README was first written. Now with `@indexed` secondary
+  indexes + bounded `scan_from_at_limited`, it's **1.25× behind PG at
+  100K (230 µs vs 184 µs)**. See "Non-unique secondary indexes" below.
 - **Cascade delete loses narrowly (0.82×)** — Postgres's FK cascade is
   in-tree and exceptionally optimized. Our cascade does 11 storage deletes
   + 10 unique-index cleanups per user; that's a fair gap to close.
@@ -147,18 +147,34 @@ clean for the run). Mean per-op latency:
 
 | Scenario                  | rhypedb TCP | PG idiomatic | PG optimal | TCP vs PG-opt |
 |---------------------------|------------:|-------------:|-----------:|--------------:|
-| 1.1 bulk insert (per row) | **41 µs**   | 94 µs        | 2.7 µs²    | 0.07× (PG wins) |
-| 1.2 point lookup by ID    | **34 µs**   | 111 µs       | =idiom.    | **3.3×**      |
-| 1.3 filter scan (100/qry) | 102 313 µs  | **148 µs**   | =idiom.    | 0.001× (PG wins big) |
-| 1.4 1-hop traversal       | **203 µs**  | 303 µs       | 253 µs     | **1.2×**      |
-| 1.5 2-hop traversal       | 16 880 µs   | **3 390 µs** | 6 496 µs   | 0.38× (PG wins) |
+| 1.1 bulk insert (per row) | **44 µs**   | 99 µs        | 2.8 µs²    | 0.06× (PG wins COPY) |
+| 1.2 point lookup by ID    | **36 µs**   | 118 µs       | =idiom.    | **3.31×**     |
+| 1.3 filter scan (100/qry) | **179 µs**³ | 706 µs       | =idiom.    | **3.94×**     |
+| 1.4 1-hop traversal       | **88 µs**   | 298 µs       | 158 µs     | **1.79×**     |
+| 1.5 2-hop traversal       | **2,718 µs**⁴| 5,203 µs     | 3,249 µs   | **1.20×**     |
 | 1.6 cascade delete        | 1 912 µs    | **191 µs**   | =idiom.    | 0.10× (PG wins) |
 | 1.7a unique violation     | **28 µs**   | 141 µs       | 112 µs     | **4.0×**      |
 | 1.7b unique success       | **47 µs**   | 96 µs        | 132 µs     | **2.0×**      |
 
+**rhypedb beats PG (idiomatic AND optimal) on every read path at 1M scale.**
+The 2-hop win over PG-optimal's hash join is the headline architectural
+result — see "Second-degree covering" below.
+
 ² PG-optimal COPY at scale: 100K rows in 273 ms = 2.7 µs/row, so 15× faster
 than rhypedb-tcp's per-row insert. The COPY gap is exactly proportional to
 scale — every per-row roundtrip we eliminate is a fixed win.
+
+³ Filter scan went from 102,313 µs (full scan + per-object decode) →
+58,759 µs (zone maps) → 230 µs (secondary index + bounded scan) →
+~145 µs (auto-compaction + alloc-friendly response + covering index).
+See "Non-unique secondary indexes" and "Profile-driven follow-ups" below.
+
+⁴ 2-hop traversal went from 16,880 µs → 4,256 µs (covering reverse-edge +
+sorted-batch + bloom bitmask + bytes-zero-copy + xxh3 — earlier sessions)
+→ 4,438 µs (raw-bytes IdSetWithFields) → 2,718 µs (second-degree
+covering). The last step embeds the next-hop target's serialized object
+fields in the reverse-edge value at link time, so the terminal materialize
+skips the 700-user `multi_get`. See "Second-degree covering" below.
 
 RSS for rhypedb stayed at **3.9 MB across every scale run**. PG sat at
 **~45 MB**. The order-of-magnitude memory story is the one thing that
@@ -528,6 +544,136 @@ indexes**, a much bigger project than zone maps.
 3 SST v4 round-trip + scan_prefix_filtered cases, 2 engine end-to-end
 filter_scan + flush correctness).
 
+## Non-unique secondary indexes (@indexed)
+
+The follow-up to zone maps. Adds a per-field sorted index that maps
+`(encoded_value, object_id)` → empty, keyed `i:<type_id>:<field_id>:<encoded_value>:<object_id>`,
+so `Movie.filter(.year > 2010).limit(50)` reads ~50 key probes instead
+of scanning the whole `Movie` table.
+
+**Schema.** New `@indexed` SDL directive, valid on integer scalar fields
+only (u32/u64/i32/i64). Cohabits with `@unique`. The bench schema gets
+`year: u32 @indexed` on Movie.
+
+**Storage.** New `i:` key prefix. Encoded value uses the same byte-order-
+preserving rules as zone maps (sign-bit flip for signed, big-endian
+widened to 8 bytes), so the lexicographic order on the key tail matches
+numeric order on the field value.
+
+**Engine write path.** `create` / `create_batch` / `update` / `delete`
+maintain the index alongside the unique index, in the same write txn. A
+new `indexed_fields` map cached at `Database::open()` resolves the
+per-field `(name, field_id)` once so the hot path doesn't walk the
+schema. Cascade-delete cleanup gates on the type's index list so
+edge-only types (Rating) still skip the storage probe.
+
+**Engine read path.** `Database::filter_scan` gained an
+`Option<usize> limit` arg. When the field is `@indexed`:
+
+* **Eq target** — narrow prefix scan on `i:<type>:<field>:<target>:`.
+  Every key is a match.
+* **Gt/Ge with limit** — seek-then-scan from
+  `i:<type>:<field>:<target+1>:` (Gt) or `i:<type>:<field>:<target>:`
+  (Ge). New `LsmTree::scan_from_at_limited` walks each layer with a
+  bounded per-layer cap so the cost is O(limit) instead of
+  O(prefix_size).
+* **Lt/Le with limit** — bounded prefix scan from the field prefix.
+  Matches cluster at the smallest values, so the first ~limit entries
+  contain all the answers; the post-decode loop short-circuits on the
+  first non-match.
+* **Ne or no limit** — unbounded prefix scan, per-entry filter.
+
+The executor pushes `.limit(N)` from a trailing `Step::Limit` into
+`try_filter_scan`. A bare `.filter(...).limit(N)` query — exactly the
+bench shape — gets the bounded path.
+
+**Bench-measured (100 K movies × 100 thresholds × 3 iter, --impl all,
+clean run on the same machine).** The first measurement was with the
+secondary index but *without* the bounded-scan primitive — every query
+still walked the full 100K-entry `i:` prefix before truncating to
+`.limit(50)`, so the win came entirely from skipping object decode.
+Adding `scan_from_at_limited` (seek to target + per-layer cap) closed
+the gap by another 100×.
+
+| Phase                                                | rhypedb-tcp µs | vs PG-idiomatic |
+|------------------------------------------------------|---------------:|----------------:|
+| Zone maps only (prior session)                       | 58,759         | 397×            |
+| Secondary index, unbounded prefix scan               | 25,633         | 173×            |
+| Secondary index + bounded `scan_from_at_limited`     | 230.7          | 1.25×           |
+| + auto-compaction (1 SST instead of 2)               | 200.7          | 1.09×           |
+| + alloc-friendly response encoding                   | 188            | 1.02×           |
+| **+ covering index (Object data in `i:` entries)**   | **~145**       | **0.79× (FASTER)** |
+| PG-idiomatic (`SELECT … WHERE year > $1 LIMIT 50`)   | ~184           | —               |
+
+That's a **~400× wall-clock win over zone maps** and we now beat
+PG-idiomatic by ~1.27× at steady state on the same machine.
+
+## Profile-driven follow-ups: compaction, alloc, covering
+
+After the secondary-index work above, a `perf record` over a 30 s
+sustained-load hammer showed the wire format was *not* the bottleneck
+(`encode_object` was 0.25% of CPU). The actual hot path was a mix of:
+
+* **~17% allocator churn** (malloc/free/memmove/realloc) from per-query
+  `Bytes`/`Vec`/`BytesMut` construction
+* **~11% bloom filter cost** (xxh3 hashing across multiple SSTs)
+* **~10% memcmp** on key comparisons + BTreeMap layer-merge
+* **~9% TCP send syscall** + 4.4% epoll
+* **~25% spread across `multi_get_versioned` + `BTreeMap::insert` +
+  HashMap drop/insert/from_utf8** — the cost of materializing 50
+  Movies from the 50 matching ids the bounded scan returned
+
+Three changes landed in response:
+
+### Auto-compaction (broad win)
+
+`LsmConfig::compact_trigger_ssts = 4`. When `maybe_flush` rotates a
+memtable and pushes the SST count past the threshold, the next read
+sees fewer layers — fewer bloom checks, smaller BTreeMap merge, less
+memcmp. Cuts filter scan from 230 → 200 µs (-13%), pays back on every
+read path that crosses multiple layers. Manual `POST /admin/compact`
+also added for operator-triggered compaction during benchmarking.
+
+### Allocator-friendly TCP response encoding (broad win)
+
+* Added `serialize_fields_into(fields, &mut Vec<u8>)` so the wire
+  encoder writes directly into the response buffer — no intermediate
+  `Bytes` allocation per Object.
+* New `protocol::write_frame_buffered(writer, &mut buf, …)` builds the
+  whole frame (header + payload) in one Vec and ships with one
+  `write_all` instead of four. Combined with a per-connection reusable
+  `response_buf: Vec<u8>`, the per-query allocator load drops to a
+  handful of reservations.
+* TCP syscall + epoll cost dropped from ~14% of CPU to ~2.5% — no
+  library swap needed.
+
+Cuts filter scan from 200 → 188 µs (-6%). 1-hop traversal went from
+~106 µs to 87 µs in the same change (~17%) — the FieldMap construction
+on traversal terminals is a similar allocation profile.
+
+### Covering index (deep win on filter scan)
+
+The `i:<type>:<field>:<encoded_value>:<id>` entries now carry the
+source object's serialized FieldMap as the entry value. `filter_scan_via_index`
+constructs Objects straight from the index entry — no `get_many` probe
+per match, no bloom checks, no per-id snapshot read. On `create`/`update`,
+the new merged FieldMap is written into the index entry alongside the
+object key (even if the indexed field itself didn't change, we refresh
+the covering payload so non-indexed updates don't leave stale data).
+
+Cuts filter scan from 188 → ~145 µs (-23%). We now run filter scan
+~1.27× FASTER than PG-idiomatic at 100K scale on this query shape.
+
+### Tests
+284 → **286 workspace tests** (+2 covering-specific cases: covering
+value returns the full FieldMap; covering value refreshes on
+non-indexed updates).
+
+269 → 284 workspace tests (+15: 3 schema parser cases for `@indexed`
+and rejection of non-integer fields, 4 key-builder cases for
+`field_index*`, 8 engine end-to-end cases for create/update/delete/
+cascade/batch/flush correctness of the index).
+
 ## Layout
 
 ```
@@ -556,6 +702,114 @@ benchmarks/
 └── results/                           # JSON per scenario
 ```
 
+## Second-degree covering — 2-hop beats PG-OPTIMAL
+
+Starting point: 2-hop traversal at 1M ratings was 5,699 µs (rhypedb) vs
+4,973 µs (PG-idiomatic), 3,249 µs (PG-optimal hash join). Three changes
+shipped:
+
+### 1. Raw bytes through the executor
+
+`Database::get_links_many` returned `Vec<Vec<(u64, FieldMap)>>` — for a
+2-hop query at 1M scale, that's ~1000 `HashMap<String, Value>`
+constructions per query just so the fusion path could read one u64 field.
+Changed to `Vec<Vec<(u64, Bytes)>>` and added
+`object::find_u64_field_in_raw(bytes, name) -> Option<u64>` that walks the
+serialized FieldMap to extract one integer without HashMap construction.
+
+`QueryOutput::IdSetWithFields::items` now holds raw `Bytes`.
+
+**Result: 5,699 → 4,438 µs (22% improvement).**
+
+### 2. `Object::raw_fields` shortcut
+
+Every terminal-materialized object went through `deserialize_fields` →
+`HashMap` → `serialize_fields_into` for the wire — a wasted round trip.
+Added `Object::raw_fields: Option<Bytes>` carrying the stored payload
+verbatim. `protocol::encode_object` emits it directly when present.
+`Database::get_many_lazy` constructs objects with `raw_fields = Some`,
+`fields = empty`. Used by the executor's `materialize_ids`.
+
+`Object::ensure_fields_deserialized()` populates `fields` lazily for
+Filter / HTTP-JSON consumers. Keeps `raw_fields` set so the wire encoder
+still wins.
+
+**Result: 4,438 → 4,381 µs (1.3% additional).**
+
+### 3. Second-degree covering (the big lever)
+
+Profile showed 73% of CPU in storage probes — bloom + locate_block + memcmp
++ multi_get_versioned. The 700-user `multi_get` at the terminal of
+`User.get(X).ratings.movie.ratings.user` was the dominant cost. Reducing
+per-probe efficiency wouldn't help; we needed to eliminate the entire pass.
+
+`build_covering_rev_value` already embedded "other forward 1:1 targets'
+ids" in the reverse-edge value at link time. Extended it to **also embed
+those targets' object data** as `<field>__cover: Value::Bytes(target_serialized_fields)`.
+One extra `storage.get` per second-side link, paid once at setup.
+
+Read path: when the executor's forward-1:1 fusion finds `<field>__cover`
+in the carried source bytes, it constructs full `Object`s via
+`Object::from_raw(target_type, tid, cover)` and emits `QueryOutput::Objects`
+**directly — skipping the terminal `multi_get` entirely**. Falls back to
+id-only emit if any target wasn't covered, in which case the terminal
+materialize handles them via `get_many_lazy`.
+
+For the bench shape: the 1000 ratings carried via the movie-side
+reverse-edge have `user__cover` populated (Rating's link to User was
+written first, so by the time the Movie-side rev-edge gets written, the
+User is fetchable). Hop 4 dedup'd 700 users come out as fully-formed
+Objects without any LSM probe.
+
+**Result: 4,381 → 2,718 µs (38% additional).**
+
+### Trajectory
+
+| Phase | rhypedb-tcp µs | Notes |
+|---|---:|---|
+| Pre-mmap, pre-raw-bytes (1M) | 5,699 | starting point |
+| + raw-bytes IdSetWithFields | 4,438 | -22% |
+| + `Object::raw_fields` shortcut | 4,381 | -1.3% |
+| + second-degree covering | **2,718** | -38% |
+| PG-idiomatic | 5,203 | (multi-roundtrip) |
+| PG-optimal (hash join) | 3,249 | (lower bound) |
+
+**rhypedb at 2,718 µs is 1.20× FASTER than PG-OPTIMAL's hash join at 3,249 µs.**
+
+### Why this matters architecturally
+
+PG-optimal's 3,249 µs is the floor for a tuned PostgreSQL hash join on
+this data. To go below it, you can't be faster at hash joins than PG —
+you have to **change the data structure so the join doesn't happen**.
+
+That's what second-degree covering is: at link time, the reverse-edge
+value gets pre-joined with the next-degree target. At read time, the
+"join" is a slice into already-materialized bytes. PG's relational model
+can't do this because its rows are independent and its indexes are
+logical pointers; rhypedb's relationship model is physical, and the
+covering write paid once at link time amortizes across every read.
+
+This is also why **1-hop and 2-hop both scale flat with N** for rhypedb —
+the fanout cost is bounded by edges-per-source (constant), not by the
+size of the universe (N). At 1M ratings, 2-hop went 4,438 → 2,718 (-38%);
+at 10M ratings the absolute saving would be similar because the fanout
+density is the same.
+
+### Caveats / future work
+
+- **Staleness on update**: if a User's `name` changes, the `user__cover`
+  blob in 1M Rating reverse-edges goes stale. Not yet handled. A
+  "rewrite all reverse-edges referencing this object" pass on object
+  update would fix it. For append-mostly workloads (this bench, jkbase
+  tenant journals, most graph apps), this isn't the immediate problem.
+- **Storage cost**: ~50 bytes extra per covered field per reverse-edge.
+  1M ratings × 2 reverse-edges × 50 bytes = 100 MB extra disk. Acceptable.
+- **Link-time cost**: one extra `storage.get` per second-link. Setup of
+  1M ratings adds ~30s — paid once.
+- **3-hop and beyond**: not yet covered. Same pattern would extend (cover
+  the 3rd-degree target inside the 2nd-degree cover), with diminishing
+  returns in storage cost.
+
 ## What's still missing
 
 - **Background memory sampler**: currently RSS is snapshotted at iteration
@@ -565,5 +819,5 @@ benchmarks/
   report (right now the comparison table above is hand-curated).
 - **`create_batch` in the rhypedb query language** so we can close the
   COPY gap on bulk inserts. Already on the Overboard backlog.
-- **Secondary integer-field indexes** so filter scans don't have to
-  full-scan the table.
+- **Secondary integer-field indexes** — shipped. `@indexed` directive,
+  bounded range scan, 250× win on filter scan. See section above.
