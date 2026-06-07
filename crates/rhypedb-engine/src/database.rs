@@ -817,6 +817,47 @@ impl Database {
         crate::catalog::apply_migration(&self.storage, &verbs)
     }
 
+    /// Change a scalar field's type. The closure converts each
+    /// existing object's value to the target type; the call holds
+    /// `CATALOG_INIT_LOCK` and commits every re-encoded object plus
+    /// the catalog kind-byte update as one atomic LSM batch.
+    ///
+    /// **Card 4/5 phase 1 scope.** Supports plain scalar fields only.
+    /// `@indexed`, `@unique`, `@vectorize`, and relation kinds are
+    /// refused with typed errors — each requires follow-on work
+    /// (index rebuild under the new encoding, uniqueness re-check,
+    /// embedding pipeline). The single-commit design is appropriate
+    /// for offline / maintenance-window migrations of small to medium
+    /// databases; large online migrations need the resumable
+    /// shadow-field machinery the synthesis design spelled out, which
+    /// is deferred.
+    ///
+    /// Like `rename_type`, the caller MUST drop this `Database` handle
+    /// after a successful call and re-open with the post-change schema
+    /// — the in-memory `field_kinds` / `schema` are stale otherwise.
+    pub fn change_field_type<F>(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        target_field_type: rhypedb_schema::FieldType,
+        converter: F,
+    ) -> EngineResult<crate::catalog::MigrationReport>
+    where
+        F: Fn(u64, &crate::object::Value) -> EngineResult<crate::object::Value>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let target_kind = crate::catalog::schema_kind_byte_public(&target_field_type);
+        let verb = crate::catalog::FieldTypeChangeVerb {
+            type_name: type_name.into(),
+            field_name: field_name.into(),
+            target_kind,
+            converter: Box::new(converter),
+        };
+        crate::catalog::apply_field_type_change(&self.storage, &self.schema, verb)
+    }
+
     /// If `Type.field` is tombstoned, return the typed `FieldRetired`
     /// error so callers using `schema.get_field` can short-circuit to
     /// a precise "this was retired" message before they encounter the
@@ -3978,6 +4019,179 @@ mod tests {
         // dropped entries, so this succeeds.
         let schema_after = parse_schema(r#"type Account { name: String }"#).unwrap();
         let _ = Database::open(schema_after, dir.path()).unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // change_field_type (card 4/5) — integration tests
+    // -----------------------------------------------------------------
+
+    /// Convert i64 age values to f64. All existing rows are re-encoded
+    /// in one atomic batch; reopening with the new schema reads them
+    /// back as floats.
+    #[test]
+    fn change_field_type_int_to_float_round_trip() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before =
+            parse_schema(r#"type User { name: String  score: i64 }"#).unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+        let scores = [5i64, 10, 15, 20];
+        let mut ids = Vec::new();
+        for s in scores {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(format!("u{s}")));
+            f.insert("score".into(), Value::I64(s));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let report = db
+            .change_field_type(
+                "User",
+                "score",
+                FieldType::Scalar(ScalarType::F64),
+                |_oid, v| {
+                    let i = match v {
+                        Value::I64(i) => *i,
+                        other => {
+                            return Err(EngineError::Catalog(
+                                crate::CatalogError::FieldTypeChangeConverterFailed {
+                                    qualified: "User.score".into(),
+                                    object_id: 0,
+                                    reason: format!("expected I64, got {}", other.type_name()),
+                                },
+                            ));
+                        }
+                    };
+                    Ok(Value::F64(i as f64))
+                },
+            )
+            .unwrap();
+        assert_eq!(report.field_type_changes.len(), 1);
+        assert_eq!(report.field_type_changes[0].objects_converted, 4);
+        assert_eq!(report.catalog_format_after, 4); // CATALOG_FORMAT_V4
+        drop(db);
+
+        // Reopen with the post-change schema.
+        let schema_after =
+            parse_schema(r#"type User { name: String  score: f64 }"#).unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        for (id, expected) in ids.iter().zip(scores.iter()) {
+            let obj = db2.get("User", *id).unwrap();
+            match obj.fields.get("score") {
+                Some(Value::F64(f)) => assert_eq!(*f, *expected as f64),
+                other => panic!("expected F64, got {other:?}"),
+            }
+        }
+    }
+
+    /// Trying to change the type of an @indexed field is refused.
+    /// Index rebuild is deferred to a follow-on card.
+    #[test]
+    fn change_field_type_on_indexed_field_refused() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { age: i64 @indexed }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let err = db
+            .change_field_type(
+                "User",
+                "age",
+                FieldType::Scalar(ScalarType::F64),
+                |_, _| Ok(Value::F64(0.0)),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::FieldTypeChangeDirectiveUnsupported {
+                directive: "@indexed",
+                ..
+            })
+        ));
+    }
+
+    /// Same source and target kind → NoOp refusal.
+    #[test]
+    fn change_field_type_same_kind_is_no_op_refused() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { age: i64 }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let err = db
+            .change_field_type(
+                "User",
+                "age",
+                FieldType::Scalar(ScalarType::I64),
+                |_, v| Ok(v.clone()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::FieldTypeChangeNoOp { .. })
+        ));
+    }
+
+    /// Converter returning the wrong kind is caught.
+    #[test]
+    fn change_field_type_converter_wrong_kind_refused() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { age: i64 }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("age".into(), Value::I64(42));
+        db.create("User", f).unwrap();
+        // Closure returns String even though target is F64.
+        let err = db
+            .change_field_type(
+                "User",
+                "age",
+                FieldType::Scalar(ScalarType::F64),
+                |_, _| Ok(Value::String("nope".into())),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(
+                crate::CatalogError::FieldTypeChangeConverterReturnedWrongKind { .. }
+            )
+        ));
+    }
+
+    /// Converter returning Err aborts the migration; catalog state is
+    /// unchanged.
+    #[test]
+    fn change_field_type_converter_error_aborts_atomically() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { age: i64 }"#).unwrap();
+        let db = Database::open(schema.clone(), dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("age".into(), Value::I64(42));
+        let user = db.create("User", f).unwrap();
+        let err = db
+            .change_field_type(
+                "User",
+                "age",
+                FieldType::Scalar(ScalarType::F64),
+                |_, _| {
+                    Err(EngineError::Catalog(
+                        crate::CatalogError::FieldTypeChangeConverterFailed {
+                            qualified: "User.age".into(),
+                            object_id: 0,
+                            reason: "user said no".into(),
+                        },
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::FieldTypeChangeConverterFailed { .. })
+        ));
+        drop(db);
+        // Reopen — object is unchanged.
+        let db2 = Database::open(schema, dir.path()).unwrap();
+        let obj = db2.get("User", user.id).unwrap();
+        assert_eq!(obj.fields.get("age"), Some(&Value::I64(42)));
     }
 
     fn test_schema() -> Schema {
