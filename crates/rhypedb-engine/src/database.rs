@@ -779,6 +779,44 @@ impl Database {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Schema migration verb (card 3/5).
+    //
+    // Today's plan supports `rename_type` only. `rename_field` is
+    // deferred to a follow-on card that also addresses zone-map
+    // name-hash keying — field-renaming today would orphan zone-map
+    // columns in existing SSTs.
+    // -----------------------------------------------------------------
+
+    /// Rename a live type from `old` to `new`. The numeric type_id is
+    /// preserved; every child catalog row (`c:E:<type>\\x00*` and
+    /// `c:R:<type>\\x00*`) is cascaded to the new type name in the
+    /// same atomic commit. Object data (`o:<type_id>:*`), index data
+    /// (`i:<type_id>:*`), edge data (`r:` / `e:`), and cover blobs
+    /// are NOT touched — they're keyed by `type_id` (stable) and by
+    /// field-name strings (unchanged by a type rename).
+    ///
+    /// On-disk effect: deletes `c:T:<old>` and `c:E:<old>\\x00*` and
+    /// `c:R:<old>\\x00*`; puts `c:T:<new>` and the renamed child rows;
+    /// deletes `c:D:` (digest) so the next open recomputes it; bumps
+    /// `c:F:` to v3 the first time.
+    ///
+    /// **Caller MUST drop this `Database` handle after a successful
+    /// rename and re-open with the post-rename schema.** Several
+    /// derived caches (`incoming_relations`, `cascade_meta_by_id`,
+    /// `indexed_fields`) are built at `open()` and not rebuilt in
+    /// place; this `Database`'s in-memory `type_ids` and `schema` are
+    /// also stale after the call. The follow-on card may add an
+    /// `Arc<Self>`-consuming variant that returns a fresh `Arc<Database>`
+    /// in one call.
+    pub fn rename_type(&self, old: &str, new: &str) -> EngineResult<crate::catalog::MigrationReport> {
+        let verbs = [crate::catalog::RenameVerb::Type {
+            old: old.into(),
+            new: new.into(),
+        }];
+        crate::catalog::apply_migration(&self.storage, &verbs)
+    }
+
     /// If `Type.field` is tombstoned, return the typed `FieldRetired`
     /// error so callers using `schema.get_field` can short-circuit to
     /// a precise "this was retired" message before they encounter the
@@ -3847,6 +3885,99 @@ mod tests {
         let db2 = open_with_shrink(smaller, dir.path());
         let err = db2.delete("Movie", movie.id).unwrap_err();
         assert!(matches!(err, EngineError::TypeRetired { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // Rename verb (card 3/5) — integration tests
+    // -----------------------------------------------------------------
+
+    /// Renaming a type via `Database::rename_type` preserves object
+    /// data. Insert under the old name, rename, drop the handle, open
+    /// with the new schema, fetch the same object by id under the new
+    /// name. Bytes are identical.
+    #[test]
+    fn rename_type_preserves_object_data_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(
+            r#"
+            type User {
+                name: String
+                email: String
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        f.insert("email".into(), Value::String("a@x".into()));
+        let user = db.create("User", f).unwrap();
+        let original_id = user.id;
+        let report = db.rename_type("User", "Account").unwrap();
+        assert_eq!(report.renamed_types.len(), 1);
+        assert_eq!(report.renamed_types[0].from, "User");
+        assert_eq!(report.renamed_types[0].to, "Account");
+        drop(db);
+
+        let schema_after = parse_schema(
+            r#"
+            type Account {
+                name: String
+                email: String
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        let fetched = db2.get("Account", original_id).unwrap();
+        assert_eq!(fetched.type_name, "Account");
+        assert_eq!(
+            fetched.fields.get("name"),
+            Some(&Value::String("Alice".into()))
+        );
+        assert_eq!(
+            fetched.fields.get("email"),
+            Some(&Value::String("a@x".into()))
+        );
+    }
+
+    /// After rename, the old name returns TypeNotFound (NOT
+    /// TypeRetired — rename is distinct from retirement).
+    #[test]
+    fn old_name_after_rename_returns_type_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", f).unwrap();
+        db.rename_type("User", "Account").unwrap();
+        drop(db);
+
+        let schema_after = parse_schema(r#"type Account { name: String }"#).unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        let err = db2.get("User", user.id).unwrap_err();
+        assert!(
+            matches!(err, EngineError::TypeNotFound(_)),
+            "expected TypeNotFound on old name, got {err}"
+        );
+    }
+
+    /// Re-opening with the post-rename schema picks up the renamed
+    /// type seamlessly — no `SchemaShrinkRequiresOptIn` because the
+    /// old name was renamed (not dropped).
+    #[test]
+    fn reopen_with_post_rename_schema_succeeds_without_shrink_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+        db.rename_type("User", "Account").unwrap();
+        drop(db);
+
+        // Open WITHOUT allow_schema_shrink — the rename leaves no
+        // dropped entries, so this succeeds.
+        let schema_after = parse_schema(r#"type Account { name: String }"#).unwrap();
+        let _ = Database::open(schema_after, dir.path()).unwrap();
     }
 
     fn test_schema() -> Schema {

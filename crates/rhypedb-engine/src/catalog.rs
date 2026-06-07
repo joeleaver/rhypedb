@@ -88,7 +88,10 @@ static CATALOG_INIT_LOCK: Mutex<()> = Mutex::new(());
 /// first tombstone TLV. A v1 binary refuses to open a v2 catalog.
 pub(crate) const CATALOG_FORMAT_V1: u64 = 1;
 pub(crate) const CATALOG_FORMAT_V2: u64 = 2;
-pub(crate) const CATALOG_FORMAT_CURRENT: u64 = CATALOG_FORMAT_V2;
+/// Bumped the first time a row is renamed. v1 catalogs that never
+/// shrank stay at v1; v2 catalogs that never renamed stay at v2.
+pub(crate) const CATALOG_FORMAT_V3: u64 = 3;
+pub(crate) const CATALOG_FORMAT_CURRENT: u64 = CATALOG_FORMAT_V3;
 
 /// Per-row record format version. Future phases may bump for rows that
 /// carry semantic-meaning TLVs phase 1 can't interpret.
@@ -130,6 +133,24 @@ const STATUS_TOMBSTONED: u8 = 0x01;
 const REASON_EXPLICIT_SHRINK:        u8 = 0x01;
 const REASON_CASCADE_PARENT_RETIRED: u8 = 0x02;
 // 0x03 reserved for card 4/5 kind-change forced retirement.
+
+// TLV tags inside id-entry bodies (phase 3 — renames).
+//
+// 0x20 carries a packed `previous_names` chain: u8 count followed by
+// `count` RenameRecord structs (each: u16 from_len + utf8 + u16 to_len
+// + utf8 + u64 BE timestamp). Most-recent first. Capped at
+// MAX_RENAME_HISTORY entries.
+// 0x21 mirrors the head-of-chain timestamp for cheap "last touched"
+// reads (u64 BE unix millis).
+// 0x22-0x2F reserved for follow-on cards (renamed_by_actor, the field-
+// rename verb that lands once zone-map keys are field-id-keyed, etc.).
+const TLV_PREVIOUS_NAMES:      u8 = 0x20;
+const TLV_LAST_RENAMED_AT_MS:  u8 = 0x21;
+
+/// Per-row cap on the rename audit chain. Operators in practice rename
+/// a single type a handful of times across a database's lifetime; 32 is
+/// generous and keeps each TLV body under ~3KB at maximum-length names.
+pub(crate) const MAX_RENAME_HISTORY: usize = 32;
 
 // Bounded retry budget on WriteConflict during catalog commits.
 // Concurrent opens fight over the digest write (always present in
@@ -181,6 +202,18 @@ pub enum RetireReason {
     CascadeParentRetired,
 }
 
+/// One step in a catalog row's rename audit chain. Stored on disk in
+/// TLV `0x20` as part of the `previous_names` vector. Most-recent rename
+/// is at index 0; the oldest is at `chain.len() - 1`. Card 3/5 only
+/// writes records for **type** renames (rename_field is deferred to a
+/// follow-on card that addresses zone-map name-hash keying).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameRecord {
+    pub from: String,
+    pub to: String,
+    pub wall_time_unix_ms: u64,
+}
+
 /// A single decoded id-entry row. `unknown_tlvs` carries every TLV the
 /// decoder didn't recognise, in original byte order, so a rewrite from
 /// a phase-1 binary preserves phase-2+ state verbatim.
@@ -199,6 +232,12 @@ pub(crate) struct IdEntry {
     pub retired_at_ms: Option<u64>,
     /// Why this entry was retired. `None` on `Live` rows.
     pub retired_reason: Option<RetireReason>,
+    /// Rename audit chain. Empty for never-renamed entries. The most
+    /// recent rename is at index 0. Encoded on disk under TLV 0x20.
+    pub previous_names: Vec<RenameRecord>,
+    /// Mirror of the head-of-chain `wall_time_unix_ms` for cheap
+    /// "last touched" reads. None for never-renamed entries.
+    pub last_renamed_at_ms: Option<u64>,
     pub unknown_tlvs: Vec<(u8, Bytes)>,
 }
 
@@ -212,6 +251,8 @@ impl IdEntry {
             status: TombstoneStatus::Live,
             retired_at_ms: None,
             retired_reason: None,
+            previous_names: Vec::new(),
+            last_renamed_at_ms: None,
             unknown_tlvs: Vec::new(),
         }
     }
@@ -225,6 +266,8 @@ impl IdEntry {
             status: TombstoneStatus::Live,
             retired_at_ms: None,
             retired_reason: None,
+            previous_names: Vec::new(),
+            last_renamed_at_ms: None,
             unknown_tlvs: Vec::new(),
         }
     }
@@ -555,6 +598,323 @@ fn load_or_initialize_attempt(
             Err(e)
         }
     }
+}
+
+// =====================================================================
+// RENAME — type rename verb (card 3/5)
+//
+// Scope: card 3/5 ships rename_type only. rename_field is deferred to
+// a follow-on card that also addresses zone-map name-hash keying —
+// renaming a field today would orphan the zone-map columns embedded
+// in existing SSTs (which are hashed by field-name string), producing
+// silent empty results from queries that should match. Type rename
+// has no such problem: field names (and therefore zone-map keys, cover
+// blob keys, and index hashes) stay unchanged.
+// =====================================================================
+
+/// One rename verb in a migration plan. Card 3/5 only supports
+/// `Type { old, new }`; a future card adds `Field { type_name, old, new }`.
+#[derive(Debug, Clone)]
+pub(crate) enum RenameVerb {
+    Type { old: String, new: String },
+}
+
+/// One entry in the report a successful migrate returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenamePair {
+    pub from: String,
+    pub to: String,
+    pub id: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MigrationReport {
+    pub renamed_types: Vec<RenamePair>,
+    pub catalog_format_before: u64,
+    pub catalog_format_after: u64,
+}
+
+/// Apply a migration plan against the current catalog state. Holds
+/// `CATALOG_INIT_LOCK` for the entire call so a concurrent reconcile
+/// or other migrate cannot race. Commits exactly one atomic LSM batch
+/// per `apply` call. Returns a structured report or a typed error.
+pub(crate) fn apply_migration(
+    storage: &LsmTree,
+    verbs: &[RenameVerb],
+) -> EngineResult<MigrationReport> {
+    let _guard = CATALOG_INIT_LOCK.lock();
+
+    let mut txn = storage.begin_txn();
+    let snap = txn.snapshot();
+
+    let result = (|| -> EngineResult<(MigrationReport, bool)> {
+        // Read current format. We support v1, v2, v3 catalogs as input.
+        let fv_raw = storage
+            .get(&txn, &KeyBuilder::catalog_format())?
+            .ok_or_else(|| {
+                EngineError::Catalog(CatalogError::MissingRequiredKey {
+                    key_debug: "c:F:".into(),
+                })
+            })?;
+        let format_before = decode_format_version("c:F:", &fv_raw)?;
+        if format_before > CATALOG_FORMAT_CURRENT {
+            return Err(EngineError::Catalog(CatalogError::UnsupportedFormat {
+                got: format_before,
+                max_supported: CATALOG_FORMAT_CURRENT,
+            }));
+        }
+        let mut cat = load_existing(storage, snap, format_before)?;
+
+        let mut report = MigrationReport {
+            catalog_format_before: format_before,
+            catalog_format_after: format_before,
+            ..MigrationReport::default()
+        };
+
+        // Per-verb pre-flight + mutation. The whole plan succeeds or
+        // fails as a unit before any storage write happens. Within a
+        // single plan, each verb's effect is visible to the next.
+        let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
+        let mut deletes: Vec<Bytes> = Vec::new();
+        let now_ms = now_unix_millis();
+        for verb in verbs {
+            match verb {
+                RenameVerb::Type { old, new } => {
+                    apply_type_rename_verb(
+                        &mut cat,
+                        old,
+                        new,
+                        now_ms,
+                        &mut puts,
+                        &mut deletes,
+                        &mut report,
+                    )?;
+                }
+            }
+        }
+
+        if report.renamed_types.is_empty() {
+            // No-op plan. Abort the txn; don't bump format or touch
+            // digest.
+            return Ok((report, false));
+        }
+
+        // Bump catalog format to v3 the first time a rename lands.
+        if cat.format_version < CATALOG_FORMAT_V3 {
+            cat.format_version = CATALOG_FORMAT_V3;
+            puts.push((
+                KeyBuilder::catalog_format(),
+                encode_format_version(CATALOG_FORMAT_V3),
+            ));
+        }
+        report.catalog_format_after = cat.format_version;
+
+        // Leave c:D: in place. The next open with the post-rename
+        // schema computes a different digest (names contribute to the
+        // hash), the digest comparison mismatches, reconcile runs, and
+        // — because the in-memory catalog is already keyed by post-
+        // rename names — reconcile finds no drops, no adds, no kind
+        // changes, and rewrites the digest in its tail commit. Net
+        // effect: one fast-path miss on the first post-rename open,
+        // then steady fast-path forever after.
+        storage.put_batch(&mut txn, &puts)?;
+        if !deletes.is_empty() {
+            storage.delete_batch(&mut txn, &deletes)?;
+        }
+        Ok((report, true))
+    })();
+
+    match result {
+        Ok((report, wrote)) => {
+            if wrote {
+                storage.commit(&mut txn)?;
+            } else {
+                storage.abort(&mut txn);
+            }
+            Ok(report)
+        }
+        Err(e) => {
+            storage.abort(&mut txn);
+            Err(e)
+        }
+    }
+}
+
+fn apply_type_rename_verb(
+    cat: &mut Catalog,
+    old: &str,
+    new: &str,
+    now_ms: u64,
+    puts: &mut Vec<(Bytes, Bytes)>,
+    deletes: &mut Vec<Bytes>,
+    report: &mut MigrationReport,
+) -> EngineResult<()> {
+    // No-op rejection.
+    if old == new {
+        return Err(EngineError::Catalog(CatalogError::RenameNoOp {
+            kind: "type",
+            name: old.into(),
+        }));
+    }
+    // Identifier safety on the new name.
+    check_identifier(new)?;
+
+    // Source must exist and be live.
+    let entry = cat
+        .type_entries
+        .get(old)
+        .ok_or_else(|| EngineError::Catalog(CatalogError::RenameSourceNotFound {
+            kind: "type",
+            name: old.into(),
+        }))?;
+    if entry.status == TombstoneStatus::Tombstoned {
+        return Err(EngineError::Catalog(CatalogError::RenameSourceRetired {
+            kind: "type",
+            name: old.into(),
+            retired_id: entry.id,
+            retired_at_ms: entry.retired_at_ms.unwrap_or(0),
+        }));
+    }
+
+    // Target must not exist (live or tombstoned).
+    if let Some(existing) = cat.type_entries.get(new) {
+        if existing.status == TombstoneStatus::Tombstoned {
+            return Err(EngineError::Catalog(
+                CatalogError::RenameTargetIsRetired {
+                    kind: "type",
+                    name: new.into(),
+                    retired_id: existing.id,
+                },
+            ));
+        }
+        return Err(EngineError::Catalog(CatalogError::RenameTargetCollision {
+            kind: "type",
+            name: new.into(),
+            existing_id: existing.id,
+        }));
+    }
+    if cat.tombstoned_type_names.contains(new) {
+        // Tombstoned but absent from type_entries — would only happen
+        // if the row was deleted out-of-band; treat as retired.
+        return Err(EngineError::Catalog(CatalogError::RenameTargetIsRetired {
+            kind: "type",
+            name: new.into(),
+            retired_id: 0,
+        }));
+    }
+
+    // History-cap check.
+    if entry.previous_names.len() + 1 > MAX_RENAME_HISTORY {
+        return Err(EngineError::Catalog(
+            CatalogError::RenameHistoryCapExceeded {
+                kind: "type",
+                name: old.into(),
+                cap: MAX_RENAME_HISTORY,
+            },
+        ));
+    }
+
+    // Mutate: rewrite the type entry's key from `old` to `new`,
+    // preserving every existing field (including unknown TLVs) and
+    // appending one RenameRecord.
+    let mut new_entry = entry.clone();
+    let preserved_id = new_entry.id;
+    new_entry.previous_names.insert(
+        0,
+        RenameRecord {
+            from: old.into(),
+            to: new.into(),
+            wall_time_unix_ms: now_ms,
+        },
+    );
+    new_entry.last_renamed_at_ms = Some(now_ms);
+
+    // Stage catalog row mutation: put the new key, delete the old.
+    puts.push((
+        KeyBuilder::catalog_type(new),
+        encode_id_entry(&new_entry),
+    ));
+    deletes.push(KeyBuilder::catalog_type(old));
+
+    // Cascade: rewrite every c:E:<old>\x00field and c:R:<old>\x00field
+    // row to use the new type name. The TLV body is preserved verbatim,
+    // including tombstoned children's retirement metadata and any
+    // unknown TLVs from a future binary.
+    let mut child_field_quals: Vec<String> = Vec::new();
+    for qual in cat.field_entries.keys() {
+        let (t, _) = split_qualified(qual);
+        if t == old {
+            child_field_quals.push(qual.clone());
+        }
+    }
+    for qual in &child_field_quals {
+        let (_, f) = split_qualified(qual);
+        let f_owned = f.to_string();
+        if let Some(field_entry) = cat.field_entries.get(qual).cloned() {
+            puts.push((
+                KeyBuilder::catalog_field(new, &f_owned),
+                encode_id_entry(&field_entry),
+            ));
+            deletes.push(KeyBuilder::catalog_field(old, &f_owned));
+            // Re-key in-memory maps.
+            let new_qual = format!("{}.{}", new, f_owned);
+            if let Some(id) = cat.field_ids.remove(qual) {
+                cat.field_ids.insert(new_qual.clone(), id);
+            }
+            if let Some(kind) = cat.field_kinds.remove(qual) {
+                cat.field_kinds.insert(new_qual.clone(), kind);
+            }
+            cat.field_entries.remove(qual);
+            cat.field_entries.insert(new_qual.clone(), field_entry);
+            // Re-key tombstoned name set if applicable.
+            if cat.tombstoned_field_quals.remove(qual) {
+                cat.tombstoned_field_quals.insert(new_qual);
+            }
+        }
+    }
+
+    let mut child_rel_quals: Vec<String> = Vec::new();
+    for qual in cat.rel_entries.keys() {
+        let (t, _) = split_qualified(qual);
+        if t == old {
+            child_rel_quals.push(qual.clone());
+        }
+    }
+    for qual in &child_rel_quals {
+        let (_, f) = split_qualified(qual);
+        let f_owned = f.to_string();
+        if let Some(rel_entry) = cat.rel_entries.get(qual).cloned() {
+            puts.push((
+                KeyBuilder::catalog_rel(new, &f_owned),
+                encode_id_entry(&rel_entry),
+            ));
+            deletes.push(KeyBuilder::catalog_rel(old, &f_owned));
+            let new_qual = format!("{}.{}", new, f_owned);
+            if let Some(id) = cat.rel_ids.remove(qual) {
+                cat.rel_ids.insert(new_qual.clone(), id);
+            }
+            cat.rel_entries.remove(qual);
+            cat.rel_entries.insert(new_qual.clone(), rel_entry);
+            if cat.tombstoned_rel_quals.remove(qual) {
+                cat.tombstoned_rel_quals.insert(new_qual);
+            }
+        }
+    }
+
+    // Re-key the type maps. Tombstoned name set is NOT touched: the
+    // old name is now FREE to be reused (the type wasn't retired, it
+    // was renamed). The new name is alive at the same numeric id.
+    cat.type_ids.remove(old);
+    cat.type_ids.insert(new.into(), preserved_id);
+    cat.type_entries.remove(old);
+    cat.type_entries.insert(new.into(), new_entry);
+
+    report.renamed_types.push(RenamePair {
+        from: old.into(),
+        to: new.into(),
+        id: preserved_id,
+    });
+    Ok(())
 }
 
 // =====================================================================
@@ -1222,6 +1582,26 @@ fn encode_id_entry(entry: &IdEntry) -> Bytes {
         }
     }
 
+    // Rename TLVs are only written when the row has a non-empty rename
+    // chain. A never-renamed entry under v3 is byte-identical to a v2
+    // entry, preserving the digest fast-path for DBs that never rename.
+    if !entry.previous_names.is_empty() {
+        let mut chain_buf: Vec<u8> = Vec::with_capacity(entry.previous_names.len() * 32);
+        debug_assert!(entry.previous_names.len() <= MAX_RENAME_HISTORY);
+        chain_buf.push(entry.previous_names.len() as u8);
+        for r in &entry.previous_names {
+            chain_buf.extend_from_slice(&(r.from.len() as u16).to_be_bytes());
+            chain_buf.extend_from_slice(r.from.as_bytes());
+            chain_buf.extend_from_slice(&(r.to.len() as u16).to_be_bytes());
+            chain_buf.extend_from_slice(r.to.as_bytes());
+            chain_buf.extend_from_slice(&r.wall_time_unix_ms.to_be_bytes());
+        }
+        write_tlv(&mut body, TLV_PREVIOUS_NAMES, &chain_buf);
+        if let Some(ms) = entry.last_renamed_at_ms {
+            write_tlv(&mut body, TLV_LAST_RENAMED_AT_MS, &ms.to_be_bytes());
+        }
+    }
+
     for (tag, value) in &entry.unknown_tlvs {
         write_tlv(&mut body, *tag, value);
     }
@@ -1291,6 +1671,8 @@ fn decode_id_entry(key_debug: &str, bytes: &[u8]) -> EngineResult<IdEntry> {
     let mut status: TombstoneStatus = TombstoneStatus::Live;
     let mut retired_at_ms: Option<u64> = None;
     let mut retired_reason: Option<RetireReason> = None;
+    let mut previous_names: Vec<RenameRecord> = Vec::new();
+    let mut last_renamed_at_ms: Option<u64> = None;
     let mut unknown_tlvs: Vec<(u8, Bytes)> = Vec::new();
     let mut seen_tags: u128 = 0; // bitset for duplicate detection (tags are u8)
 
@@ -1420,6 +1802,19 @@ fn decode_id_entry(key_debug: &str, bytes: &[u8]) -> EngineResult<IdEntry> {
                     }
                 });
             }
+            TLV_PREVIOUS_NAMES => {
+                previous_names = decode_rename_chain(key_debug, value)?;
+            }
+            TLV_LAST_RENAMED_AT_MS => {
+                if value.len() != 8 {
+                    return Err(EngineError::Catalog(CatalogError::Truncated {
+                        key_debug: key_debug.into(),
+                        len: value.len(),
+                        min: 8,
+                    }));
+                }
+                last_renamed_at_ms = Some(u64::from_be_bytes(value.try_into().unwrap()));
+            }
             other => {
                 unknown_tlvs.push((other, Bytes::copy_from_slice(value)));
             }
@@ -1479,6 +1874,8 @@ fn decode_id_entry(key_debug: &str, bytes: &[u8]) -> EngineResult<IdEntry> {
         status,
         retired_at_ms,
         retired_reason,
+        previous_names,
+        last_renamed_at_ms,
         unknown_tlvs,
     })
 }
@@ -1618,6 +2015,100 @@ fn check_identifier(name: &str) -> EngineResult<()> {
         }
     }
     Ok(())
+}
+
+fn decode_rename_chain(key_debug: &str, value: &[u8]) -> EngineResult<Vec<RenameRecord>> {
+    if value.is_empty() {
+        return Err(EngineError::Catalog(CatalogError::Truncated {
+            key_debug: key_debug.into(),
+            len: 0,
+            min: 1,
+        }));
+    }
+    let count = value[0] as usize;
+    if count == 0 {
+        return Err(EngineError::Catalog(CatalogError::EmptyRenameChain {
+            row: key_debug.into(),
+        }));
+    }
+    if count > MAX_RENAME_HISTORY {
+        return Err(EngineError::Catalog(CatalogError::RenameChainOverCap {
+            row: key_debug.into(),
+            count,
+            cap: MAX_RENAME_HISTORY,
+        }));
+    }
+    let mut chain = Vec::with_capacity(count);
+    let mut cur = 1;
+    for _ in 0..count {
+        if value.len() - cur < 2 {
+            return Err(EngineError::Catalog(CatalogError::Truncated {
+                key_debug: key_debug.into(),
+                len: value.len(),
+                min: cur + 2,
+            }));
+        }
+        let from_len = u16::from_be_bytes([value[cur], value[cur + 1]]) as usize;
+        cur += 2;
+        if value.len() - cur < from_len {
+            return Err(EngineError::Catalog(CatalogError::Truncated {
+                key_debug: key_debug.into(),
+                len: value.len(),
+                min: cur + from_len,
+            }));
+        }
+        let from = std::str::from_utf8(&value[cur..cur + from_len])
+            .map_err(|_| {
+                EngineError::Catalog(CatalogError::MalformedKey {
+                    key_debug: key_debug.into(),
+                })
+            })?
+            .to_string();
+        cur += from_len;
+
+        if value.len() - cur < 2 {
+            return Err(EngineError::Catalog(CatalogError::Truncated {
+                key_debug: key_debug.into(),
+                len: value.len(),
+                min: cur + 2,
+            }));
+        }
+        let to_len = u16::from_be_bytes([value[cur], value[cur + 1]]) as usize;
+        cur += 2;
+        if value.len() - cur < to_len {
+            return Err(EngineError::Catalog(CatalogError::Truncated {
+                key_debug: key_debug.into(),
+                len: value.len(),
+                min: cur + to_len,
+            }));
+        }
+        let to = std::str::from_utf8(&value[cur..cur + to_len])
+            .map_err(|_| {
+                EngineError::Catalog(CatalogError::MalformedKey {
+                    key_debug: key_debug.into(),
+                })
+            })?
+            .to_string();
+        cur += to_len;
+
+        if value.len() - cur < 8 {
+            return Err(EngineError::Catalog(CatalogError::Truncated {
+                key_debug: key_debug.into(),
+                len: value.len(),
+                min: cur + 8,
+            }));
+        }
+        let wall_time_unix_ms =
+            u64::from_be_bytes(value[cur..cur + 8].try_into().unwrap());
+        cur += 8;
+
+        chain.push(RenameRecord {
+            from,
+            to,
+            wall_time_unix_ms,
+        });
+    }
+    Ok(chain)
 }
 
 fn now_unix_millis() -> u64 {
@@ -2369,6 +2860,392 @@ mod tests {
         assert!(matches!(
             err,
             EngineError::Catalog(CatalogError::UnknownTombstoneStatus { status: 0x02, .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------
+    // Rename (card 3/5) — encoding + apply_migration tests
+    // -----------------------------------------------------------------
+
+    /// previous_names TLV roundtrips through encode/decode unchanged.
+    #[test]
+    fn rename_chain_roundtrip() {
+        let mut entry = IdEntry::fresh(7, kind_byte::UNSET, 100);
+        entry.previous_names = vec![
+            RenameRecord { from: "User".into(), to: "Account".into(), wall_time_unix_ms: 1_700_000_000_000 },
+            RenameRecord { from: "Person".into(), to: "User".into(), wall_time_unix_ms: 1_600_000_000_000 },
+        ];
+        entry.last_renamed_at_ms = Some(1_700_000_000_000);
+        let bytes = encode_id_entry(&entry);
+        let back = decode_id_entry("c:T:Account", &bytes).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    /// A never-renamed entry under v3 must encode byte-identical to a
+    /// pre-rename entry — preserves digest fast-path locality.
+    #[test]
+    fn never_renamed_entry_under_v3_is_byte_equal_to_pre_v3() {
+        let entry = IdEntry::fresh(42, kind_byte::SCALAR_STRING, 99);
+        let bytes_a = encode_id_entry(&entry);
+        let mut other = entry.clone();
+        other.previous_names = Vec::new();
+        other.last_renamed_at_ms = None;
+        let bytes_b = encode_id_entry(&other);
+        assert_eq!(bytes_a, bytes_b);
+    }
+
+    #[test]
+    fn rename_type_preserves_type_id() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema_before = schema_with(vec![
+            ("User", vec![scalar("name", ScalarType::String)]),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let cat_before = load_or_initialize(&storage, &schema_before, false).unwrap();
+        let user_id = cat_before.type_ids["User"];
+
+        let report = apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "User".into(),
+                new: "Account".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.renamed_types.len(), 1);
+        assert_eq!(report.renamed_types[0].id, user_id);
+        assert_eq!(report.catalog_format_after, CATALOG_FORMAT_V3);
+
+        // Reopen with post-rename schema. Account inherits User's ID.
+        let schema_after = schema_with(vec![
+            ("Account", vec![scalar("name", ScalarType::String)]),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let cat_after = load_or_initialize(&storage, &schema_after, false).unwrap();
+        assert_eq!(cat_after.type_ids["Account"], user_id);
+        // Old name is gone from type_ids.
+        assert!(!cat_after.type_ids.contains_key("User"));
+    }
+
+    #[test]
+    fn rename_type_cascades_child_field_and_relation_rows() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema_before = schema_with(vec![
+            (
+                "User",
+                vec![
+                    scalar("name", ScalarType::String),
+                    relation("favourite", "Movie", false),
+                ],
+            ),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let cat_before = load_or_initialize(&storage, &schema_before, false).unwrap();
+        let name_id = cat_before.field_ids["User.name"];
+        let fav_field_id = cat_before.field_ids["User.favourite"];
+        let fav_rel_id = cat_before.rel_ids["User.favourite"];
+
+        apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "User".into(),
+                new: "Account".into(),
+            }],
+        )
+        .unwrap();
+
+        // Reopen with the post-rename schema. Field & relation IDs are
+        // preserved under the new qualified names.
+        let schema_after = schema_with(vec![
+            (
+                "Account",
+                vec![
+                    scalar("name", ScalarType::String),
+                    relation("favourite", "Movie", false),
+                ],
+            ),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let cat_after = load_or_initialize(&storage, &schema_after, false).unwrap();
+        assert_eq!(cat_after.field_ids["Account.name"], name_id);
+        assert_eq!(cat_after.field_ids["Account.favourite"], fav_field_id);
+        assert_eq!(cat_after.rel_ids["Account.favourite"], fav_rel_id);
+        // Old qualified names are GONE — no orphaned children.
+        assert!(!cat_after.field_ids.contains_key("User.name"));
+        assert!(!cat_after.field_ids.contains_key("User.favourite"));
+        assert!(!cat_after.rel_ids.contains_key("User.favourite"));
+    }
+
+    #[test]
+    fn rename_type_records_audit_chain() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+
+        apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "User".into(),
+                new: "Account".into(),
+            }],
+        )
+        .unwrap();
+        apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "Account".into(),
+                new: "Member".into(),
+            }],
+        )
+        .unwrap();
+
+        // Re-open. The Member row's previous_names chain shows the
+        // full audit history.
+        let schema_after =
+            schema_with(vec![("Member", vec![scalar("name", ScalarType::String)])]);
+        let cat = load_or_initialize(&storage, &schema_after, false).unwrap();
+        let entry = &cat.type_entries["Member"];
+        assert_eq!(entry.previous_names.len(), 2);
+        // Most recent first.
+        assert_eq!(entry.previous_names[0].from, "Account");
+        assert_eq!(entry.previous_names[0].to, "Member");
+        assert_eq!(entry.previous_names[1].from, "User");
+        assert_eq!(entry.previous_names[1].to, "Account");
+    }
+
+    #[test]
+    fn rename_type_source_not_found_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "Missing".into(),
+                new: "Other".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameSourceNotFound { kind: "type", .. })
+        ));
+    }
+
+    #[test]
+    fn rename_type_target_collision_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![
+            ("User", vec![scalar("name", ScalarType::String)]),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "User".into(),
+                new: "Movie".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameTargetCollision { kind: "type", .. })
+        ));
+    }
+
+    #[test]
+    fn rename_type_target_is_retired_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![
+            ("User", vec![scalar("name", ScalarType::String)]),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        // Retire Movie.
+        let smaller =
+            schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let _ = load_or_initialize(&storage, &smaller, true).unwrap();
+        // Try to rename User → Movie (Movie is tombstoned).
+        let err = apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "User".into(),
+                new: "Movie".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameTargetIsRetired { kind: "type", .. })
+        ));
+    }
+
+    #[test]
+    fn rename_type_no_op_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "User".into(),
+                new: "User".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameNoOp { kind: "type", .. })
+        ));
+    }
+
+    #[test]
+    fn rename_type_first_rename_bumps_format_to_v3() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let cat_pre = load_or_initialize(&storage, &schema, false).unwrap();
+        assert_eq!(cat_pre.format_version, CATALOG_FORMAT_V1);
+        let report = apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "User".into(),
+                new: "Account".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.catalog_format_before, CATALOG_FORMAT_V1);
+        assert_eq!(report.catalog_format_after, CATALOG_FORMAT_V3);
+    }
+
+    /// Renaming a type after the source-type was retired refuses
+    /// cleanly — retired entries cannot be renamed.
+    #[test]
+    fn rename_type_source_retired_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![
+            ("User", vec![scalar("name", ScalarType::String)]),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let smaller =
+            schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let _ = load_or_initialize(&storage, &smaller, true).unwrap();
+        // Movie is tombstoned. Try to rename it.
+        let err = apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "Movie".into(),
+                new: "Film".into(),
+            }],
+        )
+        .unwrap_err();
+        // The entry exists in type_entries but is tombstoned, so we
+        // get RenameSourceRetired (not RenameSourceNotFound).
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameSourceRetired { kind: "type", .. })
+        ));
+    }
+
+    /// After rename, the old name is FREE — operator can add a new
+    /// type at the old name and it gets a fresh numeric id.
+    #[test]
+    fn old_name_is_free_after_rename_and_allocates_fresh_id_if_readded() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema_before =
+            schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let cat_pre = load_or_initialize(&storage, &schema_before, false).unwrap();
+        let original_user_id = cat_pre.type_ids["User"];
+
+        apply_migration(
+            &storage,
+            &[RenameVerb::Type {
+                old: "User".into(),
+                new: "Account".into(),
+            }],
+        )
+        .unwrap();
+
+        // Re-open with a schema that has BOTH the renamed-to name AND
+        // a fresh type at the old name.
+        let schema_after = schema_with(vec![
+            ("Account", vec![scalar("name", ScalarType::String)]),
+            ("User", vec![scalar("name", ScalarType::String)]),
+        ]);
+        let cat_after = load_or_initialize(&storage, &schema_after, false).unwrap();
+        assert_eq!(cat_after.type_ids["Account"], original_user_id);
+        // The new User must have a fresh id, NOT the original.
+        assert_ne!(cat_after.type_ids["User"], original_user_id);
+        // No tombstone — rename doesn't tombstone.
+        assert!(!cat_after.tombstoned_type_names.contains("User"));
+    }
+
+    #[test]
+    fn rename_chain_cap_overflow_refused() {
+        // Hand-construct an entry whose chain is already at the cap.
+        let mut entry = IdEntry::fresh(1, kind_byte::UNSET, 0);
+        entry.previous_names = (0..MAX_RENAME_HISTORY)
+            .map(|i| RenameRecord {
+                from: format!("Name{i}"),
+                to: format!("Name{}", i + 1),
+                wall_time_unix_ms: i as u64,
+            })
+            .collect();
+        // Build a Catalog with this one type at name "Name32" (the last `to`).
+        let mut cat = Catalog::empty();
+        cat.format_version = CATALOG_FORMAT_V3;
+        cat.insert_type("Name32".to_string(), entry);
+        let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
+        let mut deletes: Vec<Bytes> = Vec::new();
+        let mut report = MigrationReport::default();
+        let err = apply_type_rename_verb(
+            &mut cat,
+            "Name32",
+            "Name33",
+            999,
+            &mut puts,
+            &mut deletes,
+            &mut report,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameHistoryCapExceeded {
+                kind: "type",
+                cap: MAX_RENAME_HISTORY,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rename_chain_decoder_rejects_count_zero() {
+        let body = vec![0u8]; // count = 0
+        let err = decode_rename_chain("c:T:X", &body).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::EmptyRenameChain { .. })
+        ));
+    }
+
+    #[test]
+    fn rename_chain_decoder_rejects_count_over_cap() {
+        let body = vec![(MAX_RENAME_HISTORY as u8) + 1];
+        let err = decode_rename_chain("c:T:X", &body).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameChainOverCap { .. })
         ));
     }
 
