@@ -350,6 +350,35 @@ pub enum CatalogError {
     #[error("change_field_type {qualified:?} would exceed the per-row type-change history cap of {cap} entries")]
     FieldTypeChangeHistoryCapExceeded { qualified: String, cap: usize },
 
+    /// The supplied migration list has fewer entries than the catalog
+    /// reports already-applied. Indicates that the binary was downgraded
+    /// or the operator's source-controlled migration list lost entries.
+    #[error("migration list has {code_count} entries but catalog reports {catalog_count} applied — DB is ahead of code; do not run with this binary")]
+    MigrationListShorterThanApplied {
+        code_count: u64,
+        catalog_count: u64,
+    },
+
+    /// At ordinal `ordinal`, the supplied migration's name differs from
+    /// the name recorded in the catalog at that ordinal. Indicates the
+    /// operator reordered or renamed an already-applied migration —
+    /// silent acceptance would let the same ordinal mean different
+    /// things in different deploys. Refuse loudly.
+    #[error("migration at ordinal {ordinal} is named {code_name:?} in the code but {catalog_name:?} in the catalog — applied migrations cannot be renamed or reordered")]
+    MigrationNameMismatch {
+        ordinal: u64,
+        code_name: String,
+        catalog_name: String,
+    },
+
+    /// A migration's closure returned an error from one of its verbs.
+    #[error("migration #{ordinal} {name:?} failed: {reason}")]
+    MigrationVerbFailed {
+        ordinal: u64,
+        name: String,
+        reason: String,
+    },
+
     /// A field changed shape between catalog and schema — either a
     /// scalar swapped types (Int → String) or scalar↔relation flipped.
     /// On-disk values cannot be reinterpreted under the new kind without

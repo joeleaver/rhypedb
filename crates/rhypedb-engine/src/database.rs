@@ -817,6 +817,32 @@ impl Database {
         crate::catalog::apply_migration(&self.storage, &verbs)
     }
 
+    /// Apply pending migrations from the supplied list, idempotent
+    /// across repeated calls. Validates that the list hasn't been
+    /// reordered or renamed at any already-applied ordinal.
+    ///
+    /// Typical usage flow (card 5/5):
+    ///
+    /// ```ignore
+    /// let migrations = vec![
+    ///     Migration::new("001_rename_user", |m| m.rename_type("User", "Account")),
+    ///     Migration::new("002_score_to_float", |m| m.change_field_type(
+    ///         "Account", "score", FieldType::Scalar(ScalarType::F64),
+    ///         |_, v| Ok(Value::F64(/* ... */)),
+    ///     )),
+    /// ];
+    /// let db = Database::open(initial_schema, dir)?;
+    /// let report = db.run_migrations(migrations)?;
+    /// drop(db);
+    /// let db = Database::open(post_migration_schema, dir)?;
+    /// ```
+    pub fn run_migrations(
+        &self,
+        migrations: Vec<crate::catalog::Migration>,
+    ) -> EngineResult<crate::catalog::MigrationLogReport> {
+        crate::catalog::run_migrations(&self.storage, &self.schema, migrations)
+    }
+
     /// Change a scalar field's type. The closure converts each
     /// existing object's value to the target type; the call holds
     /// `CATALOG_INIT_LOCK` and commits every re-encoded object plus
@@ -4192,6 +4218,143 @@ mod tests {
         let db2 = Database::open(schema, dir.path()).unwrap();
         let obj = db2.get("User", user.id).unwrap();
         assert_eq!(obj.fields.get("age"), Some(&Value::I64(42)));
+    }
+
+    // -----------------------------------------------------------------
+    // Migration log (card 5/5)
+    // -----------------------------------------------------------------
+
+    /// Running a list of named migrations applies them in order, records
+    /// each in the log, and bumps the catalog's migration version.
+    #[test]
+    fn run_migrations_applies_and_records() {
+        use crate::catalog::Migration;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let report = db
+            .run_migrations(vec![
+                Migration::new("001_rename_user_to_account", |m| {
+                    m.rename_type("User", "Account")
+                }),
+            ])
+            .unwrap();
+        assert_eq!(report.version_before, 0);
+        assert_eq!(report.version_after, 1);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(report.applied[0].ordinal, 0);
+        assert_eq!(report.applied[0].name, "001_rename_user_to_account");
+    }
+
+    /// Re-running the same list is a no-op — already-applied
+    /// migrations are skipped.
+    #[test]
+    fn run_migrations_is_idempotent_across_reopens() {
+        use crate::catalog::Migration;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema.clone(), dir.path()).unwrap();
+        let _ = db
+            .run_migrations(vec![Migration::new("001", |m| {
+                m.rename_type("User", "Account")
+            })])
+            .unwrap();
+        drop(db);
+
+        // Reopen with the post-rename schema and re-run the same
+        // migration list. Nothing should happen.
+        let post_schema = parse_schema(r#"type Account { name: String }"#).unwrap();
+        let db2 = Database::open(post_schema, dir.path()).unwrap();
+        let report = db2
+            .run_migrations(vec![Migration::new("001", |_m| Ok(()))])
+            .unwrap();
+        assert_eq!(report.version_before, 1);
+        assert_eq!(report.version_after, 1);
+        assert!(report.applied.is_empty());
+    }
+
+    /// Renaming an applied migration is refused.
+    #[test]
+    fn run_migrations_refuses_renamed_migration() {
+        use crate::catalog::Migration;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let _ = db
+            .run_migrations(vec![Migration::new("original_name", |m| {
+                m.rename_type("User", "Account")
+            })])
+            .unwrap();
+        drop(db);
+
+        // Same logic but with a different name at ordinal 0.
+        let post_schema = parse_schema(r#"type Account { name: String }"#).unwrap();
+        let db2 = Database::open(post_schema, dir.path()).unwrap();
+        let err = db2
+            .run_migrations(vec![Migration::new("renamed_after_applied", |_| Ok(()))])
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::MigrationNameMismatch {
+                ordinal: 0,
+                ..
+            })
+        ));
+    }
+
+    /// Code list shorter than catalog → DB-ahead-of-code error.
+    #[test]
+    fn run_migrations_refuses_when_db_is_ahead_of_code() {
+        use crate::catalog::Migration;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let _ = db
+            .run_migrations(vec![Migration::new("001", |m| {
+                m.rename_type("User", "Account")
+            })])
+            .unwrap();
+        drop(db);
+
+        let post_schema = parse_schema(r#"type Account { name: String }"#).unwrap();
+        let db2 = Database::open(post_schema, dir.path()).unwrap();
+        let err = db2.run_migrations(vec![]).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::MigrationListShorterThanApplied {
+                code_count: 0,
+                catalog_count: 1,
+            })
+        ));
+    }
+
+    /// Adding one more migration runs only the new one.
+    #[test]
+    fn run_migrations_only_runs_new_entries() {
+        use crate::catalog::Migration;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let _ = db
+            .run_migrations(vec![Migration::new("001", |m| {
+                m.rename_type("User", "Account")
+            })])
+            .unwrap();
+        drop(db);
+
+        let post = parse_schema(r#"type Account { name: String }"#).unwrap();
+        let db2 = Database::open(post, dir.path()).unwrap();
+        let report = db2
+            .run_migrations(vec![
+                Migration::new("001", |_| Ok(())),
+                Migration::new("002", |m| m.rename_type("Account", "Member")),
+            ])
+            .unwrap();
+        assert_eq!(report.version_before, 1);
+        assert_eq!(report.version_after, 2);
+        assert_eq!(report.applied.len(), 1);
+        assert_eq!(report.applied[0].ordinal, 1);
+        assert_eq!(report.applied[0].name, "002");
     }
 
     fn test_schema() -> Schema {

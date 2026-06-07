@@ -4,7 +4,10 @@ pub mod error;
 pub mod object;
 pub mod vectorizer;
 
-pub use catalog::{FieldTypeChangePair, MigrationReport, RenamePair};
+pub use catalog::{
+    AppliedMigration, FieldTypeChangePair, Migration, MigrationContext, MigrationLogReport,
+    MigrationReport, RenamePair,
+};
 pub use error::{CatalogError, EngineError, EngineResult};
 
 // Re-export the storage-layer `CompareOp` so query callers can construct
