@@ -60,7 +60,7 @@ use rhypedb_schema::{FieldType, ScalarType, Schema};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::LsmTree;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Process-wide mutex serialising catalog open/reconcile operations.
@@ -80,9 +80,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// multi-process opens of the same dir are already racy regardless.
 static CATALOG_INIT_LOCK: Mutex<()> = Mutex::new(());
 
-/// Current catalog format version. Bumped if and only if the on-disk
-/// layout changes in a way a phase-1 binary cannot read.
+/// Catalog format versions. v1 is the phase-1 layout (no tombstones). v2
+/// is bumped the first time a tombstone is written. A v1 catalog with NO
+/// tombstoned rows opens cleanly under a v2 binary and stays at v1; if
+/// the operator runs a shrink with `allow_schema_shrink: true`, the
+/// reconcile commit bumps `c:F:` to v2 in the same batch that writes the
+/// first tombstone TLV. A v1 binary refuses to open a v2 catalog.
 pub(crate) const CATALOG_FORMAT_V1: u64 = 1;
+pub(crate) const CATALOG_FORMAT_V2: u64 = 2;
+pub(crate) const CATALOG_FORMAT_CURRENT: u64 = CATALOG_FORMAT_V2;
 
 /// Per-row record format version. Future phases may bump for rows that
 /// carry semantic-meaning TLVs phase 1 can't interpret.
@@ -99,9 +105,31 @@ const TLV_ASSIGNED_AT: u8 = 0x02;
 const TLV_ASSIGNED_BY: u8 = 0x03;
 const TLV_KIND: u8 = 0x04;
 
+// TLV tags inside id-entry bodies (phase 2 — tombstones).
+const TLV_STATUS:         u8 = 0x10;
+const TLV_RETIRED_AT_MS:  u8 = 0x11;
+const TLV_RETIRED_REASON: u8 = 0x13;
+// 0x12 (`retired_at_version`), 0x14 (`retired_by_format`), 0x15
+// (`retired_by_actor`), 0x16 (`retired_note`) are reserved for follow-on
+// cards. The decoder treats every tag from 0x10-0x1F as a known range —
+// if a tag we don't recognise appears here, it's preserved verbatim in
+// `unknown_tlvs` and round-tripped on rewrite, so a future binary's row
+// survives a phase-2 reopen-and-rewrite cycle byte-for-byte.
+
 // `assigned_by` payload values.
 const ASSIGNED_BY_BACKFILL: u8 = 0;
 const ASSIGNED_BY_FRESH: u8 = 1;
+
+// Tombstone status payload values for TLV_STATUS (0x10).
+const STATUS_LIVE:       u8 = 0x00;
+const STATUS_TOMBSTONED: u8 = 0x01;
+// 0x02 reserved for future "RetiringInProgress"; the decoder refuses
+// any other value rather than guess.
+
+// Retirement reason payload values for TLV_RETIRED_REASON (0x13).
+const REASON_EXPLICIT_SHRINK:        u8 = 0x01;
+const REASON_CASCADE_PARENT_RETIRED: u8 = 0x02;
+// 0x03 reserved for card 4/5 kind-change forced retirement.
 
 // Bounded retry budget on WriteConflict during catalog commits.
 // Concurrent opens fight over the digest write (always present in
@@ -130,6 +158,29 @@ pub(crate) mod kind_byte {
     pub const RELATION: u8 = 0x80;
 }
 
+/// Whether a catalog row is live (the schema still names it) or
+/// tombstoned (retired forever — its numeric ID will never be reused).
+/// Stored on disk in TLV `0x10` of every id-entry row; phase-2 binaries
+/// write `Tombstoned` only via the shrink-allowed reconcile path. The
+/// implicit value when TLV `0x10` is absent is `Live` — a v1-format row
+/// has no status TLV and decodes cleanly as `Live`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneStatus {
+    Live,
+    Tombstoned,
+}
+
+/// Why a catalog row was retired. Stored on disk in TLV `0x13`. Only
+/// meaningful on rows whose status is `Tombstoned`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetireReason {
+    /// The operator explicitly removed this entry from the schema.
+    ExplicitShrink,
+    /// This field or relation was retired because its parent type was
+    /// retired in the same reconcile commit.
+    CascadeParentRetired,
+}
+
 /// A single decoded id-entry row. `unknown_tlvs` carries every TLV the
 /// decoder didn't recognise, in original byte order, so a rewrite from
 /// a phase-1 binary preserves phase-2+ state verbatim.
@@ -139,6 +190,15 @@ pub(crate) struct IdEntry {
     pub assigned_at: u64,
     pub assigned_by: u8,
     pub kind: u8,
+    /// `Live` for v1 rows (TLV 0x10 absent) and unretired v2 rows.
+    /// `Tombstoned` only on rows the reconcile shrink path wrote.
+    pub status: TombstoneStatus,
+    /// Unix millis when the tombstone was written. `None` on `Live`
+    /// rows. Cheap observability for "when was this retired?" without
+    /// loading the (deferred) migration log.
+    pub retired_at_ms: Option<u64>,
+    /// Why this entry was retired. `None` on `Live` rows.
+    pub retired_reason: Option<RetireReason>,
     pub unknown_tlvs: Vec<(u8, Bytes)>,
 }
 
@@ -149,6 +209,9 @@ impl IdEntry {
             assigned_at: now_ms,
             assigned_by: ASSIGNED_BY_FRESH,
             kind,
+            status: TombstoneStatus::Live,
+            retired_at_ms: None,
+            retired_reason: None,
             unknown_tlvs: Vec::new(),
         }
     }
@@ -159,15 +222,61 @@ impl IdEntry {
             assigned_at: now_ms,
             assigned_by: ASSIGNED_BY_BACKFILL,
             kind,
+            status: TombstoneStatus::Live,
+            retired_at_ms: None,
+            retired_reason: None,
             unknown_tlvs: Vec::new(),
         }
+    }
+
+    /// Mark a live entry as tombstoned. Caller is responsible for
+    /// re-encoding and committing the row.
+    fn tombstone(&mut self, now_ms: u64, reason: RetireReason) {
+        self.status = TombstoneStatus::Tombstoned;
+        self.retired_at_ms = Some(now_ms);
+        self.retired_reason = Some(reason);
+    }
+}
+
+/// Retirement metadata for a single tombstoned catalog entry. Reserved
+/// for the operator-facing `Database::last_retirement_report()` API
+/// which will land in a follow-on card; today every retired entry is
+/// also recorded on its `IdEntry` via the on-disk TLVs.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RetiredEntry {
+    pub id: u64,
+    pub name: String,
+    pub reason: RetireReason,
+    pub retired_at_ms: u64,
+}
+
+/// Result of a single shrink-allowed reconcile commit. See `RetiredEntry`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct RetirementReport {
+    pub retired_types: Vec<RetiredEntry>,
+    pub retired_fields: Vec<RetiredEntry>,
+    pub retired_relations: Vec<RetiredEntry>,
+    pub catalog_format_before: u64,
+    pub catalog_format_after: u64,
+}
+
+impl RetirementReport {
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.retired_types.is_empty()
+            && self.retired_fields.is_empty()
+            && self.retired_relations.is_empty()
     }
 }
 
 /// The in-memory catalog the engine consults during open(). The
-/// `*_ids` projections are what `Database` actually stores; the
-/// `*_entries` maps carry the full [`IdEntry`] so a rewrite path
-/// (phases 2+) can preserve unknown TLVs from disk.
+/// `*_ids` projections include every ID ever allocated (live or
+/// tombstoned); the parallel `tombstoned_*` sets carry only the retired
+/// subset. Hot read paths check the negative case (id is NOT in the
+/// tombstoned set → live → proceed) so the common case is one
+/// `HashSet::contains` against an empty/tiny set.
 #[derive(Debug, Default)]
 pub(crate) struct Catalog {
     pub type_ids: HashMap<String, u64>,
@@ -178,6 +287,30 @@ pub(crate) struct Catalog {
     pub type_entries: HashMap<String, IdEntry>,
     pub field_entries: HashMap<String, IdEntry>,
     pub rel_entries: HashMap<String, IdEntry>,
+
+    /// Tombstoned numeric IDs, partitioned by row kind. Populated by
+    /// `load_existing` from on-disk status TLVs and by reconcile when
+    /// it tombstones a row in the current commit. Retired IDs ALSO
+    /// remain in `type_ids` / `field_ids` / `rel_ids` so the
+    /// duplicate-ID scan still sees them and counter self-heal still
+    /// respects them — these sets are "the subset of the ids maps that
+    /// is retired."
+    pub tombstoned_type_ids: HashSet<u64>,
+    pub tombstoned_field_ids: HashSet<u64>,
+    pub tombstoned_rel_ids: HashSet<u64>,
+
+    /// Tombstoned names, partitioned the same way. Used by reconcile's
+    /// name-reuse refusal (refusing to allocate a fresh ID for a name
+    /// that's already retired — preserves the invariant that a retired
+    /// name's data can never be silently re-bound).
+    pub tombstoned_type_names: HashSet<String>,
+    pub tombstoned_field_quals: HashSet<String>,
+    pub tombstoned_rel_quals: HashSet<String>,
+
+    /// The on-disk catalog format version. `1` for legacy / fresh
+    /// catalogs that never shrank; `2` once any tombstone has been
+    /// written.
+    pub format_version: u64,
 
     pub next_type: u64,
     pub next_field: u64,
@@ -190,24 +323,82 @@ impl Catalog {
             next_type: 1,
             next_field: 1,
             next_rel: 1,
+            format_version: CATALOG_FORMAT_V1,
             ..Self::default()
         }
     }
 
     fn insert_type(&mut self, name: String, entry: IdEntry) {
         self.type_ids.insert(name.clone(), entry.id);
+        if entry.status == TombstoneStatus::Tombstoned {
+            self.tombstoned_type_ids.insert(entry.id);
+            self.tombstoned_type_names.insert(name.clone());
+        }
         self.type_entries.insert(name, entry);
     }
 
     fn insert_field(&mut self, qual: String, entry: IdEntry) {
         self.field_ids.insert(qual.clone(), entry.id);
         self.field_kinds.insert(qual.clone(), entry.kind);
+        if entry.status == TombstoneStatus::Tombstoned {
+            self.tombstoned_field_ids.insert(entry.id);
+            self.tombstoned_field_quals.insert(qual.clone());
+        }
         self.field_entries.insert(qual, entry);
     }
 
     fn insert_rel(&mut self, qual: String, entry: IdEntry) {
         self.rel_ids.insert(qual.clone(), entry.id);
+        if entry.status == TombstoneStatus::Tombstoned {
+            self.tombstoned_rel_ids.insert(entry.id);
+            self.tombstoned_rel_quals.insert(qual.clone());
+        }
         self.rel_entries.insert(qual, entry);
+    }
+
+    /// Tombstone an existing live entry. Updates in-memory state to
+    /// match what the caller is about to commit to disk. Idempotent:
+    /// re-tombstoning an already-tombstoned entry is a no-op.
+    ///
+    /// Currently unused — `reconcile_into_txn` mutates `IdEntry` and
+    /// the tombstoned sets directly because it also encodes and stages
+    /// the row in the same loop. Kept for follow-on cards (rename API,
+    /// field-type-change migration) that may tombstone an entry from a
+    /// different code path.
+    #[allow(dead_code)]
+    fn mark_type_tombstoned(&mut self, name: &str, now_ms: u64, reason: RetireReason) {
+        if let Some(entry) = self.type_entries.get_mut(name) {
+            if entry.status == TombstoneStatus::Tombstoned {
+                return;
+            }
+            entry.tombstone(now_ms, reason);
+            self.tombstoned_type_ids.insert(entry.id);
+            self.tombstoned_type_names.insert(name.to_string());
+        }
+    }
+
+    #[allow(dead_code)]
+    fn mark_field_tombstoned(&mut self, qual: &str, now_ms: u64, reason: RetireReason) {
+        if let Some(entry) = self.field_entries.get_mut(qual) {
+            if entry.status == TombstoneStatus::Tombstoned {
+                return;
+            }
+            entry.tombstone(now_ms, reason);
+            self.tombstoned_field_ids.insert(entry.id);
+            self.tombstoned_field_quals.insert(qual.to_string());
+        }
+    }
+
+    #[allow(dead_code)]
+    fn mark_rel_tombstoned(&mut self, qual: &str, now_ms: u64, reason: RetireReason) {
+        if let Some(entry) = self.rel_entries.get_mut(qual) {
+            if entry.status == TombstoneStatus::Tombstoned {
+                return;
+            }
+            entry.tombstone(now_ms, reason);
+            self.tombstoned_rel_ids.insert(entry.id);
+            self.tombstoned_rel_quals.insert(qual.to_string());
+        }
     }
 }
 
@@ -313,13 +504,13 @@ fn load_or_initialize_attempt(
             }
             (Some(_), Some(_)) => {
                 let v = decode_format_version("c:F:", format_present.as_ref().unwrap())?;
-                if v != CATALOG_FORMAT_V1 {
+                if v > CATALOG_FORMAT_CURRENT {
                     return Err(EngineError::Catalog(CatalogError::UnsupportedFormat {
                         got: v,
-                        max_supported: CATALOG_FORMAT_V1,
+                        max_supported: CATALOG_FORMAT_CURRENT,
                     }));
                 }
-                let mut cat = load_existing(storage, snap)?;
+                let mut cat = load_existing(storage, snap, v)?;
 
                 let stored_digest = storage
                     .get(&txn, &KeyBuilder::catalog_digest())?
@@ -465,8 +656,11 @@ fn recover_partial_into_txn(
 // LOAD EXISTING — initialized catalog → in-memory Catalog struct
 // =====================================================================
 
-fn load_existing(storage: &LsmTree, snap: u64) -> EngineResult<Catalog> {
-    let mut cat = Catalog::default();
+fn load_existing(storage: &LsmTree, snap: u64, format_version: u64) -> EngineResult<Catalog> {
+    let mut cat = Catalog {
+        format_version,
+        ..Catalog::default()
+    };
 
     // c:T:* — types
     let type_prefix = KeyBuilder::catalog_prefix_type();
@@ -480,6 +674,16 @@ fn load_existing(storage: &LsmTree, snap: u64) -> EngineResult<Catalog> {
             })?
             .to_string();
         let entry = decode_id_entry(&format!("c:T:{}", name), &value)?;
+        // A v1 catalog that has a tombstoned row is internally
+        // inconsistent — v1 binaries never write tombstones, so this
+        // is either manual tampering or a binary that bumped the row
+        // format without bumping `c:F:`. Refuse to open.
+        if format_version == CATALOG_FORMAT_V1 && entry.status == TombstoneStatus::Tombstoned {
+            return Err(EngineError::Catalog(CatalogError::TombstoneOnV1Catalog {
+                row_kind: "type",
+                row_id: entry.id,
+            }));
+        }
         if let Some(prev) = seen_type_ids.insert(entry.id, name.clone()) {
             return Err(EngineError::Catalog(CatalogError::DuplicateId {
                 kind: "type",
@@ -513,6 +717,12 @@ fn load_existing(storage: &LsmTree, snap: u64) -> EngineResult<Catalog> {
         })?;
         let qual = format!("{}.{}", type_name, field_name);
         let entry = decode_id_entry(&format!("c:E:{}.{}", type_name, field_name), &value)?;
+        if format_version == CATALOG_FORMAT_V1 && entry.status == TombstoneStatus::Tombstoned {
+            return Err(EngineError::Catalog(CatalogError::TombstoneOnV1Catalog {
+                row_kind: "field",
+                row_id: entry.id,
+            }));
+        }
         if let Some(prev) = seen_field_ids.insert(entry.id, qual.clone()) {
             return Err(EngineError::Catalog(CatalogError::DuplicateId {
                 kind: "field",
@@ -546,6 +756,12 @@ fn load_existing(storage: &LsmTree, snap: u64) -> EngineResult<Catalog> {
         })?;
         let qual = format!("{}.{}", type_name, field_name);
         let entry = decode_id_entry(&format!("c:R:{}.{}", type_name, field_name), &value)?;
+        if format_version == CATALOG_FORMAT_V1 && entry.status == TombstoneStatus::Tombstoned {
+            return Err(EngineError::Catalog(CatalogError::TombstoneOnV1Catalog {
+                row_kind: "relation",
+                row_id: entry.id,
+            }));
+        }
         if let Some(prev) = seen_rel_ids.insert(entry.id, qual.clone()) {
             return Err(EngineError::Catalog(CatalogError::DuplicateId {
                 kind: "relation",
@@ -606,13 +822,14 @@ fn reconcile_into_txn(
 ) -> EngineResult<()> {
     let now_ms = now_unix_millis();
 
-    // PASS 1 — detect drops. Any catalog entry not present in the
-    // schema is a drop. Phase 1 refuses; the shrink flag is reserved
-    // for the tombstone migration phase.
+    // PASS 1 — detect drops. Drops are catalog entries the new schema
+    // doesn't name. Already-tombstoned entries are excluded; they're
+    // not "drops" — they're already retired.
     let mut dropped_types: Vec<String> = cat
         .type_ids
         .keys()
         .filter(|t| !schema.types.contains_key(t.as_str()))
+        .filter(|t| !cat.tombstoned_type_names.contains(t.as_str()))
         .cloned()
         .collect();
     dropped_types.sort();
@@ -620,6 +837,9 @@ fn reconcile_into_txn(
     let mut dropped_fields: Vec<String> = Vec::new();
     let mut dropped_rels: Vec<String> = Vec::new();
     for qual in cat.field_ids.keys() {
+        if cat.tombstoned_field_quals.contains(qual.as_str()) {
+            continue;
+        }
         let (t, f) = split_qualified(qual);
         match schema.types.get(t) {
             None => {} // already captured as a type drop
@@ -630,6 +850,9 @@ fn reconcile_into_txn(
         }
     }
     for qual in cat.rel_ids.keys() {
+        if cat.tombstoned_rel_quals.contains(qual.as_str()) {
+            continue;
+        }
         let (t, f) = split_qualified(qual);
         match schema.types.get(t) {
             None => {}
@@ -650,21 +873,103 @@ fn reconcile_into_txn(
     dropped_fields.sort();
     dropped_rels.sort();
 
-    if !dropped_types.is_empty() || !dropped_fields.is_empty() || !dropped_rels.is_empty() {
-        if allow_schema_shrink {
-            return Err(EngineError::Catalog(
-                CatalogError::SchemaShrinkNotYetSupported {
-                    dropped_types,
-                    dropped_fields,
-                    dropped_rels,
-                },
-            ));
-        }
-        return Err(EngineError::Catalog(CatalogError::SchemaShrink {
+    let has_drops =
+        !dropped_types.is_empty() || !dropped_fields.is_empty() || !dropped_rels.is_empty();
+
+    if has_drops && !allow_schema_shrink {
+        return Err(EngineError::Catalog(CatalogError::SchemaShrinkRequiresOptIn {
             dropped_types,
             dropped_fields,
             dropped_rels,
         }));
+    }
+
+    // PASS 1a — refuse re-binding a retired name. If the schema names
+    // a type/field/relation that the catalog has tombstoned, using it
+    // would either silently resurrect the retired numeric ID's data
+    // (if we used the old ID) or — worse — allocate a fresh ID and
+    // strand the retired data. Refuse loudly. Runs UNCONDITIONAL of
+    // `allow_schema_shrink` because the shrink flag governs DROPS,
+    // not REBINDS — even a non-shrinking reopen must not rebind a
+    // retired name.
+    for schema_type in schema.types.keys() {
+        if cat.tombstoned_type_names.contains(schema_type.as_str()) {
+            let retired_id = cat
+                .type_entries
+                .get(schema_type.as_str())
+                .map(|e| e.id)
+                .unwrap_or(0);
+            return Err(EngineError::Catalog(
+                CatalogError::NameReuseOfRetiredEntry {
+                    kind: "type",
+                    name: schema_type.clone(),
+                    retired_id,
+                },
+            ));
+        }
+    }
+    for (type_name, type_def) in &schema.types {
+        for field in &type_def.fields {
+            let qual = format!("{}.{}", type_name, field.name);
+            let is_rel = matches!(field.field_type, FieldType::Relation(_));
+            if cat.tombstoned_field_quals.contains(qual.as_str()) {
+                let retired_id = cat
+                    .field_entries
+                    .get(qual.as_str())
+                    .map(|e| e.id)
+                    .unwrap_or(0);
+                return Err(EngineError::Catalog(
+                    CatalogError::NameReuseOfRetiredEntry {
+                        kind: "field",
+                        name: qual,
+                        retired_id,
+                    },
+                ));
+            }
+            if is_rel && cat.tombstoned_rel_quals.contains(qual.as_str()) {
+                let retired_id = cat
+                    .rel_entries
+                    .get(qual.as_str())
+                    .map(|e| e.id)
+                    .unwrap_or(0);
+                return Err(EngineError::Catalog(
+                    CatalogError::NameReuseOfRetiredEntry {
+                        kind: "relation",
+                        name: qual,
+                        retired_id,
+                    },
+                ));
+            }
+        }
+    }
+
+    // PASS 1b — cascade closure: for every dropped type, add ALL of
+    // its catalog-known fields and relations to the dropped sets so we
+    // tombstone the whole subtree in one commit. Tag them as
+    // CascadeParentRetired so observability tells the right story.
+    let mut cascaded_fields: HashSet<String> = HashSet::new();
+    let mut cascaded_rels: HashSet<String> = HashSet::new();
+    if !dropped_types.is_empty() {
+        let dropped_type_set: HashSet<&str> =
+            dropped_types.iter().map(String::as_str).collect();
+        for qual in cat.field_ids.keys() {
+            if cat.tombstoned_field_quals.contains(qual.as_str()) {
+                continue;
+            }
+            let (t, _) = split_qualified(qual);
+            if dropped_type_set.contains(t) && !dropped_fields.contains(qual) {
+                cascaded_fields.insert(qual.clone());
+            }
+        }
+        for qual in cat.rel_ids.keys() {
+            if cat.tombstoned_rel_quals.contains(qual.as_str()) {
+                continue;
+            }
+            let (t, _) = split_qualified(qual);
+            if dropped_type_set.contains(t) && !dropped_rels.contains(qual) {
+                cascaded_rels.insert(qual.clone());
+            }
+        }
     }
 
     // PASS 2 — detect kind changes.
@@ -737,6 +1042,80 @@ fn reconcile_into_txn(
                 cat.insert_rel(qual.clone(), entry);
             }
         }
+    }
+
+    // PASS 4 — write tombstones. For each dropped (or cascaded) entry,
+    // rewrite its catalog row with `status = Tombstoned` and the
+    // retirement metadata TLVs. Re-encoding preserves `unknown_tlvs`
+    // verbatim so a future-format binary's payload survives.
+    let mut bumped_format = false;
+    for name in &dropped_types {
+        if let Some(entry) = cat.type_entries.get_mut(name) {
+            entry.tombstone(now_ms, RetireReason::ExplicitShrink);
+            cat.tombstoned_type_ids.insert(entry.id);
+            cat.tombstoned_type_names.insert(name.clone());
+            puts.push((
+                KeyBuilder::catalog_type(name),
+                encode_id_entry(entry),
+            ));
+            bumped_format = true;
+        }
+    }
+    for qual in &dropped_fields {
+        if let Some(entry) = cat.field_entries.get_mut(qual) {
+            entry.tombstone(now_ms, RetireReason::ExplicitShrink);
+            cat.tombstoned_field_ids.insert(entry.id);
+            cat.tombstoned_field_quals.insert(qual.clone());
+            let (t, f) = split_qualified(qual);
+            puts.push((KeyBuilder::catalog_field(t, f), encode_id_entry(entry)));
+            bumped_format = true;
+        }
+    }
+    for qual in &dropped_rels {
+        if let Some(entry) = cat.rel_entries.get_mut(qual) {
+            entry.tombstone(now_ms, RetireReason::ExplicitShrink);
+            cat.tombstoned_rel_ids.insert(entry.id);
+            cat.tombstoned_rel_quals.insert(qual.clone());
+            let (t, f) = split_qualified(qual);
+            puts.push((KeyBuilder::catalog_rel(t, f), encode_id_entry(entry)));
+            bumped_format = true;
+        }
+    }
+    // Cascade-tagged fields/relations whose parent type was dropped.
+    let mut cascaded_fields_sorted: Vec<&String> = cascaded_fields.iter().collect();
+    cascaded_fields_sorted.sort();
+    for qual in cascaded_fields_sorted {
+        if let Some(entry) = cat.field_entries.get_mut(qual.as_str()) {
+            entry.tombstone(now_ms, RetireReason::CascadeParentRetired);
+            cat.tombstoned_field_ids.insert(entry.id);
+            cat.tombstoned_field_quals.insert(qual.clone());
+            let (t, f) = split_qualified(qual);
+            puts.push((KeyBuilder::catalog_field(t, f), encode_id_entry(entry)));
+            bumped_format = true;
+        }
+    }
+    let mut cascaded_rels_sorted: Vec<&String> = cascaded_rels.iter().collect();
+    cascaded_rels_sorted.sort();
+    for qual in cascaded_rels_sorted {
+        if let Some(entry) = cat.rel_entries.get_mut(qual.as_str()) {
+            entry.tombstone(now_ms, RetireReason::CascadeParentRetired);
+            cat.tombstoned_rel_ids.insert(entry.id);
+            cat.tombstoned_rel_quals.insert(qual.clone());
+            let (t, f) = split_qualified(qual);
+            puts.push((KeyBuilder::catalog_rel(t, f), encode_id_entry(entry)));
+            bumped_format = true;
+        }
+    }
+
+    // Bump the catalog format version to v2 the first time we write a
+    // tombstone. A v1 catalog that never shrinks stays at v1, so a
+    // future v1 binary can still open it.
+    if bumped_format && cat.format_version < CATALOG_FORMAT_V2 {
+        cat.format_version = CATALOG_FORMAT_V2;
+        puts.push((
+            KeyBuilder::catalog_format(),
+            encode_format_version(CATALOG_FORMAT_V2),
+        ));
     }
 
     // Always refresh counters and digest. Two consequences:
@@ -825,6 +1204,24 @@ fn encode_id_entry(entry: &IdEntry) -> Bytes {
     write_tlv(&mut body, TLV_ASSIGNED_AT, &entry.assigned_at.to_be_bytes());
     write_tlv(&mut body, TLV_ASSIGNED_BY, &[entry.assigned_by]);
     write_tlv(&mut body, TLV_KIND, &[entry.kind]);
+
+    // Tombstone TLVs are only written when `status == Tombstoned`. A
+    // live entry under v2 is byte-identical to a v1 entry, preserving
+    // the digest fast-path for DBs that never shrink.
+    if entry.status == TombstoneStatus::Tombstoned {
+        write_tlv(&mut body, TLV_STATUS, &[STATUS_TOMBSTONED]);
+        if let Some(ms) = entry.retired_at_ms {
+            write_tlv(&mut body, TLV_RETIRED_AT_MS, &ms.to_be_bytes());
+        }
+        if let Some(reason) = entry.retired_reason {
+            let reason_byte = match reason {
+                RetireReason::ExplicitShrink => REASON_EXPLICIT_SHRINK,
+                RetireReason::CascadeParentRetired => REASON_CASCADE_PARENT_RETIRED,
+            };
+            write_tlv(&mut body, TLV_RETIRED_REASON, &[reason_byte]);
+        }
+    }
+
     for (tag, value) in &entry.unknown_tlvs {
         write_tlv(&mut body, *tag, value);
     }
@@ -891,6 +1288,9 @@ fn decode_id_entry(key_debug: &str, bytes: &[u8]) -> EngineResult<IdEntry> {
     let mut assigned_at: Option<u64> = None;
     let mut assigned_by: Option<u8> = None;
     let mut kind: Option<u8> = None;
+    let mut status: TombstoneStatus = TombstoneStatus::Live;
+    let mut retired_at_ms: Option<u64> = None;
+    let mut retired_reason: Option<RetireReason> = None;
     let mut unknown_tlvs: Vec<(u8, Bytes)> = Vec::new();
     let mut seen_tags: u128 = 0; // bitset for duplicate detection (tags are u8)
 
@@ -968,6 +1368,58 @@ fn decode_id_entry(key_debug: &str, bytes: &[u8]) -> EngineResult<IdEntry> {
                 }
                 kind = Some(value[0]);
             }
+            TLV_STATUS => {
+                if value.len() != 1 {
+                    return Err(EngineError::Catalog(CatalogError::Truncated {
+                        key_debug: key_debug.into(),
+                        len: value.len(),
+                        min: 1,
+                    }));
+                }
+                status = match value[0] {
+                    STATUS_LIVE => TombstoneStatus::Live,
+                    STATUS_TOMBSTONED => TombstoneStatus::Tombstoned,
+                    other => {
+                        return Err(EngineError::Catalog(
+                            CatalogError::UnknownTombstoneStatus {
+                                row: key_debug.into(),
+                                status: other,
+                            },
+                        ));
+                    }
+                };
+            }
+            TLV_RETIRED_AT_MS => {
+                if value.len() != 8 {
+                    return Err(EngineError::Catalog(CatalogError::Truncated {
+                        key_debug: key_debug.into(),
+                        len: value.len(),
+                        min: 8,
+                    }));
+                }
+                retired_at_ms = Some(u64::from_be_bytes(value.try_into().unwrap()));
+            }
+            TLV_RETIRED_REASON => {
+                if value.len() != 1 {
+                    return Err(EngineError::Catalog(CatalogError::Truncated {
+                        key_debug: key_debug.into(),
+                        len: value.len(),
+                        min: 1,
+                    }));
+                }
+                retired_reason = Some(match value[0] {
+                    REASON_EXPLICIT_SHRINK => RetireReason::ExplicitShrink,
+                    REASON_CASCADE_PARENT_RETIRED => RetireReason::CascadeParentRetired,
+                    other => {
+                        return Err(EngineError::Catalog(
+                            CatalogError::UnknownRetireReason {
+                                row: key_debug.into(),
+                                reason: other,
+                            },
+                        ));
+                    }
+                });
+            }
             other => {
                 unknown_tlvs.push((other, Bytes::copy_from_slice(value)));
             }
@@ -999,11 +1451,34 @@ fn decode_id_entry(key_debug: &str, bytes: &[u8]) -> EngineResult<IdEntry> {
         })
     })?;
 
+    // Internal-consistency check: a Tombstoned row MUST carry
+    // retired_at_ms and retired_reason. Encoders only produce that
+    // combination together; a missing one indicates either external
+    // tampering or a torn write that landed the status but not the
+    // payload. Refuse rather than guess.
+    if status == TombstoneStatus::Tombstoned {
+        if retired_at_ms.is_none() {
+            return Err(EngineError::Catalog(CatalogError::MissingRequiredTlv {
+                key_debug: key_debug.into(),
+                tag: TLV_RETIRED_AT_MS,
+            }));
+        }
+        if retired_reason.is_none() {
+            return Err(EngineError::Catalog(CatalogError::MissingRequiredTlv {
+                key_debug: key_debug.into(),
+                tag: TLV_RETIRED_REASON,
+            }));
+        }
+    }
+
     Ok(IdEntry {
         id,
         assigned_at,
         assigned_by,
         kind,
+        status,
+        retired_at_ms,
+        retired_reason,
         unknown_tlvs,
     })
 }
@@ -1242,14 +1717,17 @@ mod tests {
     #[test]
     fn encode_decode_id_entry_preserves_unknown_tlvs() {
         let mut entry = IdEntry::fresh(7, kind_byte::SCALAR_STRING, 100);
+        // Tag 0xF7 is in the experimental range; 0x16 is reserved in
+        // the tombstone range for a future free-form retire-note. Both
+        // must round-trip verbatim through a current binary.
         entry.unknown_tlvs = vec![
             (0xF7, Bytes::from_static(b"future")),
-            (0x11, Bytes::from_static(b"more")),
+            (0x16, Bytes::from_static(b"note")),
         ];
         let first = encode_id_entry(&entry);
         let back = decode_id_entry("c:T:X", &first).unwrap();
         assert_eq!(back, entry);
-        // Round-trip-future-tag: a phase-1 binary must rewrite byte-for-byte.
+        // Round-trip-future-tag: a current binary must rewrite byte-for-byte.
         let second = encode_id_entry(&back);
         assert_eq!(first, second);
     }
@@ -1669,14 +2147,20 @@ mod tests {
         let _ = load_or_initialize(&storage, &big, false).unwrap();
         let smaller = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
         let err = load_or_initialize(&storage, &smaller, false).unwrap_err();
-        let EngineError::Catalog(CatalogError::SchemaShrink { dropped_types, .. }) = err else {
-            panic!("expected SchemaShrink, got {err}");
+        let EngineError::Catalog(CatalogError::SchemaShrinkRequiresOptIn {
+            dropped_types, ..
+        }) = err
+        else {
+            panic!("expected SchemaShrinkRequiresOptIn, got {err}");
         };
         assert_eq!(dropped_types, vec!["Movie".to_string()]);
     }
 
+    /// With `allow_schema_shrink: true`, dropping a type now writes
+    /// tombstones rather than erroring. Phase 2 behavior — phase 1
+    /// would have errored with SchemaShrinkNotYetSupported here.
     #[test]
-    fn drop_type_refused_even_with_flag_in_phase_1() {
+    fn drop_type_with_flag_tombstones_the_type() {
         let dir = TempDir::new().unwrap();
         let storage = open_lsm(&dir);
         let big = schema_with(vec![
@@ -1685,10 +2169,206 @@ mod tests {
         ]);
         let _ = load_or_initialize(&storage, &big, false).unwrap();
         let smaller = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
-        let err = load_or_initialize(&storage, &smaller, true).unwrap_err();
+        let cat = load_or_initialize(&storage, &smaller, true).unwrap();
+        // Movie's id is still in type_ids (retired IDs are never removed
+        // — only marked) AND is in the tombstoned set.
+        assert!(cat.type_ids.contains_key("Movie"));
+        assert!(cat.tombstoned_type_names.contains("Movie"));
+        let movie_id = cat.type_ids["Movie"];
+        assert!(cat.tombstoned_type_ids.contains(&movie_id));
+        assert_eq!(cat.format_version, CATALOG_FORMAT_V2);
+    }
+
+    /// Dropping a type cascades to ALL of its fields and relations in
+    /// the same commit. Each cascaded entry is tagged with reason
+    /// `CascadeParentRetired` so observability tells the right story.
+    #[test]
+    fn drop_type_cascades_to_its_fields_and_relations() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let base = schema_with(vec![
+            (
+                "Movie",
+                vec![
+                    scalar("title", ScalarType::String),
+                    scalar("year", ScalarType::I64),
+                    relation("director", "Director", false),
+                ],
+            ),
+            ("Director", vec![scalar("name", ScalarType::String)]),
+        ]);
+        let _ = load_or_initialize(&storage, &base, false).unwrap();
+        let smaller = schema_with(vec![(
+            "Director",
+            vec![scalar("name", ScalarType::String)],
+        )]);
+        let cat = load_or_initialize(&storage, &smaller, true).unwrap();
+        // Type tombstoned + all child fields + the relation tombstoned.
+        assert!(cat.tombstoned_type_names.contains("Movie"));
+        assert!(cat.tombstoned_field_quals.contains("Movie.title"));
+        assert!(cat.tombstoned_field_quals.contains("Movie.year"));
+        assert!(cat.tombstoned_field_quals.contains("Movie.director"));
+        assert!(cat.tombstoned_rel_quals.contains("Movie.director"));
+        // Director is still live.
+        assert!(!cat.tombstoned_type_names.contains("Director"));
+        assert!(!cat.tombstoned_field_quals.contains("Director.name"));
+        // Cascade reason recorded.
+        let movie_entry = &cat.type_entries["Movie"];
+        assert_eq!(movie_entry.retired_reason, Some(RetireReason::ExplicitShrink));
+        let title_entry = &cat.field_entries["Movie.title"];
+        assert_eq!(
+            title_entry.retired_reason,
+            Some(RetireReason::CascadeParentRetired)
+        );
+    }
+
+    /// Re-applying the same shrunk schema is idempotent — the second
+    /// open is a no-op via the digest fast-path. Tombstone metadata
+    /// (retired_at_ms etc.) is NOT re-stamped.
+    #[test]
+    fn reapplying_shrunk_schema_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let big = schema_with(vec![
+            ("User", vec![scalar("name", ScalarType::String)]),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let _ = load_or_initialize(&storage, &big, false).unwrap();
+        let smaller = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let first = load_or_initialize(&storage, &smaller, true).unwrap();
+        let first_retired_at = first.type_entries["Movie"].retired_at_ms;
+        // Sleep is forbidden; just open again and check the timestamp is unchanged.
+        let second = load_or_initialize(&storage, &smaller, true).unwrap();
+        assert_eq!(
+            second.type_entries["Movie"].retired_at_ms,
+            first_retired_at,
+            "re-applying shrunk schema must not re-stamp retired_at_ms"
+        );
+    }
+
+    /// Reusing the name of a retired type/field/relation in a fresh
+    /// schema is refused with `NameReuseOfRetiredEntry`. The operator
+    /// must pick a different name or restore from a backup.
+    #[test]
+    fn rebinding_retired_type_name_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let big = schema_with(vec![
+            ("User", vec![scalar("name", ScalarType::String)]),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let _ = load_or_initialize(&storage, &big, false).unwrap();
+        // Retire Movie.
+        let shrunk = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let _ = load_or_initialize(&storage, &shrunk, true).unwrap();
+        // Operator tries to re-add Movie with the same name. Refuse.
+        let resurrection = schema_with(vec![
+            ("User", vec![scalar("name", ScalarType::String)]),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let err = load_or_initialize(&storage, &resurrection, true).unwrap_err();
+        let EngineError::Catalog(CatalogError::NameReuseOfRetiredEntry { kind, name, .. }) = err
+        else {
+            panic!("expected NameReuseOfRetiredEntry, got {err}");
+        };
+        assert_eq!(kind, "type");
+        assert_eq!(name, "Movie");
+    }
+
+    /// The first tombstone write bumps the catalog format to v2. A
+    /// v1-only binary must refuse to open the result.
+    #[test]
+    fn first_tombstone_bumps_catalog_format_to_v2() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let big = schema_with(vec![
+            ("User", vec![scalar("name", ScalarType::String)]),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let cat_pre = load_or_initialize(&storage, &big, false).unwrap();
+        assert_eq!(cat_pre.format_version, CATALOG_FORMAT_V1);
+        let smaller = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
+        let cat_post = load_or_initialize(&storage, &smaller, true).unwrap();
+        assert_eq!(cat_post.format_version, CATALOG_FORMAT_V2);
+    }
+
+    /// A v1 catalog whose row carries `status=Tombstoned` is internally
+    /// inconsistent; the loader refuses rather than guessing.
+    #[test]
+    fn v1_catalog_with_tombstoned_row_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        // Seed a v1 catalog.
+        let schema = schema_with(vec![("X", vec![scalar("a", ScalarType::I64)])]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        // Manually inject a tombstoned type row WITHOUT bumping c:F:.
+        let now = 1_000_000_000_000u64;
+        let mut bad = IdEntry::backfilled(99, kind_byte::UNSET, now);
+        bad.tombstone(now, RetireReason::ExplicitShrink);
+        let mut txn = storage.begin_txn();
+        storage
+            .put(
+                &mut txn,
+                &KeyBuilder::catalog_type("Bad"),
+                encode_id_entry(&bad),
+            )
+            .unwrap();
+        storage.commit(&mut txn).unwrap();
+        let err = load_or_initialize(&storage, &schema, false).unwrap_err();
         assert!(matches!(
             err,
-            EngineError::Catalog(CatalogError::SchemaShrinkNotYetSupported { .. })
+            EngineError::Catalog(CatalogError::TombstoneOnV1Catalog { .. })
+        ));
+    }
+
+    /// Tombstone TLVs round-trip through encode/decode.
+    #[test]
+    fn tombstone_tlvs_roundtrip() {
+        let mut entry = IdEntry::fresh(5, kind_byte::SCALAR_I64, 100);
+        entry.tombstone(1_700_000_000_000, RetireReason::CascadeParentRetired);
+        let bytes = encode_id_entry(&entry);
+        let back = decode_id_entry("c:T:X", &bytes).unwrap();
+        assert_eq!(back, entry);
+        assert_eq!(back.status, TombstoneStatus::Tombstoned);
+        assert_eq!(back.retired_at_ms, Some(1_700_000_000_000));
+        assert_eq!(
+            back.retired_reason,
+            Some(RetireReason::CascadeParentRetired)
+        );
+    }
+
+    /// A live entry under V2 is byte-identical to a V1 entry — critical
+    /// for the digest fast-path to stay hot across the format bump.
+    #[test]
+    fn live_entry_under_v2_is_byte_equal_to_v1() {
+        let live = IdEntry::fresh(42, kind_byte::SCALAR_STRING, 99);
+        let bytes_v1 = encode_id_entry(&live);
+        // The encoder writes tombstone TLVs only when status == Tombstoned.
+        // A live entry under V2 must encode to exactly the same bytes.
+        let mut as_v2 = live.clone();
+        as_v2.status = TombstoneStatus::Live; // unchanged
+        let bytes_v2 = encode_id_entry(&as_v2);
+        assert_eq!(bytes_v1, bytes_v2);
+    }
+
+    /// An unknown tombstone-status byte (e.g. `0x02` reserved) is
+    /// refused rather than silently treated as live.
+    #[test]
+    fn decode_id_entry_rejects_unknown_tombstone_status() {
+        // Hand-build a payload with TLV_STATUS=0x02.
+        let mut body: Vec<u8> = Vec::new();
+        write_tlv(&mut body, TLV_ID, &7u64.to_be_bytes());
+        write_tlv(&mut body, TLV_ASSIGNED_AT, &0u64.to_be_bytes());
+        write_tlv(&mut body, TLV_ASSIGNED_BY, &[0]);
+        write_tlv(&mut body, TLV_KIND, &[kind_byte::SCALAR_I64]);
+        write_tlv(&mut body, TLV_STATUS, &[0x02]);
+        let mut bytes: Vec<u8> = vec![RECORD_FORMAT_V1, KIND_ID_ENTRY];
+        bytes.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        let err = decode_id_entry("c:T:X", &bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::UnknownTombstoneStatus { status: 0x02, .. })
         ));
     }
 
@@ -1706,8 +2386,11 @@ mod tests {
         let _ = load_or_initialize(&storage, &base, false).unwrap();
         let smaller = schema_with(vec![("User", vec![scalar("name", ScalarType::String)])]);
         let err = load_or_initialize(&storage, &smaller, false).unwrap_err();
-        let EngineError::Catalog(CatalogError::SchemaShrink { dropped_fields, .. }) = err else {
-            panic!("expected SchemaShrink, got {err}");
+        let EngineError::Catalog(CatalogError::SchemaShrinkRequiresOptIn {
+            dropped_fields, ..
+        }) = err
+        else {
+            panic!("expected SchemaShrinkRequiresOptIn, got {err}");
         };
         assert_eq!(dropped_fields, vec!["User.age".to_string()]);
     }
