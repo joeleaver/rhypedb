@@ -280,6 +280,76 @@ pub enum CatalogError {
         cap: usize,
     },
 
+    /// A catalog row's `type_change_history` TLV has count = 0.
+    #[error("catalog row {row} has empty type-change chain (count = 0); absent chain should be omitted")]
+    EmptyTypeChangeChain { row: String },
+
+    /// A catalog row's `type_change_history` TLV declares more entries
+    /// than the per-row cap.
+    #[error("catalog row {row} has type-change chain count {count} which exceeds the per-row cap of {cap}")]
+    TypeChangeChainOverCap { row: String, count: usize, cap: usize },
+
+    /// `Database::change_field_type` named a field whose qualified name
+    /// is not present in the catalog (or has been tombstoned).
+    #[error("change_field_type source {qualified:?} is not a live field in the catalog")]
+    FieldTypeChangeSourceNotFound { qualified: String },
+
+    /// The named field is tombstoned. Retired fields cannot be migrated.
+    #[error("change_field_type source {qualified:?} (id={field_id}) is tombstoned at {retired_at_ms} ms; retired fields cannot be migrated")]
+    FieldTypeChangeSourceRetired {
+        qualified: String,
+        field_id: u64,
+        retired_at_ms: u64,
+    },
+
+    /// The current and target kinds are the same. No-op rejected
+    /// up-front rather than scanning every object for nothing.
+    #[error("change_field_type {qualified:?}: source and target kind are the same; remove the verb")]
+    FieldTypeChangeNoOp { qualified: String },
+
+    /// Card 4/5 phase 1 only supports migrating plain scalar fields.
+    /// `@indexed`, `@unique`, `@vectorize` are deferred to a follow-on
+    /// card because each requires additional on-disk rewriting
+    /// (index rebuild, uniqueness re-check, embedding pipeline).
+    #[error("change_field_type {qualified:?}: field carries the {directive:?} directive which is not supported by the phase-1 verb; the {planned_phase} card will lift this restriction")]
+    FieldTypeChangeDirectiveUnsupported {
+        qualified: String,
+        directive: &'static str,
+        planned_phase: &'static str,
+    },
+
+    /// The verb only handles scalar field-type changes.
+    #[error("change_field_type {qualified:?}: only scalar fields can be migrated (current kind = {current_kind}, requested kind = {requested_kind})")]
+    FieldTypeChangeNonScalar {
+        qualified: String,
+        current_kind: &'static str,
+        requested_kind: &'static str,
+    },
+
+    /// The operator-provided converter returned an error for one of
+    /// the rows. The whole migration aborts; no catalog mutation has
+    /// been committed.
+    #[error("change_field_type {qualified:?}: converter failed on object id={object_id}: {reason}")]
+    FieldTypeChangeConverterFailed {
+        qualified: String,
+        object_id: u64,
+        reason: String,
+    },
+
+    /// The converter returned a Value whose kind doesn't match the
+    /// requested target kind.
+    #[error("change_field_type {qualified:?}: converter returned a {got_kind} value for object id={object_id} but target kind is {want_kind}")]
+    FieldTypeChangeConverterReturnedWrongKind {
+        qualified: String,
+        object_id: u64,
+        got_kind: &'static str,
+        want_kind: &'static str,
+    },
+
+    /// The audit chain is already at the per-row cap.
+    #[error("change_field_type {qualified:?} would exceed the per-row type-change history cap of {cap} entries")]
+    FieldTypeChangeHistoryCapExceeded { qualified: String, cap: usize },
+
     /// A field changed shape between catalog and schema — either a
     /// scalar swapped types (Int → String) or scalar↔relation flipped.
     /// On-disk values cannot be reinterpreted under the new kind without
