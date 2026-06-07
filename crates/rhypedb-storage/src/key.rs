@@ -661,6 +661,43 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.freeze()
     }
+
+    /// Current applied migration count: `c:V:` → 8-byte u64 BE.
+    /// Used by the migration-log driver (card 5/5): the next migration
+    /// to apply is at ordinal `current_version`. Absent before any
+    /// migration has been recorded; treated as 0 in that case.
+    pub fn catalog_migration_version() -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'V');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Migration log entry for ordinal `n` (0-indexed):
+    /// `c:G:<u64 BE ordinal>` → migration record value (utf8 name +
+    /// u64 BE applied_at_unix_ms; framing documented in
+    /// `rhypedb-engine/src/catalog.rs`).
+    pub fn catalog_migration_log(ordinal: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(3 + 8);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'G');
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(ordinal);
+        buf.freeze()
+    }
+
+    /// Scan prefix for all migration log entries: `c:G:`.
+    pub fn catalog_migration_log_prefix() -> Bytes {
+        let mut buf = BytesMut::with_capacity(3);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'G');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
 }
 
 #[cfg(test)]

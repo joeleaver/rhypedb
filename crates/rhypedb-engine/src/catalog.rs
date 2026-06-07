@@ -1275,6 +1275,277 @@ fn value_to_kind_byte(v: &crate::object::Value) -> u8 {
 }
 
 // =====================================================================
+// MIGRATION LOG — versioned schema + named migration replay (card 5/5)
+//
+// Card 5/5 layers an idempotent migration framework on top of the
+// verbs cards 1-4 already provide. The operator passes a Vec of named
+// `Migration`s; we track which ordinals have been applied via two new
+// catalog keys:
+//   * `c:V:` — u64 BE current applied count (next-ordinal-to-apply)
+//   * `c:G:<u64 BE ordinal>` — applied migration record (utf8 name + ms)
+//
+// Validation on each `run_migrations` call:
+//   * `migrations.len() < current_version` → `MigrationListShorterThanApplied`
+//   * `stored_name(i) != migrations[i].name` for i < current_version
+//        → `MigrationNameMismatch`
+//
+// Pending migrations are applied one-at-a-time: each migration's
+// closure runs verbs (rename_type, change_field_type) and the log
+// record is written in the same single-commit flow each verb already
+// uses. If a migration's verb fails, the migration aborts and the
+// log entry is NOT written; the version counter is not bumped.
+// =====================================================================
+
+/// One named, ordered schema migration. Card 5/5 supports closures that
+/// run any combination of `rename_type` / `change_field_type` verbs
+/// through the `MigrationContext`. Each migration's effect is bounded
+/// by whatever those verbs commit (each is its own atomic commit; a
+/// multi-verb migration is multiple commits — see the `auto_resume`
+/// note in the synthesis).
+pub struct Migration {
+    pub name: String,
+    pub up: Box<dyn FnOnce(&MigrationContext) -> EngineResult<()> + Send + Sync>,
+}
+
+impl Migration {
+    pub fn new<S, F>(name: S, up: F) -> Self
+    where
+        S: Into<String>,
+        F: FnOnce(&MigrationContext) -> EngineResult<()> + Send + Sync + 'static,
+    {
+        Self {
+            name: name.into(),
+            up: Box::new(up),
+        }
+    }
+}
+
+/// Per-migration handle the closure uses to run verbs against the
+/// open catalog. Each method delegates to the corresponding card's
+/// verb (rename_type → card 3, change_field_type → card 4). The
+/// schema reference is the **final** schema the operator will open
+/// `Database` with after `run_migrations` completes — migrations
+/// that change field types need it to validate `@indexed` etc.
+pub struct MigrationContext<'a> {
+    storage: &'a LsmTree,
+    schema: &'a Schema,
+}
+
+impl MigrationContext<'_> {
+    pub fn rename_type(&self, old: &str, new: &str) -> EngineResult<()> {
+        let verbs = [RenameVerb::Type {
+            old: old.into(),
+            new: new.into(),
+        }];
+        apply_migration(self.storage, &verbs)?;
+        Ok(())
+    }
+
+    pub fn change_field_type<F>(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        target_field_type: FieldType,
+        converter: F,
+    ) -> EngineResult<()>
+    where
+        F: Fn(u64, &crate::object::Value) -> EngineResult<crate::object::Value>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let target_kind = schema_kind_byte(&target_field_type);
+        let verb = FieldTypeChangeVerb {
+            type_name: type_name.into(),
+            field_name: field_name.into(),
+            target_kind,
+            converter: Box::new(converter),
+        };
+        apply_field_type_change(self.storage, self.schema, verb)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MigrationLogReport {
+    pub applied: Vec<AppliedMigration>,
+    pub version_before: u64,
+    pub version_after: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMigration {
+    pub ordinal: u64,
+    pub name: String,
+    pub applied_at_unix_ms: u64,
+}
+
+/// Apply pending migrations from `migrations`. Idempotent across
+/// repeated calls — previously-applied migrations are skipped.
+/// Validates that the migration list hasn't been reordered or renamed
+/// at any already-applied ordinal.
+pub(crate) fn run_migrations(
+    storage: &LsmTree,
+    schema: &Schema,
+    migrations: Vec<Migration>,
+) -> EngineResult<MigrationLogReport> {
+    // NOTE: we do NOT hold `CATALOG_INIT_LOCK` here. Each verb the
+    // migration closure calls (rename_type, change_field_type) acquires
+    // the lock itself, and parking_lot::Mutex is non-reentrant —
+    // taking it here would deadlock. Migration-log read + log entry
+    // writes between verbs are protected by their own short txns; if
+    // a concurrent migrate runs against the same DB it'll serialise
+    // verb-by-verb the same way concurrent reconcile + migrate do.
+
+    // STEP 1: read current applied count.
+    let snap = storage.read_snapshot();
+    let current_version = match storage.get_at(snap, &KeyBuilder::catalog_migration_version())? {
+        Some(bytes) => {
+            if bytes.len() != 8 {
+                return Err(EngineError::Catalog(CatalogError::Truncated {
+                    key_debug: "c:V:".into(),
+                    len: bytes.len(),
+                    min: 8,
+                }));
+            }
+            u64::from_be_bytes(bytes[..].try_into().unwrap())
+        }
+        None => 0,
+    };
+
+    // STEP 2: detect DB-ahead-of-code.
+    if (migrations.len() as u64) < current_version {
+        return Err(EngineError::Catalog(
+            CatalogError::MigrationListShorterThanApplied {
+                code_count: migrations.len() as u64,
+                catalog_count: current_version,
+            },
+        ));
+    }
+
+    // STEP 3: detect rename/reorder of already-applied migrations.
+    for (i, mig) in migrations.iter().enumerate() {
+        let ord = i as u64;
+        if ord >= current_version {
+            break;
+        }
+        let applied = read_migration_log_entry(storage, snap, ord)?;
+        if applied.name != mig.name {
+            return Err(EngineError::Catalog(CatalogError::MigrationNameMismatch {
+                ordinal: ord,
+                code_name: mig.name.clone(),
+                catalog_name: applied.name,
+            }));
+        }
+    }
+
+    // STEP 4: apply pending migrations.
+    let mut report = MigrationLogReport {
+        version_before: current_version,
+        version_after: current_version,
+        ..MigrationLogReport::default()
+    };
+    let mut version_cursor = current_version;
+    let ctx = MigrationContext { storage, schema };
+    for (i, mig) in migrations.into_iter().enumerate() {
+        let ord = i as u64;
+        if ord < current_version {
+            continue;
+        }
+        let name = mig.name.clone();
+        (mig.up)(&ctx).map_err(|e| {
+            EngineError::Catalog(CatalogError::MigrationVerbFailed {
+                ordinal: ord,
+                name: name.clone(),
+                reason: e.to_string(),
+            })
+        })?;
+        // Persist the log entry + bump version in one commit.
+        let now_ms = now_unix_millis();
+        let mut txn = storage.begin_txn();
+        let entry_bytes = encode_migration_log_entry(&name, now_ms);
+        storage.put(&mut txn, &KeyBuilder::catalog_migration_log(ord), entry_bytes)?;
+        let next = ord + 1;
+        storage.put(
+            &mut txn,
+            &KeyBuilder::catalog_migration_version(),
+            Bytes::copy_from_slice(&next.to_be_bytes()),
+        )?;
+        storage.commit(&mut txn)?;
+        version_cursor = next;
+        report.applied.push(AppliedMigration {
+            ordinal: ord,
+            name,
+            applied_at_unix_ms: now_ms,
+        });
+    }
+    report.version_after = version_cursor;
+    Ok(report)
+}
+
+fn read_migration_log_entry(
+    storage: &LsmTree,
+    snap: u64,
+    ordinal: u64,
+) -> EngineResult<AppliedMigration> {
+    let raw = storage
+        .get_at(snap, &KeyBuilder::catalog_migration_log(ordinal))?
+        .ok_or_else(|| {
+            EngineError::Catalog(CatalogError::MissingRequiredKey {
+                key_debug: format!("c:G:{}", ordinal),
+            })
+        })?;
+    decode_migration_log_entry(ordinal, &raw)
+}
+
+/// Migration log entry format:
+/// ```text
+/// byte 0..2  : u16 BE name_len
+/// byte 2..N  : utf8 name (name_len bytes)
+/// byte N..N+8: u64 BE applied_at_unix_ms
+/// ```
+fn encode_migration_log_entry(name: &str, applied_at_unix_ms: u64) -> Bytes {
+    let mut buf: Vec<u8> = Vec::with_capacity(2 + name.len() + 8);
+    debug_assert!(name.len() <= u16::MAX as usize);
+    buf.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(&applied_at_unix_ms.to_be_bytes());
+    Bytes::from(buf)
+}
+
+fn decode_migration_log_entry(ordinal: u64, bytes: &[u8]) -> EngineResult<AppliedMigration> {
+    let key_debug = format!("c:G:{}", ordinal);
+    if bytes.len() < 2 {
+        return Err(EngineError::Catalog(CatalogError::Truncated {
+            key_debug,
+            len: bytes.len(),
+            min: 2,
+        }));
+    }
+    let name_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    if bytes.len() < 2 + name_len + 8 {
+        return Err(EngineError::Catalog(CatalogError::Truncated {
+            key_debug,
+            len: bytes.len(),
+            min: 2 + name_len + 8,
+        }));
+    }
+    let name = std::str::from_utf8(&bytes[2..2 + name_len])
+        .map_err(|_| {
+            EngineError::Catalog(CatalogError::MalformedKey {
+                key_debug: key_debug.clone(),
+            })
+        })?
+        .to_string();
+    let ts_bytes: [u8; 8] = bytes[2 + name_len..2 + name_len + 8].try_into().unwrap();
+    Ok(AppliedMigration {
+        ordinal,
+        name,
+        applied_at_unix_ms: u64::from_be_bytes(ts_bytes),
+    })
+}
+
+// =====================================================================
 // BACKFILL — fresh / legacy DB → initialized catalog
 // =====================================================================
 
