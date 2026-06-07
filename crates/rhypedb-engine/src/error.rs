@@ -221,6 +221,65 @@ pub enum CatalogError {
     #[error("catalog row {row} has unknown retirement-reason byte 0x{reason:02x}")]
     UnknownRetireReason { row: String, reason: u8 },
 
+    /// A catalog row's `previous_names` TLV has `count = 0`. An empty
+    /// chain should be omitted entirely; storing one with count zero
+    /// indicates external tampering or a writer bug.
+    #[error("catalog row {row} has empty rename chain (count = 0); absent chain should be omitted")]
+    EmptyRenameChain { row: String },
+
+    /// A catalog row's `previous_names` TLV declares more entries than
+    /// the per-row cap.
+    #[error("catalog row {row} has rename chain count {count} which exceeds the per-row cap of {cap}")]
+    RenameChainOverCap { row: String, count: usize, cap: usize },
+
+    /// `Database::migrate` plan's source name doesn't exist in the
+    /// catalog (or refers to a tombstoned entry).
+    #[error("rename source {kind} {name:?} is not a live entry in the catalog — old name must refer to a live, un-retired entry")]
+    RenameSourceNotFound { kind: &'static str, name: String },
+
+    /// The source entry the operator named has been tombstoned.
+    /// Retired entries cannot be renamed.
+    #[error("rename source {kind} {name:?} (id={retired_id}) was retired at {retired_at_ms} ms — retired entries cannot be renamed")]
+    RenameSourceRetired {
+        kind: &'static str,
+        name: String,
+        retired_id: u64,
+        retired_at_ms: u64,
+    },
+
+    /// The new name already names a live catalog entry.
+    #[error("rename target {kind} {name:?} already exists in the catalog (id={existing_id}); pick a different new name or rename the existing entry first")]
+    RenameTargetCollision {
+        kind: &'static str,
+        name: String,
+        existing_id: u64,
+    },
+
+    /// The new name is tombstoned in the catalog. Re-binding a retired
+    /// name is forbidden (would either resurrect retired data via the
+    /// old ID or strand it via a fresh ID).
+    #[error("rename target {kind} {name:?} is tombstoned (id={retired_id}); re-binding a retired name is forbidden by the catalog")]
+    RenameTargetIsRetired {
+        kind: &'static str,
+        name: String,
+        retired_id: u64,
+    },
+
+    /// `old == new` — no-op rename rejected up front rather than
+    /// silently committed.
+    #[error("rename {kind} {name:?}: old and new names are equal; remove the verb from the plan")]
+    RenameNoOp { kind: &'static str, name: String },
+
+    /// Rename would push the per-row rename history beyond
+    /// `MAX_RENAME_HISTORY`. Forces the operator to make a deliberate
+    /// decision rather than silently dropping audit data.
+    #[error("rename target {kind} {name:?} would exceed the per-row rename history cap of {cap} entries")]
+    RenameHistoryCapExceeded {
+        kind: &'static str,
+        name: String,
+        cap: usize,
+    },
+
     /// A field changed shape between catalog and schema — either a
     /// scalar swapped types (Int → String) or scalar↔relation flipped.
     /// On-disk values cannot be reinterpreted under the new kind without
