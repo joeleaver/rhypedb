@@ -89,6 +89,16 @@ pub enum EngineError {
         relation_id: u64,
         retired_at_unix_ms: u64,
     },
+
+    /// A method was called on a `Database` handle that has been
+    /// migrated away — one of the `_consuming` migrate variants
+    /// returned a fresh `Arc<Database>` and marked this one as
+    /// dead. The caller should be using the new handle. The error
+    /// is a guardrail against stale-cache reads (the old schema /
+    /// field_ids / indexed_fields are no longer valid for the
+    /// underlying storage shape).
+    #[error("database handle has been migrated away — switch to the Arc returned by the migrate verb")]
+    DatabaseMigratedAway,
 }
 
 /// Failures specific to the persisted schema catalog (see
