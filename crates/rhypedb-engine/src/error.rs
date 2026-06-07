@@ -48,6 +48,47 @@ pub enum EngineError {
 
     #[error("write conflict")]
     WriteConflict,
+
+    /// The named type was retired (tombstoned) via a previous
+    /// schema-shrink open. Its on-disk data is unreachable through
+    /// every public API. The error carries enough metadata that the
+    /// operator can confirm "yes, this is the one we dropped on date
+    /// X" without consulting a separate audit log.
+    #[error(
+        "type {name:?} (id={id}) was retired at {retired_at_unix_ms} ms — its data is no longer accessible; update your schema or restore from a backup taken before retirement"
+    )]
+    TypeRetired {
+        name: String,
+        id: u64,
+        retired_at_unix_ms: u64,
+    },
+
+    /// The named field on a still-live parent type was retired via a
+    /// previous schema-shrink open. Reads against objects of the parent
+    /// type still succeed but strip this field from the returned
+    /// FieldMap; APIs that NAME the field error with this variant.
+    #[error(
+        "field {type_name:?}.{field:?} (id={field_id}) was retired at {retired_at_unix_ms} ms — reads via this name are no longer valid; the parent type's objects are still accessible but the field is stripped from results"
+    )]
+    FieldRetired {
+        type_name: String,
+        field: String,
+        field_id: u64,
+        retired_at_unix_ms: u64,
+    },
+
+    /// The named relation was retired. Traversal through it returns
+    /// an empty edge set; APIs that NAME the relation (e.g. `link`,
+    /// `unlink`) error with this variant.
+    #[error(
+        "relation {type_name:?}.{relation:?} (id={relation_id}) was retired at {retired_at_unix_ms} ms — traversal yields no edges; the parent type's objects are still accessible"
+    )]
+    RelationRetired {
+        type_name: String,
+        relation: String,
+        relation_id: u64,
+        retired_at_unix_ms: u64,
+    },
 }
 
 /// Failures specific to the persisted schema catalog (see
@@ -132,30 +173,53 @@ pub enum CatalogError {
         initialized_present: bool,
     },
 
-    /// The schema removes one or more entries that exist in the
-    /// persisted catalog. Phase 1 refuses; the operator must re-add the
-    /// dropped entries or open the DB with the original schema. Phase 2
-    /// will flip this to a tombstone path under
-    /// `OpenOptions::allow_schema_shrink`.
+    /// The new schema removes catalog entries but the caller didn't
+    /// pass `OpenOptions::allow_schema_shrink(true)`. The hint surfaces
+    /// the opt-in path in the error itself.
     #[error(
-        "schema would drop catalog entries (types={dropped_types:?}, fields={dropped_fields:?}, relations={dropped_rels:?}); re-add the removed entries or open with the original schema"
+        "schema would drop catalog entries (types={dropped_types:?}, fields={dropped_fields:?}, relations={dropped_rels:?}). To retire these entries, set OpenOptions::allow_schema_shrink(true); retirement is one-way and cannot be reversed"
     )]
-    SchemaShrink {
+    SchemaShrinkRequiresOptIn {
         dropped_types: Vec<String>,
         dropped_fields: Vec<String>,
         dropped_rels: Vec<String>,
     },
 
-    /// `OpenOptions::allow_schema_shrink` was set but the tombstone
-    /// migration phase (card 2/5) has not yet shipped.
+    /// The schema names an entry whose name is already tombstoned in
+    /// the catalog. Re-binding the name would either resurrect the
+    /// retired data (if we reused the old ID) or strand it (if we
+    /// allocated a fresh ID). Refuse loudly. The operator must pick a
+    /// different name or restore from a backup taken before retirement.
     #[error(
-        "allow_schema_shrink is reserved for the tombstone migration phase and is not yet implemented (would-be drops: types={dropped_types:?}, fields={dropped_fields:?}, relations={dropped_rels:?})"
+        "{kind} name {name:?} is tombstoned in the catalog (retired id={retired_id}); re-binding a retired name is forbidden — pick a different name or restore from a backup taken before retirement"
     )]
-    SchemaShrinkNotYetSupported {
-        dropped_types: Vec<String>,
-        dropped_fields: Vec<String>,
-        dropped_rels: Vec<String>,
+    NameReuseOfRetiredEntry {
+        kind: &'static str,
+        name: String,
+        retired_id: u64,
     },
+
+    /// A catalog row carries `status = Tombstoned` but the on-disk
+    /// `c:F:` is v1 (which never wrote tombstones). Indicates manual
+    /// tampering or a binary that bumped a row format without bumping
+    /// the catalog format. Refuse to open.
+    #[error(
+        "{row_kind} catalog row id={row_id} is tombstoned but the catalog format is v1 — catalog is internally inconsistent"
+    )]
+    TombstoneOnV1Catalog {
+        row_kind: &'static str,
+        row_id: u64,
+    },
+
+    /// A catalog row carries an unknown tombstone-status byte. The
+    /// decoder refuses rather than guessing whether the row is live or
+    /// retired — getting that decision wrong silently corrupts queries.
+    #[error("catalog row {row} has unknown tombstone-status byte 0x{status:02x}")]
+    UnknownTombstoneStatus { row: String, status: u8 },
+
+    /// A catalog row carries an unknown retirement-reason byte.
+    #[error("catalog row {row} has unknown retirement-reason byte 0x{reason:02x}")]
+    UnknownRetireReason { row: String, reason: u8 },
 
     /// A field changed shape between catalog and schema — either a
     /// scalar swapped types (Int → String) or scalar↔relation flipped.

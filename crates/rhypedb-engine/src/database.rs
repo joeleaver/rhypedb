@@ -181,6 +181,34 @@ pub struct Database {
     type_ids: HashMap<String, u64>,
     rel_ids: HashMap<String, u64>,
     field_ids: HashMap<String, u64>,
+    /// Retired numeric IDs, partitioned by row kind. Populated from the
+    /// catalog at open(). Hot paths check the negative case (id is NOT
+    /// in the tombstoned set) so the common case is one `HashSet::contains`
+    /// against an empty/tiny set.
+    tombstoned_type_ids: std::collections::HashSet<u64>,
+    tombstoned_field_ids: std::collections::HashSet<u64>,
+    tombstoned_rel_ids: std::collections::HashSet<u64>,
+    /// Retired names, partitioned the same way. Used by resolve helpers
+    /// to surface a typed `*Retired` error when a caller names a retired
+    /// entity (e.g. `db.get("RetiredType", id)`). Type and relation
+    /// name sets are reserved for the follow-on rename / migration
+    /// cards; field quals are the hot path consulted by every read.
+    #[allow(dead_code)]
+    tombstoned_type_names: std::collections::HashSet<String>,
+    tombstoned_field_quals: std::collections::HashSet<String>,
+    #[allow(dead_code)]
+    tombstoned_rel_quals: std::collections::HashSet<String>,
+    /// Per-type set of retired field NAMES (NOT qualified). The FieldMap
+    /// strip path uses `get(type_name)` once per object; for the common
+    /// case (no retired fields on this type) the lookup misses and the
+    /// strip is essentially free.
+    retired_field_names_by_type: HashMap<String, std::collections::HashSet<String>>,
+    /// Retirement timestamps (Unix millis) keyed by numeric id. Used to
+    /// build the `*Retired` error variants without consulting the
+    /// catalog at every error site.
+    retired_at_ms_by_type_id: HashMap<u64, u64>,
+    retired_at_ms_by_field_id: HashMap<u64, u64>,
+    retired_at_ms_by_rel_id: HashMap<u64, u64>,
     next_object_id: AtomicU64,
     subscriptions: SubscriptionHub,
     /// target_type_id → list of relations that point at it. Built once at
@@ -330,6 +358,49 @@ impl Database {
         let type_ids = cat.type_ids;
         let rel_ids = cat.rel_ids;
         let field_ids = cat.field_ids;
+        let tombstoned_type_ids = cat.tombstoned_type_ids;
+        let tombstoned_field_ids = cat.tombstoned_field_ids;
+        let tombstoned_rel_ids = cat.tombstoned_rel_ids;
+        let tombstoned_type_names = cat.tombstoned_type_names;
+        let tombstoned_field_quals = cat.tombstoned_field_quals;
+        let tombstoned_rel_quals = cat.tombstoned_rel_quals;
+
+        // Retirement timestamps keyed by numeric id, populated from
+        // catalog entries' `retired_at_ms` TLV. Used to build the
+        // `*Retired` error variants without re-loading the catalog.
+        let mut retired_at_ms_by_type_id: HashMap<u64, u64> = HashMap::new();
+        let mut retired_at_ms_by_field_id: HashMap<u64, u64> = HashMap::new();
+        let mut retired_at_ms_by_rel_id: HashMap<u64, u64> = HashMap::new();
+        for (_, entry) in &cat.type_entries {
+            if let Some(ms) = entry.retired_at_ms {
+                retired_at_ms_by_type_id.insert(entry.id, ms);
+            }
+        }
+        for (_, entry) in &cat.field_entries {
+            if let Some(ms) = entry.retired_at_ms {
+                retired_at_ms_by_field_id.insert(entry.id, ms);
+            }
+        }
+        for (_, entry) in &cat.rel_entries {
+            if let Some(ms) = entry.retired_at_ms {
+                retired_at_ms_by_rel_id.insert(entry.id, ms);
+            }
+        }
+
+        // Per-type set of retired field NAMES (not qualified). Used by
+        // the FieldMap strip path — for a type with no retired fields,
+        // the HashMap lookup misses and the strip is a single hash.
+        let mut retired_field_names_by_type: HashMap<String, std::collections::HashSet<String>> =
+            HashMap::new();
+        for qual in &tombstoned_field_quals {
+            if let Some(dot) = qual.find('.') {
+                let (t, f) = (&qual[..dot], &qual[dot + 1..]);
+                retired_field_names_by_type
+                    .entry(t.to_string())
+                    .or_default()
+                    .insert(f.to_string());
+            }
+        }
 
         // Recover the max object ID by scanning existing objects.
         let mut max_object_id = 0u64;
@@ -505,6 +576,16 @@ impl Database {
             type_ids,
             rel_ids,
             field_ids,
+            tombstoned_type_ids,
+            tombstoned_field_ids,
+            tombstoned_rel_ids,
+            tombstoned_type_names,
+            tombstoned_field_quals,
+            tombstoned_rel_quals,
+            retired_field_names_by_type,
+            retired_at_ms_by_type_id,
+            retired_at_ms_by_field_id,
+            retired_at_ms_by_rel_id,
             next_object_id: AtomicU64::new(max_object_id + 1),
             subscriptions: SubscriptionHub::new(),
             incoming_relations,
@@ -590,6 +671,138 @@ impl Database {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Tombstone resolution + strip helpers. Wrap every read/write
+    // entrypoint that previously did `type_ids.get(name).ok_or(TypeNotFound)`
+    // — for a retired entity, return the typed `*Retired` variant
+    // INSTEAD of `*NotFound`. The retired entity is still in the
+    // catalog (and so in `type_ids` / `field_ids` / `rel_ids`); the
+    // distinction matters because the operator's mental model is
+    // different: "you removed it from the schema" vs. "you typoed".
+    // -----------------------------------------------------------------
+
+    /// Resolve a type name to its numeric id. Returns `TypeRetired` if
+    /// the type was tombstoned, `TypeNotFound` if it never existed.
+    fn resolve_type_id(&self, type_name: &str) -> EngineResult<u64> {
+        let type_id = self
+            .type_ids
+            .get(type_name)
+            .copied()
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        if self.tombstoned_type_ids.contains(&type_id) {
+            return Err(EngineError::TypeRetired {
+                name: type_name.into(),
+                id: type_id,
+                retired_at_unix_ms: self
+                    .retired_at_ms_by_type_id
+                    .get(&type_id)
+                    .copied()
+                    .unwrap_or(0),
+            });
+        }
+        Ok(type_id)
+    }
+
+    /// Resolve a `Type.field` pair to `(type_id, field_id)`. Surfaces
+    /// `TypeRetired` first (if the parent type itself was retired),
+    /// then `FieldRetired`, then `FieldNotFound`. Reserved for the
+    /// follow-on cards (rename / field-type change) — currently call
+    /// sites use `field_retired_error` + `schema.get_field` directly
+    /// because they also need the `FieldDef` for type-aware encoding.
+    #[allow(dead_code)]
+    fn resolve_field_id(&self, type_name: &str, field: &str) -> EngineResult<(u64, u64)> {
+        let type_id = self.resolve_type_id(type_name)?;
+        let qual = format!("{}.{}", type_name, field);
+        let field_id = self
+            .field_ids
+            .get(&qual)
+            .copied()
+            .ok_or_else(|| EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: field.into(),
+            })?;
+        if self.tombstoned_field_ids.contains(&field_id) {
+            return Err(EngineError::FieldRetired {
+                type_name: type_name.into(),
+                field: field.into(),
+                field_id,
+                retired_at_unix_ms: self
+                    .retired_at_ms_by_field_id
+                    .get(&field_id)
+                    .copied()
+                    .unwrap_or(0),
+            });
+        }
+        Ok((type_id, field_id))
+    }
+
+    /// Resolve a `Type.relation` pair to `(type_id, rel_id)`. Surfaces
+    /// `TypeRetired` first, then `RelationRetired`.
+    #[allow(dead_code)]
+    fn resolve_relation_id(&self, type_name: &str, relation: &str) -> EngineResult<(u64, u64)> {
+        let type_id = self.resolve_type_id(type_name)?;
+        let qual = format!("{}.{}", type_name, relation);
+        let rel_id =
+            self.rel_ids
+                .get(&qual)
+                .copied()
+                .ok_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: relation.into(),
+                })?;
+        if self.tombstoned_rel_ids.contains(&rel_id) {
+            return Err(EngineError::RelationRetired {
+                type_name: type_name.into(),
+                relation: relation.into(),
+                relation_id: rel_id,
+                retired_at_unix_ms: self
+                    .retired_at_ms_by_rel_id
+                    .get(&rel_id)
+                    .copied()
+                    .unwrap_or(0),
+            });
+        }
+        Ok((type_id, rel_id))
+    }
+
+    /// Strip every retired field from a decoded `FieldMap` BEFORE it
+    /// leaves the engine boundary. Called from every `deserialize_fields`
+    /// site so on-disk bytes are preserved verbatim but callers never
+    /// see a field name their current schema doesn't know. For the
+    /// common case (a type with no retired fields) the HashMap lookup
+    /// misses and the strip is a single hash + branch.
+    fn strip_tombstoned_fields(&self, type_name: &str, fields: &mut FieldMap) {
+        if let Some(retired) = self.retired_field_names_by_type.get(type_name) {
+            if !retired.is_empty() {
+                fields.retain(|name, _| !retired.contains(name));
+            }
+        }
+    }
+
+    /// If `Type.field` is tombstoned, return the typed `FieldRetired`
+    /// error so callers using `schema.get_field` can short-circuit to
+    /// a precise "this was retired" message before they encounter the
+    /// inevitable `FieldNotFound` from the schema. Returns `None` if
+    /// the field is live (or never existed — that's the caller's
+    /// `FieldNotFound` path).
+    fn field_retired_error(&self, type_name: &str, field: &str) -> Option<EngineError> {
+        let qual = format!("{}.{}", type_name, field);
+        if !self.tombstoned_field_quals.contains(&qual) {
+            return None;
+        }
+        let field_id = self.field_ids.get(&qual).copied().unwrap_or(0);
+        Some(EngineError::FieldRetired {
+            type_name: type_name.into(),
+            field: field.into(),
+            field_id,
+            retired_at_unix_ms: self
+                .retired_at_ms_by_field_id
+                .get(&field_id)
+                .copied()
+                .unwrap_or(0),
+        })
+    }
+
     /// Create a new object of the given type.
     ///
     /// `fields` may include forward (non-inverse) relation fields whose
@@ -599,11 +812,16 @@ impl Database {
     /// other targets, no extra commits). This collapses the historical
     /// `Type.create + link + link` 3-txn dance into one batched txn.
     pub fn create(&self, type_name: &str, fields: FieldMap) -> EngineResult<Object> {
+        // Check catalog state FIRST — a retired type isn't in `self.schema`
+        // anymore (the operator removed it), so falling through to
+        // `schema.get_type` would yield `TypeNotFound` for retired
+        // entities. Surfacing `TypeRetired` instead tells the operator
+        // "you removed this, not typoed it."
+        let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let type_id = self.type_ids[type_name];
         let object_id = self.next_object_id.fetch_add(1, Ordering::SeqCst);
 
         let mut txn = self.storage.begin_txn();
@@ -819,11 +1037,11 @@ impl Database {
             return Ok(Vec::new());
         }
 
+        let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let type_id = self.type_ids[type_name];
 
         let mut txn = self.storage.begin_txn();
         let mut object_ids: Vec<u64> = Vec::with_capacity(rows.len());
@@ -876,10 +1094,7 @@ impl Database {
 
     /// Get an object by type and ID.
     pub fn get(&self, type_name: &str, object_id: u64) -> EngineResult<Object> {
-        let type_id = *self
-            .type_ids
-            .get(type_name)
-            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.resolve_type_id(type_name)?;
 
         let key = KeyBuilder::object(type_id, object_id);
         let snapshot = self.storage.read_snapshot();
@@ -891,7 +1106,8 @@ impl Database {
                     object_id,
                 })?;
 
-        let fields = deserialize_fields(&data);
+        let mut fields = deserialize_fields(&data);
+        self.strip_tombstoned_fields(type_name, &mut fields);
         Ok(Object {
             type_name: type_name.into(),
             id: object_id,
@@ -909,10 +1125,7 @@ impl Database {
     /// of a traversal, a missing target is "the edge pointed to a deleted
     /// object" and should drop silently, not abort the whole query.
     pub fn get_many(&self, type_name: &str, ids: &[u64]) -> EngineResult<Vec<Object>> {
-        let type_id = *self
-            .type_ids
-            .get(type_name)
-            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.resolve_type_id(type_name)?;
 
         // Sort + dedup. Streaming traversal already dedups across hops;
         // this is the belt-and-suspenders pass for direct external callers.
@@ -935,10 +1148,12 @@ impl Database {
         let mut out = Vec::with_capacity(sorted.len());
         for (id, value) in sorted.into_iter().zip(values) {
             if let Some(data) = value {
+                let mut fields = deserialize_fields(&data);
+                self.strip_tombstoned_fields(type_name, &mut fields);
                 out.push(Object {
                     type_name: type_name.into(),
                     id,
-                    fields: deserialize_fields(&data),
+                    fields,
                     raw_fields: None,
                 });
             }
@@ -957,10 +1172,7 @@ impl Database {
     /// inspection. Saves ~50% of per-object materialize cost at 50+ objects
     /// per query (2-hop traversal terminal, filter scan covering path).
     pub fn get_many_lazy(&self, type_name: &str, ids: &[u64]) -> EngineResult<Vec<Object>> {
-        let type_id = *self
-            .type_ids
-            .get(type_name)
-            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.resolve_type_id(type_name)?;
 
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();
@@ -987,10 +1199,7 @@ impl Database {
     /// Scan all objects of a given type. Uses the LSM prefix scan on the
     /// object key prefix, so this is a real index scan — not a brute-force probe.
     pub fn scan_type(&self, type_name: &str) -> EngineResult<Vec<Object>> {
-        let type_id = *self
-            .type_ids
-            .get(type_name)
-            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.resolve_type_id(type_name)?;
 
         let prefix = KeyBuilder::object_prefix(type_id);
         let snapshot = self.storage.read_snapshot();
@@ -1005,7 +1214,8 @@ impl Database {
             let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
             let object_id = u64::from_be_bytes(id_bytes);
 
-            let fields = deserialize_fields(&data);
+            let mut fields = deserialize_fields(&data);
+            self.strip_tombstoned_fields(type_name, &mut fields);
             objects.push(Object {
                 type_name: type_name.into(),
                 id: object_id,
@@ -1051,18 +1261,18 @@ impl Database {
     ) -> EngineResult<Vec<Object>> {
         use rhypedb_storage::zone::{FieldPredicate, hash_field_name};
 
+        let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let type_id = self.type_ids[type_name];
-        let field_def =
-            type_def
-                .get_field(field_name)
-                .ok_or_else(|| EngineError::FieldNotFound {
+        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+            self.field_retired_error(type_name, field_name)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
                     type_name: type_name.into(),
                     field: field_name.into(),
-                })?;
+                })
+        })?;
 
         // Cast the raw query target to the field's actual integer type so the
         // encoding matches what's on disk. Bail out to `scan_type` (no perf
@@ -1133,8 +1343,9 @@ impl Database {
             let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
             let object_id = u64::from_be_bytes(id_bytes);
 
-            let fields = deserialize_fields(&data);
+            let mut fields = deserialize_fields(&data);
             if entry_passes_int_predicate(&fields, field_name, op, target_u64) {
+                self.strip_tombstoned_fields(type_name, &mut fields);
                 objects.push(Object {
                     type_name: type_name.into(),
                     id: object_id,
@@ -1207,10 +1418,12 @@ impl Database {
                 if value.is_empty() {
                     fallback_ids.push(object_id);
                 } else {
+                    let mut fields = deserialize_fields(&value);
+                    self.strip_tombstoned_fields(type_name, &mut fields);
                     out.push(Object {
                         type_name: type_name.into(),
                         id: object_id,
-                        fields: deserialize_fields(&value),
+                        fields,
                         raw_fields: None,
                     });
                 }
@@ -1281,10 +1494,12 @@ impl Database {
             if value.is_empty() {
                 fallback_ids.push(object_id);
             } else {
+                let mut fields = deserialize_fields(&value);
+                self.strip_tombstoned_fields(type_name, &mut fields);
                 out.push(Object {
                     type_name: type_name.into(),
                     id: object_id,
-                    fields: deserialize_fields(&value),
+                    fields,
                     raw_fields: None,
                 });
             }
@@ -1307,18 +1522,18 @@ impl Database {
         target: bool,
         limit: Option<usize>,
     ) -> EngineResult<Vec<Object>> {
+        let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let type_id = self.type_ids[type_name];
-        let field_def =
-            type_def
-                .get_field(field_name)
-                .ok_or_else(|| EngineError::FieldNotFound {
+        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+            self.field_retired_error(type_name, field_name)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
                     type_name: type_name.into(),
                     field: field_name.into(),
-                })?;
+                })
+        })?;
         if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bool)) {
             return self.scan_type(type_name);
         }
@@ -1354,18 +1569,18 @@ impl Database {
         target: f64,
         limit: Option<usize>,
     ) -> EngineResult<Vec<Object>> {
+        let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let type_id = self.type_ids[type_name];
-        let field_def =
-            type_def
-                .get_field(field_name)
-                .ok_or_else(|| EngineError::FieldNotFound {
+        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+            self.field_retired_error(type_name, field_name)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
                     type_name: type_name.into(),
                     field: field_name.into(),
-                })?;
+                })
+        })?;
         let is_float = matches!(
             field_def.field_type,
             FieldType::Scalar(ScalarType::F32 | ScalarType::F64)
@@ -1406,18 +1621,18 @@ impl Database {
         target: &[u8],
         limit: Option<usize>,
     ) -> EngineResult<Vec<Object>> {
+        let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let type_id = self.type_ids[type_name];
-        let field_def =
-            type_def
-                .get_field(field_name)
-                .ok_or_else(|| EngineError::FieldNotFound {
+        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+            self.field_retired_error(type_name, field_name)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
                     type_name: type_name.into(),
                     field: field_name.into(),
-                })?;
+                })
+        })?;
         if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bytes)) {
             return self.scan_type(type_name);
         }
@@ -1458,18 +1673,18 @@ impl Database {
         target: &str,
         limit: Option<usize>,
     ) -> EngineResult<Vec<Object>> {
+        let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let type_id = self.type_ids[type_name];
-        let field_def =
-            type_def
-                .get_field(field_name)
-                .ok_or_else(|| EngineError::FieldNotFound {
+        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+            self.field_retired_error(type_name, field_name)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
                     type_name: type_name.into(),
                     field: field_name.into(),
-                })?;
+                })
+        })?;
 
         // Non-string scalar field — no point pretending the literal applies.
         if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::String)) {
@@ -1577,10 +1792,12 @@ impl Database {
                 if value.is_empty() {
                     fallback_ids.push(object_id);
                 } else {
+                    let mut fields = deserialize_fields(&value);
+                    self.strip_tombstoned_fields(type_name, &mut fields);
                     out.push(Object {
                         type_name: type_name.into(),
                         id: object_id,
-                        fields: deserialize_fields(&value),
+                        fields,
                         raw_fields: None,
                     });
                 }
@@ -1646,10 +1863,12 @@ impl Database {
             if value.is_empty() {
                 fallback_ids.push(object_id);
             } else {
+                let mut fields = deserialize_fields(&value);
+                self.strip_tombstoned_fields(type_name, &mut fields);
                 out.push(Object {
                     type_name: type_name.into(),
                     id: object_id,
-                    fields: deserialize_fields(&value),
+                    fields,
                     raw_fields: None,
                 });
             }
@@ -1669,21 +1888,23 @@ impl Database {
         object_id: u64,
         updates: FieldMap,
     ) -> EngineResult<Object> {
+        let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let type_id = self.type_ids[type_name];
 
-        // Validate update fields.
+        // Validate update fields. Retired fields surface as
+        // `FieldRetired` so the operator learns their schema is stale,
+        // not "you typoed a field name."
         for (field_name, value) in &updates {
-            let field_def =
-                type_def
-                    .get_field(field_name)
-                    .ok_or_else(|| EngineError::FieldNotFound {
+            let field_def = type_def.get_field(field_name).ok_or_else(|| {
+                self.field_retired_error(type_name, field_name)
+                    .unwrap_or_else(|| EngineError::FieldNotFound {
                         type_name: type_name.into(),
                         field: field_name.clone(),
-                    })?;
+                    })
+            })?;
             validate_value(field_def, value)?;
         }
 
@@ -1865,10 +2086,7 @@ impl Database {
     /// Cascades are recursive — if deleting A cascades to B, and B has its own
     /// cascade relationships, those are followed too.
     pub fn delete(&self, type_name: &str, object_id: u64) -> EngineResult<()> {
-        let type_id = *self
-            .type_ids
-            .get(type_name)
-            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let type_id = self.resolve_type_id(type_name)?;
 
         let mut txn = self.storage.begin_txn();
         // type_id keyed instead of (String, u64) — drops a String alloc
@@ -2224,17 +2442,19 @@ impl Database {
         target_id: u64,
         edge_fields: Option<FieldMap>,
     ) -> EngineResult<()> {
+        let source_type_id = self.resolve_type_id(source_type)?;
         let type_def = self
             .schema
             .get_type(source_type)
             .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
 
-        let field = type_def
-            .get_field(field_name)
-            .ok_or_else(|| EngineError::FieldNotFound {
-                type_name: source_type.into(),
-                field: field_name.into(),
-            })?;
+        let field = type_def.get_field(field_name).ok_or_else(|| {
+            self.field_retired_error(source_type, field_name)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
+                    type_name: source_type.into(),
+                    field: field_name.into(),
+                })
+        })?;
 
         let rel = match &field.field_type {
             FieldType::Relation(r) => r,
@@ -2246,9 +2466,8 @@ impl Database {
             }
         };
 
-        // Verify both objects exist.
-        let source_type_id = self.type_ids[source_type];
-        let target_type_id = self.type_ids[&rel.target_type];
+        // Verify the target type isn't tombstoned.
+        let target_type_id = self.resolve_type_id(&rel.target_type)?;
 
         let mut txn = self.storage.begin_txn();
 
@@ -2271,6 +2490,18 @@ impl Database {
 
         let rel_key = format!("{source_type}.{field_name}");
         let rel_id = self.rel_ids[&rel_key];
+        if self.tombstoned_rel_ids.contains(&rel_id) {
+            return Err(EngineError::RelationRetired {
+                type_name: source_type.into(),
+                relation: field_name.into(),
+                relation_id: rel_id,
+                retired_at_unix_ms: self
+                    .retired_at_ms_by_rel_id
+                    .get(&rel_id)
+                    .copied()
+                    .unwrap_or(0),
+            });
+        }
 
         // Write edge + reverse edge.
         let edge_key = KeyBuilder::edge(source_id, rel_id, target_id);
@@ -2321,6 +2552,7 @@ impl Database {
         field_name: &str,
         target_id: u64,
     ) -> EngineResult<()> {
+        let _ = self.resolve_type_id(source_type)?;
         let rel_key = format!("{source_type}.{field_name}");
         let rel_id = *self
             .rel_ids
@@ -2329,6 +2561,18 @@ impl Database {
                 type_name: source_type.into(),
                 field: field_name.into(),
             })?;
+        if self.tombstoned_rel_ids.contains(&rel_id) {
+            return Err(EngineError::RelationRetired {
+                type_name: source_type.into(),
+                relation: field_name.into(),
+                relation_id: rel_id,
+                retired_at_unix_ms: self
+                    .retired_at_ms_by_rel_id
+                    .get(&rel_id)
+                    .copied()
+                    .unwrap_or(0),
+            });
+        }
 
         let mut txn = self.storage.begin_txn();
 
@@ -2357,17 +2601,19 @@ impl Database {
         source_id: u64,
         field_name: &str,
     ) -> EngineResult<Vec<(u64, FieldMap)>> {
+        let _ = self.resolve_type_id(source_type)?;
         let type_def = self
             .schema
             .get_type(source_type)
             .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
 
-        let field = type_def
-            .get_field(field_name)
-            .ok_or_else(|| EngineError::FieldNotFound {
-                type_name: source_type.into(),
-                field: field_name.into(),
-            })?;
+        let field = type_def.get_field(field_name).ok_or_else(|| {
+            self.field_retired_error(source_type, field_name)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
+                    type_name: source_type.into(),
+                    field: field_name.into(),
+                })
+        })?;
 
         let snapshot = self.storage.read_snapshot();
 
@@ -3417,6 +3663,191 @@ mod tests {
     use super::*;
     use crate::object::find_bytes_field_in_raw;
     use rhypedb_schema::parser::parse_schema;
+
+    fn open_with_shrink(schema: Schema, dir: &std::path::Path) -> Arc<Database> {
+        let mut opts = OpenOptions::default();
+        opts.allow_schema_shrink = true;
+        Database::open_with_options(schema, dir, opts).unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // Tombstone gating — read paths
+    // -----------------------------------------------------------------
+
+    /// A type that was retired via schema shrink must error with
+    /// `TypeRetired` (not `TypeNotFound`) when named in `get`. The
+    /// distinction matters because the operator's mental model is
+    /// different: "you removed it" vs. "you typoed."
+    #[test]
+    fn get_on_retired_type_returns_type_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        // Open with two types, insert into both, retire one, reopen.
+        let big = parse_schema(
+            r#"
+            type User { name: String }
+            type Movie { title: String }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(big, dir.path()).unwrap();
+        let mut fields = FieldMap::new();
+        fields.insert("title".into(), Value::String("Inception".into()));
+        let movie = db.create("Movie", fields).unwrap();
+        drop(db);
+
+        let smaller = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db2 = open_with_shrink(smaller, dir.path());
+        let err = db2.get("Movie", movie.id).unwrap_err();
+        let EngineError::TypeRetired { name, .. } = err else {
+            panic!("expected TypeRetired, got {err}");
+        };
+        assert_eq!(name, "Movie");
+    }
+
+    /// A field that was retired on a still-live type is stripped from
+    /// the returned FieldMap. The on-disk bytes are preserved.
+    #[test]
+    fn get_strips_retired_field_from_returned_field_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = parse_schema(
+            r#"
+            type User {
+                name: String
+                nickname: String
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(big, dir.path()).unwrap();
+        let mut fields = FieldMap::new();
+        fields.insert("name".into(), Value::String("Alice".into()));
+        fields.insert("nickname".into(), Value::String("Ally".into()));
+        let user = db.create("User", fields).unwrap();
+        drop(db);
+
+        let smaller = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db2 = open_with_shrink(smaller, dir.path());
+        let fetched = db2.get("User", user.id).unwrap();
+        assert!(fetched.fields.get("name").is_some());
+        assert!(
+            fetched.fields.get("nickname").is_none(),
+            "retired field must be stripped from returned FieldMap"
+        );
+    }
+
+    /// `scan_type` on a retired type errors; on a live type, the
+    /// returned FieldMaps have any retired fields stripped.
+    #[test]
+    fn scan_type_strips_retired_fields_and_rejects_retired_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = parse_schema(
+            r#"
+            type User {
+                name: String
+                nickname: String
+            }
+            type Movie { title: String }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(big, dir.path()).unwrap();
+        for i in 0..3 {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(format!("u{i}")));
+            f.insert("nickname".into(), Value::String(format!("nick{i}")));
+            db.create("User", f).unwrap();
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(format!("m{i}")));
+            db.create("Movie", f).unwrap();
+        }
+        drop(db);
+
+        let smaller = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db2 = open_with_shrink(smaller, dir.path());
+        let users = db2.scan_type("User").unwrap();
+        assert_eq!(users.len(), 3);
+        for u in &users {
+            assert!(u.fields.get("name").is_some());
+            assert!(u.fields.get("nickname").is_none());
+        }
+        let err = db2.scan_type("Movie").unwrap_err();
+        assert!(matches!(err, EngineError::TypeRetired { .. }));
+    }
+
+    // -----------------------------------------------------------------
+    // Tombstone gating — write paths
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn create_on_retired_type_returns_type_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = parse_schema(
+            r#"
+            type User { name: String }
+            type Movie { title: String }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(big, dir.path()).unwrap();
+        drop(db);
+        let smaller = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db2 = open_with_shrink(smaller, dir.path());
+        let mut f = FieldMap::new();
+        f.insert("title".into(), Value::String("x".into()));
+        let err = db2.create("Movie", f).unwrap_err();
+        assert!(matches!(err, EngineError::TypeRetired { .. }));
+    }
+
+    #[test]
+    fn update_with_retired_field_returns_field_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = parse_schema(
+            r#"
+            type User {
+                name: String
+                nickname: String
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(big, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        f.insert("nickname".into(), Value::String("Ally".into()));
+        let user = db.create("User", f).unwrap();
+        drop(db);
+
+        let smaller = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db2 = open_with_shrink(smaller, dir.path());
+        let mut updates = FieldMap::new();
+        updates.insert("nickname".into(), Value::String("Newname".into()));
+        let err = db2.update("User", user.id, updates).unwrap_err();
+        let EngineError::FieldRetired { field, .. } = err else {
+            panic!("expected FieldRetired, got {err}");
+        };
+        assert_eq!(field, "nickname");
+    }
+
+    #[test]
+    fn delete_on_retired_type_returns_type_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = parse_schema(
+            r#"
+            type User { name: String }
+            type Movie { title: String }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(big, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("title".into(), Value::String("x".into()));
+        let movie = db.create("Movie", f).unwrap();
+        drop(db);
+        let smaller = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db2 = open_with_shrink(smaller, dir.path());
+        let err = db2.delete("Movie", movie.id).unwrap_err();
+        assert!(matches!(err, EngineError::TypeRetired { .. }));
+    }
 
     fn test_schema() -> Schema {
         parse_schema(
