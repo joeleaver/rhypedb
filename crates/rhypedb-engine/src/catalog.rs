@@ -94,7 +94,12 @@ pub(crate) const CATALOG_FORMAT_V3: u64 = 3;
 /// Bumped the first time a field-type change is applied. Earlier-format
 /// catalogs that never change a field type stay at their current version.
 pub(crate) const CATALOG_FORMAT_V4: u64 = 4;
-pub(crate) const CATALOG_FORMAT_CURRENT: u64 = CATALOG_FORMAT_V4;
+/// Set by the first successful `rename_field` (card 3/5 phase 2). Pure
+/// marker — `c:F:` only — so v4 readers refuse to open a v5 catalog (the
+/// pre-rename binary cannot resolve `<old>` to a field that has been
+/// renamed away).
+pub(crate) const CATALOG_FORMAT_V5: u64 = 5;
+pub(crate) const CATALOG_FORMAT_CURRENT: u64 = CATALOG_FORMAT_V5;
 
 /// Per-row record format version. Future phases may bump for rows that
 /// carry semantic-meaning TLVs phase 1 can't interpret.
@@ -657,11 +662,19 @@ fn load_or_initialize_attempt(
 // blob keys, and index hashes) stay unchanged.
 // =====================================================================
 
-/// One rename verb in a migration plan. Card 3/5 only supports
-/// `Type { old, new }`; a future card adds `Field { type_name, old, new }`.
+/// One rename verb in a migration plan. Card 3/5 phase 1 shipped only
+/// the `Type` variant (rename_field was deferred because SST v4 zone-map
+/// columns were keyed by FNV(field_name) — a field rename would have
+/// silently corrupted zone pruning). With SST v5 keying zone columns by
+/// the stable catalog field_id, `Field` is now safe to land.
 #[derive(Debug, Clone)]
 pub(crate) enum RenameVerb {
     Type { old: String, new: String },
+    Field {
+        type_name: String,
+        old: String,
+        new: String,
+    },
 }
 
 /// A field-type change verb. Card 4/5 phase 1 only supports plain
@@ -689,9 +702,22 @@ pub struct RenamePair {
 #[derive(Debug, Clone, Default)]
 pub struct MigrationReport {
     pub renamed_types: Vec<RenamePair>,
+    pub renamed_fields: Vec<FieldRenamePair>,
     pub field_type_changes: Vec<FieldTypeChangePair>,
     pub catalog_format_before: u64,
     pub catalog_format_after: u64,
+}
+
+/// One field rename, included in the report. `type_name` is the (possibly
+/// already-renamed) parent type the field hangs off of. `field_id` is the
+/// stable catalog id, preserved by the rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldRenamePair {
+    pub type_name: String,
+    pub from: String,
+    pub to: String,
+    pub field_id: u64,
+    pub objects_rewritten: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,6 +736,7 @@ pub struct FieldTypeChangePair {
 /// per `apply` call. Returns a structured report or a typed error.
 pub(crate) fn apply_migration(
     storage: &LsmTree,
+    schema: &Schema,
     verbs: &[RenameVerb],
 ) -> EngineResult<MigrationReport> {
     let _guard = CATALOG_INIT_LOCK.lock();
@@ -760,21 +787,48 @@ pub(crate) fn apply_migration(
                         &mut report,
                     )?;
                 }
+                RenameVerb::Field {
+                    type_name,
+                    old,
+                    new,
+                } => {
+                    apply_field_rename_verb(
+                        storage,
+                        schema,
+                        snap,
+                        &mut cat,
+                        type_name,
+                        old,
+                        new,
+                        now_ms,
+                        &mut puts,
+                        &mut deletes,
+                        &mut report,
+                    )?;
+                }
             }
         }
 
-        if report.renamed_types.is_empty() {
+        if report.renamed_types.is_empty() && report.renamed_fields.is_empty() {
             // No-op plan. Abort the txn; don't bump format or touch
             // digest.
             return Ok((report, false));
         }
 
-        // Bump catalog format to v3 the first time a rename lands.
-        if cat.format_version < CATALOG_FORMAT_V3 {
-            cat.format_version = CATALOG_FORMAT_V3;
+        // Bump catalog format. A rename_type plan minimally bumps to v3
+        // (the historical type-rename marker). A rename_field plan that
+        // lands at all forces v5 — v4 readers can't safely resolve a
+        // renamed field to its pre-rename name (the schema names are now
+        // out of sync with the v4 binary's expectations).
+        let mut target_format = cat.format_version.max(CATALOG_FORMAT_V3);
+        if !report.renamed_fields.is_empty() {
+            target_format = target_format.max(CATALOG_FORMAT_V5);
+        }
+        if cat.format_version < target_format {
+            cat.format_version = target_format;
             puts.push((
                 KeyBuilder::catalog_format(),
-                encode_format_version(CATALOG_FORMAT_V3),
+                encode_format_version(target_format),
             ));
         }
         report.catalog_format_after = cat.format_version;
@@ -983,6 +1037,269 @@ fn apply_type_rename_verb(
         from: old.into(),
         to: new.into(),
         id: preserved_id,
+    });
+    Ok(())
+}
+
+/// rename_field verb (card 3/5 phase 2). Mirrors `apply_type_rename_verb`
+/// for catalog mutation, then additionally rewrites every object's
+/// serialized FieldMap so the field appears under the new name.
+///
+/// **Scope of rewrite:**
+/// * Every `o:<type_id>:*` object — required for correctness because
+///   FieldMap entries are keyed by field name natively (see
+///   `crates/rhypedb-engine/src/object.rs:130 serialize_fields_into`).
+/// * Catalog row `c:E:<type>\x00<old>` → `c:E:<type>\x00<new>`,
+///   preserving `field_id` and appending a `RenameRecord`.
+///
+/// **Deliberately NOT rewritten in this phase:** reverse-edge cover
+/// blobs (`r:*` values) carry a copy of the source's FieldMap under the
+/// pre-rename name. Reads via the executor's cover-fusion path observe
+/// the mismatch when the cover's `<old>__cover_v` stamp doesn't match
+/// the target's live generation (or, for non-relation renames, when the
+/// bare name lookup misses) and fall through to a fresh LSM probe —
+/// correct but slower until the cover-refresh sweeper rewrites that
+/// source's outbound rev_edges (which happens lazily as targets get
+/// updated). The same lazy-warmup answer applies as for the v4→v5 SST
+/// zone-map transition.
+///
+/// **Atomicity:** the entire rewrite + catalog mutation lands in one
+/// LSM batch under `CATALOG_INIT_LOCK`. A 1 M-object rename produces one
+/// fsync — fine for planned maintenance, not for hot online use. The
+/// resumable-cursor shadow-field design (Epic #3) is the right answer
+/// for the latter.
+#[allow(clippy::too_many_arguments)]
+fn apply_field_rename_verb(
+    storage: &LsmTree,
+    schema: &Schema,
+    snap: u64,
+    cat: &mut Catalog,
+    type_name: &str,
+    old: &str,
+    new: &str,
+    now_ms: u64,
+    puts: &mut Vec<(Bytes, Bytes)>,
+    deletes: &mut Vec<Bytes>,
+    report: &mut MigrationReport,
+) -> EngineResult<()> {
+    // No-op rejection.
+    if old == new {
+        return Err(EngineError::Catalog(CatalogError::RenameNoOp {
+            kind: "field",
+            name: format!("{type_name}.{old}"),
+        }));
+    }
+    // Identifier safety on the new name (reuses the same validator that
+    // gates schema-side identifier names — rejects `\x00`, `:`, `__`,
+    // empty, etc.).
+    check_identifier(new)?;
+
+    // Parent type must exist and be live.
+    let type_entry = cat
+        .type_entries
+        .get(type_name)
+        .ok_or_else(|| {
+            EngineError::Catalog(CatalogError::RenameSourceNotFound {
+                kind: "type",
+                name: type_name.into(),
+            })
+        })?
+        .clone();
+    if type_entry.status == TombstoneStatus::Tombstoned {
+        return Err(EngineError::Catalog(CatalogError::RenameSourceRetired {
+            kind: "type",
+            name: type_name.into(),
+            retired_id: type_entry.id,
+            retired_at_ms: type_entry.retired_at_ms.unwrap_or(0),
+        }));
+    }
+
+    let old_qual = format!("{type_name}.{old}");
+    let new_qual = format!("{type_name}.{new}");
+
+    // Source field must exist and be live.
+    let field_entry = cat
+        .field_entries
+        .get(&old_qual)
+        .ok_or_else(|| EngineError::Catalog(CatalogError::RenameSourceNotFound {
+            kind: "field",
+            name: old_qual.clone(),
+        }))?
+        .clone();
+    if field_entry.status == TombstoneStatus::Tombstoned {
+        return Err(EngineError::Catalog(CatalogError::RenameSourceRetired {
+            kind: "field",
+            name: old_qual.clone(),
+            retired_id: field_entry.id,
+            retired_at_ms: field_entry.retired_at_ms.unwrap_or(0),
+        }));
+    }
+
+    // Target field must not exist (live or tombstoned within this type).
+    // We also check the rel_entries side so e.g. `User.movie` (relation
+    // field) doesn't clash with a `User.movie` scalar field that gets
+    // renamed in.
+    if let Some(existing) = cat.field_entries.get(&new_qual) {
+        if existing.status == TombstoneStatus::Tombstoned {
+            return Err(EngineError::Catalog(CatalogError::RenameTargetIsRetired {
+                kind: "field",
+                name: new_qual.clone(),
+                retired_id: existing.id,
+            }));
+        }
+        return Err(EngineError::Catalog(CatalogError::RenameTargetCollision {
+            kind: "field",
+            name: new_qual.clone(),
+            existing_id: existing.id,
+        }));
+    }
+    if let Some(existing) = cat.rel_entries.get(&new_qual) {
+        if existing.status == TombstoneStatus::Tombstoned {
+            return Err(EngineError::Catalog(CatalogError::RenameTargetIsRetired {
+                kind: "field",
+                name: new_qual.clone(),
+                retired_id: existing.id,
+            }));
+        }
+        return Err(EngineError::Catalog(CatalogError::RenameTargetCollision {
+            kind: "field",
+            name: new_qual.clone(),
+            existing_id: existing.id,
+        }));
+    }
+    if cat.tombstoned_field_quals.contains(&new_qual) {
+        return Err(EngineError::Catalog(CatalogError::RenameTargetIsRetired {
+            kind: "field",
+            name: new_qual.clone(),
+            retired_id: 0,
+        }));
+    }
+
+    // History-cap check.
+    if field_entry.previous_names.len() + 1 > MAX_RENAME_HISTORY {
+        return Err(EngineError::Catalog(
+            CatalogError::RenameHistoryCapExceeded {
+                kind: "field",
+                name: old_qual.clone(),
+                cap: MAX_RENAME_HISTORY,
+            },
+        ));
+    }
+
+    // ---- Directive / kind refusal (phase 2 scope) -----------------
+    // Look up the schema's view of the field. The caller passes the
+    // post-rename schema (matching the run_migrations contract), so the
+    // field appears under `new` — except in the special case where the
+    // operator handed in a schema that still has `old` (e.g. called
+    // directly via Database::rename_field with the pre-rename schema).
+    // Try both to keep that path working.
+    if let Some(type_def) = schema.types.get(type_name) {
+        let field_def = type_def
+            .fields
+            .iter()
+            .find(|f| f.name == new || f.name == old);
+        if let Some(fd) = field_def {
+            if matches!(fd.field_type, FieldType::Relation(_)) {
+                return Err(EngineError::Catalog(
+                    CatalogError::RenameFieldRelationUnsupported {
+                        qualified: old_qual.clone(),
+                    },
+                ));
+            }
+            if fd.is_indexed() {
+                return Err(EngineError::Catalog(
+                    CatalogError::RenameFieldDirectiveUnsupported {
+                        qualified: old_qual.clone(),
+                        directive: "@indexed",
+                    },
+                ));
+            }
+            if fd.is_unique() {
+                return Err(EngineError::Catalog(
+                    CatalogError::RenameFieldDirectiveUnsupported {
+                        qualified: old_qual.clone(),
+                        directive: "@unique",
+                    },
+                ));
+            }
+            if fd.vectorize().is_some() {
+                return Err(EngineError::Catalog(
+                    CatalogError::RenameFieldDirectiveUnsupported {
+                        qualified: old_qual.clone(),
+                        directive: "@vectorize",
+                    },
+                ));
+            }
+        }
+    }
+
+    // ---- Object FieldMap rewrite ----------------------------------
+    // Every existing object of this type encodes the old field name in
+    // its serialized FieldMap. Rewrite each one to use the new name
+    // before catalog commit, all in the same atomic batch. Skipping
+    // this would make reads of the renamed field return None for every
+    // pre-rename object.
+    let type_id = *cat.type_ids.get(type_name).ok_or_else(|| {
+        EngineError::Catalog(CatalogError::RenameSourceNotFound {
+            kind: "type",
+            name: type_name.into(),
+        })
+    })?;
+    let prefix = KeyBuilder::object_prefix(type_id);
+    let entries = storage.scan_prefix_at(snap, &prefix)?;
+    let mut objects_rewritten: u64 = 0;
+    for (key, data) in entries {
+        let mut fields = crate::object::deserialize_fields(&data);
+        // Only rewrite when the field is present — an object may have
+        // been written before the field existed in the schema (legacy
+        // path) and just lacks the entry, in which case there's nothing
+        // to rename.
+        if let Some(value) = fields.remove(old) {
+            fields.insert(new.into(), value);
+            let new_blob = crate::object::serialize_fields(&fields);
+            puts.push((key.clone(), new_blob));
+            objects_rewritten += 1;
+        }
+    }
+
+    // ---- Catalog row mutation -------------------------------------
+    let mut new_entry = field_entry.clone();
+    let preserved_id = new_entry.id;
+    new_entry.previous_names.insert(
+        0,
+        RenameRecord {
+            from: old.into(),
+            to: new.into(),
+            wall_time_unix_ms: now_ms,
+        },
+    );
+    new_entry.last_renamed_at_ms = Some(now_ms);
+
+    puts.push((
+        KeyBuilder::catalog_field(type_name, new),
+        encode_id_entry(&new_entry),
+    ));
+    deletes.push(KeyBuilder::catalog_field(type_name, old));
+
+    // Re-key in-memory catalog maps so subsequent verbs in this same
+    // plan observe the new name. Tombstoned-quals set is NOT touched:
+    // a rename leaves the old name free for reuse (the field wasn't
+    // retired, it was renamed).
+    cat.field_ids.remove(&old_qual);
+    cat.field_ids.insert(new_qual.clone(), preserved_id);
+    if let Some(kind) = cat.field_kinds.remove(&old_qual) {
+        cat.field_kinds.insert(new_qual.clone(), kind);
+    }
+    cat.field_entries.remove(&old_qual);
+    cat.field_entries
+        .insert(new_qual.clone(), new_entry);
+
+    report.renamed_fields.push(FieldRenamePair {
+        type_name: type_name.into(),
+        from: old.into(),
+        to: new.into(),
+        field_id: preserved_id,
+        objects_rewritten,
     });
     Ok(())
 }
@@ -1337,7 +1654,22 @@ impl MigrationContext<'_> {
             old: old.into(),
             new: new.into(),
         }];
-        apply_migration(self.storage, &verbs)?;
+        apply_migration(self.storage, self.schema, &verbs)?;
+        Ok(())
+    }
+
+    pub fn rename_field(
+        &self,
+        type_name: &str,
+        old: &str,
+        new: &str,
+    ) -> EngineResult<()> {
+        let verbs = [RenameVerb::Field {
+            type_name: type_name.into(),
+            old: old.into(),
+            new: new.into(),
+        }];
+        apply_migration(self.storage, self.schema, &verbs)?;
         Ok(())
     }
 
@@ -3627,6 +3959,7 @@ mod tests {
 
         let report = apply_migration(
             &storage,
+            &schema_before,
             &[RenameVerb::Type {
                 old: "User".into(),
                 new: "Account".into(),
@@ -3669,6 +4002,7 @@ mod tests {
 
         apply_migration(
             &storage,
+            &schema_before,
             &[RenameVerb::Type {
                 old: "User".into(),
                 new: "Account".into(),
@@ -3707,6 +4041,7 @@ mod tests {
 
         apply_migration(
             &storage,
+            &schema,
             &[RenameVerb::Type {
                 old: "User".into(),
                 new: "Account".into(),
@@ -3715,6 +4050,7 @@ mod tests {
         .unwrap();
         apply_migration(
             &storage,
+            &schema,
             &[RenameVerb::Type {
                 old: "Account".into(),
                 new: "Member".into(),
@@ -3744,6 +4080,7 @@ mod tests {
         let _ = load_or_initialize(&storage, &schema, false).unwrap();
         let err = apply_migration(
             &storage,
+            &schema,
             &[RenameVerb::Type {
                 old: "Missing".into(),
                 new: "Other".into(),
@@ -3767,6 +4104,7 @@ mod tests {
         let _ = load_or_initialize(&storage, &schema, false).unwrap();
         let err = apply_migration(
             &storage,
+            &schema,
             &[RenameVerb::Type {
                 old: "User".into(),
                 new: "Movie".into(),
@@ -3795,6 +4133,7 @@ mod tests {
         // Try to rename User → Movie (Movie is tombstoned).
         let err = apply_migration(
             &storage,
+            &smaller,
             &[RenameVerb::Type {
                 old: "User".into(),
                 new: "Movie".into(),
@@ -3815,6 +4154,7 @@ mod tests {
         let _ = load_or_initialize(&storage, &schema, false).unwrap();
         let err = apply_migration(
             &storage,
+            &schema,
             &[RenameVerb::Type {
                 old: "User".into(),
                 new: "User".into(),
@@ -3836,6 +4176,7 @@ mod tests {
         assert_eq!(cat_pre.format_version, CATALOG_FORMAT_V1);
         let report = apply_migration(
             &storage,
+            &schema,
             &[RenameVerb::Type {
                 old: "User".into(),
                 new: "Account".into(),
@@ -3863,6 +4204,7 @@ mod tests {
         // Movie is tombstoned. Try to rename it.
         let err = apply_migration(
             &storage,
+            &smaller,
             &[RenameVerb::Type {
                 old: "Movie".into(),
                 new: "Film".into(),
@@ -3890,6 +4232,7 @@ mod tests {
 
         apply_migration(
             &storage,
+            &schema_before,
             &[RenameVerb::Type {
                 old: "User".into(),
                 new: "Account".into(),
@@ -3909,6 +4252,306 @@ mod tests {
         assert_ne!(cat_after.type_ids["User"], original_user_id);
         // No tombstone — rename doesn't tombstone.
         assert!(!cat_after.tombstoned_type_names.contains("User"));
+    }
+
+    // -----------------------------------------------------------------
+    // rename_field (card 3/5 phase 2) — apply_migration tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rename_field_preserves_field_id_and_bumps_format_to_v5() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema_before = schema_with(vec![(
+            "User",
+            vec![
+                scalar("name", ScalarType::String),
+                scalar("age", ScalarType::U32),
+            ],
+        )]);
+        let cat_before = load_or_initialize(&storage, &schema_before, false).unwrap();
+        let name_id = cat_before.field_ids["User.name"];
+
+        let report = apply_migration(
+            &storage,
+            &schema_before,
+            &[RenameVerb::Field {
+                type_name: "User".into(),
+                old: "name".into(),
+                new: "handle".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.renamed_fields.len(), 1);
+        let rep = &report.renamed_fields[0];
+        assert_eq!(rep.from, "name");
+        assert_eq!(rep.to, "handle");
+        assert_eq!(rep.field_id, name_id);
+        assert_eq!(report.catalog_format_after, CATALOG_FORMAT_V5);
+
+        // Reopen with the post-rename schema. Field ID is preserved under
+        // the new qualified name; the old qualified name is gone.
+        let schema_after = schema_with(vec![(
+            "User",
+            vec![
+                scalar("handle", ScalarType::String),
+                scalar("age", ScalarType::U32),
+            ],
+        )]);
+        let cat_after = load_or_initialize(&storage, &schema_after, false).unwrap();
+        assert_eq!(cat_after.field_ids["User.handle"], name_id);
+        assert!(!cat_after.field_ids.contains_key("User.name"));
+    }
+
+    #[test]
+    fn rename_field_records_audit_chain() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![(
+            "User",
+            vec![scalar("name", ScalarType::String)],
+        )]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+
+        apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "User".into(),
+                old: "name".into(),
+                new: "handle".into(),
+            }],
+        )
+        .unwrap();
+        apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "User".into(),
+                old: "handle".into(),
+                new: "username".into(),
+            }],
+        )
+        .unwrap();
+
+        // Re-open with the post-rename schema; the field's
+        // previous_names chain shows the full audit history.
+        let schema_after = schema_with(vec![(
+            "User",
+            vec![scalar("username", ScalarType::String)],
+        )]);
+        let cat = load_or_initialize(&storage, &schema_after, false).unwrap();
+        let entry = &cat.field_entries["User.username"];
+        assert_eq!(entry.previous_names.len(), 2);
+        // Most recent first.
+        assert_eq!(entry.previous_names[0].from, "handle");
+        assert_eq!(entry.previous_names[0].to, "username");
+        assert_eq!(entry.previous_names[1].from, "name");
+        assert_eq!(entry.previous_names[1].to, "handle");
+    }
+
+    #[test]
+    fn rename_field_source_not_found_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![(
+            "User",
+            vec![scalar("name", ScalarType::String)],
+        )]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "User".into(),
+                old: "missing".into(),
+                new: "other".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameSourceNotFound { kind: "field", .. })
+        ));
+    }
+
+    #[test]
+    fn rename_field_parent_type_not_found_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![(
+            "User",
+            vec![scalar("name", ScalarType::String)],
+        )]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "Missing".into(),
+                old: "name".into(),
+                new: "handle".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameSourceNotFound { kind: "type", .. })
+        ));
+    }
+
+    #[test]
+    fn rename_field_target_collision_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![(
+            "User",
+            vec![
+                scalar("name", ScalarType::String),
+                scalar("nickname", ScalarType::String),
+            ],
+        )]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "User".into(),
+                old: "name".into(),
+                new: "nickname".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameTargetCollision { kind: "field", .. })
+        ));
+    }
+
+    #[test]
+    fn rename_field_no_op_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![(
+            "User",
+            vec![scalar("name", ScalarType::String)],
+        )]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "User".into(),
+                old: "name".into(),
+                new: "name".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameNoOp { kind: "field", .. })
+        ));
+    }
+
+    #[test]
+    fn rename_field_indexed_field_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![(
+            "Movie",
+            vec![
+                scalar("title", ScalarType::String),
+                scalar_indexed("year", ScalarType::U32),
+            ],
+        )]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "Movie".into(),
+                old: "year".into(),
+                new: "released_in".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameFieldDirectiveUnsupported {
+                directive: "@indexed",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rename_field_relation_field_refused() {
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![
+            (
+                "User",
+                vec![
+                    scalar("name", ScalarType::String),
+                    relation("favourite", "Movie", false),
+                ],
+            ),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "User".into(),
+                old: "favourite".into(),
+                new: "pick".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameFieldRelationUnsupported { .. })
+        ));
+    }
+
+    #[test]
+    fn rename_field_old_name_freed_for_reuse() {
+        // After rename, the old name should be free to allocate a fresh
+        // field at — same precedent as type rename. We don't tombstone.
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema_before = schema_with(vec![(
+            "User",
+            vec![scalar("name", ScalarType::String)],
+        )]);
+        let cat_pre = load_or_initialize(&storage, &schema_before, false).unwrap();
+        let orig_field_id = cat_pre.field_ids["User.name"];
+
+        apply_migration(
+            &storage,
+            &schema_before,
+            &[RenameVerb::Field {
+                type_name: "User".into(),
+                old: "name".into(),
+                new: "handle".into(),
+            }],
+        )
+        .unwrap();
+
+        // Re-open with a schema that has BOTH the renamed-to name AND
+        // a fresh field at the old name.
+        let schema_after = schema_with(vec![(
+            "User",
+            vec![
+                scalar("handle", ScalarType::String),
+                scalar("name", ScalarType::String),
+            ],
+        )]);
+        let cat_after = load_or_initialize(&storage, &schema_after, false).unwrap();
+        assert_eq!(cat_after.field_ids["User.handle"], orig_field_id);
+        // The new `name` must have a fresh id, NOT the original.
+        assert_ne!(cat_after.field_ids["User.name"], orig_field_id);
     }
 
     #[test]

@@ -73,22 +73,22 @@ impl TombstoneArena {
         self.ranges.push(r);
     }
 
-    fn push_unique_index(&mut self, type_id: u64, field_hash: u64, value_bytes: &[u8]) {
-        let r = KeyBuilder::unique_index_into(&mut self.buf, type_id, field_hash, value_bytes);
+    fn push_unique_index(&mut self, type_id: u64, field_id: u64, value_bytes: &[u8]) {
+        let r = KeyBuilder::unique_index_into(&mut self.buf, type_id, field_id, value_bytes);
         self.ranges.push(r);
     }
 
     fn push_field_index(
         &mut self,
         type_id: u64,
-        field_hash: u64,
+        field_id: u64,
         encoded_value: &[u8; 8],
         object_id: u64,
     ) {
         let r = KeyBuilder::field_index_into(
             &mut self.buf,
             type_id,
-            field_hash,
+            field_id,
             encoded_value,
             object_id,
         );
@@ -98,14 +98,14 @@ impl TombstoneArena {
     fn push_field_index_var(
         &mut self,
         type_id: u64,
-        field_hash: u64,
+        field_id: u64,
         encoded_value: &[u8],
         object_id: u64,
     ) {
         let r = KeyBuilder::field_index_var_into(
             &mut self.buf,
             type_id,
-            field_hash,
+            field_id,
             encoded_value,
             object_id,
         );
@@ -224,7 +224,7 @@ pub struct Database {
     /// resolve names for subscription events without consulting the schema.
     type_name_by_id: HashMap<u64, String>,
     /// type_name → list of @indexed scalar fields, with their pre-resolved
-    /// (field_name, field_hash). Cached so the create/update/delete write
+    /// (field_name, field_id). Cached so the create/update/delete write
     /// paths don't re-traverse the schema per object.
     indexed_fields: HashMap<String, Vec<IndexedField>>,
     /// Per-object monotonic generation counter, bumped on every successful
@@ -251,6 +251,15 @@ pub struct Database {
     cover_refresh_tx: parking_lot::Mutex<Option<std::sync::mpsc::Sender<(u64, u64)>>>,
     /// Join handle for the cover-refresh worker thread. Taken on drop.
     cover_refresh_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// `(type_id, field_name) -> field_id` lookup used by the zone-map
+    /// extractor (write path) and `filter_scan` predicate builder (read
+    /// path). Wrapped in `Arc<ArcSwap<...>>` so:
+    /// * the extractor closure can capture it BEFORE the catalog loads
+    ///   (chicken-and-egg: `LsmConfig::zone_extractor` must be set before
+    ///   `LsmTree::open`, but the catalog only loads after); and
+    /// * a future migrate verb can rebuild and atomically swap the table
+    ///   without touching `LsmConfig` or rebuilding the closure (PR B).
+    zone_field_id_lookup: Arc<arc_swap::ArcSwap<ZoneFieldIdLookup>>,
 }
 
 /// One @indexed scalar field on a type, with everything the write path needs
@@ -343,7 +352,21 @@ impl Database {
         // object entries' FieldMap blobs at SST flush/compaction time. Lets
         // `filter_scan` skip blocks whose min/max bounds rule out the
         // predicate without per-entry decode + compare.
-        config.zone_extractor = Some(Arc::new(extract_zone_fields));
+        //
+        // Two-phase init: the extractor needs a `(type_id, field_name) ->
+        // field_id` table that only exists after `catalog::load_or_initialize`
+        // runs, but `LsmConfig::zone_extractor` must be installed BEFORE
+        // `LsmTree::open`. Capture an empty `ArcSwap<HashMap>` here and swap
+        // in the populated table after the catalog loads. No flush can fire
+        // before population because nothing has been written yet.
+        let zone_field_id_lookup: Arc<arc_swap::ArcSwap<ZoneFieldIdLookup>> = Arc::new(
+            arc_swap::ArcSwap::from_pointee(ZoneFieldIdLookup::new()),
+        );
+        let extractor_lookup = Arc::clone(&zone_field_id_lookup);
+        config.zone_extractor = Some(Arc::new(move |internal_key, value| {
+            let snapshot = extractor_lookup.load();
+            do_extract_zone_fields(&snapshot, internal_key, value)
+        }));
         config.sync_on_commit = options.sync_on_commit;
         let storage = LsmTree::open(config)?;
 
@@ -570,6 +593,14 @@ impl Database {
         }
         drop(txn2);
 
+        // Populate the zone-field-id lookup now that the catalog has
+        // assigned IDs. The extractor closure already holds a clone of
+        // this `Arc<ArcSwap>` and will pick up the new table on its next
+        // load — which can't happen before this point (no flush has
+        // fired yet; the catalog load above only does reads).
+        zone_field_id_lookup
+            .store(Arc::new(build_zone_field_id_lookup(&schema, &type_ids, &field_ids)));
+
         let db = Arc::new(Self {
             schema,
             storage,
@@ -596,6 +627,7 @@ impl Database {
             version_counters: RwLock::new(version_counters),
             cover_refresh_tx: parking_lot::Mutex::new(None),
             cover_refresh_handle: parking_lot::Mutex::new(None),
+            zone_field_id_lookup,
         });
 
         // Spawn the cover-refresh worker now that `db` lives inside an Arc
@@ -780,12 +812,12 @@ impl Database {
     }
 
     // -----------------------------------------------------------------
-    // Schema migration verb (card 3/5).
+    // Schema migration verbs (card 3/5).
     //
-    // Today's plan supports `rename_type` only. `rename_field` is
-    // deferred to a follow-on card that also addresses zone-map
-    // name-hash keying — field-renaming today would orphan zone-map
-    // columns in existing SSTs.
+    // `rename_type` shipped in card 3/5 phase 1. `rename_field` lands
+    // in phase 2: SST v5 zone maps are keyed by stable catalog
+    // field_id (rename-invariant), and FieldMap rewrites at rename
+    // time keep `o:` object data and `r:` cover blobs consistent.
     // -----------------------------------------------------------------
 
     /// Rename a live type from `old` to `new`. The numeric type_id is
@@ -814,7 +846,49 @@ impl Database {
             old: old.into(),
             new: new.into(),
         }];
-        crate::catalog::apply_migration(&self.storage, &verbs)
+        crate::catalog::apply_migration(&self.storage, &self.schema, &verbs)
+    }
+
+    /// Rename a live field from `type_name.old` to `type_name.new`. The
+    /// numeric `field_id` is preserved; every existing object's
+    /// serialized FieldMap (`o:<type_id>:<obj_id>` value) is rewritten
+    /// to use the new name in the same atomic LSM batch as the catalog
+    /// row update.
+    ///
+    /// What stays consistent by construction:
+    /// * Object reads of the new name — every existing object has been
+    ///   rewritten.
+    /// * Secondary index entries (`i:<type>:<field_id>:…`) and unique
+    ///   index entries (`u:<type>:<field_id>:…`) — both keyed by
+    ///   `field_id`, untouched by the rename.
+    /// * SST zone-map pruning — v5 zone columns are also keyed by
+    ///   `field_id`, so existing block bounds keep pruning correctly
+    ///   under the new name.
+    ///
+    /// What self-heals lazily:
+    /// * Reverse-edge cover blobs (`r:*` values) carry a copy of the
+    ///   source's FieldMap under the pre-rename name. Reads through the
+    ///   executor fusion path miss on the new name and fall through to
+    ///   a fresh LSM probe — correct, just slower until the cover-
+    ///   refresh sweeper rewrites them as targets get updated.
+    ///
+    /// **Caller MUST drop this `Database` handle after a successful
+    /// rename and re-open with the post-rename schema** — the in-memory
+    /// `schema`, `field_ids`, derived caches, and the zone-field-id
+    /// lookup are all stale until reopened. PR B's `Arc<Self>`-consuming
+    /// `migrate` variant lifts this requirement.
+    pub fn rename_field(
+        &self,
+        type_name: &str,
+        old: &str,
+        new: &str,
+    ) -> EngineResult<crate::catalog::MigrationReport> {
+        let verbs = [crate::catalog::RenameVerb::Field {
+            type_name: type_name.into(),
+            old: old.into(),
+            new: new.into(),
+        }];
+        crate::catalog::apply_migration(&self.storage, &self.schema, &verbs)
     }
 
     /// Apply pending migrations from the supplied list, idempotent
@@ -1364,7 +1438,7 @@ impl Database {
         target: i64,
         limit: Option<usize>,
     ) -> EngineResult<Vec<Object>> {
-        use rhypedb_storage::zone::{FieldPredicate, hash_field_name};
+        use rhypedb_storage::zone::FieldPredicate;
 
         let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
@@ -1421,8 +1495,22 @@ impl Database {
         }
 
         // === Zone-map fallback ===
+        // Resolve the field's stable catalog ID for the zone-map predicate.
+        // The lookup table is the same one the extractor consulted at
+        // write time, so producer and consumer agree by construction —
+        // crucially, that agreement survives `rename_field` because
+        // field_id is preserved (only the name in the catalog row
+        // changes).
+        let lookup_guard = self.zone_field_id_lookup.load();
+        let field_id = lookup_guard
+            .get(&type_id)
+            .and_then(|entries| entries.iter().find(|(n, _)| n == field_name).map(|(_, id)| *id))
+            // Field isn't enrolled (non-integer, retired, or never
+            // existed) — predicate with an unmapped field is harmless:
+            // `ZoneMap::bounds()` returns None and every block must scan.
+            .unwrap_or(u32::MAX);
         let predicate = FieldPredicate {
-            field_hash: hash_field_name(field_name.as_bytes()),
+            field_id,
             op,
             target: target_u64,
         };
@@ -3532,24 +3620,91 @@ fn validate_value(field_def: &rhypedb_schema::FieldDef, value: &Value) -> Engine
     Ok(())
 }
 
+/// `type_id` → list of `(field_name, field_id)` for every integer scalar
+/// field on that type. The zone-extractor consults this at SST flush time
+/// to translate a FieldMap's string-keyed entries into the `field_id` zone
+/// columns expect (SST v5+); the predicate builder in `filter_scan` uses
+/// the same table on the read path.
+///
+/// Rename-safety: `field_id` is the catalog's stable u64 truncated to u32
+/// — invariant across `rename_field`. So an SST written before a rename is
+/// still pruned correctly after, and the table is rebuilt without renumbering.
+pub(crate) type ZoneFieldIdLookup = HashMap<u64, Vec<(String, u32)>>;
+
+/// Build the zone-field lookup table from the loaded catalog. One entry per
+/// type that has at least one integer scalar field; the engine never enrolls
+/// non-integer fields in zone maps (`encode_int_for_zone` returns `None`
+/// for them).
+pub(crate) fn build_zone_field_id_lookup(
+    schema: &Schema,
+    type_ids: &HashMap<String, u64>,
+    field_ids: &HashMap<String, u64>,
+) -> ZoneFieldIdLookup {
+    let mut out: ZoneFieldIdLookup = HashMap::new();
+    for (type_name, type_def) in &schema.types {
+        let Some(&type_id) = type_ids.get(type_name) else {
+            continue;
+        };
+        let mut entries: Vec<(String, u32)> = Vec::new();
+        for field in &type_def.fields {
+            if !field_is_zone_eligible(field) {
+                continue;
+            }
+            let qual = format!("{type_name}.{}", field.name);
+            let Some(&fid_u64) = field_ids.get(&qual) else {
+                continue;
+            };
+            // Catalog IDs start at 1 and increment by 1 (see `c:N:E`); a
+            // schema with >2^32 fields is unreachable in practice but the
+            // debug_assert flags any future producer of larger IDs.
+            debug_assert!(fid_u64 <= u32::MAX as u64);
+            entries.push((field.name.clone(), fid_u64 as u32));
+        }
+        if !entries.is_empty() {
+            out.insert(type_id, entries);
+        }
+    }
+    out
+}
+
+/// Whether a field is eligible to be enrolled in an SST zone map. Mirrors
+/// `encode_int_for_zone`'s match arms.
+fn field_is_zone_eligible(field: &rhypedb_schema::FieldDef) -> bool {
+    matches!(
+        &field.field_type,
+        FieldType::Scalar(
+            ScalarType::U32 | ScalarType::U64 | ScalarType::I32 | ScalarType::I64
+        )
+    )
+}
+
 /// Zone-field extractor passed to `LsmConfig::zone_extractor`. Pulls integer
 /// field values out of an object entry's serialized FieldMap so the SST
 /// writer can record per-block min/max bounds.
 ///
 /// Returns empty when the entry isn't an object key (edges, reverse edges,
 /// unique-index entries, etc.) since their values aren't FieldMaps. Object
-/// keys are `o:<type>:<id>` so the prefix check is a 2-byte compare.
-pub(crate) fn extract_zone_fields(internal_key: &[u8], value: &[u8]) -> Vec<(u32, [u8; 8])> {
-    use rhypedb_storage::zone::hash_field_name;
-
-    if internal_key.len() < 2 || internal_key[0] != b'o' || internal_key[1] != b':' {
+/// keys are `o:<type>:<id>` so the prefix check is a 2-byte compare;
+/// `type_id` lives at bytes 2..10 (big-endian u64, per `KeyBuilder::object`).
+pub(crate) fn do_extract_zone_fields(
+    lookup: &ZoneFieldIdLookup,
+    internal_key: &[u8],
+    value: &[u8],
+) -> Vec<(u32, [u8; 8])> {
+    if internal_key.len() < 2 + 8 || internal_key[0] != b'o' || internal_key[1] != b':' {
         return Vec::new();
     }
+    let type_id = u64::from_be_bytes(internal_key[2..10].try_into().unwrap());
+    let Some(field_entries) = lookup.get(&type_id) else {
+        return Vec::new();
+    };
     let fields = deserialize_fields(value);
-    let mut out = Vec::with_capacity(2);
-    for (name, val) in &fields {
-        if let Some(encoded) = encode_int_for_zone(val) {
-            out.push((hash_field_name(name.as_bytes()), encoded));
+    let mut out: Vec<(u32, [u8; 8])> = Vec::with_capacity(field_entries.len());
+    for (name, fid) in field_entries {
+        if let Some(val) = fields.get(name.as_str())
+            && let Some(encoded) = encode_int_for_zone(val)
+        {
+            out.push((*fid, encoded));
         }
     }
     out
@@ -4045,6 +4200,193 @@ mod tests {
         // dropped entries, so this succeeds.
         let schema_after = parse_schema(r#"type Account { name: String }"#).unwrap();
         let _ = Database::open(schema_after, dir.path()).unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // rename_field (card 3/5 phase 2) — integration tests
+    // -----------------------------------------------------------------
+
+    /// Insert two objects under the old name, rename, reopen with the
+    /// post-rename schema, and assert both objects round-trip the value
+    /// under the new field name. Proves the in-batch FieldMap rewrite
+    /// landed for every object.
+    #[test]
+    fn rename_field_rewrites_object_fieldmaps_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(
+            r#"
+            type User {
+                name: String
+                age: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+
+        let mut f1 = FieldMap::new();
+        f1.insert("name".into(), Value::String("Alice".into()));
+        f1.insert("age".into(), Value::U32(30));
+        let u1 = db.create("User", f1).unwrap();
+
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String("Bob".into()));
+        f2.insert("age".into(), Value::U32(25));
+        let u2 = db.create("User", f2).unwrap();
+
+        let report = db.rename_field("User", "name", "handle").unwrap();
+        assert_eq!(report.renamed_fields.len(), 1);
+        assert_eq!(report.renamed_fields[0].objects_rewritten, 2);
+        drop(db);
+
+        let schema_after = parse_schema(
+            r#"
+            type User {
+                handle: String
+                age: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        let r1 = db2.get("User", u1.id).unwrap();
+        assert_eq!(
+            r1.fields.get("handle"),
+            Some(&Value::String("Alice".into())),
+            "object 1 must expose the value under the new name"
+        );
+        assert_eq!(
+            r1.fields.get("age"),
+            Some(&Value::U32(30)),
+            "untouched fields preserved"
+        );
+        assert!(
+            r1.fields.get("name").is_none(),
+            "the old name must NOT remain in the rewritten FieldMap"
+        );
+        let r2 = db2.get("User", u2.id).unwrap();
+        assert_eq!(
+            r2.fields.get("handle"),
+            Some(&Value::String("Bob".into()))
+        );
+    }
+
+    /// A field rename preserves the SST zone-map pruning — block bounds
+    /// are keyed by stable field_id (SST v5), so a `filter_scan` on the
+    /// renamed field still uses the bounds laid down before the rename.
+    #[test]
+    fn rename_field_preserves_zone_map_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                year: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+        // Insert enough movies to flush a multi-block SST.
+        for i in 0u32..256 {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(format!("Film {i}")));
+            f.insert("year".into(), Value::U32(1900 + i));
+            db.create("Movie", f).unwrap();
+        }
+        // Force a flush so the zone map gets baked into a v5 SST.
+        db.storage.flush().unwrap();
+
+        db.rename_field("Movie", "year", "released_in").unwrap();
+        drop(db);
+
+        let schema_after = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                released_in: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        // filter_scan on `released_in` with a tight predicate. If the
+        // zone map keyed by the new name's hash (it doesn't — it's keyed
+        // by field_id), bounds would be missing and we'd over-scan; if
+        // the rewrite missed objects, results would be empty. Both
+        // failure modes manifest as wrong counts.
+        let results = db2
+            .filter_scan(
+                "Movie",
+                "released_in",
+                rhypedb_storage::zone::CompareOp::Gt,
+                2100,
+                None,
+            )
+            .unwrap();
+        // Years 2101..2155 inclusive: 55 entries.
+        assert_eq!(results.len(), 55, "results: {}", results.len());
+    }
+
+    /// `Database::rename_field` errors propagate as typed catalog
+    /// errors. Smoke-test that the indexed-field refusal surfaces
+    /// without a catalog state mutation.
+    #[test]
+    fn rename_field_indexed_field_refused_at_db_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                year: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let err = db.rename_field("Movie", "year", "released_in").unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::RenameFieldDirectiveUnsupported {
+                directive: "@indexed",
+                ..
+            })
+        ));
+    }
+
+    /// `Database::rename_field` is idempotent when wrapped in
+    /// `run_migrations` — a second call with the same migration list
+    /// is a no-op rather than re-running the verb (which would refuse
+    /// with `RenameSourceNotFound` because the old name is gone).
+    #[test]
+    fn rename_field_idempotent_via_run_migrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        let u = db.create("User", f).unwrap();
+
+        db.run_migrations(vec![crate::catalog::Migration::new(
+            "001_rename_name_to_handle",
+            |m| m.rename_field("User", "name", "handle"),
+        )])
+        .unwrap();
+        drop(db);
+
+        // Re-open with post-rename schema; replay should be a no-op.
+        let schema_after = parse_schema(r#"type User { handle: String }"#).unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        db2.run_migrations(vec![crate::catalog::Migration::new(
+            "001_rename_name_to_handle",
+            |_| Ok(()),
+        )])
+        .unwrap();
+        let r = db2.get("User", u.id).unwrap();
+        assert_eq!(
+            r.fields.get("handle"),
+            Some(&Value::String("Alice".into()))
+        );
     }
 
     // -----------------------------------------------------------------

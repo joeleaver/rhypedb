@@ -10,7 +10,7 @@ pub enum KeyPrefix {
     Unique = b'u',
     Queue = b'q',
     VectorState = b's',
-    /// Non-unique scalar secondary index: `i:<type_id>:<field_hash>:<encoded_value>:<object_id>`.
+    /// Non-unique scalar secondary index: `i:<type_id>:<field_id>:<encoded_value>:<object_id>`.
     /// Empty value payload — the data is the key itself. Encoded value uses
     /// the same byte-order-preserving rules as zone maps so a prefix scan
     /// returns ids in ascending field-value order.
@@ -188,26 +188,26 @@ impl KeyBuilder {
         buf.freeze()
     }
 
-    /// Unique index key: `u:<type_id>:<field_name_hash>:<value_bytes>`
+    /// Unique index key: `u:<type_id>:<field_id>:<value_bytes>`
     /// Maps to the object_id that holds this unique value.
-    pub fn unique_index(type_id: u64, field_hash: u64, value_bytes: &[u8]) -> Bytes {
+    pub fn unique_index(type_id: u64, field_id: u64, value_bytes: &[u8]) -> Bytes {
         let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + value_bytes.len());
         buf.put_u8(KeyPrefix::Unique as u8);
         buf.put_u8(SEPARATOR);
         buf.put_u64(type_id);
         buf.put_u8(SEPARATOR);
-        buf.put_u64(field_hash);
+        buf.put_u64(field_id);
         buf.put_u8(SEPARATOR);
         buf.put_slice(value_bytes);
         buf.freeze()
     }
 
-    /// Secondary field index key: `i:<type_id>:<field_hash>:<encoded_value>:<object_id>`.
+    /// Secondary field index key: `i:<type_id>:<field_id>:<encoded_value>:<object_id>`.
     /// `encoded_value` is the 8-byte byte-order-preserving encoding from the
     /// engine; `object_id` is big-endian u64. Empty value payload.
     pub fn field_index(
         type_id: u64,
-        field_hash: u64,
+        field_id: u64,
         encoded_value: &[u8; 8],
         object_id: u64,
     ) -> Bytes {
@@ -216,7 +216,7 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.put_u64(type_id);
         buf.put_u8(SEPARATOR);
-        buf.put_u64(field_hash);
+        buf.put_u64(field_id);
         buf.put_u8(SEPARATOR);
         buf.put_slice(encoded_value);
         buf.put_u8(SEPARATOR);
@@ -225,23 +225,23 @@ impl KeyBuilder {
     }
 
     /// Prefix for scanning every entry of one type's indexed field, sorted
-    /// ascending by encoded value: `i:<type_id>:<field_hash>:`.
-    pub fn field_index_prefix(type_id: u64, field_hash: u64) -> Bytes {
+    /// ascending by encoded value: `i:<type_id>:<field_id>:`.
+    pub fn field_index_prefix(type_id: u64, field_id: u64) -> Bytes {
         let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1);
         buf.put_u8(KeyPrefix::FieldIndex as u8);
         buf.put_u8(SEPARATOR);
         buf.put_u64(type_id);
         buf.put_u8(SEPARATOR);
-        buf.put_u64(field_hash);
+        buf.put_u64(field_id);
         buf.put_u8(SEPARATOR);
         buf.freeze()
     }
 
     /// Prefix for scanning every entry of one type's indexed field matching a
-    /// specific value (equality lookup): `i:<type_id>:<field_hash>:<encoded_value>:`.
+    /// specific value (equality lookup): `i:<type_id>:<field_id>:<encoded_value>:`.
     pub fn field_index_value_prefix(
         type_id: u64,
-        field_hash: u64,
+        field_id: u64,
         encoded_value: &[u8; 8],
     ) -> Bytes {
         let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + 8 + 1);
@@ -249,7 +249,7 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.put_u64(type_id);
         buf.put_u8(SEPARATOR);
-        buf.put_u64(field_hash);
+        buf.put_u64(field_id);
         buf.put_u8(SEPARATOR);
         buf.put_slice(encoded_value);
         buf.put_u8(SEPARATOR);
@@ -257,7 +257,7 @@ impl KeyBuilder {
     }
 
     /// Secondary field index key for variable-length encoded values:
-    /// `i:<type_id>:<field_hash>:<encoded_value><object_id>`.
+    /// `i:<type_id>:<field_id>:<encoded_value><object_id>`.
     ///
     /// `encoded_value` is the caller-supplied sort-preserving encoding which
     /// MUST embed its own end-of-value marker (e.g. the engine's string
@@ -267,7 +267,7 @@ impl KeyBuilder {
     /// fixed-width variant; sorts ascending by encoded value then object_id.
     pub fn field_index_var(
         type_id: u64,
-        field_hash: u64,
+        field_id: u64,
         encoded_value: &[u8],
         object_id: u64,
     ) -> Bytes {
@@ -276,7 +276,7 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.put_u64(type_id);
         buf.put_u8(SEPARATOR);
-        buf.put_u64(field_hash);
+        buf.put_u64(field_id);
         buf.put_u8(SEPARATOR);
         buf.put_slice(encoded_value);
         buf.put_u64(object_id);
@@ -284,14 +284,14 @@ impl KeyBuilder {
     }
 
     /// Equality-prefix for the variable-length secondary index:
-    /// `i:<type_id>:<field_hash>:<encoded_value>`. Used for `Eq` lookups —
+    /// `i:<type_id>:<field_id>:<encoded_value>`. Used for `Eq` lookups —
     /// matches every key whose encoded value equals the supplied bytes,
     /// regardless of object_id. Because `encoded_value` carries its own
     /// terminator, this prefix can't be confused with a longer value that
     /// shares the same starting bytes.
     pub fn field_index_var_value_prefix(
         type_id: u64,
-        field_hash: u64,
+        field_id: u64,
         encoded_value: &[u8],
     ) -> Bytes {
         let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1 + encoded_value.len());
@@ -299,7 +299,7 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.put_u64(type_id);
         buf.put_u8(SEPARATOR);
-        buf.put_u64(field_hash);
+        buf.put_u64(field_id);
         buf.put_u8(SEPARATOR);
         buf.put_slice(encoded_value);
         buf.freeze()
@@ -412,7 +412,7 @@ impl KeyBuilder {
     pub fn unique_index_into(
         buf: &mut Vec<u8>,
         type_id: u64,
-        field_hash: u64,
+        field_id: u64,
         value_bytes: &[u8],
     ) -> (u32, u32) {
         let start = buf.len() as u32;
@@ -420,7 +420,7 @@ impl KeyBuilder {
         buf.push(SEPARATOR);
         buf.extend_from_slice(&type_id.to_be_bytes());
         buf.push(SEPARATOR);
-        buf.extend_from_slice(&field_hash.to_be_bytes());
+        buf.extend_from_slice(&field_id.to_be_bytes());
         buf.push(SEPARATOR);
         buf.extend_from_slice(value_bytes);
         (start, buf.len() as u32)
@@ -429,7 +429,7 @@ impl KeyBuilder {
     pub fn field_index_into(
         buf: &mut Vec<u8>,
         type_id: u64,
-        field_hash: u64,
+        field_id: u64,
         encoded_value: &[u8; 8],
         object_id: u64,
     ) -> (u32, u32) {
@@ -438,7 +438,7 @@ impl KeyBuilder {
         buf.push(SEPARATOR);
         buf.extend_from_slice(&type_id.to_be_bytes());
         buf.push(SEPARATOR);
-        buf.extend_from_slice(&field_hash.to_be_bytes());
+        buf.extend_from_slice(&field_id.to_be_bytes());
         buf.push(SEPARATOR);
         buf.extend_from_slice(encoded_value);
         buf.push(SEPARATOR);
@@ -447,13 +447,14 @@ impl KeyBuilder {
     }
 
     /// Arena-style variant of `field_index_var`. Layout matches the owned
-    /// constructor exactly: `i:<type>:<field>:<encoded_value><object_id>` —
-    /// no separator between the value and id (the caller-supplied terminator
-    /// inside `encoded_value` already disambiguates the boundary).
+    /// constructor exactly: `i:<type>:<field_id>:<encoded_value><object_id>`
+    /// — no separator between the value and id (the caller-supplied
+    /// terminator inside `encoded_value` already disambiguates the
+    /// boundary).
     pub fn field_index_var_into(
         buf: &mut Vec<u8>,
         type_id: u64,
-        field_hash: u64,
+        field_id: u64,
         encoded_value: &[u8],
         object_id: u64,
     ) -> (u32, u32) {
@@ -462,7 +463,7 @@ impl KeyBuilder {
         buf.push(SEPARATOR);
         buf.extend_from_slice(&type_id.to_be_bytes());
         buf.push(SEPARATOR);
-        buf.extend_from_slice(&field_hash.to_be_bytes());
+        buf.extend_from_slice(&field_id.to_be_bytes());
         buf.push(SEPARATOR);
         buf.extend_from_slice(encoded_value);
         buf.extend_from_slice(&object_id.to_be_bytes());

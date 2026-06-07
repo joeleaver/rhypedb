@@ -34,6 +34,20 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                 });
             }
 
+            // Reserve the `__` prefix for internal sidecar keys: the engine
+            // embeds `__cover_<field_id>`, `__coverv_<field_id>`, and
+            // `__rel_<rel_id>` entries inside serialized FieldMaps (cover
+            // blobs) and reserves `<field>__shadow` for the in-flight
+            // field-type migration writer hook. A user-declared field with
+            // a `__` prefix would collide with those, silently corrupting
+            // covering-index reads.
+            if field.name.starts_with("__") {
+                return Err(SchemaError::Validation(format!(
+                    "field '{}.{}': names starting with `__` are reserved for internal use",
+                    type_def.name, field.name
+                )));
+            }
+
             // Validate relationship targets exist.
             if let FieldType::Relation(rel) = &field.field_type
                 && !schema.types.contains_key(&rel.target_type) {
@@ -775,6 +789,27 @@ mod tests {
 
         let user = schema.get_type("User").unwrap();
         assert_eq!(user.fields.len(), 2);
+    }
+
+    #[test]
+    fn reject_field_with_double_underscore_prefix() {
+        // The `__` prefix is reserved for engine-internal cover-blob and
+        // shadow-field keys; user fields collide silently otherwise.
+        let result = parse_schema(
+            r#"
+            type User {
+                __cover_3: String
+            }
+            "#,
+        );
+        let err = result.expect_err("must reject");
+        match err {
+            SchemaError::Validation(msg) => {
+                assert!(msg.contains("`__`"), "msg: {msg}");
+                assert!(msg.contains("__cover_3"), "msg: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 
     #[test]
