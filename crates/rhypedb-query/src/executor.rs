@@ -274,8 +274,20 @@ fn execute_step(
                             find_u64_field_in_raw(bytes, cover_v_field_name.as_str())
                                 .unwrap_or(0);
                         let live_v = db.object_version(target_type.as_str(), tid);
+                        // `live_v != 0` is the existence guard. Every live
+                        // object is born at generation >= 1, so version 0 means
+                        // the target is either DELETED (its counter was
+                        // forgotten) or predates the born-at-1 change. Trusting
+                        // a cover whose target reads 0 would let a deleted
+                        // object surface as a phantom (a never-updated target's
+                        // cover_v is also 0, so `embedded_v == live_v` alone
+                        // can't tell "alive at v0" from "deleted"). Falling
+                        // through to a probe is correct for both; it costs the
+                        // fast path only for legacy v0 covers, which self-heal
+                        // on the next update/relink.
                         if let Some(c) = cover
                             && embedded_v == live_v
+                            && live_v != 0
                         {
                             any_covered = true;
                             covered_items.push((tid, c));
@@ -1339,6 +1351,175 @@ mod tests {
             Some(&Value::String("Renamed".into())),
             "fusion must fall through to a fresh probe when the embedded \
              cover_v is stale relative to the live generation counter"
+        );
+    }
+
+    #[test]
+    fn fusion_drops_target_deleted_without_prior_update() {
+        // Phantom-read regression: a target that is CREATED-but-NEVER-UPDATED
+        // gets `<field>__cover_v = object_version(target) = 0`. If that target
+        // is then DELETED, `object_version` still returns 0 (no counter entry),
+        // so the executor's `embedded_v == live_v` staleness check sees `0 == 0`
+        // and treats the stale cover as fresh — serving the deleted object
+        // straight from the embedded blob, with no LSM probe to catch the
+        // deletion. The deleted target must NOT appear in results.
+        //
+        // `Rating.user @on_delete(remove)` lets us delete the User while the
+        // Movie-side rev_edge that embeds `user__cover` survives — that
+        // surviving cover is exactly what could phantom the deleted user.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                ratings: [Rating] @inverse(Rating.user)
+            }
+
+            type Movie {
+                title: String
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+
+            type Rating {
+                stars: u32
+                user: User @on_delete(remove)
+                movie: Movie
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Aliens".into()));
+        let movie = db.create("Movie", mf).unwrap();
+
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        let rating = db.create("Rating", rf).unwrap();
+
+        db.link("Rating", rating.id, "user", alice.id, None).unwrap();
+        db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+
+        // Born-at-1: a live, never-updated object reads generation >= 1, so
+        // generation 0 is reserved for "absent" (never-created or deleted).
+        assert_eq!(db.object_version("User", alice.id), 1);
+
+        // Baseline fusion returns Alice from the fresh cover.
+        let q = parse_query(&format!("Movie.get({}).ratings.user", movie.id)).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        assert!(
+            matches!(&result, QueryOutput::Objects(o) if o.len() == 1),
+            "baseline: expected 1 user, got {result:?}"
+        );
+
+        // Delete Alice (never updated). Rating.user is @on_delete(remove), so
+        // the Rating survives and the Movie-side rev_edge keeps user__cover.
+        db.delete("User", alice.id).unwrap();
+        assert!(
+            db.get("User", alice.id).is_err(),
+            "Alice must be gone from the LSM after delete"
+        );
+
+        // Re-run the fusion. A deleted object must never surface.
+        let q = parse_query(&format!("Movie.get({}).ratings.user", movie.id)).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let objs = match result {
+            QueryOutput::Objects(objs) => objs,
+            other => panic!("expected Objects, got {other:?}"),
+        };
+        assert!(
+            objs.is_empty(),
+            "deleted user surfaced as a phantom via a stale cover (cover_v 0 == live 0): {:?}",
+            objs.into_iter()
+                .map(|mut o| {
+                    o.ensure_fields_deserialized();
+                    o.fields.get("name").cloned()
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fusion_drops_nested_3hop_target_deleted_without_prior_update() {
+        // Same phantom, one level deeper: the deleted target sits in a NESTED
+        // 3-hop cover (`director__cover` embedded inside `movie__cover`). The
+        // nested read reuses the same guarded fusion loop, so a never-updated
+        // Director that is deleted must not surface through the nested cover.
+        // `Movie.director @on_delete(remove)` lets us delete the Director while
+        // the Movie (and the rev_edge carrying the nested cover) survives.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Director {
+                name: String
+            }
+            type Movie {
+                title: String
+                director: Director @on_delete(remove)
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+            type User {
+                name: String
+                ratings: [Rating] @inverse(Rating.user)
+            }
+            type Rating {
+                stars: u32
+                user: User
+                movie: Movie
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut df = FieldMap::new();
+        df.insert("name".into(), Value::String("Scott".into()));
+        let director = db.create("Director", df).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        mf.insert("director".into(), Value::U64(director.id));
+        let movie = db.create("Movie", mf).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut rf = FieldMap::new();
+        rf.insert("stars".into(), Value::U32(5));
+        rf.insert("user".into(), Value::U64(user.id));
+        rf.insert("movie".into(), Value::U64(movie.id));
+        db.create("Rating", rf).unwrap();
+
+        // Baseline: the 3-hop fusion resolves the director.
+        let q = parse_query(&format!("User.get({}).ratings.movie.director", user.id)).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        assert!(
+            matches!(&result, QueryOutput::Objects(o) if o.len() == 1),
+            "baseline: expected 1 director, got {result:?}"
+        );
+
+        // Delete the never-updated Director; Movie survives (remove policy),
+        // so the nested director__cover (cover_v == 1) lingers in the rev_edge.
+        db.delete("Director", director.id).unwrap();
+
+        let q = parse_query(&format!("User.get({}).ratings.movie.director", user.id)).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let objs = match result {
+            QueryOutput::Objects(objs) => objs,
+            other => panic!("expected Objects, got {other:?}"),
+        };
+        assert!(
+            objs.is_empty(),
+            "deleted director surfaced as a phantom via a stale NESTED 3-hop cover: {:?}",
+            objs.into_iter()
+                .map(|mut o| {
+                    o.ensure_fields_deserialized();
+                    o.fields.get("name").cloned()
+                })
+                .collect::<Vec<_>>()
         );
     }
 

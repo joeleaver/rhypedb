@@ -1421,10 +1421,19 @@ impl Database {
             &mut txn, type_name, type_def, type_id, object_id, &fields, &mut puts,
         )?;
 
-        self.storage.put_batch(&mut txn, &puts)?;
-        let version = self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
-            other => EngineError::Storage(other),
+        // `stage_create_writes` bumped this object's in-memory generation to 1
+        // (born-at-1). If the write doesn't land, undo it so a future create
+        // reusing nothing — and any cover stamping — sees a consistent counter.
+        self.storage.put_batch(&mut txn, &puts).map_err(|e| {
+            self.rollback_version(type_id, object_id);
+            EngineError::Storage(e)
+        })?;
+        let version = self.storage.commit(&mut txn).map_err(|e| {
+            self.rollback_version(type_id, object_id);
+            match e {
+                rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                other => EngineError::Storage(other),
+            }
         })?;
 
         self.subscriptions.publish(ChangeEvent {
@@ -1610,6 +1619,21 @@ impl Database {
             ));
         }
 
+        // Born at generation 1. Establishing a non-zero generation at create
+        // time is what makes generation 0 mean "absent": a live, never-updated
+        // object reads version >= 1, while `delete` (via `forget_version`)
+        // drops it back to 0. The fusion reader's `cover_v == object_version`
+        // check then naturally rejects a cover for a deleted target — its
+        // stamped `cover_v` (>= 1, taken while alive) can never equal the
+        // post-delete live version (0) — closing the never-updated-then-
+        // deleted phantom. Done last so a staging error above leaves no bump
+        // to undo; the caller rolls this back if the commit doesn't land.
+        let v = self.bump_version(type_id, object_id);
+        puts.push((
+            KeyBuilder::object_version(type_id, object_id),
+            Bytes::copy_from_slice(&v.to_be_bytes()),
+        ));
+
         Ok(scalar_fields)
     }
 
@@ -1646,19 +1670,46 @@ impl Database {
 
         for fields in &rows {
             let object_id = self.next_object_id.fetch_add(1, Ordering::SeqCst);
-            let scalar_fields = self.stage_create_writes(
+            match self.stage_create_writes(
                 &mut txn, type_name, type_def, type_id, object_id, fields, &mut puts,
-            )?;
-            scalar_rows.push(scalar_fields);
-            object_ids.push(object_id);
+            ) {
+                Ok(scalar_fields) => {
+                    // stage_create_writes bumped this object to generation 1.
+                    scalar_rows.push(scalar_fields);
+                    object_ids.push(object_id);
+                }
+                Err(e) => {
+                    // This row never bumped (bump is the last step), but every
+                    // successfully-staged earlier row did — undo them all.
+                    for id in &object_ids {
+                        self.rollback_version(type_id, *id);
+                    }
+                    return Err(e);
+                }
+            }
         }
 
-        self.storage.put_batch(&mut txn, &puts)?;
-
-        let version = self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
-            other => EngineError::Storage(other),
-        })?;
+        // born-at-1 rollback on a failed batch — none of the rows land, so no
+        // in-memory generation should survive either.
+        let rollback_all = |db: &Self| {
+            for id in &object_ids {
+                db.rollback_version(type_id, *id);
+            }
+        };
+        if let Err(e) = self.storage.put_batch(&mut txn, &puts) {
+            rollback_all(self);
+            return Err(EngineError::Storage(e));
+        }
+        let version = match self.storage.commit(&mut txn) {
+            Ok(v) => v,
+            Err(e) => {
+                rollback_all(self);
+                return Err(match e {
+                    rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                    other => EngineError::Storage(other),
+                });
+            }
+        };
 
         // Build the returned Objects + publish events after commit.
         // Events report only the scalar fields (relation values went into
@@ -7652,8 +7703,8 @@ mod tests {
 
         assert_eq!(
             db.object_version("User", uid),
-            0,
-            "freshly-created object should have generation 0"
+            1,
+            "born-at-1: a freshly-created object has generation 1 (0 is reserved for absent)"
         );
 
         let mut upd = FieldMap::new();
@@ -7662,8 +7713,8 @@ mod tests {
 
         assert_eq!(
             db.object_version("User", uid),
-            1,
-            "successful update must bump the per-object generation"
+            2,
+            "successful update must bump the per-object generation (1 -> 2)"
         );
 
         let groups = db.get_links_many("Movie", &[mid], "ratings").unwrap();
@@ -7687,8 +7738,8 @@ mod tests {
         let stamped_v = crate::object::find_u64_field_in_raw(cover, "user__cover_v")
             .expect("cover_v stamp should be present");
         assert_eq!(
-            stamped_v, 0,
-            "stamp records the target's generation as of cover-write time"
+            stamped_v, 1,
+            "stamp records the target's generation (born-at-1) as of cover-write time"
         );
         assert!(
             stamped_v < db.object_version("User", uid),
@@ -7736,7 +7787,7 @@ mod tests {
     fn cover_refresh_worker_repairs_stale_user_cover() {
         // End-to-end check that the background sweeper rewrites the
         // movie-side rev_edge `user__cover` after the user updates. Verifies:
-        //   1. Pre-update: cover_v stamp == 0 (user never bumped).
+        //   1. Pre-update: cover_v stamp == 1 (born-at-1, user never updated).
         //   2. Post-update + post-sweep: cover_v stamp matches the new
         //      live generation AND the embedded cover bytes reflect the new
         //      user.name.
@@ -7744,13 +7795,13 @@ mod tests {
 
         let stamp_before =
             read_movie_side_user_cover_v(&db, mid).expect("cover_v should be present pre-update");
-        assert_eq!(stamp_before, 0);
+        assert_eq!(stamp_before, 1);
 
         let mut upd = FieldMap::new();
         upd.insert("name".into(), Value::String("Renamed".into()));
         db.update("User", uid, upd).unwrap();
         let new_v = db.object_version("User", uid);
-        assert_eq!(new_v, 1);
+        assert_eq!(new_v, 2);
 
         // Sweeper runs asynchronously; poll until repair lands or fail.
         let repaired = poll_until(
@@ -7809,7 +7860,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let stamp = read_movie_side_user_cover_v(&db, mid).unwrap();
-        assert_eq!(stamp, 0, "no sweeper means cover_v stamp must stay at 0");
+        assert_eq!(
+            stamp, 1,
+            "no sweeper means cover_v stays at the born-at-1 value stamped at link time"
+        );
         assert_eq!(
             read_movie_side_user_name(&db, mid).as_deref(),
             Some("Alice"),
@@ -7895,7 +7949,7 @@ mod tests {
         );
         let stamp = crate::object::find_u64_field_in_raw(&movie_cover_bytes, "director__cover_v")
             .expect("movie__cover should carry director__cover_v stamp");
-        assert_eq!(stamp, 0, "fresh director has generation 0");
+        assert_eq!(stamp, 1, "born-at-1: a freshly-created director has generation 1");
     }
 
     #[test]
