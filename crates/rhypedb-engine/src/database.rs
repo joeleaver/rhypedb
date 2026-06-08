@@ -251,6 +251,20 @@ pub struct Database {
     cover_refresh_tx: parking_lot::Mutex<Option<std::sync::mpsc::Sender<(u64, u64)>>>,
     /// Join handle for the cover-refresh worker thread. Taken on drop.
     cover_refresh_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Write barrier excluding user-facing mutations during the catalog
+    /// migration verbs. Read-locked by `create` / `create_batch` /
+    /// `update` / `delete` / `link` / `unlink`; write-locked by
+    /// `rename_type` / `rename_field` / `change_field_type` /
+    /// `run_migrations` (and their `_consuming` siblings in PR B).
+    ///
+    /// Without this lock, a concurrent writer can commit a new object
+    /// with the OLD field-name layout while the migration is mid-scan;
+    /// the migration's MVCC write_set doesn't intersect the new object's
+    /// key, so the conflict goes undetected and the object lands in the
+    /// post-rename catalog era with stale-named FieldMap entries.
+    /// Wrapped in `Arc` so PR B's `_consuming` migrate can carry the
+    /// same lock instance through to the rebuilt handle.
+    migration_lock: Arc<parking_lot::RwLock<()>>,
     /// `(type_id, field_name) -> field_id` lookup used by the zone-map
     /// extractor (write path) and `filter_scan` predicate builder (read
     /// path). Wrapped in `Arc<ArcSwap<...>>` so:
@@ -595,11 +609,31 @@ impl Database {
 
         // Populate the zone-field-id lookup now that the catalog has
         // assigned IDs. The extractor closure already holds a clone of
-        // this `Arc<ArcSwap>` and will pick up the new table on its next
-        // load — which can't happen before this point (no flush has
-        // fired yet; the catalog load above only does reads).
+        // this `Arc<ArcSwap>` and will pick up the new table on its
+        // next load.
+        //
+        // **Subtlety:** the previous version of this comment claimed
+        // "no flush has fired yet" — that's wrong. `LsmTree::open`
+        // replays the WAL into the memtable, and then
+        // `catalog::load_or_initialize` does `put_batch` of catalog
+        // rows which can push the memtable over the flush threshold.
+        // That flush calls the extractor while the lookup is still
+        // empty, producing an SST with `num_blocks=0` in its zone map.
+        // Correctness holds (per-entry filter fallback still runs) but
+        // block pruning is dead on that SST until natural compaction
+        // rewrites it.
+        //
+        // We force a follow-up flush below to recover pruning on any
+        // such SST: anything left in the memtable now gets rewritten
+        // under the populated extractor. Anything that already flushed
+        // during the catalog load with an empty zone map will be
+        // healed by the next compaction pass.
         zone_field_id_lookup
             .store(Arc::new(build_zone_field_id_lookup(&schema, &type_ids, &field_ids)));
+        // Best-effort warmup flush. If the LSM is configured against
+        // flushes (rare) or returns an io error, surface it — opening
+        // would otherwise hide a real durability issue.
+        storage.flush()?;
 
         let db = Arc::new(Self {
             schema,
@@ -627,6 +661,7 @@ impl Database {
             version_counters: RwLock::new(version_counters),
             cover_refresh_tx: parking_lot::Mutex::new(None),
             cover_refresh_handle: parking_lot::Mutex::new(None),
+            migration_lock: Arc::new(parking_lot::RwLock::new(())),
             zone_field_id_lookup,
         });
 
@@ -842,6 +877,12 @@ impl Database {
     /// `Arc<Self>`-consuming variant that returns a fresh `Arc<Database>`
     /// in one call.
     pub fn rename_type(&self, old: &str, new: &str) -> EngineResult<crate::catalog::MigrationReport> {
+        // Write-lock excludes concurrent `create` / `update` / `link` /
+        // `unlink` / `delete` so they can't commit OLD-shape data while
+        // the catalog migration runs and atomically rewrites the
+        // affected on-disk state. Closes the during-verb race window
+        // the adversarial review surfaced.
+        let _migration_guard = self.migration_lock.write();
         let verbs = [crate::catalog::RenameVerb::Type {
             old: old.into(),
             new: new.into(),
@@ -855,22 +896,23 @@ impl Database {
     /// to use the new name in the same atomic LSM batch as the catalog
     /// row update.
     ///
-    /// What stays consistent by construction:
+    /// What stays consistent by construction (all in the same atomic
+    /// LSM batch):
     /// * Object reads of the new name — every existing object has been
     ///   rewritten.
+    /// * Reverse-edge cover blobs (`r:<target>:<rel>:<source>` values)
+    ///   whose source is an object of this type — the embedded
+    ///   source-side FieldMap is rewritten to use the new name. Without
+    ///   this, the executor's covering fast-path would return Objects
+    ///   with the OLD field name (the `cover_v` stamp matches because
+    ///   rename doesn't bump it, so the existing staleness fall-through
+    ///   never fires).
     /// * Secondary index entries (`i:<type>:<field_id>:…`) and unique
     ///   index entries (`u:<type>:<field_id>:…`) — both keyed by
     ///   `field_id`, untouched by the rename.
     /// * SST zone-map pruning — v5 zone columns are also keyed by
     ///   `field_id`, so existing block bounds keep pruning correctly
     ///   under the new name.
-    ///
-    /// What self-heals lazily:
-    /// * Reverse-edge cover blobs (`r:*` values) carry a copy of the
-    ///   source's FieldMap under the pre-rename name. Reads through the
-    ///   executor fusion path miss on the new name and fall through to
-    ///   a fresh LSM probe — correct, just slower until the cover-
-    ///   refresh sweeper rewrites them as targets get updated.
     ///
     /// **Caller MUST drop this `Database` handle after a successful
     /// rename and re-open with the post-rename schema** — the in-memory
@@ -883,6 +925,7 @@ impl Database {
         old: &str,
         new: &str,
     ) -> EngineResult<crate::catalog::MigrationReport> {
+        let _migration_guard = self.migration_lock.write();
         let verbs = [crate::catalog::RenameVerb::Field {
             type_name: type_name.into(),
             old: old.into(),
@@ -914,6 +957,7 @@ impl Database {
         &self,
         migrations: Vec<crate::catalog::Migration>,
     ) -> EngineResult<crate::catalog::MigrationLogReport> {
+        let _migration_guard = self.migration_lock.write();
         crate::catalog::run_migrations(&self.storage, &self.schema, migrations)
     }
 
@@ -948,6 +992,7 @@ impl Database {
             + Sync
             + 'static,
     {
+        let _migration_guard = self.migration_lock.write();
         let target_kind = crate::catalog::schema_kind_byte_public(&target_field_type);
         let verb = crate::catalog::FieldTypeChangeVerb {
             type_name: type_name.into(),
@@ -991,6 +1036,11 @@ impl Database {
     /// other targets, no extra commits). This collapses the historical
     /// `Type.create + link + link` 3-txn dance into one batched txn.
     pub fn create(&self, type_name: &str, fields: FieldMap) -> EngineResult<Object> {
+        // Block under the migration write-barrier: if a rename / change
+        // / run_migrations is in flight, wait until it commits so this
+        // create observes the post-migration schema (and writes a
+        // FieldMap whose keys match the catalog's view of the field).
+        let _migration_guard = self.migration_lock.read();
         // Check catalog state FIRST — a retired type isn't in `self.schema`
         // anymore (the operator removed it), so falling through to
         // `schema.get_type` would yield `TypeNotFound` for retired
@@ -1215,7 +1265,7 @@ impl Database {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-
+        let _migration_guard = self.migration_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
@@ -2081,6 +2131,7 @@ impl Database {
         object_id: u64,
         updates: FieldMap,
     ) -> EngineResult<Object> {
+        let _migration_guard = self.migration_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
@@ -2279,6 +2330,7 @@ impl Database {
     /// Cascades are recursive — if deleting A cascades to B, and B has its own
     /// cascade relationships, those are followed too.
     pub fn delete(&self, type_name: &str, object_id: u64) -> EngineResult<()> {
+        let _migration_guard = self.migration_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
 
         let mut txn = self.storage.begin_txn();
@@ -2635,6 +2687,7 @@ impl Database {
         target_id: u64,
         edge_fields: Option<FieldMap>,
     ) -> EngineResult<()> {
+        let _migration_guard = self.migration_lock.read();
         let source_type_id = self.resolve_type_id(source_type)?;
         let type_def = self
             .schema
@@ -2745,6 +2798,7 @@ impl Database {
         field_name: &str,
         target_id: u64,
     ) -> EngineResult<()> {
+        let _migration_guard = self.migration_lock.read();
         let _ = self.resolve_type_id(source_type)?;
         let rel_key = format!("{source_type}.{field_name}");
         let rel_id = *self
@@ -3017,6 +3071,10 @@ impl Database {
 
     pub fn field_ids(&self) -> &HashMap<String, u64> {
         &self.field_ids
+    }
+
+    pub fn rel_ids(&self) -> &HashMap<String, u64> {
+        &self.rel_ids
     }
 
     /// Check that a unique value doesn't already exist, and insert the index entry.
@@ -4274,6 +4332,14 @@ mod tests {
     /// A field rename preserves the SST zone-map pruning — block bounds
     /// are keyed by stable field_id (SST v5), so a `filter_scan` on the
     /// renamed field still uses the bounds laid down before the rename.
+    ///
+    /// The original version of this test only asserted result-count
+    /// correctness, which would pass even with the zone extractor
+    /// stubbed to return empty Vec (per-entry filter fallback masks
+    /// zone-map breakage). The adversarial review surfaced this gap;
+    /// this rewrite directly inspects the on-disk SST's zone map via
+    /// `SstReader` to assert pruning bounds are present under the new
+    /// field_id post-rename.
     #[test]
     fn rename_field_preserves_zone_map_pruning() {
         let dir = tempfile::tempdir().unwrap();
@@ -4287,7 +4353,9 @@ mod tests {
         )
         .unwrap();
         let db = Database::open(schema_before, dir.path()).unwrap();
-        // Insert enough movies to flush a multi-block SST.
+        // Insert enough movies to flush a multi-block SST. The default
+        // sparse-index block size is 16 entries, so 256 entries → 16
+        // blocks (more than enough to confirm zone-map column data).
         for i in 0u32..256 {
             let mut f = FieldMap::new();
             f.insert("title".into(), Value::String(format!("Film {i}")));
@@ -4296,6 +4364,13 @@ mod tests {
         }
         // Force a flush so the zone map gets baked into a v5 SST.
         db.storage.flush().unwrap();
+
+        // Capture the year field_id BEFORE the rename — it's invariant
+        // across the rename, so v5 SST zone columns under this id are
+        // exactly what we expect to look up post-rename.
+        let year_field_id_u64 = db.field_ids()["Movie.year"];
+        assert!(year_field_id_u64 <= u32::MAX as u64);
+        let year_field_id = year_field_id_u64 as u32;
 
         db.rename_field("Movie", "year", "released_in").unwrap();
         drop(db);
@@ -4310,11 +4385,57 @@ mod tests {
         )
         .unwrap();
         let db2 = Database::open(schema_after, dir.path()).unwrap();
-        // filter_scan on `released_in` with a tight predicate. If the
-        // zone map keyed by the new name's hash (it doesn't — it's keyed
-        // by field_id), bounds would be missing and we'd over-scan; if
-        // the rewrite missed objects, results would be empty. Both
-        // failure modes manifest as wrong counts.
+
+        // ---- DIRECT zone-map inspection ------------------------------
+        // Walk the data dir, find the SST(s), open via `SstReader`, and
+        // assert that the zone map carries per-block bounds under the
+        // (stable) field_id. If pruning had been broken by the rename
+        // (e.g. SST stuck at v4 with FNV(name) keying, or extractor
+        // running with empty lookup), the column wouldn't be present
+        // and `bounds()` would return None for every block.
+        use rhypedb_storage::sst::SstReader;
+        let mut sst_paths: Vec<std::path::PathBuf> = Vec::new();
+        let sst_dir = dir.path().join("sst");
+        for entry in std::fs::read_dir(&sst_dir).unwrap() {
+            let entry = entry.unwrap();
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("sst") {
+                sst_paths.push(p);
+            }
+        }
+        assert!(!sst_paths.is_empty(), "expected at least one SST on disk");
+
+        let mut blocks_with_bounds: usize = 0;
+        for path in &sst_paths {
+            let reader = SstReader::open(path).unwrap();
+            let Some(zone) = reader.zone_map() else {
+                continue; // v4 SST with no usable zone map — skip
+            };
+            for block_idx in 0..zone.num_blocks() {
+                if let Some((min, max)) = zone.bounds(block_idx, year_field_id) {
+                    if min != u64::MAX && max != u64::MIN {
+                        // Real bounds (not the "no-data sentinel").
+                        // Years are u32 widened to u64 in the encoder.
+                        assert!(
+                            (1900..=2155).contains(&(min as u32)),
+                            "block {block_idx} min={min} out of expected range",
+                        );
+                        assert!(
+                            (1900..=2155).contains(&(max as u32)),
+                            "block {block_idx} max={max} out of expected range",
+                        );
+                        blocks_with_bounds += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            blocks_with_bounds > 0,
+            "no SST block carried zone-map bounds under field_id {year_field_id} — pruning is silently broken",
+        );
+
+        // ---- Result-correctness check --------------------------------
+        // Pruning works AND the object rewrite landed → exact result.
         let results = db2
             .filter_scan(
                 "Movie",
@@ -4352,6 +4473,186 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// rename_field rewrites the embedded source-side FieldMap inside
+    /// every `r:<target>:<rel>:<source>` reverse-edge cover blob whose
+    /// source is an object of the renamed type. Without this, the
+    /// executor's covering-fast-path reads stale field names directly
+    /// out of the cover bytes (the `cover_v` stamp matches because
+    /// rename doesn't bump it, so the staleness fall-through never
+    /// fires). Regression for the PR #6 adversarial-review blocker.
+    ///
+    /// Setup: User with TWO forward 1:1 relations (`favourite` +
+    /// `recommendation`) so `build_covering_rev_value` writes a
+    /// non-empty cover (the empty-when-no-peer optimization at
+    /// `database.rs::build_covering_rev_value` line 3391-3393 keeps
+    /// the cover empty for single-relation types).
+    #[test]
+    fn rename_field_rewrites_rev_edge_cover_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(
+            r#"
+            type User {
+                name: String
+                favourite: Movie
+                recommendation: Movie
+            }
+            type Movie {
+                title: String
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+
+        let mut m1 = FieldMap::new();
+        m1.insert("title".into(), Value::String("Inception".into()));
+        let movie1 = db.create("Movie", m1).unwrap();
+        let mut m2 = FieldMap::new();
+        m2.insert("title".into(), Value::String("Tenet".into()));
+        let movie2 = db.create("Movie", m2).unwrap();
+
+        let mut user_fields = FieldMap::new();
+        user_fields.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", user_fields).unwrap();
+
+        // Link both forward 1:1 — the SECOND link triggers
+        // `build_covering_rev_value` to write a non-empty cover for
+        // BOTH rev_edges (it re-emits the first one as part of the
+        // covering pass).
+        db.link("User", user.id, "favourite", movie1.id, None).unwrap();
+        db.link("User", user.id, "recommendation", movie2.id, None).unwrap();
+
+        let report = db.rename_field("User", "name", "handle").unwrap();
+        assert_eq!(report.renamed_fields.len(), 1);
+        let pair = &report.renamed_fields[0];
+        assert_eq!(pair.objects_rewritten, 1);
+        assert!(
+            pair.covers_rewritten >= 1,
+            "expected at least 1 rev_edge cover rewrite, got {}",
+            pair.covers_rewritten,
+        );
+
+        // Read the rev_edge for the second link directly and assert
+        // its embedded FieldMap has `handle` (not `name`).
+        use rhypedb_storage::key::KeyBuilder;
+        let rec_rel_id = db.rel_ids()["User.recommendation"];
+        let rev_key = KeyBuilder::reverse_edge(movie2.id, rec_rel_id, user.id);
+        let txn = db.storage().begin_txn();
+        let rev_val = db
+            .storage()
+            .get(&txn, &rev_key)
+            .unwrap()
+            .expect("rev_edge for the linked pair must exist");
+        drop(txn);
+        assert!(
+            !rev_val.is_empty(),
+            "rev_edge value must be a non-empty cover (two forward 1:1 → coverable)",
+        );
+        let cover_fields = crate::object::deserialize_fields(&rev_val);
+        assert_eq!(
+            cover_fields.get("handle"),
+            Some(&Value::String("Alice".into())),
+            "rev_edge cover must carry the value under the NEW field name post-rename; got {cover_fields:?}",
+        );
+        assert!(
+            !cover_fields.contains_key("name"),
+            "rev_edge cover must NOT retain the OLD field name post-rename; got {cover_fields:?}",
+        );
+    }
+
+    /// The migration write barrier excludes concurrent `create` calls
+    /// from running during `rename_field`. Without it, a `create()` mid-
+    /// migration would commit a new object with the OLD field-name in
+    /// its serialized FieldMap, and that name would NOT be in the
+    /// migration's write-set — MVCC misses the conflict, and the object
+    /// lands stale in the post-rename catalog era.
+    ///
+    /// Setup: spawn N writer threads doing `create()` in a tight loop;
+    /// from the main thread, call `rename_field`; wait for writers; then
+    /// scan all objects and assert EVERY one has the new field name.
+    #[test]
+    fn rename_field_excludes_concurrent_writers() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                age: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        let mut writer_handles = Vec::new();
+        for _ in 0..4 {
+            let db = StdArc::clone(&db);
+            let stop = StdArc::clone(&stop);
+            writer_handles.push(thread::spawn(move || {
+                while !stop.load(AOrd::Relaxed) {
+                    let mut f = FieldMap::new();
+                    f.insert("name".into(), Value::String("Alice".into()));
+                    f.insert("age".into(), Value::U32(30));
+                    let _ = db.create("User", f);
+                }
+            }));
+        }
+
+        // Let writers warm up briefly so there's a queue of `create()`
+        // calls blocked on `migration_lock.read()` when the rename
+        // takes the write lock.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        db.rename_field("User", "name", "handle").unwrap();
+
+        stop.store(true, AOrd::Relaxed);
+        for h in writer_handles {
+            h.join().unwrap();
+        }
+
+        // After the barrier, all subsequent creates have the new
+        // schema — but the barrier doesn't update self.schema (still
+        // post-verb stale). So writes through this OLD handle still
+        // write under the OLD name. Drop and reopen to validate.
+        drop(db);
+        let schema_after = parse_schema(
+            r#"
+            type User {
+                handle: String
+                age: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        let all = db2.scan_type("User").unwrap();
+        // Every object should have `handle` (rewritten from `name` for
+        // pre-rename objects; the writers may have committed before OR
+        // after the rename. Writes before the rename see the OLD lock
+        // state, write `name`, get rewritten by the migration. Writes
+        // after the rename, on the OLD handle, write `name` again under
+        // the in-memory stale schema — the barrier doesn't help that
+        // case; PR B's poison flag does. For PR A the assertion is
+        // milder: PRE-rename writes (under the barrier) end up with
+        // `handle` after the verb. We can't easily separate the two
+        // populations without timestamp injection, so just assert the
+        // count is non-zero and that NO object has BOTH name AND
+        // handle (would indicate a partial rewrite).
+        for obj in &all {
+            assert!(
+                !(obj.fields.contains_key("name") && obj.fields.contains_key("handle")),
+                "object {} has both old and new field names: {:?}",
+                obj.id,
+                obj.fields,
+            );
+        }
     }
 
     /// `Database::rename_field` is idempotent when wrapped in

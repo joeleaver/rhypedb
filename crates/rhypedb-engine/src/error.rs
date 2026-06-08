@@ -454,4 +454,12 @@ pub enum CatalogError {
     /// the schema validator; surfaces here as a defense-in-depth check.
     #[error("identifier {name:?} contains reserved byte 0x{byte:02x}")]
     ReservedByteInIdentifier { name: String, byte: u8 },
+
+    /// An identifier contains `__` anywhere — reserved for engine-
+    /// internal cover-blob and shadow-field sidecar keys
+    /// (`<field>__cover`, `<field>__cover_v`, `<field>__shadow`,
+    /// `__cover_<field_id>`, etc.). Schema validation and the rename
+    /// verbs both refuse user identifiers in this namespace.
+    #[error("identifier {name:?} contains reserved `__` substring (engine sidecar namespace)")]
+    ReservedDoubleUnderscoreInIdentifier { name: String },
 }
