@@ -518,29 +518,40 @@ impl Database {
         // (migrate doesn't change existing object IDs, and the SAME
         // atomic counter is carried verbatim through to the new
         // handle).
-        let max_object_id = if carry.is_some() {
-            // Unused: carry path constructs the AtomicU64 from
-            // `Arc::clone(&c.next_object_id)` rather than from `max + 1`.
-            0u64
-        } else {
-            let mut max_object_id = 0u64;
-            let txn = storage.begin_txn();
-            for &type_id in type_ids.values() {
-                let prefix = KeyBuilder::object_prefix(type_id);
-                if let Ok(entries) = storage.scan_prefix(&txn, &prefix) {
-                    for (key, _) in &entries {
-                        // Object key: o:<type_id>:<object_id> — last 8 bytes are the object ID.
-                        if key.len() >= 8 {
-                            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-                            let object_id = u64::from_be_bytes(id_bytes);
-                            max_object_id = max_object_id.max(object_id);
+        // One `o:*` scan recovers two things: the high-water object id (for
+        // `next_object_id`) and the born bit for every live object. Each
+        // existing `o:` key seeds `version_counters` to generation 1 — this is
+        // what lets a create skip a persisted `g:` key entirely: an object's
+        // existence on disk IS its born bit, reconstructed here at open. The
+        // `g:*` override scan below only bumps the few objects that were
+        // UPDATED (generation >= 2). The carry path skips this — it clones the
+        // in-memory counters from the old handle verbatim.
+        let (max_object_id, mut version_counters): (u64, HashMap<(u64, u64), u64>) =
+            if carry.is_some() {
+                // Unused: carry path constructs `next_object_id` from
+                // `Arc::clone(&c.next_object_id)` and clones `version_counters`.
+                (0u64, HashMap::new())
+            } else {
+                let mut max_object_id = 0u64;
+                let mut seed: HashMap<(u64, u64), u64> = HashMap::new();
+                let txn = storage.begin_txn();
+                for &type_id in type_ids.values() {
+                    let prefix = KeyBuilder::object_prefix(type_id);
+                    if let Ok(entries) = storage.scan_prefix(&txn, &prefix) {
+                        for (key, _) in &entries {
+                            // Object key: o:<type_id>:<object_id> — last 8 bytes are the object ID.
+                            if key.len() >= 8 {
+                                let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+                                let object_id = u64::from_be_bytes(id_bytes);
+                                max_object_id = max_object_id.max(object_id);
+                                seed.insert((type_id, object_id), 1);
+                            }
                         }
                     }
                 }
-            }
-            drop(txn);
-            max_object_id
-        };
+                drop(txn);
+                (max_object_id, seed)
+            };
 
         // Precompute the reverse-relation index used by cascade delete.
         // Without this, every delete_inner call walks the entire schema
@@ -666,43 +677,33 @@ impl Database {
             }
         }
 
-        // Repopulate the per-object generation counter from `g:` keys.
-        // Cost is one prefix scan at startup proportional to the number
-        // of never-yet-updated objects, then HashMap lookups for every
-        // cover-write and every fusion check. Counters for objects that
-        // have never been updated stay absent (read-side defaults to 0).
-        // The carry path skips this scan entirely — the SAME
-        // `Arc<RwLock<HashMap>>` is carried verbatim to the new handle,
-        // so both old and new observe the same in-memory counter map.
-        let version_counters: HashMap<(u64, u64), u64> =
-            if carry.is_some() {
-                // Unused in the carry path — the struct construction
-                // below uses `Arc::clone(&c.version_counters)`.
-                HashMap::new()
-            } else {
-                let mut version_counters: HashMap<(u64, u64), u64> = HashMap::new();
-                let txn2 = storage.begin_txn();
-                if let Ok(entries) = storage.scan_prefix(&txn2, &KeyBuilder::object_version_prefix())
-                {
-                    for (key, value) in entries {
-                        if key.len() < 1 + 1 + 8 + 1 + 8 || value.len() != 8 {
-                            continue;
-                        }
-                        let type_id_bytes: [u8; 8] = key[2..10].try_into().unwrap();
-                        let obj_id_bytes: [u8; 8] = key[11..19].try_into().unwrap();
-                        let v_bytes: [u8; 8] = value[..].try_into().unwrap();
-                        version_counters.insert(
-                            (
-                                u64::from_be_bytes(type_id_bytes),
-                                u64::from_be_bytes(obj_id_bytes),
-                            ),
-                            u64::from_be_bytes(v_bytes),
-                        );
+        // Override the born-bit seed with persisted generations for objects
+        // that have been UPDATED at least once. A `g:` key is written only on
+        // update (generation >= 2), so this scan touches just those objects;
+        // never-updated objects keep their seeded generation of 1. The carry
+        // path skips this entirely — the SAME `Arc<RwLock<HashMap>>` is carried
+        // verbatim to the new handle, so old and new observe one counter map.
+        if carry.is_none() {
+            let txn2 = storage.begin_txn();
+            if let Ok(entries) = storage.scan_prefix(&txn2, &KeyBuilder::object_version_prefix()) {
+                for (key, value) in entries {
+                    if key.len() < 1 + 1 + 8 + 1 + 8 || value.len() != 8 {
+                        continue;
                     }
+                    let type_id_bytes: [u8; 8] = key[2..10].try_into().unwrap();
+                    let obj_id_bytes: [u8; 8] = key[11..19].try_into().unwrap();
+                    let v_bytes: [u8; 8] = value[..].try_into().unwrap();
+                    version_counters.insert(
+                        (
+                            u64::from_be_bytes(type_id_bytes),
+                            u64::from_be_bytes(obj_id_bytes),
+                        ),
+                        u64::from_be_bytes(v_bytes),
+                    );
                 }
-                drop(txn2);
-                version_counters
-            };
+            }
+            drop(txn2);
+        }
 
         // Populate the zone-field-id lookup now that the catalog has
         // assigned IDs. The extractor closure already holds a clone of
@@ -1461,8 +1462,8 @@ impl Database {
     /// can be populated symmetrically — both sides of a pair of 1:1 links
     /// land with full covers, instead of the historical sequence-dependent
     /// "second link gets a cover, first stays empty" pattern. Cover_v
-    /// stamps are read from the in-memory `version_counters` map (defaults
-    /// to 0 for never-updated targets).
+    /// stamps are read from the in-memory `version_counters` map (a live
+    /// never-updated target reads 1; an absent/deleted target reads 0).
     ///
     /// Unique-index puts are issued inline (the next row in `create_batch`
     /// must see them through MVCC to detect intra-batch dup values). All
@@ -1619,20 +1620,24 @@ impl Database {
             ));
         }
 
-        // Born at generation 1. Establishing a non-zero generation at create
-        // time is what makes generation 0 mean "absent": a live, never-updated
-        // object reads version >= 1, while `delete` (via `forget_version`)
-        // drops it back to 0. The fusion reader's `cover_v == object_version`
-        // check then naturally rejects a cover for a deleted target — its
-        // stamped `cover_v` (>= 1, taken while alive) can never equal the
-        // post-delete live version (0) — closing the never-updated-then-
-        // deleted phantom. Done last so a staging error above leaves no bump
-        // to undo; the caller rolls this back if the commit doesn't land.
-        let v = self.bump_version(type_id, object_id);
-        puts.push((
-            KeyBuilder::object_version(type_id, object_id),
-            Bytes::copy_from_slice(&v.to_be_bytes()),
-        ));
+        // Born at generation 1 — IN MEMORY ONLY, no persisted `g:` key.
+        // Generation 0 means "absent": a live, never-updated object reads
+        // version >= 1, while `delete` (via `forget_version`) drops it back to
+        // 0, so the fusion reader's `cover_v == object_version && != 0` check
+        // rejects a cover for a deleted target (its `cover_v`, taken while
+        // alive, can never equal the post-delete live version 0) — closing the
+        // never-updated-then-deleted phantom.
+        //
+        // The born bit is NOT persisted here: an object's existence is already
+        // on disk as its `o:` key, and `open()` reconstructs generation 1 for
+        // every live object from the `o:*` scan it already runs for
+        // `next_object_id` (see `rebuild_with_arc_storage`). A `g:` key is
+        // written only when an object is UPDATED (generation >= 2), where the
+        // higher value can't be derived from existence alone — so creates and
+        // never-updated deletes carry no generation write-amp. Done last so a
+        // staging error above leaves no in-memory bump to undo; the caller
+        // rolls this back if the commit doesn't land.
+        self.bump_version(type_id, object_id);
 
         Ok(scalar_fields)
     }
@@ -3199,21 +3204,23 @@ impl Database {
         // Stage the object's own tombstone.
         arena.push_object(type_id, object_id);
 
-        // Drop the persisted generation counter. The `g:` key only exists
-        // for objects that have been updated at least once; tombstoning a
-        // non-existent key is pure WAL+memtable bloat. The atomic
-        // `version_counter_count` lets us skip the RwLock acquire entirely
-        // when nothing has ever been updated (the bench case).
+        // Drop the persisted `g:` generation key — but only for objects that
+        // were UPDATED (generation >= 2). A never-updated object has no `g:`
+        // key on disk (born-at-1 lives in memory; existence comes from the
+        // `o:` key), so tombstoning it would be pure WAL+SST bloat. The atomic
+        // `version_counter_count` skips even the RwLock acquire when the
+        // counter map is empty.
         if self
             .version_counter_count
             .load(std::sync::atomic::Ordering::Relaxed)
             != 0
         {
-            let has_version = self
+            let was_updated = self
                 .version_counters
                 .read()
-                .contains_key(&(type_id, object_id));
-            if has_version {
+                .get(&(type_id, object_id))
+                .is_some_and(|&v| v > 1);
+            if was_updated {
                 arena.push_object_version(type_id, object_id);
             }
         }
@@ -8077,5 +8084,84 @@ mod tests {
             .filter_scan("User", "age", CompareOp::Gt, 15, None)
             .unwrap();
         assert_eq!(gt.len(), 25, "should include 16..=40");
+    }
+
+    #[test]
+    fn create_writes_no_generation_key_update_does() {
+        // born-at-1 lives in memory only: a create persists NO `g:` key
+        // (existence is the born bit, reconstructed at open from the `o:*`
+        // scan). A `g:` key appears only once an object is UPDATED.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", f).unwrap();
+        assert_eq!(
+            db.object_version("User", alice.id),
+            1,
+            "born at generation 1 in memory"
+        );
+
+        let g_prefix = KeyBuilder::object_version_prefix();
+        let txn = db.storage().begin_txn();
+        let g_after_create = db.storage().scan_prefix(&txn, &g_prefix).unwrap();
+        drop(txn);
+        assert!(
+            g_after_create.is_empty(),
+            "create must persist no g: key, found {}",
+            g_after_create.len()
+        );
+
+        // An update bumps to generation 2 AND persists exactly one g: key.
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alicia".into()));
+        db.update("User", alice.id, uf).unwrap();
+        assert_eq!(db.object_version("User", alice.id), 2);
+
+        let txn2 = db.storage().begin_txn();
+        let g_after_update = db.storage().scan_prefix(&txn2, &g_prefix).unwrap();
+        drop(txn2);
+        assert_eq!(
+            g_after_update.len(),
+            1,
+            "update must persist exactly one g: key"
+        );
+    }
+
+    #[test]
+    fn born_bit_reconstructed_from_object_scan_on_reopen() {
+        // Dropping the persisted create-time `g:` key must not lose the born
+        // bit across a restart: open() re-seeds generation 1 for every live
+        // object from the `o:*` scan. A live never-updated object reads 1 after
+        // reopen; a deleted one reads 0 (its `o:` key is gone, so never seeded).
+        let dir = tempfile::tempdir().unwrap();
+        let schema_text = r#"type User { name: String }"#;
+
+        let (live_id, dead_id) = {
+            let db = Database::open(parse_schema(schema_text).unwrap(), dir.path()).unwrap();
+            let mut a = FieldMap::new();
+            a.insert("name".into(), Value::String("Live".into()));
+            let live = db.create("User", a).unwrap();
+            let mut b = FieldMap::new();
+            b.insert("name".into(), Value::String("Dead".into()));
+            let dead = db.create("User", b).unwrap();
+            db.delete("User", dead.id).unwrap();
+            (live.id, dead.id)
+        };
+
+        // Reopen: version_counters rebuilt purely from disk (o:* seed, no g:).
+        let db = Database::open(parse_schema(schema_text).unwrap(), dir.path()).unwrap();
+        assert_eq!(
+            db.object_version("User", live_id),
+            1,
+            "live never-updated object must reconstruct generation 1 from existence"
+        );
+        assert_eq!(
+            db.object_version("User", dead_id),
+            0,
+            "deleted object must read generation 0 after reopen (o: key gone, never seeded)"
+        );
     }
 }

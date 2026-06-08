@@ -1445,6 +1445,75 @@ mod tests {
     }
 
     #[test]
+    fn fusion_phantom_stays_closed_across_restart() {
+        // The born bit is no longer a persisted `g:` key — it is reconstructed
+        // at open() from the `o:*` object scan. This proves dropping that key
+        // does not reintroduce the never-updated-then-deleted phantom across a
+        // restart: a deleted target's `o:` key is gone, so the reopen scan
+        // never re-seeds its generation, `object_version` reads 0, and the
+        // surviving Movie-side `user__cover` is rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let schema_text = r#"
+            type User {
+                name: String
+                ratings: [Rating] @inverse(Rating.user)
+            }
+            type Movie {
+                title: String
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+            type Rating {
+                stars: u32
+                user: User @on_delete(remove)
+                movie: Movie
+            }
+        "#;
+
+        let (alice_id, movie_id) = {
+            let db = Database::open(parse_schema(schema_text).unwrap(), dir.path()).unwrap();
+            let mut uf = FieldMap::new();
+            uf.insert("name".into(), Value::String("Alice".into()));
+            let alice = db.create("User", uf).unwrap();
+            let mut mf = FieldMap::new();
+            mf.insert("title".into(), Value::String("Aliens".into()));
+            let movie = db.create("Movie", mf).unwrap();
+            let mut rf = FieldMap::new();
+            rf.insert("stars".into(), Value::U32(5));
+            let rating = db.create("Rating", rf).unwrap();
+            db.link("Rating", rating.id, "user", alice.id, None).unwrap();
+            db.link("Rating", rating.id, "movie", movie.id, None).unwrap();
+            // Delete Alice (never updated) while the Movie-side cover survives.
+            db.delete("User", alice.id).unwrap();
+            (alice.id, movie.id)
+        };
+
+        // Reopen: version_counters is rebuilt from disk (o:* seed + g:* override).
+        let db = Database::open(parse_schema(schema_text).unwrap(), dir.path()).unwrap();
+        assert_eq!(
+            db.object_version("User", alice_id),
+            0,
+            "deleted target must read generation 0 after restart (not re-seeded)"
+        );
+
+        let q = parse_query(&format!("Movie.get({movie_id}).ratings.user")).unwrap();
+        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let objs = match result {
+            QueryOutput::Objects(objs) => objs,
+            other => panic!("expected Objects, got {other:?}"),
+        };
+        assert!(
+            objs.is_empty(),
+            "deleted user phantomed via a stale cover after restart: {:?}",
+            objs.into_iter()
+                .map(|mut o| {
+                    o.ensure_fields_deserialized();
+                    o.fields.get("name").cloned()
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn fusion_drops_nested_3hop_target_deleted_without_prior_update() {
         // Same phantom, one level deeper: the deleted target sits in a NESTED
         // 3-hop cover (`director__cover` embedded inside `movie__cover`). The
