@@ -21,8 +21,15 @@ const SST_MAGIC: &[u8; 4] = b"RSST";
 /// - v4: + zone map block before the bloom block, footer extended with
 ///   `[zonemap_offset: u64][zonemap_size: u32]`. Per-block min/max for
 ///   opted-in integer fields enables `scan_prefix_filtered` to skip whole
-///   blocks before any entry decode.
-const SST_VERSION: u32 = 4;
+///   blocks before any entry decode. Zone columns keyed by FNV-1a of
+///   field name — vulnerable to `rename_field`.
+/// - v5: zone map keyed by stable catalog `field_id` instead of FNV(name).
+///   Wire format identical to v4 (still `u32` per column key); only the
+///   *meaning* of the bits changes, so the version bump is the safety
+///   marker. v4 files keep opening for read but their zone map is
+///   discarded (block pruning falls back to full scan) — natural
+///   compaction rewrites them as v5.
+const SST_VERSION: u32 = 5;
 
 /// v1 footer: [index_offset: 8][index_count: 4][magic: 4]
 const FOOTER_V1_SIZE: usize = 8 + 4 + 4;
@@ -32,7 +39,7 @@ const FOOTER_V1_SIZE: usize = 8 + 4 + 4;
 /// format changes (v3 prepends a 1-byte hash-algorithm tag).
 const FOOTER_V2_SIZE: usize = 8 + 4 + 8 + 4 + 4;
 
-/// v4 footer: [zonemap_offset: 8][zonemap_size: 4] + v2/v3 footer.
+/// v4/v5 footer: [zonemap_offset: 8][zonemap_size: 4] + v2/v3 footer.
 const FOOTER_V4_SIZE: usize = 8 + 4 + FOOTER_V2_SIZE;
 
 /// A single entry in the SST data block.
@@ -299,18 +306,18 @@ impl SstReader {
             return Err(Error::SstCorrupted("bad magic".into()));
         }
         let version = u32::from_be_bytes(data[4..8].try_into().unwrap());
-        if !(1..=4).contains(&version) {
+        if !(1..=5).contains(&version) {
             return Err(Error::SstCorrupted(format!("unsupported version: {version}")));
         }
 
-        let (index_offset, index_count, bloom, zone_map) = if version == 4 {
+        let (index_offset, index_count, bloom, zone_map) = if version == 4 || version == 5 {
             if data.len() < SST_MAGIC.len() + 4 + FOOTER_V4_SIZE {
-                return Err(Error::SstCorrupted("v4 footer truncated".into()));
+                return Err(Error::SstCorrupted("v4/v5 footer truncated".into()));
             }
             let footer_start = data.len() - FOOTER_V4_SIZE;
             // Magic check: footer_start + 36 (zonemap u64+u32 + bloom u64+u32 + index u64+u32 = 36).
             if &data[footer_start + 36..] != SST_MAGIC {
-                return Err(Error::SstCorrupted("bad v4 footer magic".into()));
+                return Err(Error::SstCorrupted("bad v4/v5 footer magic".into()));
             }
             let zonemap_offset = u64::from_be_bytes(
                 data[footer_start..footer_start + 8].try_into().unwrap(),
@@ -334,15 +341,26 @@ impl SstReader {
             if zonemap_offset + zonemap_size > footer_start {
                 return Err(Error::SstCorrupted("zonemap extends past footer".into()));
             }
-            let zone_slice = &data[zonemap_offset..zonemap_offset + zonemap_size];
-            let zone_map = ZoneMap::read_from(&mut &zone_slice[..])?;
+            // v5 columns are keyed by stable field_id; v4 columns are keyed
+            // by FNV-1a(field_name) and would be miskeyed under the new
+            // convention (zero pruning hits, or worse, false matches if a
+            // hash happens to collide with a field_id). The zone map block
+            // is still parsed/skipped over for layout consistency, but only
+            // wired into the reader for v5. v4 SSTs serve correct results
+            // without block pruning until natural compaction rewrites them.
+            let zone_map = if version == 5 {
+                let zone_slice = &data[zonemap_offset..zonemap_offset + zonemap_size];
+                Some(ZoneMap::read_from(&mut &zone_slice[..])?)
+            } else {
+                None
+            };
 
             if bloom_offset + bloom_size > footer_start {
                 return Err(Error::SstCorrupted("bloom block extends past footer".into()));
             }
             let bloom_slice = &data[bloom_offset..bloom_offset + bloom_size];
             if bloom_slice.is_empty() {
-                return Err(Error::SstCorrupted("v4 bloom missing algo byte".into()));
+                return Err(Error::SstCorrupted("v4/v5 bloom missing algo byte".into()));
             }
             let algo = HashAlgo::from_byte(bloom_slice[0]).ok_or_else(|| {
                 Error::SstCorrupted(format!("unknown bloom algo byte: {}", bloom_slice[0]))
@@ -350,7 +368,7 @@ impl SstReader {
             let bloom = BloomFilter::read_from(&mut &bloom_slice[1..], algo)
                 .map_err(|e| Error::SstCorrupted(format!("bloom: {e}")))?;
 
-            (index_offset, index_count, Some(bloom), Some(zone_map))
+            (index_offset, index_count, Some(bloom), zone_map)
         } else if version == 2 || version == 3 {
             if data.len() < SST_MAGIC.len() + 4 + FOOTER_V2_SIZE {
                 return Err(Error::SstCorrupted("v2/v3 footer truncated".into()));
@@ -1058,7 +1076,7 @@ impl SstReader {
             if block_idx != current_block_passed {
                 if !zone_map.block_could_match(
                     block_idx,
-                    predicate.field_hash,
+                    predicate.field_id,
                     predicate.op,
                     predicate.target,
                 ) {
@@ -2297,14 +2315,18 @@ mod tests {
         assert!(reader.prefix_range_overlaps_sorted(&refs));
     }
 
-    // --- v4 zone map + scan_prefix_filtered --------------------------------
+    // --- v5 zone map + scan_prefix_filtered --------------------------------
+
+    /// Synthetic field_id for the `year` column in zone-map tests. In
+    /// production this comes from the catalog (`c:F:` rows); here we use a
+    /// small constant so the test is hermetic.
+    const YEAR_FIELD_ID: u32 = 1;
 
     /// Build an SST of "movie" entries (one int field "year") with the given
     /// (id, year) pairs, in id-sorted order. Returns the reader.
     fn build_movie_sst(path: &Path, entries: &[(u64, u32)]) -> SstReader {
-        use crate::zone::{hash_field_name, ZoneFieldExtractor};
+        use crate::zone::ZoneFieldExtractor;
 
-        let year_hash = hash_field_name(b"year");
         // Naive extractor: parse our test format (just the year as the value).
         let extractor: ZoneFieldExtractor = std::sync::Arc::new(
             move |_internal_key: &[u8], value: &[u8]| -> Vec<(u32, [u8; 8])> {
@@ -2313,7 +2335,7 @@ mod tests {
                     return Vec::new();
                 }
                 let year = u32::from_be_bytes(value.try_into().unwrap()) as u64;
-                vec![(year_hash, year.to_be_bytes())]
+                vec![(YEAR_FIELD_ID, year.to_be_bytes())]
             },
         );
 
@@ -2329,28 +2351,25 @@ mod tests {
     }
 
     #[test]
-    fn v4_sst_carries_zone_map() {
-        use crate::zone::hash_field_name;
-
+    fn v5_sst_carries_zone_map() {
         let dir = tempfile::tempdir().unwrap();
         let entries: Vec<(u64, u32)> = (0u64..32).map(|i| (i, 1900 + i as u32)).collect();
-        let reader = build_movie_sst(&dir.path().join("v4.sst"), &entries);
+        let reader = build_movie_sst(&dir.path().join("v5.sst"), &entries);
 
-        let zone = reader.zone_map().expect("v4 SST must carry zone map");
-        let h = hash_field_name(b"year");
+        let zone = reader.zone_map().expect("v5 SST must carry zone map");
         // 32 entries / 16-per-block = 2 blocks. Block 0: years 1900-1915.
         // Block 1: years 1916-1931.
-        let (min0, max0) = zone.bounds(0, h).unwrap();
+        let (min0, max0) = zone.bounds(0, YEAR_FIELD_ID).unwrap();
         assert_eq!(min0, 1900);
         assert_eq!(max0, 1915);
-        let (min1, max1) = zone.bounds(1, h).unwrap();
+        let (min1, max1) = zone.bounds(1, YEAR_FIELD_ID).unwrap();
         assert_eq!(min1, 1916);
         assert_eq!(max1, 1931);
     }
 
     #[test]
     fn scan_prefix_filtered_skips_blocks_that_cant_match() {
-        use crate::zone::{hash_field_name, CompareOp, FieldPredicate};
+        use crate::zone::{CompareOp, FieldPredicate};
 
         let dir = tempfile::tempdir().unwrap();
         // 4 blocks of 16 entries each. Years are tightly clustered per block:
@@ -2361,7 +2380,7 @@ mod tests {
         // year > 1940 must skip blocks 0 and 1 entirely (their max < 1940).
         // Predicate target = 1940 encoded as u64.
         let predicate = FieldPredicate {
-            field_hash: hash_field_name(b"year"),
+            field_id: YEAR_FIELD_ID,
             op: CompareOp::Gt,
             target: 1940,
         };
@@ -2377,7 +2396,7 @@ mod tests {
 
     #[test]
     fn scan_prefix_filtered_falls_back_when_no_zone_map() {
-        use crate::zone::{hash_field_name, CompareOp, FieldPredicate};
+        use crate::zone::{CompareOp, FieldPredicate};
 
         // SST built WITHOUT an extractor — no zone map (well, an empty one).
         // scan_prefix_filtered should behave like scan_prefix.
@@ -2395,7 +2414,7 @@ mod tests {
         let reader = SstReader::open(&sst_path).unwrap();
 
         let predicate = FieldPredicate {
-            field_hash: hash_field_name(b"year"),
+            field_id: YEAR_FIELD_ID,
             op: CompareOp::Gt,
             target: 1900,
         };

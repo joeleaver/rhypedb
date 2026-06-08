@@ -34,6 +34,26 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                 });
             }
 
+            // Reserve the `__` substring (anywhere in the name) for
+            // internal sidecar keys. The engine writes these keys inside
+            // serialized FieldMaps (cover blobs in rev_edge values):
+            //   - `<field>__cover` (Bytes) — second-degree cover blob
+            //   - `<field>__cover_v` (U64) — cover generation stamp
+            //   - `<field>__shadow` — in-flight field-type migration value
+            //
+            // A user-declared field whose name CONTAINS `__` anywhere can
+            // collide with these suffix patterns (e.g. user field
+            // `bar__cover` would be overwritten by the engine's cover for
+            // the relation field `bar`). Reject the entire `__` substring
+            // rather than just the prefix to close that hole.
+            if field.name.contains("__") {
+                return Err(SchemaError::Validation(format!(
+                    "field '{}.{}': names containing `__` are reserved for internal use \
+                     (engine sidecar keys: `<field>__cover`, `<field>__cover_v`, `<field>__shadow`)",
+                    type_def.name, field.name
+                )));
+            }
+
             // Validate relationship targets exist.
             if let FieldType::Relation(rel) = &field.field_type
                 && !schema.types.contains_key(&rel.target_type) {
@@ -775,6 +795,62 @@ mod tests {
 
         let user = schema.get_type("User").unwrap();
         assert_eq!(user.fields.len(), 2);
+    }
+
+    #[test]
+    fn reject_field_with_double_underscore_prefix() {
+        // The `__` substring is reserved for engine-internal cover-blob
+        // and shadow-field keys; user fields collide silently otherwise.
+        let result = parse_schema(
+            r#"
+            type User {
+                __cover_3: String
+            }
+            "#,
+        );
+        let err = result.expect_err("must reject");
+        match err {
+            SchemaError::Validation(msg) => {
+                assert!(msg.contains("`__`"), "msg: {msg}");
+                assert!(msg.contains("__cover_3"), "msg: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_field_with_double_underscore_mid_name() {
+        // The collision vector is the SUFFIX patterns (`<field>__cover`,
+        // etc.), so even mid-name `__` must be rejected. Regression for
+        // the `bar__cover` clobbers `bar`-relation cover hazard surfaced
+        // by adversarial review of PR #6.
+        let result = parse_schema(
+            r#"
+            type User {
+                bar__cover: String
+            }
+            "#,
+        );
+        let err = result.expect_err("must reject");
+        match err {
+            SchemaError::Validation(msg) => {
+                assert!(msg.contains("`__`"), "msg: {msg}");
+                assert!(msg.contains("bar__cover"), "msg: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_field_with_double_underscore_suffix() {
+        let result = parse_schema(
+            r#"
+            type User {
+                name__: String
+            }
+            "#,
+        );
+        assert!(matches!(result, Err(SchemaError::Validation(_))));
     }
 
     #[test]

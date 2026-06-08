@@ -350,6 +350,26 @@ pub enum CatalogError {
     #[error("change_field_type {qualified:?} would exceed the per-row type-change history cap of {cap} entries")]
     FieldTypeChangeHistoryCapExceeded { qualified: String, cap: usize },
 
+    /// Card 3/5 phase 2 of rename_field refuses fields carrying
+    /// `@indexed`, `@unique`, or `@vectorize`. Each requires follow-on
+    /// rewriting that's deliberately deferred (covering-index values
+    /// would be stale, uniqueness re-check has to know whether the
+    /// rename collides with an existing record under the new name in
+    /// the abstract namespace, the vectorize source ref has to update).
+    /// Refuse up-front rather than ship a half-correct rewrite.
+    #[error("rename_field {qualified:?}: field carries the {directive:?} directive which is not supported by the phase-2 verb; lift this restriction in a follow-on card")]
+    RenameFieldDirectiveUnsupported {
+        qualified: String,
+        directive: &'static str,
+    },
+
+    /// Relation fields aren't supported by rename_field phase 2 — every
+    /// reverse-edge cover blob from this source type embeds the field
+    /// by name, and an in-flight rewrite of those covers is deferred to
+    /// the same follow-on card as the directive lift.
+    #[error("rename_field {qualified:?}: relation fields cannot be renamed by the phase-2 verb; lift this restriction in a follow-on card")]
+    RenameFieldRelationUnsupported { qualified: String },
+
     /// The supplied migration list has fewer entries than the catalog
     /// reports already-applied. Indicates that the binary was downgraded
     /// or the operator's source-controlled migration list lost entries.
@@ -434,4 +454,12 @@ pub enum CatalogError {
     /// the schema validator; surfaces here as a defense-in-depth check.
     #[error("identifier {name:?} contains reserved byte 0x{byte:02x}")]
     ReservedByteInIdentifier { name: String, byte: u8 },
+
+    /// An identifier contains `__` anywhere — reserved for engine-
+    /// internal cover-blob and shadow-field sidecar keys
+    /// (`<field>__cover`, `<field>__cover_v`, `<field>__shadow`,
+    /// `__cover_<field_id>`, etc.). Schema validation and the rename
+    /// verbs both refuse user identifiers in this namespace.
+    #[error("identifier {name:?} contains reserved `__` substring (engine sidecar namespace)")]
+    ReservedDoubleUnderscoreInIdentifier { name: String },
 }
