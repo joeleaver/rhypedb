@@ -141,21 +141,19 @@ fn bench_search(dims: usize, bits: u8, n: usize, n_queries: usize) {
 }
 
 fn main() {
-    println!("=== TurboQuant kernel microbench ===");
-    // The isolated kernel is the optimization target: measured at full size.
-    println!("-- isolated kernel (inner_product_estimate_prepared) --");
-    for &dims in &[384usize, 1536] {
-        for &bits in &[2u8, 4] {
-            bench_kernel(dims, bits, 10_000, 7);
-        }
+    println!("=== TurboQuant kernel + build microbench ===");
+    // Isolated search kernel — unchanged by the build-path work; run small as a
+    // sanity check that the distance estimate didn't move.
+    println!("-- isolated kernel (sanity) --");
+    for &bits in &[2u8, 4] {
+        bench_kernel(384, bits, 10_000, 5);
     }
-    // End-to-end search. NOTE: HNSW *construction* is dominated by
-    // `prepare_stored`'s O(d²) matmuls (a separate, construction-only cost not
-    // touched by this kernel change), so we keep this to one modest 384-dim
-    // point. The figures of interest are `qps` (search throughput) and
-    // `recall@10` — which must be byte-for-byte identical before/after, since the
-    // kernel rewrite is bit-identical. (1536-dim search is covered by the
-    // isolated kernel numbers above; its build is too slow to be worth timing.)
-    println!("-- end-to-end search (QuantizedIndex, bits=4) --");
-    bench_search(384, 4, 10_000, 300);
+    // Build + search. `build=… ins/s` is the figure of interest for the build
+    // optimization (prepare_stored): HNSW construction is dominated by
+    // `prepare_stored`'s O(d²) matmuls during neighbor pruning. `qps` and
+    // `recall@10` confirm search throughput and accuracy are preserved. Two
+    // dims so the O(d²) win is visible; sizes kept modest for a quick A/B.
+    println!("-- build + search (QuantizedIndex, bits=4) --");
+    bench_search(384, 4, 6_000, 300);
+    bench_search(768, 4, 2_000, 300);
 }
