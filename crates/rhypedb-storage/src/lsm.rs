@@ -64,11 +64,11 @@ impl LsmConfig {
 /// and runs `compact_inner`).
 ///
 /// Three flags drive the worker:
-///   * `pending`  — `maybe_flush` set this when crossing the SST threshold;
-///                  worker clears it when it picks up the job.
-///   * `running`  — set while `compact_inner` is in flight; cleared after.
-///                  Lets `wait_for_compaction` block until idle.
-///   * `shutdown` — set by `Drop`; tells the worker to exit its loop.
+/// * `pending` — `maybe_flush` set this when crossing the SST threshold;
+///   worker clears it when it picks up the job.
+/// * `running` — set while `compact_inner` is in flight; cleared after.
+///   Lets `wait_for_compaction` block until idle.
+/// * `shutdown` — set by `Drop`; tells the worker to exit its loop.
 #[derive(Default)]
 struct CompactionState {
     pending: bool,
@@ -345,7 +345,7 @@ impl LsmTree {
             }
             let vals = sst.multi_get_versioned(&keys, version)?;
             let mut next = Vec::with_capacity(remaining.len());
-            for ((orig_idx, key), val) in remaining.into_iter().zip(vals.into_iter()) {
+            for ((orig_idx, key), val) in remaining.into_iter().zip(vals) {
                 match val {
                     Some(memval) => out[orig_idx] = memval,
                     None => next.push((orig_idx, key)),
@@ -1905,12 +1905,11 @@ mod tests {
                 "missing present id {id} at idx {i}"
             );
         }
-        for offset in 0..absent_ids.len() {
+        for (offset, absent_id) in absent_ids.iter().enumerate() {
             let idx = present_ids.len() + offset;
             assert!(
                 results[idx].is_none(),
-                "absent id {} at idx {idx} unexpectedly returned {:?}",
-                absent_ids[offset],
+                "absent id {absent_id} at idx {idx} unexpectedly returned {:?}",
                 results[idx]
             );
         }

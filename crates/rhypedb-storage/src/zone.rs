@@ -188,7 +188,9 @@ impl ZoneMap {
         if self.num_fields == 0 {
             // Zone maps with zero fields don't carry per-block data — treat
             // as covering whatever the SST has (always returns true on check).
-            return self.bounds.len() / 1; // = 0
+            // `bounds` is empty when `num_fields == 0` (it was built with
+            // `num_blocks * num_fields * 2 == 0` capacity), so this is 0.
+            return self.bounds.len();
         }
         self.bounds.len() / (self.num_fields * 2)
     }

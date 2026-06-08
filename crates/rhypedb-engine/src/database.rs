@@ -479,17 +479,17 @@ impl Database {
         let mut retired_at_ms_by_type_id: HashMap<u64, u64> = HashMap::new();
         let mut retired_at_ms_by_field_id: HashMap<u64, u64> = HashMap::new();
         let mut retired_at_ms_by_rel_id: HashMap<u64, u64> = HashMap::new();
-        for (_, entry) in &cat.type_entries {
+        for entry in cat.type_entries.values() {
             if let Some(ms) = entry.retired_at_ms {
                 retired_at_ms_by_type_id.insert(entry.id, ms);
             }
         }
-        for (_, entry) in &cat.field_entries {
+        for entry in cat.field_entries.values() {
             if let Some(ms) = entry.retired_at_ms {
                 retired_at_ms_by_field_id.insert(entry.id, ms);
             }
         }
-        for (_, entry) in &cat.rel_entries {
+        for entry in cat.rel_entries.values() {
             if let Some(ms) = entry.retired_at_ms {
                 retired_at_ms_by_rel_id.insert(entry.id, ms);
             }
@@ -956,10 +956,10 @@ impl Database {
     /// common case (a type with no retired fields) the HashMap lookup
     /// misses and the strip is a single hash + branch.
     fn strip_tombstoned_fields(&self, type_name: &str, fields: &mut FieldMap) {
-        if let Some(retired) = self.retired_field_names_by_type.get(type_name) {
-            if !retired.is_empty() {
-                fields.retain(|name, _| !retired.contains(name));
-            }
+        if let Some(retired) = self.retired_field_names_by_type.get(type_name)
+            && !retired.is_empty()
+        {
+            fields.retain(|name, _| !retired.contains(name));
         }
     }
 
@@ -1865,24 +1865,32 @@ impl Database {
         // encoding matches what's on disk. Bail out to `scan_type` (no perf
         // gain, but correct) for non-integer scalar fields.
         let target_value = match &field_def.field_type {
-            FieldType::Scalar(ScalarType::U32) => {
-                if !(0..=u32::MAX as i64).contains(&target) {
-                    // Predicate target out of u32 range — answer is trivially
-                    // empty (no entry can equal/compare appropriately) for
-                    // many ops; fall back to scan_type for the safety.
-                    return self.scan_type(type_name);
-                }
+            FieldType::Scalar(ScalarType::U32) if (0..=u32::MAX as i64).contains(&target) => {
                 Value::U32(target as u32)
             }
-            FieldType::Scalar(ScalarType::U64) => {
-                if target < 0 {
-                    return self.scan_type(type_name);
-                }
-                Value::U64(target as u64)
+            FieldType::Scalar(ScalarType::U64) if target >= 0 => Value::U64(target as u64),
+            FieldType::Scalar(ScalarType::I32)
+                if (i32::MIN as i64..=i32::MAX as i64).contains(&target) =>
+            {
+                Value::I32(target as i32)
             }
-            FieldType::Scalar(ScalarType::I32) => Value::I32(target as i32),
             FieldType::Scalar(ScalarType::I64) => Value::I64(target),
-            _ => return self.scan_type(type_name),
+            // Non-integer field, or an integer field whose declared type can't
+            // represent `target` (out of range). The typed index/zone fast
+            // path doesn't apply — compare per row so the answer stays correct
+            // (and empty for non-numeric fields) instead of returning the whole
+            // table.
+            _ => {
+                return self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+                    Value::U32(n) => Some(compare_partial(*n as i128, op, target as i128)),
+                    Value::U64(n) => Some(compare_partial(*n as i128, op, target as i128)),
+                    Value::I32(n) => Some(compare_partial(*n as i128, op, target as i128)),
+                    Value::I64(n) => Some(compare_partial(*n as i128, op, target as i128)),
+                    Value::F64(f) => Some(compare_partial(*f, op, target as f64)),
+                    Value::F32(f) => Some(compare_partial(*f as f64, op, target as f64)),
+                    _ => Some(false),
+                });
+            }
         };
 
         let target_bytes = encode_int_for_zone(&target_value).unwrap();
@@ -2128,16 +2136,16 @@ impl Database {
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+        // Validate the field exists (errors as Retired / NotFound). A non-bool
+        // field never matches a bool literal: the fallback closure below
+        // returns an empty set, not the whole table.
+        type_def.get_field(field_name).ok_or_else(|| {
             self.field_retired_error(type_name, field_name)
                 .unwrap_or_else(|| EngineError::FieldNotFound {
                     type_name: type_name.into(),
                     field: field_name.into(),
                 })
         })?;
-        if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bool)) {
-            return self.scan_type(type_name);
-        }
 
         if let Some(idx_fields) = self.indexed_fields.get(type_name)
             && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
@@ -2186,11 +2194,10 @@ impl Database {
             field_def.field_type,
             FieldType::Scalar(ScalarType::F32 | ScalarType::F64)
         );
-        if !is_float {
-            return self.scan_type(type_name);
-        }
 
-        if let Some(idx_fields) = self.indexed_fields.get(type_name)
+        // Float index fast path — only when the field actually is a float.
+        if is_float
+            && let Some(idx_fields) = self.indexed_fields.get(type_name)
             && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
             && ifd.kind == IndexedKind::Float
         {
@@ -2204,9 +2211,17 @@ impl Database {
                 limit,
             );
         }
+        // Per-row fallback: compare ANY numeric field value against the f64
+        // target, so an int field compared to a float literal filters
+        // correctly. Non-numeric fields never match — an empty result, not the
+        // whole table.
         self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
             Value::F64(f) => Some(compare_partial(*f, op, target)),
             Value::F32(f) => Some(compare_partial(*f as f64, op, target)),
+            Value::U32(n) => Some(compare_partial(*n as f64, op, target)),
+            Value::U64(n) => Some(compare_partial(*n as f64, op, target)),
+            Value::I32(n) => Some(compare_partial(*n as f64, op, target)),
+            Value::I64(n) => Some(compare_partial(*n as f64, op, target)),
             _ => Some(false),
         })
     }
@@ -2227,16 +2242,16 @@ impl Database {
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+        // Validate the field exists (errors as Retired / NotFound). A non-bytes
+        // field never matches a bytes literal: the fallback closure below
+        // returns an empty set, not the whole table.
+        type_def.get_field(field_name).ok_or_else(|| {
             self.field_retired_error(type_name, field_name)
                 .unwrap_or_else(|| EngineError::FieldNotFound {
                     type_name: type_name.into(),
                     field: field_name.into(),
                 })
         })?;
-        if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::Bytes)) {
-            return self.scan_type(type_name);
-        }
 
         if let Some(idx_fields) = self.indexed_fields.get(type_name)
             && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
@@ -2279,18 +2294,16 @@ impl Database {
             .schema
             .get_type(type_name)
             .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
-        let field_def = type_def.get_field(field_name).ok_or_else(|| {
+        // Validate the field exists (errors as Retired / NotFound). A
+        // non-string field never matches a string literal: the fallback
+        // closure below returns an empty set, not the whole table.
+        type_def.get_field(field_name).ok_or_else(|| {
             self.field_retired_error(type_name, field_name)
                 .unwrap_or_else(|| EngineError::FieldNotFound {
                     type_name: type_name.into(),
                     field: field_name.into(),
                 })
         })?;
-
-        // Non-string scalar field — no point pretending the literal applies.
-        if !matches!(field_def.field_type, FieldType::Scalar(ScalarType::String)) {
-            return self.scan_type(type_name);
-        }
 
         // === Indexed fast path ===
         if let Some(idx_fields) = self.indexed_fields.get(type_name)
@@ -2769,6 +2782,10 @@ impl Database {
     ///     stage tombstones without a per-relation `scan_prefix`. At
     ///     K=100 cascading Ratings this drops 200 LSM scans per User
     ///     delete.
+    // Internal staging helper: the args are cohesive (txn + identity +
+    // delete-mode flags); grouping them into a struct would add indirection
+    // without clarity.
+    #[allow(clippy::too_many_arguments)]
     fn delete_inner(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
@@ -3481,6 +3498,7 @@ impl Database {
     ///
     /// Caller must hold a write txn. Silently no-ops on value-kind mismatches
     /// (e.g. null, or wrong scalar type) — there's nothing to index.
+    #[allow(clippy::too_many_arguments)]
     fn insert_field_index(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
@@ -4341,8 +4359,10 @@ mod tests {
     use rhypedb_schema::parser::parse_schema;
 
     fn open_with_shrink(schema: Schema, dir: &std::path::Path) -> Arc<Database> {
-        let mut opts = OpenOptions::default();
-        opts.allow_schema_shrink = true;
+        let opts = OpenOptions {
+            allow_schema_shrink: true,
+            ..Default::default()
+        };
         Database::open_with_options(schema, dir, opts).unwrap()
     }
 
@@ -4404,9 +4424,9 @@ mod tests {
         let smaller = parse_schema(r#"type User { name: String }"#).unwrap();
         let db2 = open_with_shrink(smaller, dir.path());
         let fetched = db2.get("User", user.id).unwrap();
-        assert!(fetched.fields.get("name").is_some());
+        assert!(fetched.fields.contains_key("name"));
         assert!(
-            fetched.fields.get("nickname").is_none(),
+            !fetched.fields.contains_key("nickname"),
             "retired field must be stripped from returned FieldMap"
         );
     }
@@ -4443,8 +4463,8 @@ mod tests {
         let users = db2.scan_type("User").unwrap();
         assert_eq!(users.len(), 3);
         for u in &users {
-            assert!(u.fields.get("name").is_some());
-            assert!(u.fields.get("nickname").is_none());
+            assert!(u.fields.contains_key("name"));
+            assert!(!u.fields.contains_key("nickname"));
         }
         let err = db2.scan_type("Movie").unwrap_err();
         assert!(matches!(err, EngineError::TypeRetired { .. }));
@@ -4677,7 +4697,7 @@ mod tests {
             "untouched fields preserved"
         );
         assert!(
-            r1.fields.get("name").is_none(),
+            !r1.fields.contains_key("name"),
             "the old name must NOT remain in the rewritten FieldMap"
         );
         let r2 = db2.get("User", u2.id).unwrap();
@@ -4770,20 +4790,21 @@ mod tests {
                 continue; // v4 SST with no usable zone map — skip
             };
             for block_idx in 0..zone.num_blocks() {
-                if let Some((min, max)) = zone.bounds(block_idx, year_field_id) {
-                    if min != u64::MAX && max != u64::MIN {
-                        // Real bounds (not the "no-data sentinel").
-                        // Years are u32 widened to u64 in the encoder.
-                        assert!(
-                            (1900..=2155).contains(&(min as u32)),
-                            "block {block_idx} min={min} out of expected range",
-                        );
-                        assert!(
-                            (1900..=2155).contains(&(max as u32)),
-                            "block {block_idx} max={max} out of expected range",
-                        );
-                        blocks_with_bounds += 1;
-                    }
+                if let Some((min, max)) = zone.bounds(block_idx, year_field_id)
+                    && min != u64::MAX
+                    && max != u64::MIN
+                {
+                    // Real bounds (not the "no-data sentinel").
+                    // Years are u32 widened to u64 in the encoder.
+                    assert!(
+                        (1900..=2155).contains(&(min as u32)),
+                        "block {block_idx} min={min} out of expected range",
+                    );
+                    assert!(
+                        (1900..=2155).contains(&(max as u32)),
+                        "block {block_idx} max={max} out of expected range",
+                    );
+                    blocks_with_bounds += 1;
                 }
             }
         }

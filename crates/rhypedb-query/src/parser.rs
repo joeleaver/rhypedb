@@ -125,6 +125,17 @@ impl<'a> Parser<'a> {
             .map_err(|_| self.error("invalid integer"))
     }
 
+    /// Parse a non-negative count (`limit` / `offset` / `k`). Rejects negatives,
+    /// which would otherwise wrap to a huge `usize` (an unbounded limit, or a
+    /// `k` that overflows the vectorizer's candidate math).
+    fn parse_count(&mut self) -> QueryResult<usize> {
+        let n = self.parse_int()?;
+        if n < 0 {
+            return Err(self.error("expected a non-negative integer"));
+        }
+        Ok(n as usize)
+    }
+
     fn parse_number(&mut self) -> QueryResult<Literal> {
         self.skip_ws();
         let start = self.pos;
@@ -223,33 +234,59 @@ impl<'a> Parser<'a> {
         Ok(fields)
     }
 
+    /// Predicate grammar with standard boolean precedence (`&&` binds tighter
+    /// than `||`) and parenthesized grouping, both left-associative:
+    /// ```text
+    /// predicate = and_term ("||" | "or" and_term)*
+    /// and_term  = factor   ("&&" | "and" factor)*
+    /// factor    = "(" predicate ")" | atom
+    /// ```
     fn parse_predicate(&mut self) -> QueryResult<Predicate> {
-        let left = self.parse_predicate_atom()?;
+        let mut left = self.parse_and_term()?;
+        loop {
+            self.skip_ws();
+            let remaining = &self.input[self.pos..];
+            if remaining.starts_with("||") {
+                self.pos += 2;
+            } else if remaining.starts_with("or ") {
+                self.pos += 3;
+            } else {
+                break;
+            }
+            let right = self.parse_and_term()?;
+            left = Predicate::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
 
-        self.skip_ws();
-        let remaining = &self.input[self.pos..];
-
-        if remaining.starts_with("&&") || remaining.starts_with("and ") {
+    fn parse_and_term(&mut self) -> QueryResult<Predicate> {
+        let mut left = self.parse_predicate_factor()?;
+        loop {
+            self.skip_ws();
+            let remaining = &self.input[self.pos..];
             if remaining.starts_with("&&") {
                 self.pos += 2;
+            } else if remaining.starts_with("and ") {
+                self.pos += 4;
             } else {
-                self.pos += 3;
+                break;
             }
-            let right = self.parse_predicate()?;
-            return Ok(Predicate::And(Box::new(left), Box::new(right)));
+            let right = self.parse_predicate_factor()?;
+            left = Predicate::And(Box::new(left), Box::new(right));
         }
-
-        if remaining.starts_with("||") || remaining.starts_with("or ") {
-            if remaining.starts_with("or ") {
-                self.pos += 3;
-            } else {
-                self.pos += 2;
-            }
-            let right = self.parse_predicate()?;
-            return Ok(Predicate::Or(Box::new(left), Box::new(right)));
-        }
-
         Ok(left)
+    }
+
+    fn parse_predicate_factor(&mut self) -> QueryResult<Predicate> {
+        self.skip_ws();
+        if self.peek() == Some('(') {
+            self.advance(); // consume '('
+            let inner = self.parse_predicate()?;
+            self.expect_char(')')?;
+            Ok(inner)
+        } else {
+            self.parse_predicate_atom()
+        }
     }
 
     fn parse_predicate_atom(&mut self) -> QueryResult<Predicate> {
@@ -360,13 +397,19 @@ impl<'a> Parser<'a> {
         let source = self.parse_source()?;
         let mut steps = Vec::new();
 
+        // Pipeline semantics: steps apply left-to-right, so `.limit(N).offset(M)`
+        // means "take N then skip M" (= N-M rows) — almost always a pagination
+        // mistake. Reject an offset that follows a limit on the SAME collection.
+        // A `traverse`/`similar` in between changes which collection limit and
+        // offset act on, so it resets the check. `.offset(M).limit(N)` reads as
+        // "skip M, take N" and yields the expected page.
+        let mut saw_limit = false;
         loop {
             self.skip_ws();
             if self.peek() != Some('.') {
                 break;
             }
 
-            let _saved_pos = self.pos;
             self.advance(); // consume '.'
 
             self.skip_ws();
@@ -381,6 +424,18 @@ impl<'a> Parser<'a> {
                     field_name: ident,
                 }
             };
+
+            match &step {
+                Step::Limit { .. } => saw_limit = true,
+                Step::Traverse { .. } | Step::Similar { .. } => saw_limit = false,
+                Step::Offset { .. } if saw_limit => {
+                    return Err(self.error(
+                        "`.offset(...)` must come before `.limit(...)`: `.limit(N).offset(M)` \
+                         takes N rows then skips M. For pagination use `.offset(M).limit(N)`.",
+                    ));
+                }
+                _ => {}
+            }
 
             steps.push(step);
         }
@@ -483,7 +538,7 @@ impl<'a> Parser<'a> {
                 self.expect_char(',')?;
                 self.skip_ws();
                 self.expect_str("k:")?;
-                let k = self.parse_int()? as usize;
+                let k = self.parse_count()?;
                 self.expect_char(')')?;
                 Ok(Step::Similar {
                     field_name,
@@ -542,13 +597,13 @@ impl<'a> Parser<'a> {
             }
             "limit" => {
                 self.expect_char('(')?;
-                let count = self.parse_int()? as usize;
+                let count = self.parse_count()?;
                 self.expect_char(')')?;
                 Ok(Step::Limit { count })
             }
             "offset" => {
                 self.expect_char('(')?;
-                let count = self.parse_int()? as usize;
+                let count = self.parse_count()?;
                 self.expect_char(')')?;
                 Ok(Step::Offset { count })
             }
@@ -757,10 +812,94 @@ mod tests {
 
     #[test]
     fn parse_limit_offset() {
-        let q = parse_query("User.filter(.age > 18).limit(10).offset(20)").unwrap();
+        // Pagination idiom: offset before limit ("skip 20, take 10").
+        let q = parse_query("User.filter(.age > 18).offset(20).limit(10)").unwrap();
         assert_eq!(q.steps.len(), 2);
+        assert_eq!(q.steps[0], Step::Offset { count: 20 });
+        assert_eq!(q.steps[1], Step::Limit { count: 10 });
+    }
+
+    #[test]
+    fn limit_before_offset_is_rejected() {
+        // `.limit(N).offset(M)` is the pagination footgun under sequential
+        // pipeline semantics (take N then skip M = N-M rows); the parser
+        // rejects it and points at the `.offset(M).limit(N)` idiom.
+        let err = parse_query("User.filter(.age > 18).limit(10).offset(20)").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("offset") && msg.contains("limit"),
+            "expected an offset/limit ordering error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn limit_then_traverse_then_offset_is_allowed() {
+        // A traverse between limit and offset changes which collection they act
+        // on ("take 10 users, go to friends, skip 5 friends"), so it is NOT the
+        // pagination footgun and must parse.
+        let q = parse_query("User.filter(.age > 18).limit(10).friends.offset(5)").unwrap();
+        assert_eq!(q.steps.len(), 3);
         assert_eq!(q.steps[0], Step::Limit { count: 10 });
-        assert_eq!(q.steps[1], Step::Offset { count: 20 });
+        assert!(matches!(q.steps[1], Step::Traverse { .. }));
+        assert_eq!(q.steps[2], Step::Offset { count: 5 });
+    }
+
+    #[test]
+    fn negative_count_is_rejected() {
+        // limit/offset/k wrap to a huge usize if parsed as a raw cast; reject.
+        assert!(parse_query("User.limit(-1)").is_err());
+        assert!(parse_query("User.offset(-5)").is_err());
+    }
+
+    #[test]
+    fn predicate_and_binds_tighter_than_or() {
+        // `a && b || c` parses as `Or(And(a, b), c)` (standard precedence).
+        let q = parse_query("User.filter(.a > 1 && .b > 2 || .c > 3)").unwrap();
+        let pred = match &q.source {
+            Source::Filter { predicate, .. } => predicate,
+            _ => panic!("expected filter source"),
+        };
+        match pred {
+            Predicate::Or(left, right) => {
+                assert!(matches!(**left, Predicate::And(_, _)), "left of Or should be And(a,b), got {left:?}");
+                assert!(matches!(**right, Predicate::Compare { .. }), "right of Or should be c, got {right:?}");
+            }
+            other => panic!("expected Or at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn predicate_or_then_and_groups_correctly() {
+        // `a || b && c` parses as `Or(a, And(b, c))`.
+        let q = parse_query("User.filter(.a > 1 || .b > 2 && .c > 3)").unwrap();
+        let pred = match &q.source {
+            Source::Filter { predicate, .. } => predicate,
+            _ => panic!("expected filter source"),
+        };
+        match pred {
+            Predicate::Or(left, right) => {
+                assert!(matches!(**left, Predicate::Compare { .. }), "left of Or should be a, got {left:?}");
+                assert!(matches!(**right, Predicate::And(_, _)), "right of Or should be And(b,c), got {right:?}");
+            }
+            other => panic!("expected Or at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn predicate_parentheses_override_precedence() {
+        // `(a || b) && c` parses as `And(Or(a, b), c)`.
+        let q = parse_query("User.filter((.a > 1 || .b > 2) && .c > 3)").unwrap();
+        let pred = match &q.source {
+            Source::Filter { predicate, .. } => predicate,
+            _ => panic!("expected filter source"),
+        };
+        match pred {
+            Predicate::And(left, right) => {
+                assert!(matches!(**left, Predicate::Or(_, _)), "left of And should be Or(a,b), got {left:?}");
+                assert!(matches!(**right, Predicate::Compare { .. }), "right of And should be c, got {right:?}");
+            }
+            other => panic!("expected And at top, got {other:?}"),
+        }
     }
 
     #[test]
@@ -818,11 +957,11 @@ mod tests {
 
     #[test]
     fn parse_float_literal() {
-        let q = parse_query("User.filter(.score > 3.14)").unwrap();
+        let q = parse_query("User.filter(.score > 2.5)").unwrap();
         match &q.source {
             Source::Filter { predicate, .. } => match predicate {
                 Predicate::Compare { value, .. } => {
-                    assert_eq!(*value, Literal::Float(3.14));
+                    assert_eq!(*value, Literal::Float(2.5));
                 }
                 _ => panic!("expected Compare"),
             },

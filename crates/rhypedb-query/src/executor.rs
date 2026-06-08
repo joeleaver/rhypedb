@@ -63,9 +63,19 @@ pub struct ExecContext<'a> {
 
 /// Execute a parsed query against the database.
 pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput> {
-    let mut result = execute_source(ctx.db, &query.source, &query.steps)?;
+    // Bare `Type.similar(...)` is a global vector search. Handle it before the
+    // generic source scan: `Source::All` would otherwise materialize the entire
+    // type just to build an all-permissive candidate set, turning an O(k) k-NN
+    // lookup into an O(type-size) scan.
+    let (mut result, first_step) = match (&query.source, query.steps.first()) {
+        (
+            Source::All { type_name },
+            Some(Step::Similar { field_name, query: sq, k }),
+        ) => (run_similar(ctx, type_name, field_name, sq, *k, None)?, 1),
+        _ => (execute_source(ctx.db, &query.source, &query.steps)?, 0),
+    };
 
-    for step in &query.steps {
+    for step in &query.steps[first_step..] {
         result = execute_step(ctx, result, step, &query.source)?;
     }
 
@@ -132,7 +142,7 @@ fn execute_source(
         }
 
         Source::Create { type_name, fields } => {
-            let field_map = literal_map_to_field_map(fields)?;
+            let field_map = literal_map_to_field_map(db, type_name, fields)?;
             let obj = db.create(type_name, field_map)?;
             Ok(QueryOutput::Single(obj))
         }
@@ -140,7 +150,7 @@ fn execute_source(
         Source::CreateBatch { type_name, rows } => {
             let field_maps: Vec<FieldMap> = rows
                 .iter()
-                .map(literal_map_to_field_map)
+                .map(|r| literal_map_to_field_map(db, type_name, r))
                 .collect::<QueryResult<_>>()?;
             let objects = db.create_batch(type_name, field_maps)?;
             Ok(QueryOutput::Objects(objects))
@@ -397,7 +407,7 @@ fn execute_step(
         Step::Update { fields } => {
             // Update needs (type, id) only — work directly from IDs.
             let (type_name, ids) = ids_from_output(current, source)?;
-            let field_map = literal_map_to_field_map(fields)?;
+            let field_map = literal_map_to_field_map(db, &type_name, fields)?;
             let mut updated = Vec::with_capacity(ids.len());
             for id in &ids {
                 updated.push(db.update(&type_name, *id, field_map.clone())?);
@@ -426,7 +436,14 @@ fn execute_step(
             let edge_map = if edge_fields.is_empty() {
                 None
             } else {
-                Some(literal_map_to_field_map(edge_fields)?)
+                // Edge fields belong to the relation, not the source type's
+                // scalar fields, so they get the best-effort mapping (no
+                // schema-directed coercion).
+                let mut m = FieldMap::new();
+                for (name, lit) in edge_fields {
+                    m.insert(name.clone(), literal_to_value(lit, None)?);
+                }
+                Some(m)
             };
             // Resolve the relation field once — every source row has the
             // same type at this point.
@@ -454,29 +471,13 @@ fn execute_step(
             query,
             k,
         } => {
-            let vectorizer = ctx.vectorizer.ok_or_else(|| {
-                QueryError::Type("vector similarity search requires a vectorizer".into())
-            })?;
-
-            let type_name = infer_type_from_objects(&[], source)
-                .ok_or_else(|| QueryError::Type("cannot determine type for similar()".into()))?;
-
-            let ef = (*k).max(50); // search width >= k
-            let results = match query {
-                SimilarQuery::Text(text) => {
-                    vectorizer.search_text(&type_name, field_name, text, *k, ef)?
-                }
-                SimilarQuery::Vector(vec) => {
-                    vectorizer.search_vector(&type_name, field_name, vec, *k, ef)?
-                }
-            };
-
-            let objects: Vec<Object> = results
-                .iter()
-                .filter_map(|(id, _dist)| db.get(&type_name, *id).ok())
-                .collect();
-
-            Ok(QueryOutput::Objects(objects))
+            // Type AND candidate set come from the live pipeline:
+            // `A.filter(...).similar(...)` restricts to the filtered rows;
+            // `A.bs.similar(...)` searches the traversed B type. (A bare
+            // `Type.similar(...)` is handled in `execute` as a global search.)
+            let (type_name, incoming_ids) = ids_from_output(current, source)?;
+            let allowed: HashSet<u64> = incoming_ids.into_iter().collect();
+            run_similar(ctx, &type_name, field_name, query, *k, Some(&allowed))
         }
 
         Step::Limit { count } => match current {
@@ -511,6 +512,64 @@ fn execute_step(
             }
         },
     }
+}
+
+/// Run a vector similarity search over `type_name.field_name`.
+///
+/// `restrict = None` searches the whole type (a bare `Type.similar(...)`), so
+/// no candidate set is materialized and `k` results are fetched directly.
+/// `Some(set)` restricts results to the incoming pipeline ids (a preceding
+/// `.filter()`/`.traverse()`), over-fetching to compensate for post-filtering.
+/// An empty restriction short-circuits to no results — which also avoids
+/// calling the vectorizer with a possibly-wrong type when an upstream step
+/// emptied the pipeline after a traversal.
+fn run_similar(
+    ctx: &ExecContext<'_>,
+    type_name: &str,
+    field_name: &str,
+    query: &SimilarQuery,
+    k: usize,
+    restrict: Option<&HashSet<u64>>,
+) -> QueryResult<QueryOutput> {
+    // An empty candidate set can never match — return early before touching the
+    // vectorizer, so a pipeline that emptied after a traversal doesn't trigger a
+    // wrong-type index lookup (and doesn't even require a vectorizer).
+    if matches!(restrict, Some(set) if set.is_empty()) {
+        return Ok(QueryOutput::Objects(Vec::new()));
+    }
+
+    let vectorizer = ctx.vectorizer.ok_or_else(|| {
+        QueryError::Type("vector similarity search requires a vectorizer".into())
+    })?;
+
+    // Over-fetch only when restricting (post-filtering discards some hits); a
+    // global search needs just k. Heavy filtering can still yield < k results
+    // (a known HNSW post-filtering limitation) — an exact small-set path is a
+    // follow-up.
+    let (search_k, ef) = match restrict {
+        Some(_) => {
+            let sk = k.saturating_mul(4).max(k);
+            (sk, sk.saturating_mul(2).max(64))
+        }
+        None => (k, k.max(50)),
+    };
+    let results = match query {
+        SimilarQuery::Text(text) => {
+            vectorizer.search_text(type_name, field_name, text, search_k, ef)?
+        }
+        SimilarQuery::Vector(vec) => {
+            vectorizer.search_vector(type_name, field_name, vec, search_k, ef)?
+        }
+    };
+
+    let objects: Vec<Object> = results
+        .iter()
+        .filter(|(id, _dist)| restrict.is_none_or(|set| set.contains(id)))
+        .take(k)
+        .filter_map(|(id, _dist)| ctx.db.get(type_name, *id).ok())
+        .collect();
+
+    Ok(QueryOutput::Objects(objects))
 }
 
 /// Read the type_name from any QueryOutput shape, without consuming it.
@@ -657,7 +716,7 @@ fn compare_values(field_val: &Value, op: &CompareOp, literal: &Literal) -> bool 
     match (field_val, literal) {
         (Value::String(a), Literal::String(b)) => compare_ord(a.as_str(), op, b.as_str()),
         (Value::U32(a), Literal::Int(b)) => compare_ord(*a as i64, op, *b),
-        (Value::U64(a), Literal::Int(b)) => compare_ord(*a as i64, op, *b),
+        (Value::U64(a), Literal::Int(b)) => compare_ord(*a as i128, op, *b as i128),
         (Value::I32(a), Literal::Int(b)) => compare_ord(*a as i64, op, *b),
         (Value::I64(a), Literal::Int(b)) => compare_ord(*a, op, *b),
         (Value::F32(a), Literal::Float(b)) => compare_ord(*a as f64, op, *b),
@@ -666,6 +725,8 @@ fn compare_values(field_val: &Value, op: &CompareOp, literal: &Literal) -> bool 
         (Value::F64(a), Literal::Int(b)) => compare_ord(*a, op, *b as f64 ),
         (Value::U32(a), Literal::Float(b)) => compare_ord(*a as f64, op, *b),
         (Value::U64(a), Literal::Float(b)) => compare_ord(*a as f64, op, *b),
+        (Value::I32(a), Literal::Float(b)) => compare_ord(*a as f64, op, *b),
+        (Value::I64(a), Literal::Float(b)) => compare_ord(*a as f64, op, *b),
         (Value::Bool(a), Literal::Bool(b)) => match op {
             CompareOp::Eq => a == b,
             CompareOp::Ne => a != b,
@@ -691,38 +752,70 @@ fn compare_ord<T: PartialOrd>(a: T, op: &CompareOp, b: T) -> bool {
     }
 }
 
+/// Build a FieldMap from parsed literals, coercing each value into the
+/// target type's declared scalar type. Schema-directed coercion is what makes
+/// `f64`/`u64`/`i32`/`i64` fields reachable from the query language: the
+/// parser only ever produces `Int`/`Float` literals, and the engine's
+/// `validate_value` requires an exact `Value`/`ScalarType` match.
 fn literal_map_to_field_map(
+    db: &Database,
+    type_name: &str,
     literals: &HashMap<String, Literal>,
 ) -> QueryResult<FieldMap> {
+    let type_def = db.schema().get_type(type_name);
     let mut fields = FieldMap::new();
     for (name, lit) in literals {
-        let value = literal_to_value(lit)?;
-        fields.insert(name.clone(), value);
+        let target = type_def
+            .and_then(|td| td.get_field(name))
+            .and_then(|fd| match &fd.field_type {
+                rhypedb_schema::FieldType::Scalar(st) => Some(st.clone()),
+                _ => None,
+            });
+        fields.insert(name.clone(), literal_to_value(lit, target)?);
     }
     Ok(fields)
 }
 
-fn literal_to_value(lit: &Literal) -> QueryResult<Value> {
-    match lit {
-        Literal::String(s) => Ok(Value::String(s.clone())),
-        Literal::Int(i) => {
-            if *i >= 0 && *i <= u32::MAX as i64 {
-                Ok(Value::U32(*i as u32))
-            } else {
-                Ok(Value::I64(*i))
-            }
-        }
-        Literal::Float(f) => Ok(Value::F32(*f as f32)),
-        Literal::Bool(b) => Ok(Value::Bool(*b)),
-        Literal::Null => Ok(Value::Null),
-    }
-}
+/// Convert a literal into a `Value`. When the field's declared scalar type is
+/// known (`target`), the literal is coerced to match it; otherwise (relation
+/// target ids, edge fields, fields the schema doesn't know) a best-effort
+/// mapping is used.
+fn literal_to_value(lit: &Literal, target: Option<rhypedb_schema::ScalarType>) -> QueryResult<Value> {
+    use rhypedb_schema::ScalarType as ST;
 
-fn infer_type_from_objects(objects: &[Object], source: &Source) -> Option<String> {
-    if let Some(first) = objects.first() {
-        return Some(first.type_name.clone());
+    // Null is valid for any field type.
+    if let Literal::Null = lit {
+        return Ok(Value::Null);
     }
-    source_type_name(source)
+
+    let Some(st) = target else {
+        return Ok(match lit {
+            Literal::String(s) => Value::String(s.clone()),
+            Literal::Int(i) if (0..=u32::MAX as i64).contains(i) => Value::U32(*i as u32),
+            Literal::Int(i) => Value::I64(*i),
+            Literal::Float(f) => Value::F32(*f as f32),
+            Literal::Bool(b) => Value::Bool(*b),
+            Literal::Null => Value::Null,
+        });
+    };
+
+    let mismatch = || QueryError::Type(format!("literal {lit:?} is not valid for a {st:?} field"));
+    Ok(match (&st, lit) {
+        (ST::String, Literal::String(s)) => Value::String(s.clone()),
+        (ST::Bool, Literal::Bool(b)) => Value::Bool(*b),
+        (ST::U32, Literal::Int(i)) if (0..=u32::MAX as i64).contains(i) => Value::U32(*i as u32),
+        (ST::U64, Literal::Int(i)) if *i >= 0 => Value::U64(*i as u64),
+        (ST::I32, Literal::Int(i)) if (i32::MIN as i64..=i32::MAX as i64).contains(i) => {
+            Value::I32(*i as i32)
+        }
+        (ST::I64, Literal::Int(i)) => Value::I64(*i),
+        (ST::F32, Literal::Float(f)) => Value::F32(*f as f32),
+        (ST::F64, Literal::Float(f)) => Value::F64(*f),
+        // Integer literals widen into float fields (`score: 5` for an `f64`).
+        (ST::F32, Literal::Int(i)) => Value::F32(*i as f32),
+        (ST::F64, Literal::Int(i)) => Value::F64(*i as f64),
+        _ => return Err(mismatch()),
+    })
 }
 
 fn scan_all_objects(db: &Database, type_name: &str) -> QueryResult<Vec<Object>> {
@@ -784,12 +877,16 @@ fn try_filter_scan(
     }
 }
 
-/// If the query's first step is a bare `.limit(N)` (no intervening filter,
-/// traverse, or offset that could reorder/expand results), return `Some(N)`
-/// so we can push it into the storage scan. Filter→limit on a non-pushed
-/// predicate is also safe — the caller's outer filter walk will obey the
-/// same cap. Anything else (offset, traverse, etc.) makes the limit
-/// non-equivalent at storage layer; we return `None` for safety.
+/// If the query's first step is `.limit(N)`, return `Some(N)` so the filter
+/// scan can stop after N matches.
+///
+/// Sound under the language's sequential pipeline semantics: a trailing
+/// `.offset(M)` after the limit can't occur, because the parser rejects
+/// `.limit(...).offset(...)` (offset must precede limit). A *leading*
+/// `.offset(M)` instead makes `steps.first()` an `Offset`, so this returns
+/// `None` and no limit is pushed. Steps that only shrink/transform the result
+/// after a leading limit (a further filter or traverse) still honor the cap,
+/// since the scan already returned at most N rows.
 fn leading_limit(steps: &[Step]) -> Option<usize> {
     match steps.first()? {
         Step::Limit { count } => Some(*count),
@@ -824,6 +921,130 @@ mod tests {
         f.insert("age".into(), Value::U32(age));
         f.insert("active".into(), Value::Bool(true));
         db.create("User", f).unwrap()
+    }
+
+    fn product_db(dir: &std::path::Path) -> std::sync::Arc<Database> {
+        let schema = parse_schema(
+            r#"
+            type Product {
+                name: String
+                price: f64
+                big: u64
+                rating: i32
+                delta: i64
+            }
+            "#,
+        )
+        .unwrap();
+        Database::open(schema, dir).unwrap()
+    }
+
+    #[test]
+    fn create_coerces_literals_to_declared_scalar_types() {
+        // Before the fix every Float -> F32 and every small Int -> U32, so
+        // f64/u64/i32/i64 fields rejected the value with TypeMismatch. Now the
+        // literal is coerced to the field's declared scalar type.
+        let dir = tempfile::tempdir().unwrap();
+        let db = product_db(dir.path());
+        let ctx = ExecContext { db: &db, vectorizer: None };
+
+        let q = parse_query(
+            r#"Product.create({ name: "a", price: 3.5, big: 5, rating: -7, delta: 9 })"#,
+        )
+        .unwrap();
+        let obj = match execute(&ctx, &q).unwrap() {
+            QueryOutput::Single(o) => o,
+            other => panic!("expected Single, got {other:?}"),
+        };
+        assert_eq!(obj.fields.get("price"), Some(&Value::F64(3.5)));
+        assert_eq!(obj.fields.get("big"), Some(&Value::U64(5)));
+        assert_eq!(obj.fields.get("rating"), Some(&Value::I32(-7)));
+        assert_eq!(obj.fields.get("delta"), Some(&Value::I64(9)));
+    }
+
+    #[test]
+    fn filter_int_field_with_float_literal_does_not_overmatch() {
+        // `.rating > 4.5` on an i32 field used to return ALL rows
+        // (filter_scan_float fell back to scan_type); now it filters
+        // correctly via the per-row numeric fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let db = product_db(dir.path());
+        let ctx = ExecContext { db: &db, vectorizer: None };
+        for (n, r) in [("a", 1), ("b", 5), ("c", 10)] {
+            let q = parse_query(&format!(
+                r#"Product.create({{ name: "{n}", price: 1.0, big: 1, rating: {r}, delta: 0 }})"#
+            ))
+            .unwrap();
+            execute(&ctx, &q).unwrap();
+        }
+        let q = parse_query("Product.filter(.rating > 4.5)").unwrap();
+        let objs = match execute(&ctx, &q).unwrap() {
+            QueryOutput::Objects(o) => o,
+            other => panic!("expected Objects, got {other:?}"),
+        };
+        let mut names: Vec<String> = objs
+            .iter()
+            .filter_map(|o| match o.fields.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn and_predicate_compares_int_field_against_float_literal() {
+        // An And predicate bypasses the filter_scan fast path and evaluates
+        // via compare_values, which previously lacked I32/I64-vs-Float arms
+        // (so `.rating >= 5.0` silently matched nothing).
+        let dir = tempfile::tempdir().unwrap();
+        let db = product_db(dir.path());
+        let ctx = ExecContext { db: &db, vectorizer: None };
+        for (n, r, p) in [("a", 1, 10.0), ("b", 5, 20.0), ("c", 8, 200.0)] {
+            let q = parse_query(&format!(
+                r#"Product.create({{ name: "{n}", price: {p}, big: 1, rating: {r}, delta: 0 }})"#
+            ))
+            .unwrap();
+            execute(&ctx, &q).unwrap();
+        }
+        let q = parse_query("Product.filter(.rating >= 5.0 && .price < 100.0)").unwrap();
+        let objs = match execute(&ctx, &q).unwrap() {
+            QueryOutput::Objects(o) => o,
+            other => panic!("expected Objects, got {other:?}"),
+        };
+        let names: Vec<String> = objs
+            .iter()
+            .filter_map(|o| match o.fields.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn similar_on_empty_filtered_set_returns_empty() {
+        // A filter that matches nothing before .similar() yields an empty
+        // result and must NOT require a vectorizer or trigger a wrong-type
+        // index lookup (the empty candidate set short-circuits first).
+        let dir = tempfile::tempdir().unwrap();
+        let db = product_db(dir.path());
+        let ctx = ExecContext { db: &db, vectorizer: None };
+        execute(
+            &ctx,
+            &parse_query(
+                r#"Product.create({ name: "a", price: 1.0, big: 1, rating: 1, delta: 0 })"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let q = parse_query(r#"Product.filter(.rating > 9999).similar(.name, "x", k: 5)"#).unwrap();
+        match execute(&ctx, &q).unwrap() {
+            QueryOutput::Objects(o) => assert!(o.is_empty()),
+            other => panic!("expected empty Objects, got {other:?}"),
+        }
     }
 
     #[test]

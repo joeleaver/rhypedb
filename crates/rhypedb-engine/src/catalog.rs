@@ -686,10 +686,13 @@ pub(crate) struct FieldTypeChangeVerb {
     pub field_name: String,
     pub target_kind: u8,
     /// User-supplied per-row converter. `Fn(object_id, old_value)`.
-    pub converter: Box<
-        dyn Fn(u64, &crate::object::Value) -> EngineResult<crate::object::Value> + Send + Sync,
-    >,
+    pub converter: RowConverter,
 }
+
+/// Per-row value converter for a field-type change:
+/// `Fn(object_id, old_value) -> new_value`.
+pub(crate) type RowConverter =
+    Box<dyn Fn(u64, &crate::object::Value) -> EngineResult<crate::object::Value> + Send + Sync>;
 
 /// One entry in the report a successful migrate returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -720,7 +723,7 @@ pub struct FieldRenamePair {
     pub objects_rewritten: u64,
     /// Count of `r:*` reverse-edge cover blobs whose embedded source-side
     /// FieldMap was rewritten in the same atomic batch as the catalog row
-    /// + object rewrites. Each rev_edge from an object of this type via a
+    /// and object rewrites. Each rev_edge from an object of this type via a
     /// forward 1:1 or 1:N relation gets rewritten exactly once.
     pub covers_rewritten: u64,
 }
@@ -1773,8 +1776,12 @@ fn value_to_kind_byte(v: &crate::object::Value) -> u8 {
 /// note in the synthesis).
 pub struct Migration {
     pub name: String,
-    pub up: Box<dyn FnOnce(&MigrationContext) -> EngineResult<()> + Send + Sync>,
+    pub up: MigrationUp,
 }
+
+/// The `up` closure of a [`Migration`]: applies the migration's verbs through
+/// the `MigrationContext`. Consumed (FnOnce) when the migration runs.
+pub type MigrationUp = Box<dyn FnOnce(&MigrationContext) -> EngineResult<()> + Send + Sync>;
 
 impl Migration {
     pub fn new<S, F>(name: S, up: F) -> Self
