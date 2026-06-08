@@ -48,6 +48,8 @@ pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 // Request types
 pub const REQ_QUERY: u8 = 0x01;
 pub const REQ_PING: u8 = 0x02;
+/// Bulk ingest of caller-supplied (precomputed) vectors for one Vector field.
+pub const REQ_VECTOR_BATCH: u8 = 0x03;
 
 // Response types
 pub const RESP_OBJECTS: u8 = 0x80;
@@ -337,6 +339,76 @@ pub fn encode_query_payload(query: &str) -> Vec<u8> {
 }
 
 /// Decode a Query request payload.
+/// A decoded `REQ_VECTOR_BATCH` request: which Vector field to ingest into, and
+/// the `(object_id, vector)` rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorBatch {
+    pub type_name: String,
+    pub field_name: String,
+    pub rows: Vec<(u64, Vec<f32>)>,
+}
+
+/// Decode a `REQ_VECTOR_BATCH` payload:
+/// `[type_len:u16 BE][type utf8][field_len:u16 BE][field utf8][count:u32 BE]`
+/// then `count` rows of `[object_id:u64 BE][dim:u32 BE][f32 x dim, little-endian]`.
+pub fn decode_vector_batch_payload(data: &[u8]) -> io::Result<VectorBatch> {
+    fn err(m: impl Into<String>) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, m.into())
+    }
+    let mut pos = 0usize;
+
+    let read_str = |data: &[u8], pos: &mut usize, what: &str| -> io::Result<String> {
+        if data.len() < *pos + 2 {
+            return Err(err(format!("vector-batch: {what} length missing")));
+        }
+        let n = u16::from_be_bytes(data[*pos..*pos + 2].try_into().unwrap()) as usize;
+        *pos += 2;
+        if data.len() < *pos + n {
+            return Err(err(format!("vector-batch: {what} truncated")));
+        }
+        let s = std::str::from_utf8(&data[*pos..*pos + n])
+            .map_err(|e| err(format!("vector-batch: {what} utf8: {e}")))?
+            .to_string();
+        *pos += n;
+        Ok(s)
+    };
+
+    let type_name = read_str(data, &mut pos, "type")?;
+    let field_name = read_str(data, &mut pos, "field")?;
+
+    if data.len() < pos + 4 {
+        return Err(err("vector-batch: count missing"));
+    }
+    let count = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+
+    let mut rows = Vec::with_capacity(count.min(1 << 20));
+    for _ in 0..count {
+        if data.len() < pos + 12 {
+            return Err(err("vector-batch: row header truncated"));
+        }
+        let object_id = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let dim = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let byte_len = dim * 4;
+        if data.len() < pos + byte_len {
+            return Err(err("vector-batch: vector data truncated"));
+        }
+        let mut v = Vec::with_capacity(dim);
+        for c in data[pos..pos + byte_len].chunks_exact(4) {
+            v.push(f32::from_le_bytes(c.try_into().unwrap()));
+        }
+        pos += byte_len;
+        rows.push((object_id, v));
+    }
+    Ok(VectorBatch {
+        type_name,
+        field_name,
+        rows,
+    })
+}
+
 pub fn decode_query_payload(data: &[u8]) -> io::Result<String> {
     if data.len() < 4 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "query length missing"));
@@ -396,6 +468,38 @@ mod tests {
             fields,
             raw_fields: None,
         }
+    }
+
+    #[test]
+    fn vector_batch_decode_roundtrip() {
+        // Build a payload exactly as the Python client does and decode it.
+        let type_name = "Doc";
+        let field_name = "embedding";
+        let rows: Vec<(u64, Vec<f32>)> =
+            vec![(1, vec![0.5, -1.0, 2.0]), (7, vec![3.0, 4.0, 5.0])];
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(type_name.len() as u16).to_be_bytes());
+        payload.extend_from_slice(type_name.as_bytes());
+        payload.extend_from_slice(&(field_name.len() as u16).to_be_bytes());
+        payload.extend_from_slice(field_name.as_bytes());
+        payload.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+        for (id, vec) in &rows {
+            payload.extend_from_slice(&id.to_be_bytes());
+            payload.extend_from_slice(&(vec.len() as u32).to_be_bytes());
+            for f in vec {
+                payload.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+
+        let batch = decode_vector_batch_payload(&payload).unwrap();
+        assert_eq!(batch.type_name, "Doc");
+        assert_eq!(batch.field_name, "embedding");
+        assert_eq!(batch.rows, rows);
+
+        // Truncated payloads are rejected, not panicked on.
+        assert!(decode_vector_batch_payload(&payload[..payload.len() - 1]).is_err());
+        assert!(decode_vector_batch_payload(&[0, 1]).is_err());
     }
 
     #[test]

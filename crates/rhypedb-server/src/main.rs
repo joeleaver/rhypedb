@@ -330,8 +330,16 @@ async fn main() {
         .types
         .values()
         .any(|td| td.fields.iter().any(|f| f.vectorize().is_some()));
+    // Build the vectorizer if the schema has ANY Vector field — bare Vector
+    // fields (no @vectorize) hold caller-supplied vectors via the binary
+    // vector-batch op and still need their HNSW index. The embed worker only
+    // runs when there are @vectorize fields to auto-embed.
+    let has_vector_field = schema
+        .types
+        .values()
+        .any(|td| td.vector_fields().next().is_some());
 
-    let vectorizer = if has_vectorize {
+    let vectorizer = if has_vector_field {
         let v = Arc::new(
             Vectorizer::new(
                 Arc::clone(db.storage()),
@@ -341,7 +349,9 @@ async fn main() {
             )
             .unwrap(),
         );
-        v.start_worker(1);
+        if has_vectorize {
+            v.start_worker(1);
+        }
         Some(v)
     } else {
         None
@@ -511,6 +521,46 @@ where
 
                 if let Err(e) = write_result {
                     eprintln!("tcp write_frame error: {e}");
+                    return;
+                }
+            }
+            protocol::REQ_VECTOR_BATCH => {
+                let result = match protocol::decode_vector_batch_payload(&frame.payload) {
+                    Ok(batch) => match &state.vectorizer {
+                        Some(v) => v
+                            .ingest_vectors(&batch.type_name, &batch.field_name, &batch.rows)
+                            .map_err(|e| format!("{e}")),
+                        None => Err(
+                            "server has no vector index (schema declares no Vector field)"
+                                .to_string(),
+                        ),
+                    },
+                    Err(e) => Err(format!("decode: {e}")),
+                };
+                let write_result = match result {
+                    Ok(_n) => {
+                        protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            frame.req_id,
+                            protocol::RESP_DONE,
+                            |_| {},
+                        )
+                        .await
+                    }
+                    Err(msg) => {
+                        protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            frame.req_id,
+                            protocol::RESP_ERROR,
+                            |buf| protocol::encode_error_payload_into(&msg, buf),
+                        )
+                        .await
+                    }
+                };
+                if let Err(e) = write_result {
+                    eprintln!("tcp vector-batch write error: {e}");
                     return;
                 }
             }

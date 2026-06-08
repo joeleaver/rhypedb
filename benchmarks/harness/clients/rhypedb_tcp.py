@@ -14,6 +14,7 @@ import struct
 # Request types
 REQ_QUERY = 0x01
 REQ_PING = 0x02
+REQ_VECTOR_BATCH = 0x03
 
 # Response types
 RESP_OBJECTS = 0x80
@@ -90,6 +91,48 @@ class RhypedbTcpClient:
             raise RhypedbError(f"ping req_id mismatch: {resp_id} != {rid}")
         if kind != RESP_PONG:
             raise RhypedbError(f"expected RESP_PONG, got 0x{kind:02x}")
+
+    def vector_batch(self, type_name: str, field_name: str, ids, vectors) -> dict:
+        """Bulk-ingest precomputed vectors for one Vector field via the binary
+        REQ_VECTOR_BATCH op.
+
+        `ids` is a sequence of int object ids; `vectors` is an (N, D) float32
+        array (numpy or sequence-of-sequences). One frame per call — callers
+        chunk large loads. Payload:
+        [type_len:u16][type][field_len:u16][field][count:u32] then count rows of
+        [object_id:u64 BE][dim:u32 BE][f32 x dim little-endian].
+        """
+        import numpy as np
+
+        rid = self._next_req_id()
+        tb = type_name.encode("utf-8")
+        fb = field_name.encode("utf-8")
+        arr = np.ascontiguousarray(vectors, dtype="<f4")
+        n, dim = arr.shape
+        if len(ids) != n:
+            raise RhypedbError(f"ids/vectors length mismatch: {len(ids)} != {n}")
+
+        parts = [
+            struct.pack(">H", len(tb)), tb,
+            struct.pack(">H", len(fb)), fb,
+            struct.pack(">I", n),
+        ]
+        row_hdr = struct.Struct(">QI")
+        for i in range(n):
+            parts.append(row_hdr.pack(int(ids[i]), dim))
+            parts.append(arr[i].tobytes())
+        payload = b"".join(parts)
+
+        self._send_frame(rid, REQ_VECTOR_BATCH, payload)
+        resp_id, kind, body = self._recv_frame()
+        if resp_id != rid:
+            raise RhypedbError(f"vector_batch req_id mismatch: {resp_id} != {rid}")
+        if kind == RESP_DONE:
+            return {"ok": True}
+        if kind == RESP_ERROR:
+            (msg_len,) = struct.unpack(">I", body[:4])
+            return {"error": body[4:4 + msg_len].decode("utf-8", errors="replace")}
+        raise RhypedbError(f"unexpected vector_batch response 0x{kind:02x}")
 
     def query(self, q: str) -> dict:
         """Execute a query. Returns a dict matching the HTTP JSON shape so the

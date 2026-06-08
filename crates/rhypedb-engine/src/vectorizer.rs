@@ -125,6 +125,13 @@ pub struct Vectorizer {
     running: Arc<AtomicBool>,
     worker_handles: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
     claim_mutex: parking_lot::Mutex<()>,
+    /// Serializes HNSW `index.insert` calls. `HnswIndex::insert` is not atomic
+    /// (it wires bidirectional neighbors across several independent lock
+    /// acquisitions), so two concurrent inserts into the same index can corrupt
+    /// graph connectivity. Inserts were historically single-threaded (one embed
+    /// worker); BYO `ingest_vectors` adds a concurrent surface (one task per TCP
+    /// connection), so all inserts take this lock.
+    insert_lock: parking_lot::Mutex<()>,
 }
 
 impl Vectorizer {
@@ -137,21 +144,25 @@ impl Vectorizer {
         // Create HNSW indexes for each @vectorize field.
         let mut indexes = HashMap::new();
 
+        // Build an HNSW index for EVERY Vector field. A `@vectorize` field is a
+        // Vector field whose values come from auto-embedding a source text; a
+        // bare Vector field (no `@vectorize`) holds caller-supplied vectors via
+        // `ingest_vector` (bring-your-own-embeddings). Both share one index +
+        // the `v:` keyspace, so both rebuild from the LSM on restart.
         for type_def in schema.types.values() {
             for field in &type_def.fields {
-                if let Some(_vec_def) = field.vectorize()
-                    && let FieldType::Vector(vt) = &field.field_type {
-                        let index_key = format!("{}.{}", type_def.name, field.name);
-                        let hnsw_config = HnswConfig {
-                            m: 16,
-                            m_max0: 32,
-                            ef_construction: 100,
-                            metric: Metric::Cosine,
-                        };
-                        let quant_config = TurboQuantConfig::new(vt.dimensions, 3);
-                        let index = QuantizedIndex::new(hnsw_config, quant_config);
-                        indexes.insert(index_key, Arc::new(index));
-                    }
+                if let FieldType::Vector(vt) = &field.field_type {
+                    let index_key = format!("{}.{}", type_def.name, field.name);
+                    let hnsw_config = HnswConfig {
+                        m: 16,
+                        m_max0: 32,
+                        ef_construction: 100,
+                        metric: Metric::Cosine,
+                    };
+                    let quant_config = TurboQuantConfig::new(vt.dimensions, 3);
+                    let index = QuantizedIndex::new(hnsw_config, quant_config);
+                    indexes.insert(index_key, Arc::new(index));
+                }
             }
         }
 
@@ -181,6 +192,7 @@ impl Vectorizer {
             running: Arc::new(AtomicBool::new(false)),
             worker_handles: parking_lot::Mutex::new(Vec::new()),
             claim_mutex: parking_lot::Mutex::new(()),
+            insert_lock: parking_lot::Mutex::new(()),
         };
 
         vectorizer.rebuild_indexes()?;
@@ -572,33 +584,12 @@ impl Vectorizer {
                 }
 
                 let embedding = &embeddings[emb_idx];
-
-                let index_key = format!("{}.{}", job.type_name, job.vector_field);
-                if let Some(index) = self.indexes.read().get(&index_key) {
-                    index.insert(job.object_id, embedding);
-                }
-
-                let type_id = self.type_ids[&job.type_name];
-                let field_key = format!("{}.{}", job.type_name, job.vector_field);
-                let field_id = self.field_ids[&field_key];
-
-                let vector_key = KeyBuilder::vector(type_id, job.object_id, field_id);
-                let vector_bytes = serialize_f32_vec(embedding);
-                let state_key =
-                    KeyBuilder::vector_state(type_id, job.object_id, field_id);
-
-                let mut txn = self.storage.begin_txn();
-                self.storage.put(&mut txn, &vector_key, vector_bytes)?;
-                self.storage.put(
-                    &mut txn,
-                    &state_key,
-                    Bytes::from(vec![VectorState::Indexed as u8]),
+                self.store_and_index(
+                    &job.type_name,
+                    job.object_id,
+                    &job.vector_field,
+                    embedding,
                 )?;
-                self.storage.commit(&mut txn).map_err(|e| match e {
-                    rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
-                    other => crate::EngineError::Storage(other),
-                })?;
-
                 processed += 1;
             }
         }
@@ -757,6 +748,144 @@ impl Vectorizer {
         Ok(index.search(query_vec, k, ef))
     }
 
+    /// Store one vector under its `v:` key, mark it `Indexed`, and insert it
+    /// into the in-memory HNSW index. The single point where a vector becomes
+    /// durable + searchable; shared by the embed worker and `ingest_vector`.
+    fn store_and_index(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        vector_field: &str,
+        vector: &[f32],
+    ) -> EngineResult<()> {
+        let index_key = format!("{type_name}.{vector_field}");
+        let index = self
+            .indexes
+            .read()
+            .get(&index_key)
+            .cloned()
+            .ok_or_else(|| crate::EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: vector_field.into(),
+            })?;
+        {
+            let _guard = self.insert_lock.lock();
+            index.insert(object_id, vector);
+        }
+
+        let type_id = self.type_ids[type_name];
+        let field_id = self.field_ids[&index_key];
+        let vector_key = KeyBuilder::vector(type_id, object_id, field_id);
+        let state_key = KeyBuilder::vector_state(type_id, object_id, field_id);
+
+        let mut txn = self.storage.begin_txn();
+        self.storage
+            .put(&mut txn, &vector_key, serialize_f32_vec(vector))?;
+        self.storage.put(
+            &mut txn,
+            &state_key,
+            Bytes::from(vec![VectorState::Indexed as u8]),
+        )?;
+        self.storage.commit(&mut txn).map_err(|e| match e {
+            rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
+            other => crate::EngineError::Storage(other),
+        })?;
+        Ok(())
+    }
+
+    /// Expected dimension of a Vector field, or an error if the field isn't a
+    /// Vector field on a known type.
+    fn vector_field_dim(&self, type_name: &str, vector_field: &str) -> EngineResult<usize> {
+        self.schema
+            .get_type(type_name)
+            .and_then(|td| td.get_field(vector_field))
+            .and_then(|fd| match &fd.field_type {
+                FieldType::Vector(vt) => Some(vt.dimensions as usize),
+                _ => None,
+            })
+            .ok_or_else(|| crate::EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: vector_field.into(),
+            })
+    }
+
+    /// Ingest a caller-supplied (precomputed) vector for an object's Vector
+    /// field — bring-your-own-embeddings, no embedding step. Validates the
+    /// dimension against the schema, then stores + indexes it synchronously.
+    pub fn ingest_vector(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        vector_field: &str,
+        vector: &[f32],
+    ) -> EngineResult<()> {
+        let expected = self.vector_field_dim(type_name, vector_field)?;
+        validate_vector(vector_field, vector, expected)?;
+        self.store_and_index(type_name, object_id, vector_field, vector)
+    }
+
+    /// Batch form of [`ingest_vector`]: validate every row's dimension up front
+    /// (so a bad row leaves nothing partially applied), then index all rows and
+    /// persist their `v:`/state keys in a SINGLE transaction. Returns the count
+    /// ingested. Callers chunk large loads across calls to bound txn size.
+    pub fn ingest_vectors(
+        &self,
+        type_name: &str,
+        vector_field: &str,
+        rows: &[(u64, Vec<f32>)],
+    ) -> EngineResult<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let index_key = format!("{type_name}.{vector_field}");
+        let expected = self.vector_field_dim(type_name, vector_field)?;
+        // Validate EVERY row (dimension + finiteness) before any mutation, so a
+        // bad row leaves nothing partially applied. Finiteness matters: a NaN/inf
+        // component would otherwise reach the quantizer (NaN silently coerced to
+        // an all-zero vector; inf -> NaN -> a panic backstopped in quantize.rs).
+        for (_object_id, vector) in rows {
+            validate_vector(vector_field, vector, expected)?;
+        }
+        let index = self
+            .indexes
+            .read()
+            .get(&index_key)
+            .cloned()
+            .ok_or_else(|| crate::EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: vector_field.into(),
+            })?;
+        let type_id = self.type_ids[type_name];
+        let field_id = self.field_ids[&index_key];
+
+        // All HNSW inserts for the batch under the insert lock (serialized vs
+        // other ingests + the embed worker), then persist outside the lock.
+        {
+            let _guard = self.insert_lock.lock();
+            for (object_id, vector) in rows {
+                index.insert(*object_id, vector);
+            }
+        }
+        let mut txn = self.storage.begin_txn();
+        for (object_id, vector) in rows {
+            self.storage.put(
+                &mut txn,
+                &KeyBuilder::vector(type_id, *object_id, field_id),
+                serialize_f32_vec(vector),
+            )?;
+            self.storage.put(
+                &mut txn,
+                &KeyBuilder::vector_state(type_id, *object_id, field_id),
+                Bytes::from(vec![VectorState::Indexed as u8]),
+            )?;
+        }
+        self.storage.commit(&mut txn).map_err(|e| match e {
+            rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
+            other => crate::EngineError::Storage(other),
+        })?;
+        Ok(rows.len())
+    }
+
     /// Start background worker threads for vectorization.
     /// Each worker loads its own embedding model (~300MB per worker).
     pub fn start_worker(self: &Arc<Self>, num_workers: usize) {
@@ -855,6 +984,28 @@ impl Drop for Vectorizer {
     fn drop(&mut self) {
         self.stop_worker();
     }
+}
+
+/// Validate a caller-supplied vector before ingest: correct dimension and all
+/// components finite (no NaN/inf). Rejecting non-finite values up front keeps
+/// them out of the quantizer/HNSW — a NaN would be silently coerced to an
+/// all-zero vector, and an inf would become a NaN inside the quantizer.
+fn validate_vector(vector_field: &str, vector: &[f32], expected: usize) -> EngineResult<()> {
+    if vector.len() != expected {
+        return Err(crate::EngineError::TypeMismatch {
+            field: vector_field.into(),
+            expected: format!("vector of dimension {expected}"),
+            got: format!("vector of dimension {}", vector.len()),
+        });
+    }
+    if !vector.iter().all(|x| x.is_finite()) {
+        return Err(crate::EngineError::TypeMismatch {
+            field: vector_field.into(),
+            expected: "vector with all-finite components".into(),
+            got: "vector containing NaN or infinity".into(),
+        });
+    }
+    Ok(())
 }
 
 fn serialize_f32_vec(vec: &[f32]) -> Bytes {
@@ -1319,5 +1470,168 @@ mod tests {
                 "should have 3 vectors after delta rebuild"
             );
         }
+    }
+
+    // --- Bring-your-own-vector (BYO) ingest: a bare Vector field, no embedder ---
+
+    fn byo_setup(
+        dir: &std::path::Path,
+    ) -> (Arc<LsmTree>, Schema, HashMap<String, u64>, HashMap<String, u64>) {
+        // A BARE Vector field — no @vectorize, so no embedder is involved.
+        let schema = parse_schema(
+            r#"
+            type Doc {
+                embedding: Vector<4>
+            }
+            "#,
+        )
+        .unwrap();
+        let storage = LsmTree::open(LsmConfig::new(dir)).unwrap();
+        let mut type_ids = HashMap::new();
+        type_ids.insert("Doc".into(), 1u64);
+        let mut field_ids = HashMap::new();
+        field_ids.insert("Doc.embedding".into(), 1u64);
+        (storage, schema, type_ids, field_ids)
+    }
+
+    #[test]
+    fn byo_ingest_and_search_bare_vector_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = byo_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        // A bare Vector field gets an HNSW index even without @vectorize.
+        v.ingest_vectors(
+            "Doc",
+            "embedding",
+            &[
+                (1, vec![1.0, 0.0, 0.0, 0.0]),
+                (2, vec![0.0, 1.0, 0.0, 0.0]),
+                (3, vec![0.0, 0.0, 1.0, 0.0]),
+            ],
+        )
+        .unwrap();
+
+        let results = v
+            .search_vector("Doc", "embedding", &[0.9, 0.1, 0.0, 0.0], 1, 16)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].0, 1,
+            "nearest to [0.9,0.1,0,0] must be id 1, got {results:?}"
+        );
+        assert_eq!(
+            v.get_state("Doc", 1, "embedding").unwrap(),
+            VectorState::Indexed
+        );
+    }
+
+    #[test]
+    fn byo_ingest_rebuilds_index_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = byo_setup(dir.path());
+        {
+            let v = Vectorizer::new(
+                Arc::clone(&storage),
+                schema.clone(),
+                type_ids.clone(),
+                field_ids.clone(),
+            )
+            .unwrap();
+            v.ingest_vectors(
+                "Doc",
+                "embedding",
+                &[(1, vec![1.0, 0.0, 0.0, 0.0]), (2, vec![0.0, 1.0, 0.0, 0.0])],
+            )
+            .unwrap();
+        }
+        // New vectorizer over the same storage: rebuild_indexes must restore the
+        // index from the `v:` keys — no @vectorize, no embedder, no re-ingest.
+        let v2 = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let results = v2
+            .search_vector("Doc", "embedding", &[0.1, 0.9, 0.0, 0.0], 1, 16)
+            .unwrap();
+        assert_eq!(
+            results[0].0, 2,
+            "after restart, nearest to [0.1,0.9,0,0] must be id 2, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn byo_ingest_rejects_dim_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = byo_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+        // Field is Vector<4>; a 3-dim vector must be rejected.
+        assert!(
+            v.ingest_vector("Doc", 1, "embedding", &[1.0, 0.0, 0.0]).is_err(),
+            "3-dim vector into a Vector<4> field must error"
+        );
+    }
+
+    #[test]
+    fn byo_batch_validates_all_dims_before_applying() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = byo_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+        // Second row has the wrong dim — the whole batch is rejected up front,
+        // with nothing partially applied.
+        assert!(
+            v.ingest_vectors(
+                "Doc",
+                "embedding",
+                &[(1, vec![1.0, 0.0, 0.0, 0.0]), (2, vec![0.0, 1.0, 0.0])],
+            )
+            .is_err(),
+            "batch with a bad-dim row must error"
+        );
+        let results = v
+            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "no rows should have been applied, got {results:?}"
+        );
+    }
+
+    #[test]
+    fn byo_ingest_rejects_non_finite() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = byo_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        // Untrusted callers can supply NaN/inf — these must be rejected before
+        // reaching the quantizer (inf would panic it; NaN would silently store
+        // an all-zero vector), with nothing applied.
+        assert!(
+            v.ingest_vector("Doc", 1, "embedding", &[f32::INFINITY, 0.0, 0.0, 0.0])
+                .is_err(),
+            "an +inf component must be rejected"
+        );
+        assert!(
+            v.ingest_vector("Doc", 2, "embedding", &[0.0, f32::NAN, 0.0, 0.0])
+                .is_err(),
+            "a NaN component must be rejected"
+        );
+        // Batch: one bad row rejects the whole batch, nothing applied.
+        assert!(
+            v.ingest_vectors(
+                "Doc",
+                "embedding",
+                &[
+                    (1, vec![1.0, 0.0, 0.0, 0.0]),
+                    (2, vec![0.0, f32::NEG_INFINITY, 0.0, 0.0]),
+                ],
+            )
+            .is_err(),
+            "a batch containing a non-finite row must be rejected"
+        );
+        let results = v
+            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16)
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "no rows should have been applied after rejection, got {results:?}"
+        );
     }
 }

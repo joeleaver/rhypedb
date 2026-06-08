@@ -347,11 +347,13 @@ impl Codebook {
     }
 
     fn quantize(&self, value: f32) -> usize {
-        // Binary search on decision boundaries.
-        match self
-            .boundaries
-            .binary_search_by(|b| b.partial_cmp(&value).unwrap())
-        {
+        // Binary search on decision boundaries. `total_cmp` gives a total order
+        // even for non-finite `value` (NaN sorts above every finite boundary),
+        // so this never panics the way `partial_cmp(..).unwrap()` would —
+        // callers should still reject non-finite vectors before quantizing, but
+        // this keeps the quantizer panic-free as a backstop. Boundaries are all
+        // finite and ascending, so `total_cmp` agrees with their sort order.
+        match self.boundaries.binary_search_by(|b| b.total_cmp(&value)) {
             Ok(i) => i + 1,
             Err(i) => i,
         }
