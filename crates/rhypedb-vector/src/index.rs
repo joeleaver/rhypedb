@@ -29,14 +29,15 @@ impl DistanceProvider for TurboQuantDistance {
     }
 
     fn distance_stored(&self, a: &CompressedVector, b: &CompressedVector) -> f32 {
-        // For stored-vs-stored, decompress one side and use asymmetric distance.
-        let a_approx = self.quantizer.decompress(a);
+        // For stored-vs-stored, project `a` (no full decompress — see
+        // TurboQuantizer::prepare_stored) and use the asymmetric estimator.
+        let prepared = self.quantizer.prepare_stored(a);
         self.quantizer
-            .distance_estimate(&a_approx, b, self.metric)
+            .distance_estimate_prepared(&prepared, b, self.metric)
     }
 
     fn prepare_stored(&self, stored: &CompressedVector) -> PreparedQuery {
-        self.quantizer.prepare_query(&self.quantizer.decompress(stored))
+        self.quantizer.prepare_stored(stored)
     }
 
     fn store(&self, vector: &[f32]) -> CompressedVector {

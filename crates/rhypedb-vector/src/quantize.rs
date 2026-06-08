@@ -56,6 +56,12 @@ pub struct TurboQuantizer {
     rotation_matrix: Vec<f32>, // d x d, row-major — orthogonal via QR
     codebook: Codebook,
     qjl_matrix: Vec<f32>, // d x d, i.i.d. N(0,1)
+    /// Precomputed S·Rᵀ (d×d, row-major). Lets `prepare_stored` project a
+    /// decompressed vector with ONE matvec instead of an inverse rotation plus
+    /// two projections — see [`Self::prepare_stored`]. Derived from
+    /// `qjl_matrix` and `rotation_matrix`, so it is NOT serialized; it is
+    /// recomputed in `new` and `read_from`.
+    sr_t: Vec<f32>,
 }
 
 /// Precomputed Lloyd-Max codebook for Beta-distributed values.
@@ -76,12 +82,14 @@ impl TurboQuantizer {
         let rotation_matrix = generate_rotation_matrix(dims);
         let qjl_matrix = generate_qjl_matrix(dims);
         let codebook = compute_beta_codebook(dims, num_centroids);
+        let sr_t = compute_sr_t(&qjl_matrix, &rotation_matrix, dims);
 
         Self {
             config,
             rotation_matrix,
             codebook,
             qjl_matrix,
+            sr_t,
         }
     }
 
@@ -159,6 +167,41 @@ impl TurboQuantizer {
             rq: mat_vec_mul(&self.rotation_matrix, query, dims),
             sq: mat_vec_mul(&self.qjl_matrix, query, dims),
             q_norm: query.iter().map(|x| x * x).sum::<f32>().sqrt(),
+        }
+    }
+
+    /// Prepare an already-*stored* (compressed) vector for use as a query,
+    /// skipping the O(d²) inverse rotation that `decompress` + `prepare_query`
+    /// would perform.
+    ///
+    /// A decompressed vector is `x̂ = ‖x‖·Rᵀ·c`, where `c` is the per-dimension
+    /// centroid vector. Because R is orthonormal, `R·x̂ = ‖x‖·(R·Rᵀ)·c = ‖x‖·c`
+    /// (the rotated query the MSE term needs — with NO matmul) and
+    /// `S·x̂ = ‖x‖·(S·Rᵀ)·c = sr_t·(‖x‖·c)` (ONE matvec via the precomputed
+    /// `sr_t`). So this costs one O(d²) matvec instead of the three an inverse
+    /// rotation plus R- and S-projections would. Used on the HNSW build path,
+    /// where neighbor pruning re-projects stored nodes. Equivalent to
+    /// `prepare_query(&decompress(compressed))` up to the tiny floating-point
+    /// deviation of R·Rᵀ from the identity.
+    pub fn prepare_stored(&self, compressed: &CompressedVector) -> PreparedQuery {
+        let dims = self.config.dimensions as usize;
+
+        // scaled = ‖x‖ · c  (this is exactly R·x̂, the rotated query the MSE term
+        // consumes — produced without the inverse-rotation matmul).
+        let indices = bit_unpack(&compressed.data, self.config.bits, dims);
+        let scaled: Vec<f32> = indices
+            .iter()
+            .map(|&i| self.codebook.centroids[i as usize] * compressed.norm)
+            .collect();
+
+        // sq = S·x̂ = (S·Rᵀ)·(‖x‖·c) = sr_t · scaled.
+        let sq = mat_vec_mul(&self.sr_t, &scaled, dims);
+        let q_norm = scaled.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        PreparedQuery {
+            rq: scaled,
+            sq,
+            q_norm,
         }
     }
 
@@ -272,11 +315,13 @@ impl TurboQuantizer {
         let rotation_matrix = read_f32_vec(r, dims * dims)?;
         let codebook = Codebook::read_from(r)?;
         let qjl_matrix = read_f32_vec(r, dims * dims)?;
+        let sr_t = compute_sr_t(&qjl_matrix, &rotation_matrix, dims);
         Ok(Self {
             config,
             rotation_matrix,
             codebook,
             qjl_matrix,
+            sr_t,
         })
     }
 }
@@ -521,6 +566,23 @@ fn generate_qjl_matrix(dims: usize) -> Vec<f32> {
     (0..dims * dims)
         .map(|_| sample_normal(&mut rng))
         .collect()
+}
+
+/// Precompute `M = S·Rᵀ` (row-major, d×d). Since `Rᵀ`'s column j is R's row j,
+/// `M[i][j] = Σ_k S[i][k]·R[j][k]` — the dot product of row i of the QJL matrix
+/// with row j of the rotation matrix. O(d³), computed once per quantizer; the
+/// contiguous-row inner loop vectorizes well. Used by [`TurboQuantizer::prepare_stored`].
+fn compute_sr_t(qjl: &[f32], rotation: &[f32], dims: usize) -> Vec<f32> {
+    let mut m = vec![0.0f32; dims * dims];
+    for i in 0..dims {
+        let s_row = &qjl[i * dims..(i + 1) * dims];
+        let m_row = &mut m[i * dims..(i + 1) * dims];
+        for (j, m_ij) in m_row.iter_mut().enumerate() {
+            let r_row = &rotation[j * dims..(j + 1) * dims];
+            *m_ij = s_row.iter().zip(r_row).map(|(&s, &r)| s * r).sum();
+        }
+    }
+    m
 }
 
 fn mat_vec_mul(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32> {
@@ -1029,6 +1091,71 @@ mod tests {
                 reference.to_bits(),
                 "correction_dot_fused mismatch: dims={dims}"
             );
+        }
+    }
+
+    /// The fast `prepare_stored` (one matvec via sr_t) must match the original
+    /// `prepare_query(&decompress(cv))` path (inverse rotation + two projections)
+    /// to within the floating-point deviation of R·Rᵀ from identity. We assert on
+    /// the resulting stored-vs-stored distance estimates across all metrics —
+    /// that's the value the build path actually consumes.
+    #[test]
+    fn prepare_stored_matches_decompress_path() {
+        let mut rng = rand::rng();
+        for &dims in &[64usize, 128] {
+            for &bits in &[2u8, 3, 4] {
+                let q = TurboQuantizer::new(TurboQuantConfig::new(dims as u32, bits));
+                for _ in 0..15 {
+                    let a_vec: Vec<f32> =
+                        (0..dims).map(|_| rng.random_range(-2.0..2.0)).collect();
+                    let b_vec: Vec<f32> =
+                        (0..dims).map(|_| rng.random_range(-2.0..2.0)).collect();
+                    let a = q.compress(&a_vec);
+                    let b = q.compress(&b_vec);
+
+                    let old_prepared = q.prepare_query(&q.decompress(&a));
+                    let new_prepared = q.prepare_stored(&a);
+
+                    for metric in [
+                        distance::Metric::DotProduct,
+                        distance::Metric::Cosine,
+                        distance::Metric::L2,
+                    ] {
+                        let old_d =
+                            q.distance_estimate_prepared(&old_prepared, &b, metric);
+                        let new_d =
+                            q.distance_estimate_prepared(&new_prepared, &b, metric);
+                        let denom = old_d.abs().max(1e-3);
+                        assert!(
+                            (old_d - new_d).abs() / denom < 0.02,
+                            "prepare_stored diverged: dims={dims} bits={bits} \
+                             metric={metric:?} old={old_d} new={new_d}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// sr_t must equal S·Rᵀ: i.e. mat_vec_mul(sr_t, v) == qjl·(rotationᵀ·v) for
+    /// any v. Checks the precompute directly, independent of prepare_stored.
+    #[test]
+    fn sr_t_equals_s_times_r_transpose() {
+        let mut rng = rand::rng();
+        let dims = 48usize;
+        let q = TurboQuantizer::new(TurboQuantConfig::new(dims as u32, 4));
+        for _ in 0..10 {
+            let v: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
+            let via_sr_t = mat_vec_mul(&q.sr_t, &v, dims);
+            // Reference: Rᵀ·v then S·(…).
+            let rt_v = mat_vec_mul_transpose(&q.rotation_matrix, &v, dims);
+            let reference = mat_vec_mul(&q.qjl_matrix, &rt_v, dims);
+            for (a, b) in via_sr_t.iter().zip(reference.iter()) {
+                assert!(
+                    (a - b).abs() <= 1e-3 * (1.0 + b.abs()),
+                    "sr_t mismatch: {a} vs {b}"
+                );
+            }
         }
     }
 
