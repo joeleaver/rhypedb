@@ -209,7 +209,12 @@ pub struct Database {
     retired_at_ms_by_type_id: HashMap<u64, u64>,
     retired_at_ms_by_field_id: HashMap<u64, u64>,
     retired_at_ms_by_rel_id: HashMap<u64, u64>,
-    next_object_id: AtomicU64,
+    /// `Arc`-shared so the `_consuming` migrate variants hand the SAME
+    /// `AtomicU64` to the rebuilt handle. Without sharing, the OLD
+    /// handle's `fetch_add` after carry-snapshot and the NEW handle's
+    /// `fetch_add` from the snapshot can return the same id —
+    /// collision + silent overwrite on the shared `Arc<LsmTree>`.
+    next_object_id: Arc<AtomicU64>,
     /// Subscription hub for change events. Wrapped in `Arc` so the
     /// `_consuming` migrate variants can hand the same hub to the new
     /// `Database` handle without dropping live subscribers' channels.
@@ -236,13 +241,18 @@ pub struct Database {
     /// compares against the live generation to detect stale covers). Backed
     /// by `g:<type_id>:<object_id>` keys for restart durability — the map is
     /// repopulated by scanning that prefix in `open()`.
-    version_counters: RwLock<HashMap<(u64, u64), u64>>,
+    /// `Arc`-shared so the `_consuming` migrate variants hand the SAME
+    /// RwLock to the rebuilt handle. Without sharing, the OLD handle's
+    /// `update()` between carry-snapshot and the new handle taking over
+    /// would persist to LSM but not to NEW's in-memory map, causing
+    /// cover_v generation divergence on subsequent NEW updates.
+    version_counters: Arc<RwLock<HashMap<(u64, u64), u64>>>,
     /// Cheap lockless "is `version_counters` non-empty?" check. Cascade
     /// delete uses it to skip the per-cascaded-object `version_counters.read()
     /// .contains_key()` when no object has ever been updated. For the bench
     /// (insert + delete, no updates) this saves 100 RwLock acquires per
     /// User-delete at K=100. Updated alongside every map mutation.
-    version_counter_count: std::sync::atomic::AtomicUsize,
+    version_counter_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Outbound channel to the cover-refresh worker. Each successful
     /// `update()` pushes the bumped target's `(type_id, object_id)` here;
     /// the worker scans `r:<target>:*` for incoming 1:1 forward sources
@@ -323,8 +333,14 @@ struct IndexedField {
 /// subscription hub keeps live channel receivers).
 pub(crate) struct CarryState {
     pub subscriptions: Arc<SubscriptionHub>,
-    pub next_object_id: u64,
-    pub version_counters: HashMap<(u64, u64), u64>,
+    /// SAME `Arc<AtomicU64>` the OLD handle holds. Any `fetch_add` on
+    /// either handle's pointer increments the same counter.
+    pub next_object_id: Arc<AtomicU64>,
+    /// SAME `Arc<RwLock<...>>` the OLD handle holds — see
+    /// `Database::version_counters` for the rationale.
+    pub version_counters: Arc<RwLock<HashMap<(u64, u64), u64>>>,
+    pub version_counter_count: Arc<std::sync::atomic::AtomicUsize>,
+    pub migration_lock: Arc<parking_lot::RwLock<()>>,
 }
 
 /// Operator-tunable knobs that don't depend on schema. Pass to
@@ -495,10 +511,14 @@ impl Database {
         }
 
         // Recover the max object ID by scanning existing objects —
-        // skipped when the carry has it (migrate doesn't change
-        // existing object IDs, so the old handle's counter is exact).
-        let max_object_id = if let Some(c) = carry.as_ref() {
-            c.next_object_id.saturating_sub(1)
+        // skipped when carry provides the shared `Arc<AtomicU64>`
+        // (migrate doesn't change existing object IDs, and the SAME
+        // atomic counter is carried verbatim through to the new
+        // handle).
+        let max_object_id = if carry.is_some() {
+            // Unused: carry path constructs the AtomicU64 from
+            // `Arc::clone(&c.next_object_id)` rather than from `max + 1`.
+            0u64
         } else {
             let mut max_object_id = 0u64;
             let txn = storage.begin_txn();
@@ -648,12 +668,14 @@ impl Database {
         // of never-yet-updated objects, then HashMap lookups for every
         // cover-write and every fusion check. Counters for objects that
         // have never been updated stay absent (read-side defaults to 0).
-        // The carry path skips this scan entirely — `g:*` keys are
-        // unchanged by any current migration verb, so the old handle's
-        // in-memory map already matches.
+        // The carry path skips this scan entirely — the SAME
+        // `Arc<RwLock<HashMap>>` is carried verbatim to the new handle,
+        // so both old and new observe the same in-memory counter map.
         let version_counters: HashMap<(u64, u64), u64> =
-            if let Some(c) = carry.as_ref() {
-                c.version_counters.clone()
+            if carry.is_some() {
+                // Unused in the carry path — the struct construction
+                // below uses `Arc::clone(&c.version_counters)`.
+                HashMap::new()
             } else {
                 let mut version_counters: HashMap<(u64, u64), u64> = HashMap::new();
                 let txn2 = storage.begin_txn();
@@ -723,19 +745,32 @@ impl Database {
             retired_at_ms_by_type_id,
             retired_at_ms_by_field_id,
             retired_at_ms_by_rel_id,
-            next_object_id: AtomicU64::new(max_object_id + 1),
-            subscriptions: carry
-                .map(|c| c.subscriptions)
-                .unwrap_or_else(|| Arc::new(SubscriptionHub::new())),
+            next_object_id: match &carry {
+                Some(c) => Arc::clone(&c.next_object_id),
+                None => Arc::new(AtomicU64::new(max_object_id + 1)),
+            },
+            subscriptions: match &carry {
+                Some(c) => Arc::clone(&c.subscriptions),
+                None => Arc::new(SubscriptionHub::new()),
+            },
             incoming_relations,
             cascade_meta_by_id,
             type_name_by_id,
             indexed_fields,
-            version_counter_count: std::sync::atomic::AtomicUsize::new(version_counters.len()),
-            version_counters: RwLock::new(version_counters),
+            version_counter_count: match &carry {
+                Some(c) => Arc::clone(&c.version_counter_count),
+                None => Arc::new(std::sync::atomic::AtomicUsize::new(version_counters.len())),
+            },
+            version_counters: match &carry {
+                Some(c) => Arc::clone(&c.version_counters),
+                None => Arc::new(RwLock::new(version_counters)),
+            },
             cover_refresh_tx: parking_lot::Mutex::new(None),
             cover_refresh_handle: parking_lot::Mutex::new(None),
-            migration_lock: Arc::new(parking_lot::RwLock::new(())),
+            migration_lock: match &carry {
+                Some(c) => Arc::clone(&c.migration_lock),
+                None => Arc::new(parking_lot::RwLock::new(())),
+            },
             zone_field_id_lookup,
             opts: options.clone(),
             migrated: std::sync::atomic::AtomicBool::new(false),
@@ -959,12 +994,27 @@ impl Database {
     /// `Arc<Self>`-consuming variant that returns a fresh `Arc<Database>`
     /// in one call.
     pub fn rename_type(&self, old: &str, new: &str) -> EngineResult<crate::catalog::MigrationReport> {
+        // Reject calls on a handle that's been migrated away (a held
+        // Arc::clone after a `_consuming` verb produced a new handle).
+        // The catalog state on disk would be valid but the in-memory
+        // schema / type_ids / field_ids of this stale handle don't
+        // match it — running another verb against it would corrupt.
+        self.check_not_migrated()?;
         // Write-lock excludes concurrent `create` / `update` / `link` /
         // `unlink` / `delete` so they can't commit OLD-shape data while
         // the catalog migration runs and atomically rewrites the
         // affected on-disk state. Closes the during-verb race window
         // the adversarial review surfaced.
         let _migration_guard = self.migration_lock.write();
+        self.rename_type_inner(old, new)
+    }
+
+    /// Inner body of `rename_type` without locking. Callers MUST hold
+    /// `migration_lock.write()` (and have already run the
+    /// `check_not_migrated` guard if appropriate). Used by the
+    /// `_consuming` variant so the lock + poison + rebuild can be one
+    /// atomic critical section.
+    fn rename_type_inner(&self, old: &str, new: &str) -> EngineResult<crate::catalog::MigrationReport> {
         let verbs = [crate::catalog::RenameVerb::Type {
             old: old.into(),
             new: new.into(),
@@ -1007,7 +1057,18 @@ impl Database {
         old: &str,
         new: &str,
     ) -> EngineResult<crate::catalog::MigrationReport> {
+        self.check_not_migrated()?;
         let _migration_guard = self.migration_lock.write();
+        self.rename_field_inner(type_name, old, new)
+    }
+
+    /// Lock-less inner body of `rename_field`. See `rename_type_inner`.
+    fn rename_field_inner(
+        &self,
+        type_name: &str,
+        old: &str,
+        new: &str,
+    ) -> EngineResult<crate::catalog::MigrationReport> {
         let verbs = [crate::catalog::RenameVerb::Field {
             type_name: type_name.into(),
             old: old.into(),
@@ -1039,7 +1100,15 @@ impl Database {
         &self,
         migrations: Vec<crate::catalog::Migration>,
     ) -> EngineResult<crate::catalog::MigrationLogReport> {
+        self.check_not_migrated()?;
         let _migration_guard = self.migration_lock.write();
+        self.run_migrations_inner(migrations)
+    }
+
+    fn run_migrations_inner(
+        &self,
+        migrations: Vec<crate::catalog::Migration>,
+    ) -> EngineResult<crate::catalog::MigrationLogReport> {
         crate::catalog::run_migrations(&self.storage, &self.schema, migrations)
     }
 
@@ -1074,7 +1143,24 @@ impl Database {
             + Sync
             + 'static,
     {
+        self.check_not_migrated()?;
         let _migration_guard = self.migration_lock.write();
+        self.change_field_type_inner(type_name, field_name, target_field_type, converter)
+    }
+
+    fn change_field_type_inner<F>(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        target_field_type: rhypedb_schema::FieldType,
+        converter: F,
+    ) -> EngineResult<crate::catalog::MigrationReport>
+    where
+        F: Fn(u64, &crate::object::Value) -> EngineResult<crate::object::Value>
+            + Send
+            + Sync
+            + 'static,
+    {
         let target_kind = crate::catalog::schema_kind_byte_public(&target_field_type);
         let verb = crate::catalog::FieldTypeChangeVerb {
             type_name: type_name.into(),
@@ -1132,13 +1218,30 @@ impl Database {
     /// the consumed handle. The returned report is the same one
     /// `rename_type` would return.
     pub fn rename_type_consuming(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         old: &str,
         new: &str,
         post_schema: Schema,
     ) -> EngineResult<(crate::catalog::MigrationReport, Arc<Self>)> {
+        // Take `migration_lock.write()` once and HOLD IT through the
+        // verb + rebuild + poison atomic sequence. Without the held
+        // lock, the window between the verb's commit (catalog migrated
+        // on disk) and the poison flag being set could let a concurrent
+        // writer's `create()` (waiting on `migration_lock.read()`)
+        // acquire the lock and commit OLD-shape data into the post-
+        // migration catalog era. With the lock held, the concurrent
+        // writer remains blocked until the new handle exists and the
+        // poison fires.
+        //
+        // `self: &Arc<Self>` — caller's Arc isn't consumed by the call.
+        // On Err, the caller still owns their original Arc; on Ok they
+        // get both the (now poisoned) original AND the new handle.
+        // This sidesteps the "destroy the only Arc on benign validation
+        // error" hazard the adversarial review flagged for the prior
+        // `self: Arc<Self>` signature.
         self.check_not_migrated()?;
-        let report = self.rename_type(old, new)?;
+        let _guard = self.migration_lock.write();
+        let report = self.rename_type_inner(old, new)?;
         let new_db = self.clone_into_new_handle(post_schema)?;
         Ok((report, new_db))
     }
@@ -1146,14 +1249,15 @@ impl Database {
     /// `Arc<Self>`-consuming variant of `rename_field`. See
     /// `rename_type_consuming` for the shared semantics.
     pub fn rename_field_consuming(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         type_name: &str,
         old: &str,
         new: &str,
         post_schema: Schema,
     ) -> EngineResult<(crate::catalog::MigrationReport, Arc<Self>)> {
         self.check_not_migrated()?;
-        let report = self.rename_field(type_name, old, new)?;
+        let _guard = self.migration_lock.write();
+        let report = self.rename_field_inner(type_name, old, new)?;
         let new_db = self.clone_into_new_handle(post_schema)?;
         Ok((report, new_db))
     }
@@ -1161,7 +1265,7 @@ impl Database {
     /// `Arc<Self>`-consuming variant of `change_field_type`. See
     /// `rename_type_consuming` for the shared semantics.
     pub fn change_field_type_consuming<F>(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         type_name: &str,
         field_name: &str,
         target_field_type: rhypedb_schema::FieldType,
@@ -1175,7 +1279,9 @@ impl Database {
             + 'static,
     {
         self.check_not_migrated()?;
-        let report = self.change_field_type(type_name, field_name, target_field_type, converter)?;
+        let _guard = self.migration_lock.write();
+        let report =
+            self.change_field_type_inner(type_name, field_name, target_field_type, converter)?;
         let new_db = self.clone_into_new_handle(post_schema)?;
         Ok((report, new_db))
     }
@@ -1183,12 +1289,13 @@ impl Database {
     /// `Arc<Self>`-consuming variant of `run_migrations`. See
     /// `rename_type_consuming` for the shared semantics.
     pub fn run_migrations_consuming(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         migrations: Vec<crate::catalog::Migration>,
         post_schema: Schema,
     ) -> EngineResult<(crate::catalog::MigrationLogReport, Arc<Self>)> {
         self.check_not_migrated()?;
-        let report = self.run_migrations(migrations)?;
+        let _guard = self.migration_lock.write();
+        let report = self.run_migrations_inner(migrations)?;
         let new_db = self.clone_into_new_handle(post_schema)?;
         Ok((report, new_db))
     }
@@ -1202,28 +1309,42 @@ impl Database {
     /// Private — every public entry point that constructs a successor
     /// handle goes through one of the `_consuming` verbs above.
     fn clone_into_new_handle(
-        self: Arc<Self>,
+        self: &Arc<Self>,
         post_schema: Schema,
     ) -> EngineResult<Arc<Self>> {
+        // Carry the SHARED Arc instances — not snapshots. This makes
+        // `next_object_id`/`version_counters`/`migration_lock`/etc. one
+        // and the same across OLD and NEW handles, closing the carry-
+        // race window where the OLD handle could fetch_add a new id
+        // (or bump a version_counter) after the snapshot but before
+        // the poison and end up colliding with the NEW handle's first
+        // operation.
         let carry = CarryState {
             subscriptions: Arc::clone(&self.subscriptions),
-            next_object_id: self
-                .next_object_id
-                .load(std::sync::atomic::Ordering::SeqCst),
-            version_counters: self.version_counters.read().clone(),
+            next_object_id: Arc::clone(&self.next_object_id),
+            version_counters: Arc::clone(&self.version_counters),
+            version_counter_count: Arc::clone(&self.version_counter_count),
+            migration_lock: Arc::clone(&self.migration_lock),
         };
-        let new_db = Self::rebuild_with_arc_storage(
+        // Poison the OLD handle BEFORE rebuilding. If `rebuild_with_arc_storage`
+        // succeeds, the OLD handle is already marked migrated so any
+        // racing call to a public read/write method through `resolve_type_id`
+        // surfaces `DatabaseMigratedAway` instead of stale-cache results.
+        // If rebuild FAILS, the catalog change has already committed on
+        // disk — the old handle is functionally dead (its in-memory
+        // schema disagrees with the on-disk catalog), so poisoning it
+        // is the safer failure mode than leaving it un-poisoned and
+        // letting the caller observe inconsistent reads. The contract
+        // becomes: on Err, drop the OLD handle and reopen.
+        self.migrated
+            .store(true, std::sync::atomic::Ordering::Release);
+        Self::rebuild_with_arc_storage(
             Arc::clone(&self.storage),
             post_schema,
             self.opts.clone(),
             Arc::clone(&self.zone_field_id_lookup),
             Some(carry),
-        )?;
-        // Poison the old handle. Release so any reader doing an Acquire
-        // load observes the post-migration state.
-        self.migrated
-            .store(true, std::sync::atomic::Ordering::Release);
-        Ok(new_db)
+        )
     }
 
     /// Guardrail for read/write entry points. Returns
@@ -5091,6 +5212,108 @@ mod tests {
         // the event from the NEW handle — proving the hub is shared.
         let evt = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(evt.type_name, "Account");
+    }
+
+    /// `next_object_id` must be SHARED (not snapshotted) between OLD
+    /// and NEW handles. Otherwise a concurrent `create()` on OLD that
+    /// races the migration's snapshot can mint the same ID NEW's first
+    /// `create()` will also mint — silent overwrite on the shared
+    /// `Arc<LsmTree>`. Regression for PR #7 adversarial-review blocker.
+    #[test]
+    fn migrate_shares_next_object_id_arc() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+
+        let schema_after = parse_schema(r#"type Account { name: String }"#).unwrap();
+        let (_report, db2) =
+            db.rename_type_consuming("User", "Account", schema_after).unwrap();
+
+        // Both handles must point to the SAME AtomicU64 — `Arc::ptr_eq`
+        // is the structural guarantee.
+        assert!(
+            Arc::ptr_eq(&db.next_object_id, &db2.next_object_id),
+            "next_object_id Arc must be shared between OLD and NEW handles",
+        );
+    }
+
+    /// Same as above for `version_counters` and `migration_lock` —
+    /// PR #7 blockers + majors collapse into "carry the shared Arcs".
+    #[test]
+    fn migrate_shares_version_counters_and_migration_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+
+        let schema_after = parse_schema(r#"type Account { name: String }"#).unwrap();
+        let (_report, db2) =
+            db.rename_type_consuming("User", "Account", schema_after).unwrap();
+
+        assert!(
+            Arc::ptr_eq(&db.version_counters, &db2.version_counters),
+            "version_counters Arc must be shared",
+        );
+        assert!(
+            Arc::ptr_eq(&db.version_counter_count, &db2.version_counter_count),
+            "version_counter_count Arc must be shared",
+        );
+        assert!(
+            Arc::ptr_eq(&db.migration_lock, &db2.migration_lock),
+            "migration_lock Arc must be shared so writers on either handle serialize against migrations on either handle",
+        );
+    }
+
+    /// A `_consuming` verb that errors out must NOT consume the
+    /// caller's Arc. With the prior `self: Arc<Self>` signature the Arc
+    /// was moved into the function and dropped on `?` early-return,
+    /// destroying the caller's only handle on benign validation errors
+    /// (no-op, source-not-found, etc.). The `self: &Arc<Self>` switch
+    /// preserves the caller's Arc through any failure path.
+    #[test]
+    fn consuming_verb_preserves_arc_on_validation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        // No-op rename (old == new) is rejected as RenameNoOp.
+        let post_schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        match db.rename_type_consuming("User", "User", post_schema) {
+            Err(EngineError::Catalog(crate::CatalogError::RenameNoOp { .. })) => {}
+            Ok(_) => panic!("expected RenameNoOp"),
+            Err(e) => panic!("expected RenameNoOp, got {e}"),
+        }
+
+        // The caller's `db` Arc is still alive AND usable — the verb
+        // didn't poison it because the verb itself errored before
+        // reaching the rebuild + poison sequence.
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        db.create("User", f).unwrap();
+    }
+
+    /// Non-consuming migrate verbs must reject calls on a handle that
+    /// was already migrated away via a `_consuming` verb. Otherwise a
+    /// stale `Arc::clone` could run another migration against the OLD
+    /// in-memory schema (which doesn't match the on-disk catalog
+    /// anymore) and corrupt.
+    #[test]
+    fn non_consuming_verbs_reject_after_consuming_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+        let old_handle = Arc::clone(&db);
+
+        let schema_after = parse_schema(r#"type Account { name: String }"#).unwrap();
+        let (_report, _new_db) =
+            db.rename_type_consuming("User", "Account", schema_after).unwrap();
+
+        // `old_handle` is the same Arc — it's now poisoned.
+        // Direct `rename_type` (non-consuming) must reject.
+        let err = old_handle.rename_type("Account", "Member").unwrap_err();
+        assert!(
+            matches!(err, EngineError::DatabaseMigratedAway),
+            "non-consuming rename_type on poisoned handle must error DatabaseMigratedAway, got {err}",
+        );
     }
 
     // -----------------------------------------------------------------
