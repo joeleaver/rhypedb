@@ -171,25 +171,26 @@ impl TurboQuantizer {
     ) -> f32 {
         let dims = self.config.dimensions as usize;
 
+        debug_assert_eq!(prepared.rq.len(), dims);
+        debug_assert_eq!(prepared.sq.len(), dims);
+
         // MSE term: ⟨q, x̂_mse⟩ = ‖x‖ · ⟨R·q, cv⟩, where cv[i] is the centroid for
         // the quantized rotated coordinate i (decompress's pre-inverse-rotation
         // values). Avoids materializing x̂_mse (which would need the R^T multiply).
-        let indices = bit_unpack(&compressed.data, self.config.bits, dims);
-        let mse_dot: f32 = indices
-            .iter()
-            .zip(prepared.rq.iter())
-            .map(|(&i, &rqi)| self.codebook.centroids[i as usize] * rqi)
-            .sum::<f32>()
-            * compressed.norm;
+        //
+        // The decode is fused into the dot product: instead of `bit_unpack`-ing
+        // the indices into a heap `Vec<u8>` and then zipping, we walk the packed
+        // bytes and accumulate `centroids[idx] · rq[i]` in one allocation-free
+        // pass. Summation is strictly position-ordered, so the result is
+        // bit-identical to the previous materialized path.
+        let mse_dot =
+            mse_dot_fused(&compressed.data, self.config.bits, &self.codebook.centroids, &prepared.rq)
+                * compressed.norm;
 
         // QJL correction: ‖r‖ · ‖x‖ · √(π/2)/d · ⟨signs, S·q⟩ (signs are ±1, so a
-        // signed sum over the pre-projected sq).
-        let signs = unpack_bools(&compressed.qjl_signs, dims);
-        let correction_dot: f32 = signs
-            .iter()
-            .zip(prepared.sq.iter())
-            .map(|(&b, &s)| if b { s } else { -s })
-            .sum();
+        // signed sum over the pre-projected sq). Likewise fused: the sign bits are
+        // applied to `sq` in place with no intermediate `Vec<bool>`.
+        let correction_dot = correction_dot_fused(&compressed.qjl_signs, &prepared.sq);
 
         let qjl_scale = (std::f32::consts::FRAC_PI_2).sqrt() / dims as f32;
         let correction = compressed.residual_norm * compressed.norm * qjl_scale * correction_dot;
@@ -538,6 +539,121 @@ fn mat_vec_mul_transpose(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32
     result
 }
 
+// --- Fused decode + dot product (allocation-free hot kernel) ---
+
+/// `Σ_i centroids[idx_i] · rq[i]`, decoding `bits`-wide quantized indices
+/// straight out of the packed byte stream — no intermediate `Vec`.
+///
+/// Byte-aligned widths (2 and 4 bits) get specialized loops that the optimizer
+/// can keep in registers and unroll; the odd width (3) falls back to a generic
+/// bit-walker. All three accumulate strictly in position order, so the sum is
+/// bit-identical to `bit_unpack` followed by a zipped `.sum()`.
+#[inline]
+fn mse_dot_fused(data: &[u8], bits: u8, centroids: &[f32], rq: &[f32]) -> f32 {
+    let dims = rq.len();
+    match bits {
+        4 => {
+            // Each byte holds two indices: high nibble first (even position),
+            // low nibble second (odd position).
+            let pairs = dims / 2;
+            let mut acc = 0.0f32;
+            for j in 0..pairs {
+                let b = data[j];
+                acc += centroids[(b >> 4) as usize] * rq[2 * j];
+                acc += centroids[(b & 0x0F) as usize] * rq[2 * j + 1];
+            }
+            if dims & 1 == 1 {
+                // Trailing odd dimension lives in the high nibble of its byte.
+                let b = data[pairs];
+                acc += centroids[(b >> 4) as usize] * rq[dims - 1];
+            }
+            acc
+        }
+        2 => {
+            // Each byte holds four indices, MSB-first.
+            let quads = dims / 4;
+            let mut acc = 0.0f32;
+            for j in 0..quads {
+                let b = data[j];
+                acc += centroids[((b >> 6) & 0x03) as usize] * rq[4 * j];
+                acc += centroids[((b >> 4) & 0x03) as usize] * rq[4 * j + 1];
+                acc += centroids[((b >> 2) & 0x03) as usize] * rq[4 * j + 2];
+                acc += centroids[(b & 0x03) as usize] * rq[4 * j + 3];
+            }
+            let done = quads * 4;
+            if done < dims {
+                let b = data[quads];
+                for (r, &rqi) in rq[done..].iter().enumerate() {
+                    let shift = 6 - 2 * r;
+                    acc += centroids[((b >> shift) & 0x03) as usize] * rqi;
+                }
+            }
+            acc
+        }
+        _ => mse_dot_generic(data, bits, centroids, rq),
+    }
+}
+
+/// Generic bit-width fused decode+dot. Mirrors [`bit_unpack`]'s MSB-first walk
+/// exactly, accumulating in place. Used for the non-byte-aligned 3-bit case.
+#[inline]
+fn mse_dot_generic(data: &[u8], bits: u8, centroids: &[f32], rq: &[f32]) -> f32 {
+    let bits = bits as usize;
+    let mut acc = 0.0f32;
+    let mut bit_pos = 0usize;
+    for &rqi in rq {
+        let mut val = 0u8;
+        for _ in 0..bits {
+            val <<= 1;
+            if (data[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1 == 1 {
+                val |= 1;
+            }
+            bit_pos += 1;
+        }
+        acc += centroids[val as usize] * rqi;
+    }
+    acc
+}
+
+/// `Σ_i sign_i · sq[i]` where `sign_i = +1` if the packed bit is set, else `-1`.
+/// Walks the packed sign bytes MSB-first with no intermediate `Vec<bool>`.
+/// Bit-identical to `unpack_bools` followed by a zipped `if b { s } else { -s }`.
+#[inline]
+fn correction_dot_fused(signs: &[u8], sq: &[f32]) -> f32 {
+    let dims = sq.len();
+    let full = dims / 8;
+    let mut acc = 0.0f32;
+    for (byte_i, &b) in signs[..full].iter().enumerate() {
+        let base = byte_i * 8;
+        acc += sign_apply((b >> 7) & 1, sq[base]);
+        acc += sign_apply((b >> 6) & 1, sq[base + 1]);
+        acc += sign_apply((b >> 5) & 1, sq[base + 2]);
+        acc += sign_apply((b >> 4) & 1, sq[base + 3]);
+        acc += sign_apply((b >> 3) & 1, sq[base + 4]);
+        acc += sign_apply((b >> 2) & 1, sq[base + 5]);
+        acc += sign_apply((b >> 1) & 1, sq[base + 6]);
+        acc += sign_apply(b & 1, sq[base + 7]);
+    }
+    let rem = dims % 8;
+    if rem > 0 {
+        let b = signs[full];
+        let base = full * 8;
+        for (k, &s) in sq[base..].iter().enumerate() {
+            acc += sign_apply((b >> (7 - k)) & 1, s);
+        }
+    }
+    acc
+}
+
+/// `bit == 1 → +s`, `bit == 0 → -s`, branchlessly by XOR-ing the f32 sign bit.
+/// Bit-identical to `if bit { s } else { -s }` (negation also just flips the
+/// sign bit, including for ±0 and ±∞).
+#[inline(always)]
+fn sign_apply(bit: u8, s: f32) -> f32 {
+    let flip = ((bit ^ 1) as u32) << 31;
+    f32::from_bits(s.to_bits() ^ flip)
+}
+
 // --- Bit packing ---
 
 fn bit_pack(indices: &[u8], bits: u8) -> Vec<u8> {
@@ -586,6 +702,10 @@ fn pack_bools(bools: &[bool]) -> Vec<u8> {
     packed
 }
 
+/// Reference (materializing) sign unpack. The hot path no longer uses this —
+/// [`correction_dot_fused`] decodes signs in place — so it is retained only as
+/// the test oracle that the fused decoder is checked against.
+#[cfg(test)]
 fn unpack_bools(packed: &[u8], count: usize) -> Vec<bool> {
     let mut bools = Vec::with_capacity(count);
     for i in 0..count {
@@ -818,6 +938,98 @@ mod tests {
         assert_eq!(quantizer.qjl_matrix, restored.qjl_matrix);
         assert_eq!(quantizer.codebook.centroids, restored.codebook.centroids);
         assert_eq!(quantizer.codebook.boundaries, restored.codebook.boundaries);
+    }
+
+    /// The fused, allocation-free kernel must produce *bit-identical* results to
+    /// the original materialize-then-zip implementation, for every bit width and
+    /// for dims that are odd / not a multiple of 8 (exercising the tail paths).
+    /// Bit-identity is what guarantees recall is unchanged by the optimization.
+    #[test]
+    fn fused_kernel_bit_identical_to_materialized() {
+        let mut rng = rand::rng();
+        for &dims in &[16usize, 30, 31, 32, 33, 64, 127, 384] {
+            for &bits in &[2u8, 3, 4] {
+                let quantizer = TurboQuantizer::new(TurboQuantConfig::new(dims as u32, bits));
+                for _ in 0..25 {
+                    let query: Vec<f32> =
+                        (0..dims).map(|_| rng.random_range(-3.0..3.0)).collect();
+                    let target: Vec<f32> =
+                        (0..dims).map(|_| rng.random_range(-3.0..3.0)).collect();
+                    let prepared = quantizer.prepare_query(&query);
+                    let cv = quantizer.compress(&target);
+
+                    // Reference: the exact computation the kernel used to perform.
+                    let indices = bit_unpack(&cv.data, bits, dims);
+                    let ref_mse: f32 = indices
+                        .iter()
+                        .zip(prepared.rq.iter())
+                        .map(|(&i, &rqi)| quantizer.codebook.centroids[i as usize] * rqi)
+                        .sum::<f32>()
+                        * cv.norm;
+                    let sgns = unpack_bools(&cv.qjl_signs, dims);
+                    let ref_corr_dot: f32 = sgns
+                        .iter()
+                        .zip(prepared.sq.iter())
+                        .map(|(&b, &s)| if b { s } else { -s })
+                        .sum();
+                    let qjl_scale = (std::f32::consts::FRAC_PI_2).sqrt() / dims as f32;
+                    let ref_ip = ref_mse + cv.residual_norm * cv.norm * qjl_scale * ref_corr_dot;
+
+                    let got = quantizer.inner_product_estimate_prepared(&prepared, &cv);
+                    assert_eq!(
+                        got.to_bits(),
+                        ref_ip.to_bits(),
+                        "fused kernel diverged: dims={dims} bits={bits} got={got} ref={ref_ip}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fused helpers in isolation must match the materialized helpers exactly.
+    #[test]
+    fn fused_helpers_match_materialized() {
+        let mut rng = rand::rng();
+        for &dims in &[1usize, 7, 8, 9, 15, 16, 17, 100] {
+            // MSE: for each bit width, random indices + random rq.
+            for &bits in &[2u8, 3, 4] {
+                let max_idx = 1u8 << bits;
+                let indices: Vec<u8> =
+                    (0..dims).map(|_| rng.random_range(0..max_idx)).collect();
+                let centroids: Vec<f32> =
+                    (0..max_idx).map(|_| rng.random_range(-1.0..1.0)).collect();
+                let rq: Vec<f32> = (0..dims).map(|_| rng.random_range(-2.0..2.0)).collect();
+                let packed = bit_pack(&indices, bits);
+
+                let reference: f32 = indices
+                    .iter()
+                    .zip(rq.iter())
+                    .map(|(&i, &r)| centroids[i as usize] * r)
+                    .sum();
+                let fused = mse_dot_fused(&packed, bits, &centroids, &rq);
+                assert_eq!(
+                    fused.to_bits(),
+                    reference.to_bits(),
+                    "mse_dot_fused mismatch: dims={dims} bits={bits}"
+                );
+            }
+
+            // Correction: random signs + random sq.
+            let bools: Vec<bool> = (0..dims).map(|_| rng.random_bool(0.5)).collect();
+            let sq: Vec<f32> = (0..dims).map(|_| rng.random_range(-2.0..2.0)).collect();
+            let packed_signs = pack_bools(&bools);
+            let reference: f32 = bools
+                .iter()
+                .zip(sq.iter())
+                .map(|(&b, &s)| if b { s } else { -s })
+                .sum();
+            let fused = correction_dot_fused(&packed_signs, &sq);
+            assert_eq!(
+                fused.to_bits(),
+                reference.to_bits(),
+                "correction_dot_fused mismatch: dims={dims}"
+            );
+        }
     }
 
     #[test]
