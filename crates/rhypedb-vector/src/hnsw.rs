@@ -67,6 +67,29 @@ pub trait DistanceProvider: Send + Sync {
 
     /// Deserialize a stored vector from a reader.
     fn read_stored(&self, r: &mut dyn io::Read) -> io::Result<Self::Stored>;
+
+    /// Resident byte size of one stored vector, including its heap allocations,
+    /// for memory accounting. (Used by [`HnswIndex::memory_bytes`].)
+    fn stored_bytes(stored: &Self::Stored) -> usize;
+}
+
+/// Breakdown of an HNSW index's in-memory footprint. `stored_bytes` is the
+/// vector data (compressed codes or raw f32); `graph_bytes` the neighbor lists;
+/// the rest is per-node structs and the id→index map. This is the RAM the index
+/// needs to *serve* queries — it excludes any durability/LSM layer above it.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMemory {
+    pub nodes: usize,
+    pub stored_bytes: usize,
+    pub graph_bytes: usize,
+    pub node_overhead: usize,
+    pub id_map_bytes: usize,
+}
+
+impl IndexMemory {
+    pub fn total(&self) -> usize {
+        self.stored_bytes + self.graph_bytes + self.node_overhead + self.id_map_bytes
+    }
 }
 
 /// Default distance provider using full-precision f32 vectors.
@@ -106,6 +129,11 @@ impl DistanceProvider for ExactDistance {
     fn read_stored(&self, r: &mut dyn io::Read) -> io::Result<Vec<f32>> {
         let len = read_u32(r)? as usize;
         read_f32_vec(r, len)
+    }
+
+    fn stored_bytes(stored: &Vec<f32>) -> usize {
+        // Heap only — the inline Vec header is counted in node_overhead.
+        stored.capacity() * std::mem::size_of::<f32>()
     }
 }
 
@@ -310,6 +338,37 @@ impl<D: DistanceProvider> HnswIndex<D> {
 
     pub fn active_count(&self) -> usize {
         self.nodes.read().iter().filter(|n| !n.deleted).count()
+    }
+
+    /// Precise in-memory footprint of the index (codes + graph + overhead),
+    /// computed by walking the structure — not via process RSS. This is the RAM
+    /// needed to serve k-NN; it excludes any durability layer (e.g. the LSM the
+    /// server persists the vectors into for restart).
+    pub fn memory_bytes(&self) -> IndexMemory {
+        let nodes = self.nodes.read();
+        let node_struct = std::mem::size_of::<Node<D::Stored>>();
+        let vec_hdr = std::mem::size_of::<Vec<u64>>();
+        let mut stored_bytes = 0usize;
+        let mut graph_bytes = 0usize;
+        for node in nodes.iter() {
+            stored_bytes += D::stored_bytes(&node.stored);
+            graph_bytes += node.neighbors.capacity() * vec_hdr;
+            for layer in &node.neighbors {
+                graph_bytes += layer.capacity() * std::mem::size_of::<u64>();
+            }
+        }
+        let n = nodes.len();
+        // HashMap<u64, usize>: a bucket per slot at current capacity, ~1 control
+        // byte + the (key, value) pair; a reasonable resident estimate.
+        let entry = std::mem::size_of::<u64>() + std::mem::size_of::<usize>() + 1;
+        let id_map_bytes = self.id_to_idx.read().capacity() * entry;
+        IndexMemory {
+            nodes: n,
+            stored_bytes,
+            graph_bytes,
+            node_overhead: n * node_struct,
+            id_map_bytes,
+        }
     }
 
     pub fn contains_id(&self, id: u64) -> bool {

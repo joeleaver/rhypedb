@@ -1,7 +1,7 @@
 use std::io;
 
 use crate::distance::{self, Metric};
-use crate::hnsw::{DistanceProvider, HnswConfig, HnswIndex};
+use crate::hnsw::{DistanceProvider, HnswConfig, HnswIndex, IndexMemory};
 use crate::quantize::{CompressedVector, PreparedQuery, TurboQuantConfig, TurboQuantizer};
 use crate::serial::{read_u8, write_u8};
 
@@ -50,6 +50,12 @@ impl DistanceProvider for TurboQuantDistance {
 
     fn read_stored(&self, r: &mut dyn io::Read) -> io::Result<CompressedVector> {
         CompressedVector::read_from(r)
+    }
+
+    fn stored_bytes(stored: &CompressedVector) -> usize {
+        // Heap allocations only (codes + QJL signs); the inline struct (Vec
+        // headers + the two f32 norms) is counted in node_overhead.
+        stored.data.len() + stored.qjl_signs.len()
     }
 }
 
@@ -108,6 +114,12 @@ impl QuantizedIndex {
 
     pub fn contains_id(&self, id: u64) -> bool {
         self.hnsw.contains_id(id)
+    }
+
+    /// Precise in-memory footprint of the index (codes + graph + overhead),
+    /// excluding any LSM/durability layer. See [`HnswIndex::memory_bytes`].
+    pub fn memory_bytes(&self) -> IndexMemory {
+        self.hnsw.memory_bytes()
     }
 
     pub fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
