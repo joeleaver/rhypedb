@@ -9,10 +9,8 @@ use std::sync::Arc;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
@@ -24,7 +22,6 @@ use rhypedb_engine::object::{Object, Value};
 use rhypedb_engine::vectorizer::Vectorizer;
 use rhypedb_query::executor::{ExecContext, QueryOutput};
 use rhypedb_schema::parser::parse_schema;
-use rhypedb_subscribe::{ChangeKind, SubscriptionFilter};
 
 mod protocol;
 mod query_cache;
@@ -296,66 +293,6 @@ async fn handle_status(
     Json(result)
 }
 
-/// WebSocket subscription endpoint.
-/// Query params: ?type=User&id=5&kind=create,update
-#[derive(Deserialize)]
-struct SubscribeParams {
-    #[serde(rename = "type")]
-    type_name: Option<String>,
-    id: Option<u64>,
-    kind: Option<String>,
-}
-
-async fn handle_subscribe(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<SubscribeParams>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, params))
-}
-
-async fn handle_ws_connection(
-    mut socket: WebSocket,
-    state: Arc<AppState>,
-    params: SubscribeParams,
-) {
-    let mut filter = match (&params.type_name, params.id) {
-        (Some(tn), Some(id)) => SubscriptionFilter::for_object(tn.clone(), id),
-        (Some(tn), None) => SubscriptionFilter::for_type(tn.clone()),
-        _ => SubscriptionFilter::all(),
-    };
-
-    if let Some(kind_str) = &params.kind {
-        filter.kinds = kind_str
-            .split(',')
-            .filter_map(|k| match k.trim() {
-                "create" => Some(ChangeKind::Create),
-                "update" => Some(ChangeKind::Update),
-                "delete" => Some(ChangeKind::Delete),
-                _ => None,
-            })
-            .collect();
-    }
-
-    let (_sub_id, rx) = state.db.subscriptions().subscribe(filter);
-
-    let (tx_async, mut rx_async) = tokio::sync::mpsc::unbounded_channel();
-    tokio::task::spawn_blocking(move || {
-        while let Ok(event) = rx.recv() {
-            if tx_async.send(event).is_err() {
-                break;
-            }
-        }
-    });
-
-    while let Some(event) = rx_async.recv().await {
-        let json = serde_json::to_string(&event).unwrap();
-        if socket.send(Message::Text(json.into())).await.is_err() {
-            break;
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -418,7 +355,6 @@ async fn main() {
 
     let app = Router::new()
         .route("/query", post(handle_query))
-        .route("/subscribe", get(handle_subscribe))
         .route("/status", get(handle_status))
         .route("/health", get(handle_health))
         .route("/admin/compact", post(handle_admin_compact))
@@ -441,7 +377,6 @@ async fn main() {
     println!("rhypedb HTTP listening on {}", cli.listen);
     println!("rhypedb binary TCP listening on {}", cli.tcp_listen);
     println!("  POST /query     — execute queries");
-    println!("  GET  /subscribe — WebSocket subscriptions");
     println!("  GET  /health    — health check");
 
     // Spawn the binary TCP accept loop.
