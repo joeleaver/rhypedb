@@ -13,7 +13,10 @@ use rhypedb_storage::lsm::{LsmConfig, LsmTree};
 use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionHub};
 
 use crate::error::{EngineError, EngineResult};
-use crate::object::{FieldMap, Object, Value, deserialize_fields, serialize_fields};
+use crate::object::{
+    FieldMap, Object, Value, deserialize_fields, deserialize_fields_projected, extract_field,
+    serialize_fields,
+};
 
 /// One row of the precomputed reverse-relation index used by cascade delete.
 /// `is_many` distinguishes forward 1:1 incoming relations (where the source's
@@ -1814,6 +1817,77 @@ impl Database {
         Ok(objects)
     }
 
+    /// Column-projected point lookup: like [`get`](Self::get) but deserializes
+    /// only `fields` instead of the whole object, skipping the `String`-key +
+    /// `Value` allocations for every other field. The returned Object's
+    /// `fields` holds exactly the requested-and-present columns.
+    ///
+    /// A building block for predicate pushdown and intermediate-hop projection;
+    /// callers that need the full object should use `get`.
+    pub fn get_projected(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        fields: &[&str],
+    ) -> EngineResult<Object> {
+        let type_id = self.resolve_type_id(type_name)?;
+
+        let key = KeyBuilder::object(type_id, object_id);
+        let snapshot = self.storage.read_snapshot();
+        let data =
+            self.storage
+                .get_at(snapshot, &key)?
+                .ok_or_else(|| EngineError::ObjectNotFound {
+                    type_name: type_name.into(),
+                    object_id,
+                })?;
+
+        let mut projected = deserialize_fields_projected(&data, fields);
+        self.strip_tombstoned_fields(type_name, &mut projected);
+        Ok(Object {
+            type_name: type_name.into(),
+            id: object_id,
+            fields: projected,
+            raw_fields: None,
+        })
+    }
+
+    /// Column-projected type scan: like [`scan_type`](Self::scan_type) but
+    /// deserializes only `fields` per object. The win scales with the ratio of
+    /// skipped columns to kept ones — a wide type scanned for two columns pays
+    /// a fraction of the full-deserialize cost.
+    pub fn scan_type_projected(
+        &self,
+        type_name: &str,
+        fields: &[&str],
+    ) -> EngineResult<Vec<Object>> {
+        let type_id = self.resolve_type_id(type_name)?;
+
+        let prefix = KeyBuilder::object_prefix(type_id);
+        let snapshot = self.storage.read_snapshot();
+        let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
+
+        let mut objects = Vec::with_capacity(entries.len());
+        for (key, data) in entries {
+            if key.len() < 8 {
+                continue;
+            }
+            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let object_id = u64::from_be_bytes(id_bytes);
+
+            let mut projected = deserialize_fields_projected(&data, fields);
+            self.strip_tombstoned_fields(type_name, &mut projected);
+            objects.push(Object {
+                type_name: type_name.into(),
+                id: object_id,
+                fields: projected,
+                raw_fields: None,
+            });
+        }
+
+        Ok(objects)
+    }
+
     /// Filtered scan: pushes a single-field integer comparison down to storage.
     ///
     /// Two fast paths are layered:
@@ -1940,6 +2014,19 @@ impl Database {
         // Re-evaluate the predicate per entry (zone maps are block-level).
         // Stop accumulating once we've hit the caller's limit — the scan
         // can't terminate early but we can at least skip the object copy.
+        //
+        // Column projection: read only the predicate field to re-check the
+        // coarse block filter; rows that fail never pay the full FieldMap
+        // deserialize. The survivors (typically a small fraction) get the
+        // full `deserialize_fields` so the returned Object is complete.
+        //
+        // The survivor path deliberately walks the blob twice — once in
+        // `extract_field` (a partial walk that stops at the predicate field,
+        // no allocation) and once in `deserialize_fields`. Folding both into a
+        // single predicate-aware deserializer would only save the short prefix
+        // re-walk on the *matching* rows, at the cost of coupling predicate
+        // evaluation into the deserializer and losing `extract_field` as a
+        // clean, reusable projection primitive — not worth it.
         let cap = limit.unwrap_or(usize::MAX);
         let mut objects = Vec::new();
         for (key, data) in entries {
@@ -1949,19 +2036,23 @@ impl Database {
             if key.len() < 8 {
                 continue;
             }
+            let passes = extract_field(&data, field_name)
+                .map(|v| value_passes_int_predicate(&v, op, target_u64))
+                .unwrap_or(false);
+            if !passes {
+                continue;
+            }
             let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
             let object_id = u64::from_be_bytes(id_bytes);
 
             let mut fields = deserialize_fields(&data);
-            if entry_passes_int_predicate(&fields, field_name, op, target_u64) {
-                self.strip_tombstoned_fields(type_name, &mut fields);
-                objects.push(Object {
-                    type_name: type_name.into(),
-                    id: object_id,
-                    fields,
-                    raw_fields: None,
-                });
-            }
+            self.strip_tombstoned_fields(type_name, &mut fields);
+            objects.push(Object {
+                type_name: type_name.into(),
+                id: object_id,
+                fields,
+                raw_fields: None,
+            });
         }
 
         Ok(objects)
@@ -2327,10 +2418,19 @@ impl Database {
         })
     }
 
-    /// Per-row fallback when no index serves the predicate. Walks every
-    /// object of the type via `scan_type` and applies `predicate` to the
-    /// field's value, capping at `limit` matches. `predicate` returns
-    /// `Some(bool)` (pass / fail) per value; `None` is treated as fail.
+    /// Per-row fallback when no index serves the predicate. Walks the object-
+    /// key prefix and applies `predicate` to the field's value, capping at
+    /// `limit` matches. `predicate` returns `Some(bool)` (pass / fail) per
+    /// value; `None` is treated as fail.
+    ///
+    /// Column projection: the predicate is evaluated against *only* the named
+    /// field, extracted in O(1)-skip fashion from each row's raw bytes. The
+    /// full `deserialize_fields` (HashMap + every `Value`) runs only for rows
+    /// that pass — so a selective filter over a wide type stops paying to
+    /// materialize the columns it discards. `field_name` is always a live
+    /// (non-retired) field here: every public `filter_scan_*` entry point
+    /// validates it before falling through, so reading it pre-strip matches
+    /// the post-strip value the old `scan_type` path saw.
     fn filter_scan_fallback<F>(
         &self,
         type_name: &str,
@@ -2341,20 +2441,37 @@ impl Database {
     where
         F: FnMut(&Value) -> Option<bool>,
     {
+        let type_id = self.resolve_type_id(type_name)?;
+        let prefix = KeyBuilder::object_prefix(type_id);
+        let snapshot = self.storage.read_snapshot();
+        let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
+
         let cap = limit.unwrap_or(usize::MAX);
         let mut out = Vec::new();
-        for obj in self.scan_type(type_name)? {
+        for (key, data) in entries {
             if out.len() >= cap {
                 break;
             }
-            let pass = obj
-                .fields
-                .get(field_name)
+            if key.len() < 8 {
+                continue;
+            }
+            let pass = extract_field(&data, field_name)
+                .as_ref()
                 .and_then(&mut predicate)
                 .unwrap_or(false);
-            if pass {
-                out.push(obj);
+            if !pass {
+                continue;
             }
+            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let object_id = u64::from_be_bytes(id_bytes);
+            let mut fields = deserialize_fields(&data);
+            self.strip_tombstoned_fields(type_name, &mut fields);
+            out.push(Object {
+                type_name: type_name.into(),
+                id: object_id,
+                fields,
+                raw_fields: None,
+            });
         }
         Ok(out)
     }
@@ -4144,19 +4261,18 @@ pub(crate) fn do_extract_zone_fields(
     out
 }
 
-/// Per-entry re-check for `filter_scan`. The block-level zone filter is
-/// coarse; entries that survived may still individually fail the predicate.
-pub(crate) fn entry_passes_int_predicate(
-    fields: &FieldMap,
-    field_name: &str,
+/// Per-entry re-check for `filter_scan`'s zone-map path. The block-level zone
+/// filter is coarse; entries that survived may still individually fail the
+/// predicate. Takes the single predicate-field `Value` (extracted via
+/// `extract_field` — no full deserialize) and re-applies the integer compare.
+/// A non-integer / absent value never matches.
+pub(crate) fn value_passes_int_predicate(
+    value: &Value,
     op: rhypedb_storage::zone::CompareOp,
     target_u64: u64,
 ) -> bool {
     use rhypedb_storage::zone::CompareOp;
 
-    let Some(value) = fields.get(field_name) else {
-        return false;
-    };
     let Some(bytes) = encode_int_for_zone(value) else {
         return false;
     };
@@ -5739,6 +5855,83 @@ mod tests {
             all[0].fields.get("name"),
             Some(&Value::String("Bob".into()))
         );
+    }
+
+    #[test]
+    fn get_projected_returns_only_requested_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut fields = FieldMap::new();
+        fields.insert("name".into(), Value::String("Alice".into()));
+        fields.insert("email".into(), Value::String("alice@example.com".into()));
+        fields.insert("age".into(), Value::U32(30));
+        let user = db.create("User", fields).unwrap();
+
+        let proj = db.get_projected("User", user.id, &["name", "age"]).unwrap();
+        assert_eq!(proj.id, user.id);
+        assert_eq!(proj.fields.len(), 2);
+        assert_eq!(proj.fields.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(proj.fields.get("age"), Some(&Value::U32(30)));
+        assert!(!proj.fields.contains_key("email"), "email was not projected");
+
+        // Projected values agree with a full get.
+        let full = db.get("User", user.id).unwrap();
+        assert_eq!(proj.fields.get("name"), full.fields.get("name"));
+        assert_eq!(proj.fields.get("age"), full.fields.get("age"));
+    }
+
+    #[test]
+    fn get_projected_missing_object_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+        let err = db.get_projected("User", 9999, &["name"]).unwrap_err();
+        assert!(
+            matches!(err, EngineError::ObjectNotFound { .. }),
+            "expected ObjectNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn scan_type_projected_returns_only_requested_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        for i in 0..5 {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(format!("User{i}")));
+            f.insert("email".into(), Value::String(format!("u{i}@x.com")));
+            f.insert("age".into(), Value::U32(20 + i));
+            db.create("User", f).unwrap();
+        }
+
+        let projected = db.scan_type_projected("User", &["name"]).unwrap();
+        assert_eq!(projected.len(), 5);
+        for obj in &projected {
+            assert_eq!(obj.fields.len(), 1, "only `name` should be materialized");
+            assert!(matches!(obj.fields.get("name"), Some(Value::String(_))));
+        }
+
+        // Same id set + same name values as a full scan.
+        let mut proj_names: Vec<_> = projected
+            .iter()
+            .filter_map(|o| match o.fields.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut full_names: Vec<_> = db
+            .scan_type("User")
+            .unwrap()
+            .iter()
+            .filter_map(|o| match o.fields.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        proj_names.sort();
+        full_names.sort();
+        assert_eq!(proj_names, full_names);
     }
 
     #[test]

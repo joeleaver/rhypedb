@@ -396,6 +396,177 @@ pub fn find_u64_field_in_raw(data: &[u8], field_name: &str) -> Option<u64> {
     None
 }
 
+/// Scan a serialized FieldMap (same format as `serialize_fields`) for a
+/// single field by name, returning its typed `Value` if present, or `None`
+/// if the field is absent or the data is malformed. The general form of
+/// `find_u64_field_in_raw` / `find_bytes_field_in_raw`: it skips past every
+/// non-matching field in O(1) (read the length, advance the cursor — no
+/// copy) and only materializes the one `Value` the caller asked for.
+///
+/// This is the column-projection primitive for predicate pushdown: the
+/// filter-scan loop reads just the predicate field per candidate row and
+/// only pays the full `deserialize_fields` cost on rows that actually pass,
+/// instead of building a whole `HashMap` of `Value`s per row just to read one.
+///
+/// `Value::Bytes` is sliced zero-copy from `data`; that's why this takes a
+/// `&Bytes` rather than `&[u8]`.
+pub fn extract_field(data: &Bytes, field_name: &str) -> Option<Value> {
+    if data.len() < 2 {
+        return None;
+    }
+    let mut pos = 0;
+    let count = u16::from_be_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+    pos += 2;
+    let needle = field_name.as_bytes();
+
+    for _ in 0..count {
+        if pos + 2 > data.len() {
+            return None;
+        }
+        let name_len = u16::from_be_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+        pos += 2;
+        if pos + name_len + 1 > data.len() {
+            return None;
+        }
+        let name_match = name_len == needle.len() && &data[pos..pos + name_len] == needle;
+        pos += name_len;
+        let tag = data[pos];
+        pos += 1;
+
+        // Read the length prefix for variable-width values (advancing `pos`
+        // past it), then compute the byte span of the value payload itself.
+        let value_len = match tag {
+            0 => 0,        // Null
+            2 | 4 | 6 => 4, // U32 / I32 / F32
+            3 | 5 | 7 => 8, // U64 / I64 / F64
+            8 => 1,        // Bool
+            1 | 9 => {
+                // String / Bytes
+                if pos + 4 > data.len() {
+                    return None;
+                }
+                let l = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+                pos += 4;
+                l
+            }
+            _ => return None,
+        };
+
+        if name_match {
+            if pos + value_len > data.len() {
+                return None;
+            }
+            let val = match tag {
+                0 => Value::Null,
+                1 => Value::String(std::str::from_utf8(&data[pos..pos + value_len]).ok()?.to_string()),
+                2 => Value::U32(u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?)),
+                3 => Value::U64(u64::from_be_bytes(data[pos..pos + 8].try_into().ok()?)),
+                4 => Value::I32(i32::from_be_bytes(data[pos..pos + 4].try_into().ok()?)),
+                5 => Value::I64(i64::from_be_bytes(data[pos..pos + 8].try_into().ok()?)),
+                6 => Value::F32(f32::from_be_bytes(data[pos..pos + 4].try_into().ok()?)),
+                7 => Value::F64(f64::from_be_bytes(data[pos..pos + 8].try_into().ok()?)),
+                8 => Value::Bool(data[pos] != 0),
+                9 => Value::Bytes(data.slice(pos..pos + value_len)),
+                _ => return None,
+            };
+            return Some(val);
+        }
+        pos += value_len;
+    }
+    None
+}
+
+/// Deserialize only the named fields from a serialized FieldMap, skipping the
+/// rest. Same wire format as `deserialize_fields`, but a field whose name
+/// isn't in `wanted` is walked past in O(1) without allocating its `String`
+/// key or constructing its `Value` — the whole point of column projection.
+/// The walk early-exits once every wanted field has been found.
+///
+/// Returned map contains only the wanted fields that were actually present;
+/// missing names are simply absent (the caller treats them as `None`).
+///
+/// Takes `&Bytes` (not `&[u8]`) so a projected `Value::Bytes` is sliced
+/// zero-copy from the source, matching `extract_field`.
+pub fn deserialize_fields_projected(data: &Bytes, wanted: &[&str]) -> FieldMap {
+    let mut fields = HashMap::with_capacity(wanted.len());
+    if data.len() < 2 || wanted.is_empty() {
+        return fields;
+    }
+    let mut pos = 0;
+    let count = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+    pos += 2;
+
+    for _ in 0..count {
+        if pos + 2 > data.len() {
+            break;
+        }
+        let name_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if pos + name_len + 1 > data.len() {
+            break;
+        }
+        let name_bytes = &data[pos..pos + name_len];
+        let want = wanted.iter().any(|w| w.as_bytes() == name_bytes);
+        pos += name_len;
+        let tag = data[pos];
+        pos += 1;
+
+        // Length prefix for variable-width values; `value_len` is the payload span.
+        let value_len = match tag {
+            0 => 0,
+            2 | 4 | 6 => 4,
+            3 | 5 | 7 => 8,
+            8 => 1,
+            1 | 9 => {
+                if pos + 4 > data.len() {
+                    break;
+                }
+                let l = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                l
+            }
+            _ => break,
+        };
+        if pos + value_len > data.len() {
+            break;
+        }
+
+        if want {
+            let name = match std::str::from_utf8(name_bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    pos += value_len;
+                    continue;
+                }
+            };
+            let value = match tag {
+                0 => Value::Null,
+                1 => Value::String(
+                    std::str::from_utf8(&data[pos..pos + value_len])
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                2 => Value::U32(u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap())),
+                3 => Value::U64(u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap())),
+                4 => Value::I32(i32::from_be_bytes(data[pos..pos + 4].try_into().unwrap())),
+                5 => Value::I64(i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap())),
+                6 => Value::F32(f32::from_be_bytes(data[pos..pos + 4].try_into().unwrap())),
+                7 => Value::F64(f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap())),
+                8 => Value::Bool(data[pos] != 0),
+                9 => Value::Bytes(data.slice(pos..pos + value_len)),
+                _ => Value::Null,
+            };
+            fields.insert(name, value);
+            // Early-exit once we've collected every distinct wanted field.
+            if fields.len() == wanted.len() {
+                break;
+            }
+        }
+        pos += value_len;
+    }
+    fields
+}
+
 /// Deserialize a FieldMap from stored bytes.
 pub fn deserialize_fields(data: &[u8]) -> FieldMap {
     let mut fields = HashMap::new();
@@ -560,5 +731,92 @@ mod tests {
             decoded.get("data"),
             Some(&Value::Bytes(Bytes::from_static(b"binary")))
         );
+    }
+
+    #[test]
+    fn extract_field_returns_each_value_type() {
+        let mut fields = FieldMap::new();
+        fields.insert("s".into(), Value::String("hi".into()));
+        fields.insert("u32".into(), Value::U32(7));
+        fields.insert("u64".into(), Value::U64(0xdead_beef));
+        fields.insert("i32".into(), Value::I32(-7));
+        fields.insert("i64".into(), Value::I64(-9_000_000_000));
+        fields.insert("f32".into(), Value::F32(1.5));
+        fields.insert("f64".into(), Value::F64(2.25));
+        fields.insert("b".into(), Value::Bool(true));
+        fields.insert("by".into(), Value::Bytes(Bytes::from_static(b"\x00\x01raw")));
+        fields.insert("n".into(), Value::Null);
+        let data = serialize_fields(&fields);
+
+        assert_eq!(extract_field(&data, "s"), Some(Value::String("hi".into())));
+        assert_eq!(extract_field(&data, "u32"), Some(Value::U32(7)));
+        assert_eq!(extract_field(&data, "u64"), Some(Value::U64(0xdead_beef)));
+        assert_eq!(extract_field(&data, "i32"), Some(Value::I32(-7)));
+        assert_eq!(extract_field(&data, "i64"), Some(Value::I64(-9_000_000_000)));
+        assert_eq!(extract_field(&data, "f32"), Some(Value::F32(1.5)));
+        assert_eq!(extract_field(&data, "f64"), Some(Value::F64(2.25)));
+        assert_eq!(extract_field(&data, "b"), Some(Value::Bool(true)));
+        assert_eq!(
+            extract_field(&data, "by"),
+            Some(Value::Bytes(Bytes::from_static(b"\x00\x01raw")))
+        );
+        assert_eq!(extract_field(&data, "n"), Some(Value::Null));
+    }
+
+    #[test]
+    fn extract_field_missing_and_empty() {
+        let mut fields = FieldMap::new();
+        fields.insert("x".into(), Value::U32(1));
+        let data = serialize_fields(&fields);
+        assert_eq!(extract_field(&data, "nope"), None);
+        assert_eq!(extract_field(&Bytes::new(), "x"), None);
+    }
+
+    #[test]
+    fn extract_field_skips_past_variable_width_fields() {
+        // A large Bytes field BEFORE the target exercises the O(1) skip of a
+        // variable-width payload (read len, advance — no copy).
+        let mut fields = FieldMap::new();
+        fields.insert("blob".into(), Value::Bytes(Bytes::from(vec![9u8; 4096])));
+        fields.insert("name".into(), Value::String("zebra".into()));
+        fields.insert("target".into(), Value::I64(-42));
+        let data = serialize_fields(&fields);
+        // Whatever the HashMap iteration order, the target is reachable.
+        assert_eq!(extract_field(&data, "target"), Some(Value::I64(-42)));
+    }
+
+    #[test]
+    fn projected_returns_only_wanted_and_matches_full() {
+        let mut fields = FieldMap::new();
+        fields.insert("a".into(), Value::String("alpha".into()));
+        fields.insert("b".into(), Value::U64(99));
+        fields.insert("c".into(), Value::Bytes(Bytes::from_static(b"data")));
+        fields.insert("d".into(), Value::Bool(false));
+        let data = serialize_fields(&fields);
+
+        let proj = deserialize_fields_projected(&data, &["a", "c"]);
+        assert_eq!(proj.len(), 2);
+        assert_eq!(proj.get("a"), Some(&Value::String("alpha".into())));
+        assert_eq!(proj.get("c"), Some(&Value::Bytes(Bytes::from_static(b"data"))));
+        assert!(!proj.contains_key("b"));
+        assert!(!proj.contains_key("d"));
+
+        // Projected values agree with a full deserialize.
+        let full = deserialize_fields(&data);
+        for k in ["a", "c"] {
+            assert_eq!(proj.get(k), full.get(k));
+        }
+    }
+
+    #[test]
+    fn projected_empty_and_missing_names() {
+        let mut fields = FieldMap::new();
+        fields.insert("a".into(), Value::U32(1));
+        let data = serialize_fields(&fields);
+        assert!(deserialize_fields_projected(&data, &[]).is_empty());
+        // A wanted name that's absent simply doesn't appear.
+        let proj = deserialize_fields_projected(&data, &["a", "ghost"]);
+        assert_eq!(proj.len(), 1);
+        assert_eq!(proj.get("a"), Some(&Value::U32(1)));
     }
 }
