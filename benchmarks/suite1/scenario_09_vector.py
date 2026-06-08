@@ -58,6 +58,7 @@ def run_rhypedb(
     n_queries: int,
     insert_chunk: int,
     server_pattern: str,
+    data_dir: str | None = None,
 ) -> common.ScenarioResult:
     """Connects to an ALREADY-RUNNING rhypedb server whose schema declares
     `type Vec { embedding: Vector<D> }` with D == ds.dim. The caller (a driver
@@ -131,6 +132,14 @@ def run_rhypedb(
     finally:
         client.close()
 
+    # On-disk footprint (LSM: compressed v: keys + object keys). With --no-sync
+    # much of the index lives in-memory (reflected in RSS); disk is supplementary.
+    if data_dir:
+        result.disk_mb = common.disk_usage_mb(Path(data_dir))
+        result.metadata["bytes_per_vector_rss"] = (
+            (result.rss_post_load_mb - result.rss_cold_mb) * 1024 * 1024 / max(1, ds.train.shape[0])
+        )
+
     return result
 
 
@@ -197,6 +206,25 @@ def run_pgvector(
                 result.rss_post_load_mb = common.rss_mb(pg_pid)
                 result.rss_peak_mb = result.rss_post_load_mb
 
+            # On-disk sizes — the reliable memory metric for pgvector (its HNSW
+            # index + heap live in shared_buffers / OS page cache, not the
+            # backend's RSS). pgvector HNSW stores the full f32 vectors INSIDE the
+            # index, so pg_index_bytes is the resident-to-serve footprint; the
+            # heap (pg_table_bytes) is a second f32 copy.
+            cur.execute("SELECT pg_table_size('vec')")
+            result.metadata["pg_table_bytes"] = int(cur.fetchone()[0])
+            cur.execute(
+                "SELECT COALESCE(SUM(pg_relation_size(indexrelid)), 0) "
+                "FROM pg_index WHERE indrelid = 'vec'::regclass"
+            )
+            result.metadata["pg_index_bytes"] = int(cur.fetchone()[0])
+            cur.execute("SELECT pg_total_relation_size('vec')")
+            result.metadata["pg_total_bytes"] = int(cur.fetchone()[0])
+            result.metadata["bytes_per_vector_index"] = (
+                result.metadata["pg_index_bytes"] / max(1, n)
+            )
+            result.disk_mb = result.metadata["pg_total_bytes"] / (1024 * 1024)
+
             test = ds.test[:n_queries]
             retrieved = np.full((len(test), k), -1, dtype=np.int64)
             for qi in range(len(test)):
@@ -237,6 +265,8 @@ def main() -> None:
     parser.add_argument("--tcp-port", type=int, default=4501)
     parser.add_argument("--pg-dsn", default="postgresql://bench:bench@127.0.0.1:5433/bench")
     parser.add_argument("--pg-container", default="rhypedb-bench-postgres")
+    parser.add_argument("--data-dir", default=None,
+                        help="rhypedb data dir, for on-disk footprint measurement")
     parser.add_argument("--out", type=Path, default=Path("benchmarks/results/scenario_09.json"))
     args = parser.parse_args()
 
@@ -252,7 +282,8 @@ def main() -> None:
         print("Running rhypedb...")
         t0 = time.time()
         results.append(run_rhypedb(ds, args.tcp_host, args.tcp_port,
-                                   args.k, n_queries, args.insert_chunk, args.server_pattern))
+                                   args.k, n_queries, args.insert_chunk, args.server_pattern,
+                                   data_dir=args.data_dir))
         print(f"  rhypedb done in {time.time() - t0:.1f}s")
     if "pg" in impls:
         print("Running pgvector...")
@@ -271,6 +302,24 @@ def main() -> None:
         build = r.metadata.get("build_ms", 0.0)
         print(f"  {r.implementation:<14} {recall:>10.4f} {build:>12.1f} "
               f"{op.get('p50_us', 0):>14.2f} {op.get('mean_us', 0):>16.2f}")
+
+    print("\nMemory (the comparison that counts):")
+    n_train = ds.train.shape[0]
+    print(f"  {'impl':<14} {'RSS post-load':>14} {'RSS delta':>11} {'disk/idx MB':>12} {'bytes/vec':>11}")
+    for r in results:
+        delta = r.rss_post_load_mb - r.rss_cold_mb
+        if r.implementation == "pgvector":
+            idx_mb = r.metadata.get("pg_index_bytes", 0) / (1024 * 1024)
+            bpv = r.metadata.get("bytes_per_vector_index", 0.0)
+            note = f"idx={idx_mb:.0f} (heap={r.metadata.get('pg_table_bytes',0)/(1024*1024):.0f})"
+        else:
+            idx_mb = r.disk_mb
+            bpv = r.metadata.get("bytes_per_vector_rss", 0.0)
+            note = f"disk={idx_mb:.0f}"
+        print(f"  {r.implementation:<14} {r.rss_post_load_mb:>12.1f}MB {delta:>9.1f}MB "
+              f"{note:>12} {bpv:>9.1f}B")
+    print(f"  (n_train={n_train}; rhypedb bytes/vec = RSS delta/n; "
+          f"pgvector bytes/vec = HNSW index size/n, +f32 heap copy)")
 
     common.write_results(results, args.out)
     print(f"\nWrote results to {args.out}")

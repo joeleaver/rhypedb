@@ -16,13 +16,18 @@ DATA=/tmp/vecbench-rhypedb-data
 HTTP_PORT=4500
 TCP_PORT=4501
 
-# 1) Resolve the dataset dimension (downloads/caches the hdf5 if needed).
-DIM=$(.venv-bench/bin/python -c "
+# 1) Resolve the dataset dimension. Synthetic datasets encode it in the name
+# (synthetic-384-angular -> 384); ann-benchmarks datasets read it from the hdf5.
+if [[ "$DATASET" == synthetic-* ]]; then
+  DIM=$(echo "$DATASET" | cut -d- -f2)
+else
+  DIM=$(.venv-bench/bin/python -c "
 from benchmarks.harness import vector_data
 import h5py
 with h5py.File(vector_data._download('$DATASET'), 'r') as f:
     print(f['train'].shape[1])
 ") || { echo "failed to resolve dataset dimension"; exit 1; }
+fi
 echo "dataset=$DATASET dim=$DIM subset=$SUBSET queries=$QUERIES k=$K"
 
 # 2) Fresh data dir + dimension-matched schema.
@@ -45,9 +50,11 @@ echo "server up pid=$SRV"
 # 4) Run the scenario (connects to the running server) + tear down.
 # pgvector ef_search matched to rhypedb's internal `.similar` ef (= k.max(50)).
 EF_SEARCH="${5:-50}"
+OUT="benchmarks/results/scenario_09_${DATASET}_${SUBSET}.json"
 .venv-bench/bin/python -m benchmarks.suite1.scenario_09_vector \
   --dataset "$DATASET" --subset "$SUBSET" --queries "$QUERIES" --k "$K" \
-  --ef-search "$EF_SEARCH" --tcp-port "$TCP_PORT" --impl tcp,pg
+  --ef-search "$EF_SEARCH" --tcp-port "$TCP_PORT" --impl tcp,pg \
+  --data-dir "$DATA" --out "$OUT"
 RC=$?
 
 kill "$SRV" 2>/dev/null || true
