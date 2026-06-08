@@ -4,38 +4,38 @@
     "implementation": "rhypedb-tcp",
     "iterations": 1,
     "iteration_stats": {
-      "min_ms": 17278.500503,
-      "p50_ms": 17278.500503,
-      "p95_ms": 17278.500503,
-      "p99_ms": 17278.500503,
-      "max_ms": 17278.500503,
-      "mean_ms": 17278.500503
+      "min_ms": 127341.078685,
+      "p50_ms": 127341.078685,
+      "p95_ms": 127341.078685,
+      "p99_ms": 127341.078685,
+      "max_ms": 127341.078685,
+      "mean_ms": 127341.078685
     },
     "operation_stats": {
-      "n": 1000,
-      "min_us": 210.036,
-      "p50_us": 477.921,
-      "p95_us": 679.281,
-      "p99_us": 848.591,
-      "max_us": 1192.42,
-      "mean_us": 484.971115,
-      "total_ms": 484.971115
+      "n": 300,
+      "min_us": 809.357,
+      "p50_us": 3821.11,
+      "p95_us": 5021.384,
+      "p99_us": 6236.637,
+      "max_us": 6612.106,
+      "mean_us": 3676.4967133333334,
+      "total_ms": 1102.949014
     },
-    "rss_cold_mb": 15.5078125,
-    "rss_post_load_mb": 50.88671875,
-    "rss_peak_mb": 50.88671875,
-    "rss_steady_mb": 51.08984375,
+    "rss_cold_mb": 16.0390625,
+    "rss_post_load_mb": 48.15625,
+    "rss_peak_mb": 48.15625,
+    "rss_steady_mb": 35.44140625,
     "disk_mb": 0.0,
     "metadata": {
-      "dataset": "glove-25-angular",
-      "n_train": 20000,
-      "dim": 25,
+      "dataset": "nytimes-256-angular",
+      "n_train": 10000,
+      "dim": 256,
       "k": 10,
-      "n_queries": 1000,
+      "n_queries": 300,
       "hnsw_m": 16,
       "hnsw_ef_construction": 100,
-      "build_ms": 17278.500503,
-      "recall_at_k": 0.3619
+      "build_ms": 127341.078685,
+      "recall_at_k": 0.6296666666666667
     }
   },
   {
@@ -43,22 +43,22 @@
     "implementation": "pgvector",
     "iterations": 1,
     "iteration_stats": {
-      "min_ms": 3987.398746,
-      "p50_ms": 3987.398746,
-      "p95_ms": 3987.398746,
-      "p99_ms": 3987.398746,
-      "max_ms": 3987.398746,
-      "mean_ms": 3987.398746
+      "min_ms": 1450.200774,
+      "p50_ms": 1450.200774,
+      "p95_ms": 1450.200774,
+      "p99_ms": 1450.200774,
+      "max_ms": 1450.200774,
+      "mean_ms": 1450.200774
     },
     "operation_stats": {
-      "n": 1000,
-      "min_us": 229.092,
-      "p50_us": 422.086,
-      "p95_us": 534.108,
-      "p99_us": 630.029,
-      "max_us": 1239.068,
-      "mean_us": 424.337125,
-      "total_ms": 424.337125
+      "n": 300,
+      "min_us": 508.69,
+      "p50_us": 784.901,
+      "p95_us": 1183.774,
+      "p99_us": 1366.278,
+      "max_us": 2579.757,
+      "mean_us": 829.37292,
+      "total_ms": 248.81187599999998
     },
     "rss_cold_mb": 45.97265625,
     "rss_post_load_mb": 45.97265625,
@@ -66,16 +66,16 @@
     "rss_steady_mb": 45.97265625,
     "disk_mb": 0.0,
     "metadata": {
-      "dataset": "glove-25-angular",
-      "n_train": 20000,
-      "dim": 25,
+      "dataset": "nytimes-256-angular",
+      "n_train": 10000,
+      "dim": 256,
       "k": 10,
-      "n_queries": 1000,
+      "n_queries": 300,
       "hnsw_m": 16,
       "hnsw_ef_construction": 100,
       "hnsw_ef_search": 50,
-      "build_ms": 3987.398746,
-      "recall_at_k": 0.8922
+      "build_ms": 1450.200774,
+      "recall_at_k": 0.8063333333333333
     }
   }
 ]

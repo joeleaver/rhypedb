@@ -95,19 +95,23 @@ def _download(name: str) -> Path:
 def brute_force_neighbors(
     train: np.ndarray, test: np.ndarray, k: int, metric: str
 ) -> np.ndarray:
-    """Exact top-k ground truth. Cosine = normalize then argmax dot product;
-    euclidean = argmin squared L2. Returns (Q, k) int indices into ``train``."""
+    """Exact top-k ground truth, ORDERED nearest-first. Cosine = normalize then
+    max dot product; euclidean = min squared L2. Returns (Q, k) int indices into
+    ``train``. argpartition finds the top-k set cheaply; we then sort just those
+    k by true distance so a slice ``[:j]`` is the true top-j (not k arbitrary)."""
     if metric == "angular":
         tn = train / (np.linalg.norm(train, axis=1, keepdims=True) + 1e-30)
         qn = test / (np.linalg.norm(test, axis=1, keepdims=True) + 1e-30)
-        sims = qn @ tn.T  # (Q, N) cosine similarity; larger = closer
-        return np.argpartition(-sims, k, axis=1)[:, :k]
-    # euclidean
-    # ||q - t||^2 = ||q||^2 - 2 q.t + ||t||^2; ||q||^2 is constant per row.
-    t_sq = np.einsum("ij,ij->i", train, train)  # (N,)
-    dots = test @ train.T  # (Q, N)
-    d2 = t_sq[None, :] - 2.0 * dots  # drop the per-row ||q||^2 constant
-    return np.argpartition(d2, k, axis=1)[:, :k]
+        score = qn @ tn.T  # (Q, N) cosine similarity; larger = closer
+        neg = -score  # smaller = closer, for a unified argmin form
+    else:  # euclidean: ||q - t||^2 = ||q||^2 - 2 q.t + ||t||^2 (drop ||q||^2)
+        t_sq = np.einsum("ij,ij->i", train, train)
+        neg = t_sq[None, :] - 2.0 * (test @ train.T)  # smaller = closer
+
+    topk = np.argpartition(neg, k, axis=1)[:, :k]  # top-k SET (unordered)
+    rows = np.arange(neg.shape[0])[:, None]
+    order = np.argsort(neg[rows, topk], axis=1)  # sort the k by true distance
+    return topk[rows, order]  # ordered nearest-first
 
 
 def load(name: str, subset: int | None = None, gt_k: int = 100) -> VectorDataset:
