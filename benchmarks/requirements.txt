@@ -2,3 +2,8 @@
 # Pinned to a recent psycopg 3 minor for reproducibility; binary wheel avoids
 # needing libpq-dev to build from source.
 psycopg[binary]>=3.3,<3.4
+
+# Suite 2 (vector) only: numpy for vector handling on the rhypedb TCP client +
+# brute-force recall, h5py to read ann-benchmarks HDF5 datasets (glove/sift).
+numpy>=1.26
+h5py>=3.10

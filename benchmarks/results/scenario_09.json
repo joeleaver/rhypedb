@@ -1,0 +1,81 @@
+[
+  {
+    "scenario": "2.1 vector_knn",
+    "implementation": "rhypedb-tcp",
+    "iterations": 1,
+    "iteration_stats": {
+      "min_ms": 17278.500503,
+      "p50_ms": 17278.500503,
+      "p95_ms": 17278.500503,
+      "p99_ms": 17278.500503,
+      "max_ms": 17278.500503,
+      "mean_ms": 17278.500503
+    },
+    "operation_stats": {
+      "n": 1000,
+      "min_us": 210.036,
+      "p50_us": 477.921,
+      "p95_us": 679.281,
+      "p99_us": 848.591,
+      "max_us": 1192.42,
+      "mean_us": 484.971115,
+      "total_ms": 484.971115
+    },
+    "rss_cold_mb": 15.5078125,
+    "rss_post_load_mb": 50.88671875,
+    "rss_peak_mb": 50.88671875,
+    "rss_steady_mb": 51.08984375,
+    "disk_mb": 0.0,
+    "metadata": {
+      "dataset": "glove-25-angular",
+      "n_train": 20000,
+      "dim": 25,
+      "k": 10,
+      "n_queries": 1000,
+      "hnsw_m": 16,
+      "hnsw_ef_construction": 100,
+      "build_ms": 17278.500503,
+      "recall_at_k": 0.3619
+    }
+  },
+  {
+    "scenario": "2.1 vector_knn",
+    "implementation": "pgvector",
+    "iterations": 1,
+    "iteration_stats": {
+      "min_ms": 3987.398746,
+      "p50_ms": 3987.398746,
+      "p95_ms": 3987.398746,
+      "p99_ms": 3987.398746,
+      "max_ms": 3987.398746,
+      "mean_ms": 3987.398746
+    },
+    "operation_stats": {
+      "n": 1000,
+      "min_us": 229.092,
+      "p50_us": 422.086,
+      "p95_us": 534.108,
+      "p99_us": 630.029,
+      "max_us": 1239.068,
+      "mean_us": 424.337125,
+      "total_ms": 424.337125
+    },
+    "rss_cold_mb": 45.97265625,
+    "rss_post_load_mb": 45.97265625,
+    "rss_peak_mb": 45.97265625,
+    "rss_steady_mb": 45.97265625,
+    "disk_mb": 0.0,
+    "metadata": {
+      "dataset": "glove-25-angular",
+      "n_train": 20000,
+      "dim": 25,
+      "k": 10,
+      "n_queries": 1000,
+      "hnsw_m": 16,
+      "hnsw_ef_construction": 100,
+      "hnsw_ef_search": 50,
+      "build_ms": 3987.398746,
+      "recall_at_k": 0.8922
+    }
+  }
+]

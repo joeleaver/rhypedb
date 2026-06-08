@@ -13,7 +13,10 @@
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector/pgvector:pg16 is stock Postgres 16 plus the `vector` extension,
+    # so Suite 1 (relational) still runs unchanged and Suite 2 (vector) can
+    # `CREATE EXTENSION vector`. Swapped from postgres:16-alpine for Suite 2.
+    image: pgvector/pgvector:pg16
     container_name: rhypedb-bench-postgres
     environment:
       POSTGRES_USER: bench

@@ -5,3 +5,6 @@ __pycache__/
 /.venv-bench/
 /.playwright-mcp/
 /.claude/
+
+# Suite 2 vector dataset cache (large ann-benchmarks HDF5 files)
+benchmarks/.vector-data/
