@@ -462,6 +462,20 @@ impl<D: DistanceProvider> HnswIndex<D> {
         } else {
             Some(ep_val as usize)
         };
+        // A corrupt/partially-written snapshot (no checksum) could carry an
+        // entry point or neighbor index that does not address a real node.
+        // Neighbor indices are used as unchecked slice indices in the hot loops,
+        // so reject any out-of-range index here with InvalidData — that routes
+        // the engine to its LSM rebuild fallback instead of panicking on the
+        // first traversal.
+        if let Some(ep) = entry_point
+            && ep >= num_nodes
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HNSW entry point out of range",
+            ));
+        }
         let max_layer = read_u32(r)? as usize;
 
         let mut nodes = Vec::with_capacity(num_nodes);
@@ -476,7 +490,14 @@ impl<D: DistanceProvider> HnswIndex<D> {
                 let num_neighbors = read_u32(r)? as usize;
                 let mut layer_neighbors = Vec::with_capacity(num_neighbors);
                 for _ in 0..num_neighbors {
-                    layer_neighbors.push(read_u32(r)?);
+                    let nidx = read_u32(r)?;
+                    if nidx as usize >= num_nodes {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "HNSW neighbor index out of range",
+                        ));
+                    }
+                    layer_neighbors.push(nidx);
                 }
                 neighbors.push(layer_neighbors);
             }
@@ -890,6 +911,40 @@ mod tests {
         let distance = ExactDistance { metric: Metric::L2 };
         let result = HnswIndex::load(&mut &buf[..], distance);
         assert!(result.is_err(), "v1 HNSW snapshot must be rejected");
+    }
+
+    #[test]
+    fn load_rejects_neighbor_index_out_of_range() {
+        // A structurally well-formed v2 snapshot whose stored neighbor index is
+        // >= num_nodes (a partial write / bit-flip — snapshots have no checksum)
+        // must be rejected with an error, NOT loaded so it panics on the first
+        // traversal. load() returning Err routes the engine to its LSM rebuild
+        // fallback (vectorizer::rebuild_indexes).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(HNSW_MAGIC);
+        write_u32(&mut buf, 2).unwrap(); // version 2
+        write_u32(&mut buf, 8).unwrap(); // m
+        write_u32(&mut buf, 16).unwrap(); // m_max0
+        write_u32(&mut buf, 50).unwrap(); // ef_construction
+        write_u8(&mut buf, Metric::L2.to_u8()).unwrap();
+        write_u64(&mut buf, 1).unwrap(); // num_nodes = 1
+        write_i64(&mut buf, 0).unwrap(); // entry_point = 0 (in range)
+        write_u32(&mut buf, 0).unwrap(); // max_layer
+        // node 0
+        write_u64(&mut buf, 42).unwrap(); // id
+        write_u8(&mut buf, 0).unwrap(); // not deleted
+        write_u32(&mut buf, 1).unwrap(); // 1 layer
+        write_u32(&mut buf, 1).unwrap(); // layer 0: 1 neighbor
+        write_u32(&mut buf, 5).unwrap(); // neighbor index 5 >= num_nodes(1): invalid
+        write_u32(&mut buf, 2).unwrap(); // stored: len 2
+        write_f32_slice(&mut buf, &[1.0, 2.0]).unwrap();
+
+        let distance = ExactDistance { metric: Metric::L2 };
+        let result = HnswIndex::load(&mut &buf[..], distance);
+        assert!(
+            result.is_err(),
+            "v2 snapshot with an out-of-range neighbor index must be rejected"
+        );
     }
 
     #[test]
