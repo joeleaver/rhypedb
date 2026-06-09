@@ -1,0 +1,92 @@
+[
+  {
+    "scenario": "2.1 vector_knn",
+    "implementation": "rhypedb-tcp",
+    "iterations": 1,
+    "iteration_stats": {
+      "min_ms": 243488.221144,
+      "p50_ms": 243488.221144,
+      "p95_ms": 243488.221144,
+      "p99_ms": 243488.221144,
+      "max_ms": 243488.221144,
+      "mean_ms": 243488.221144
+    },
+    "operation_stats": {
+      "n": 200,
+      "min_us": 2043.472,
+      "p50_us": 3576.15,
+      "p95_us": 4756.535,
+      "p99_us": 6179.316,
+      "max_us": 6849.91,
+      "mean_us": 3532.999995,
+      "total_ms": 706.5999989999999
+    },
+    "rss_cold_mb": 16.671875,
+    "rss_post_load_mb": 85.015625,
+    "rss_peak_mb": 85.015625,
+    "rss_steady_mb": 42.796875,
+    "disk_mb": 39.81404781341553,
+    "metadata": {
+      "dataset": "synthetic-384-angular",
+      "n_train": 30000,
+      "dim": 384,
+      "k": 10,
+      "n_queries": 200,
+      "hnsw_m": 16,
+      "hnsw_ef_construction": 100,
+      "rss_cold_anon_mb": 4.51171875,
+      "build_ms": 243488.221144,
+      "rss_post_load_anon_mb": 35.78515625,
+      "rss_post_load_file_mb": 12.17578125,
+      "recall_at_k": 0.732,
+      "rss_steady_anon_mb": 29.1328125,
+      "rss_steady_file_mb": 12.25390625,
+      "bytes_per_vector_anon_steady": 860.5696,
+      "bytes_per_vector_rss": 2388.7872
+    }
+  },
+  {
+    "scenario": "2.1 vector_knn",
+    "implementation": "pgvector",
+    "iterations": 1,
+    "iteration_stats": {
+      "min_ms": 8828.691796,
+      "p50_ms": 8828.691796,
+      "p95_ms": 8828.691796,
+      "p99_ms": 8828.691796,
+      "max_ms": 8828.691796,
+      "mean_ms": 8828.691796
+    },
+    "operation_stats": {
+      "n": 200,
+      "min_us": 830.045,
+      "p50_us": 1023.239,
+      "p95_us": 1455.644,
+      "p99_us": 1757.512,
+      "max_us": 1892.387,
+      "mean_us": 1068.82349,
+      "total_ms": 213.764698
+    },
+    "rss_cold_mb": 2.20703125,
+    "rss_post_load_mb": 2.20703125,
+    "rss_peak_mb": 2.20703125,
+    "rss_steady_mb": 2.20703125,
+    "disk_mb": 106.546875,
+    "metadata": {
+      "dataset": "synthetic-384-angular",
+      "n_train": 30000,
+      "dim": 384,
+      "k": 10,
+      "n_queries": 200,
+      "hnsw_m": 16,
+      "hnsw_ef_construction": 100,
+      "hnsw_ef_search": 50,
+      "build_ms": 8828.691796,
+      "pg_table_bytes": 49586176,
+      "pg_index_bytes": 62136320,
+      "pg_total_bytes": 111722496,
+      "bytes_per_vector_index": 2071.210666666667,
+      "recall_at_k": 0.907
+    }
+  }
+]

@@ -1,0 +1,86 @@
+[
+  {
+    "scenario": "2.1 vector_knn",
+    "implementation": "rhypedb-tcp",
+    "iterations": 1,
+    "iteration_stats": {
+      "min_ms": 904185.067,
+      "p50_ms": 904185.067,
+      "p95_ms": 904185.067,
+      "p99_ms": 904185.067,
+      "max_ms": 904185.067,
+      "mean_ms": 904185.067
+    },
+    "operation_stats": {
+      "n": 500,
+      "min_us": 563.574,
+      "p50_us": 1810.087,
+      "p95_us": 2638.341,
+      "p99_us": 2986.798,
+      "max_us": 7607.421,
+      "mean_us": 1873.53463,
+      "total_ms": 936.7673149999999
+    },
+    "rss_cold_mb": 17.16796875,
+    "rss_post_load_mb": 269.00390625,
+    "rss_peak_mb": 269.00390625,
+    "rss_steady_mb": 98.10546875,
+    "disk_mb": 123.31088924407959,
+    "metadata": {
+      "dataset": "synthetic-384-angular",
+      "n_train": 100000,
+      "dim": 384,
+      "k": 10,
+      "n_queries": 500,
+      "hnsw_m": 16,
+      "hnsw_ef_construction": 100,
+      "build_ms": 904185.067,
+      "recall_at_k": 0.6602,
+      "bytes_per_vector_rss": 2640.6912
+    }
+  },
+  {
+    "scenario": "2.1 vector_knn",
+    "implementation": "pgvector",
+    "iterations": 1,
+    "iteration_stats": {
+      "min_ms": 86712.579504,
+      "p50_ms": 86712.579504,
+      "p95_ms": 86712.579504,
+      "p99_ms": 86712.579504,
+      "max_ms": 86712.579504,
+      "mean_ms": 86712.579504
+    },
+    "operation_stats": {
+      "n": 500,
+      "min_us": 1051.896,
+      "p50_us": 1968.336,
+      "p95_us": 7205.482,
+      "p99_us": 9951.867,
+      "max_us": 13437.057,
+      "mean_us": 2593.793462,
+      "total_ms": 1296.8967309999998
+    },
+    "rss_cold_mb": 2.19140625,
+    "rss_post_load_mb": 2.2109375,
+    "rss_peak_mb": 2.2109375,
+    "rss_steady_mb": 2.2109375,
+    "disk_mb": 353.7890625,
+    "metadata": {
+      "dataset": "synthetic-384-angular",
+      "n_train": 100000,
+      "dim": 384,
+      "k": 10,
+      "n_queries": 500,
+      "hnsw_m": 16,
+      "hnsw_ef_construction": 100,
+      "hnsw_ef_search": 50,
+      "build_ms": 86712.579504,
+      "pg_table_bytes": 163905536,
+      "pg_index_bytes": 207069184,
+      "pg_total_bytes": 370974720,
+      "bytes_per_vector_index": 2070.69184,
+      "recall_at_k": 0.9996
+    }
+  }
+]

@@ -692,9 +692,9 @@ fn mat_vec_mul_transpose(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32
 /// QJL projection matvecs, whose outputs are either quantized or handed to the
 /// already-approximate TurboQuant distance estimator, where a sub-ULP
 /// perturbation sits far below the quantization noise floor (recall is verified
-/// to be preserved within HNSW run-to-run variance). The distance *kernel*
-/// itself — [`inner_product_estimate_prepared`] — remains exactly bit-identical;
-/// only the projection matvecs are reassociated.
+/// to be preserved within HNSW run-to-run variance). The distance kernel
+/// ([`mse_dot_fused`]/[`correction_dot_fused`]) likewise reassociates for ILP;
+/// the index *decode* there stays exact, only the accumulation order changes.
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
@@ -799,16 +799,8 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
             acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
             i += 8;
         }
-        // Combine the four 256-bit accumulators, then horizontally reduce to a scalar.
-        let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-        let lo = _mm256_castps256_ps128(acc);
-        let hi = _mm256_extractf128_ps::<1>(acc);
-        let mut s = _mm_add_ps(lo, hi); // 4 partial sums
-        let shuf = _mm_movehdup_ps(s); // [s1, s1, s3, s3]
-        s = _mm_add_ps(s, shuf); // [s0+s1, _, s2+s3, _]
-        let hi64 = _mm_movehl_ps(shuf, s); // bring s2+s3 down to lane 0
-        s = _mm_add_ss(s, hi64); // (s0+s1) + (s2+s3)
-        let mut total = _mm_cvtss_f32(s);
+        // Combine the four 256-bit accumulators, then horizontally reduce.
+        let mut total = hsum256(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
         // Scalar remainder (n not a multiple of 8).
         while i < n {
             total += *pa.add(i) * *pb.add(i);
@@ -818,98 +810,203 @@ unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Horizontal sum of a `__m256` (8 lanes → scalar). AVX2 implies the AVX/SSE3
+/// shuffles used here, so it is callable from any `avx2`-enabled context.
+///
+/// # Safety
+/// Caller must ensure AVX2 is available.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    // All register-only shuffles/adds (no memory access), so safe in an avx2 ctx.
+    let lo = _mm256_castps256_ps128(v);
+    let hi = _mm256_extractf128_ps::<1>(v);
+    let mut s = _mm_add_ps(lo, hi); // 4 partial sums
+    let shuf = _mm_movehdup_ps(s); // [s1, s1, s3, s3]
+    s = _mm_add_ps(s, shuf); // [s0+s1, _, s2+s3, _]
+    let hi64 = _mm_movehl_ps(shuf, s); // bring s2+s3 down to lane 0
+    s = _mm_add_ss(s, hi64); // (s0+s1) + (s2+s3)
+    _mm_cvtss_f32(s)
+}
+
 // --- Fused decode + dot product (allocation-free hot kernel) ---
 
 /// `Σ_i centroids[idx_i] · rq[i]`, decoding `bits`-wide quantized indices
 /// straight out of the packed byte stream — no intermediate `Vec`.
 ///
-/// Byte-aligned widths (2 and 4 bits) get specialized loops that the optimizer
-/// can keep in registers and unroll; the odd width (3) falls back to a generic
-/// bit-walker. All three accumulate strictly in position order, so the sum is
-/// bit-identical to `bit_unpack` followed by a zipped `.sum()`.
+/// Dispatches to a runtime-detected AVX2 path (gather the centroids for 8 decoded
+/// indices, then fused-multiply-add against `rq`) or a portable multiple-
+/// accumulator scalar fallback. Both keep several accumulators in flight to break
+/// the single-accumulator dependency chain, so they REASSOCIATE the sum — the
+/// result differs from a strict position-ordered `.sum()` by a few ULPs. The
+/// index *decode* stays exact (see [`decode8_indices`]); only the accumulation
+/// order changes. This is the hottest function in HNSW search/build; recall is
+/// verified preserved within HNSW run-to-run variance (e2e).
 #[inline]
 fn mse_dot_fused(data: &[u8], bits: u8, centroids: &[f32], rq: &[f32]) -> f32 {
-    let dims = rq.len();
-    match bits {
-        4 => {
-            // Each byte holds two indices: high nibble first (even position),
-            // low nibble second (odd position).
-            let pairs = dims / 2;
-            let mut acc = 0.0f32;
-            for j in 0..pairs {
-                let b = data[j];
-                acc += centroids[(b >> 4) as usize] * rq[2 * j];
-                acc += centroids[(b & 0x0F) as usize] * rq[2 * j + 1];
-            }
-            if dims & 1 == 1 {
-                // Trailing odd dimension lives in the high nibble of its byte.
-                let b = data[pairs];
-                acc += centroids[(b >> 4) as usize] * rq[dims - 1];
-            }
-            acc
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() {
+            // SAFETY: gated on runtime AVX2+FMA. The decoded gather indices are
+            // masked to `0..2^bits <= centroids.len()` so the gather is in-bounds,
+            // and `rq` is read only within full 8-lane groups (`8*g + 8 <= dims`).
+            return unsafe { mse_dot_avx2(data, bits, centroids, rq) };
         }
+    }
+    mse_dot_scalar(data, bits, centroids, rq)
+}
+
+/// Decode the 8 quantized indices of group `g` (logical positions `8g..8g+8`)
+/// from the `bits` bytes holding them, MSB-first — matching [`bit_pack`]. Valid
+/// only for full 8-index groups (`8·bits` bits = `bits` whole bytes, so groups
+/// are byte-aligned). Every returned value is masked into `0..2^bits`, so it is
+/// always a safe `centroids` index regardless of the input bytes.
+#[inline]
+fn decode8_indices(data: &[u8], bits: u8, g: usize) -> [i32; 8] {
+    match bits {
         2 => {
-            // Each byte holds four indices, MSB-first.
-            let quads = dims / 4;
-            let mut acc = 0.0f32;
-            for j in 0..quads {
-                let b = data[j];
-                acc += centroids[((b >> 6) & 0x03) as usize] * rq[4 * j];
-                acc += centroids[((b >> 4) & 0x03) as usize] * rq[4 * j + 1];
-                acc += centroids[((b >> 2) & 0x03) as usize] * rq[4 * j + 2];
-                acc += centroids[(b & 0x03) as usize] * rq[4 * j + 3];
-            }
-            let done = quads * 4;
-            if done < dims {
-                let b = data[quads];
-                for (r, &rqi) in rq[done..].iter().enumerate() {
-                    let shift = 6 - 2 * r;
-                    acc += centroids[((b >> shift) & 0x03) as usize] * rqi;
-                }
-            }
-            acc
+            let b0 = data[2 * g];
+            let b1 = data[2 * g + 1];
+            [
+                ((b0 >> 6) & 3) as i32,
+                ((b0 >> 4) & 3) as i32,
+                ((b0 >> 2) & 3) as i32,
+                (b0 & 3) as i32,
+                ((b1 >> 6) & 3) as i32,
+                ((b1 >> 4) & 3) as i32,
+                ((b1 >> 2) & 3) as i32,
+                (b1 & 3) as i32,
+            ]
         }
         3 => {
-            // 3-bit is not byte-aligned, but 8 indices pack into exactly 3 bytes,
-            // so decode them as a group with fixed shifts/masks instead of the
-            // bit-by-bit walker. MSB-first, byte order b0,b1,b2 — bit-identical to
-            // `mse_dot_generic` (same index values, same position-ordered sum), so
-            // recall is unchanged; this just removes the inner per-bit branch.
-            let groups = dims / 8;
-            let mut acc = 0.0f32;
-            for g in 0..groups {
-                let b0 = data[3 * g];
-                let b1 = data[3 * g + 1];
-                let b2 = data[3 * g + 2];
-                let base = 8 * g;
-                acc += centroids[((b0 >> 5) & 7) as usize] * rq[base];
-                acc += centroids[((b0 >> 2) & 7) as usize] * rq[base + 1];
-                acc += centroids[((((b0 & 3) << 1) | (b1 >> 7)) & 7) as usize] * rq[base + 2];
-                acc += centroids[((b1 >> 4) & 7) as usize] * rq[base + 3];
-                acc += centroids[((b1 >> 1) & 7) as usize] * rq[base + 4];
-                acc += centroids[((((b1 & 1) << 2) | (b2 >> 6)) & 7) as usize] * rq[base + 5];
-                acc += centroids[((b2 >> 3) & 7) as usize] * rq[base + 6];
-                acc += centroids[(b2 & 7) as usize] * rq[base + 7];
-            }
-            // Tail: the < 8 remaining indices. Continue the SAME `acc` in position
-            // order (bit-walking from the next bit) — summing the tail into its own
-            // accumulator and adding would re-associate and lose bit-identity.
-            let done = groups * 8;
-            let mut bit_pos = groups * 24; // bits consumed by the full groups
-            for &rqi in &rq[done..] {
-                let mut val = 0u8;
-                for _ in 0..3 {
-                    val <<= 1;
-                    if (data[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1 == 1 {
-                        val |= 1;
-                    }
-                    bit_pos += 1;
-                }
-                acc += centroids[val as usize] * rqi;
-            }
-            acc
+            let b0 = data[3 * g];
+            let b1 = data[3 * g + 1];
+            let b2 = data[3 * g + 2];
+            [
+                ((b0 >> 5) & 7) as i32,
+                ((b0 >> 2) & 7) as i32,
+                ((((b0 & 3) << 1) | (b1 >> 7)) & 7) as i32,
+                ((b1 >> 4) & 7) as i32,
+                ((b1 >> 1) & 7) as i32,
+                ((((b1 & 1) << 2) | (b2 >> 6)) & 7) as i32,
+                ((b2 >> 3) & 7) as i32,
+                (b2 & 7) as i32,
+            ]
         }
-        _ => mse_dot_generic(data, bits, centroids, rq),
+        4 => {
+            let b0 = data[4 * g];
+            let b1 = data[4 * g + 1];
+            let b2 = data[4 * g + 2];
+            let b3 = data[4 * g + 3];
+            [
+                (b0 >> 4) as i32,
+                (b0 & 0xF) as i32,
+                (b1 >> 4) as i32,
+                (b1 & 0xF) as i32,
+                (b2 >> 4) as i32,
+                (b2 & 0xF) as i32,
+                (b3 >> 4) as i32,
+                (b3 & 0xF) as i32,
+            ]
+        }
+        _ => unreachable!("TurboQuant bits must be 2, 3, or 4"),
+    }
+}
+
+/// Portable multiple-accumulator `mse_dot`: decode 8 indices per group and FMA
+/// them into 8 independent lanes (so the optimizer keeps several in flight), then
+/// a bit-walked tail for the `< 8` remainder. Reassociated — see [`mse_dot_fused`].
+fn mse_dot_scalar(data: &[u8], bits: u8, centroids: &[f32], rq: &[f32]) -> f32 {
+    let dims = rq.len();
+    let groups = dims / 8;
+    let mut a = [0.0f32; 8];
+    for g in 0..groups {
+        let idx = decode8_indices(data, bits, g);
+        let base = 8 * g;
+        for l in 0..8 {
+            a[l] += centroids[idx[l] as usize] * rq[base + l];
+        }
+    }
+    let mut acc = ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
+    let done = groups * 8;
+    if done < dims {
+        // Full groups consume `groups * bits` whole bytes, so the tail resumes on
+        // a byte boundary and the bit-walker reads a clean sub-slice.
+        acc += mse_dot_generic(&data[groups * bits as usize..], bits, centroids, &rq[done..]);
+    }
+    acc
+}
+
+/// AVX2+FMA `mse_dot`: the centroid codebook is tiny (`2^bits <= 16` entries), so
+/// look it up with an in-register cross-lane permute (`permutevar8x32`) instead of
+/// a memory gather — gather is microcoded and measured ~30% SLOWER here for a LUT
+/// this small. Per group of 8: decode the indices, permute the codebook to get the
+/// 8 centroids, then FMA against 8 `rq` values; two 256-bit accumulators in flight.
+/// 4-bit needs both halves of the 16-entry codebook (two permutes blended on the
+/// index's bit 3).
+///
+/// # Safety
+/// Caller must ensure AVX2+FMA (see [`has_avx2_fma`]). All ops are register-only
+/// except the `rq` loads, which stay within full 8-lane groups (`8*g + 8 <= dims`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn mse_dot_avx2(data: &[u8], bits: u8, centroids: &[f32], rq: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let dims = rq.len();
+    let groups = dims / 8;
+    let rptr = rq.as_ptr();
+    // Load the codebook into one (<=8 entries: 2-/3-bit) or two (16 entries:
+    // 4-bit) registers via a zero-padded stack copy, so no out-of-bounds read of
+    // the short `centroids` slice.
+    let mut lut = [0.0f32; 16];
+    lut[..centroids.len()].copy_from_slice(centroids);
+    let four_bit = bits == 4;
+    // SAFETY: see fn-level note. `lut` is a fixed 16-float array (two full
+    // loadu_ps); the decoded-index array is 8×i32 = 32 bytes (one loadu_si256);
+    // `rptr` loads stay within the full groups; permute/blend are register-only.
+    unsafe {
+        let lo = _mm256_loadu_ps(lut.as_ptr());
+        let hi = _mm256_loadu_ps(lut.as_ptr().add(8));
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+
+        // Permute the codebook by the (in-range) decoded indices in `iv`.
+        let lookup = |iv: __m256i| -> __m256 {
+            let clo = _mm256_permutevar8x32_ps(lo, iv);
+            if four_bit {
+                let chi = _mm256_permutevar8x32_ps(hi, iv); // permute masks index to &7
+                // Select the high half where index bit 3 is set: shift bit 3 to the
+                // sign bit and use it as the blend mask.
+                let sel = _mm256_castsi256_ps(_mm256_slli_epi32::<28>(iv));
+                _mm256_blendv_ps(clo, chi, sel)
+            } else {
+                clo
+            }
+        };
+
+        let mut g = 0usize;
+        while g + 2 <= groups {
+            let i0 = decode8_indices(data, bits, g);
+            let i1 = decode8_indices(data, bits, g + 1);
+            let iv0 = _mm256_loadu_si256(i0.as_ptr().cast());
+            let iv1 = _mm256_loadu_si256(i1.as_ptr().cast());
+            acc0 = _mm256_fmadd_ps(lookup(iv0), _mm256_loadu_ps(rptr.add(8 * g)), acc0);
+            acc1 = _mm256_fmadd_ps(lookup(iv1), _mm256_loadu_ps(rptr.add(8 * (g + 1))), acc1);
+            g += 2;
+        }
+        while g < groups {
+            let i0 = decode8_indices(data, bits, g);
+            let iv0 = _mm256_loadu_si256(i0.as_ptr().cast());
+            acc0 = _mm256_fmadd_ps(lookup(iv0), _mm256_loadu_ps(rptr.add(8 * g)), acc0);
+            g += 1;
+        }
+        let mut acc = hsum256(_mm256_add_ps(acc0, acc1));
+        let done = groups * 8;
+        if done < dims {
+            acc += mse_dot_generic(&data[groups * bits as usize..], bits, centroids, &rq[done..]);
+        }
+        acc
     }
 }
 
@@ -935,24 +1032,28 @@ fn mse_dot_generic(data: &[u8], bits: u8, centroids: &[f32], rq: &[f32]) -> f32 
 }
 
 /// `Σ_i sign_i · sq[i]` where `sign_i = +1` if the packed bit is set, else `-1`.
-/// Walks the packed sign bytes MSB-first with no intermediate `Vec<bool>`.
-/// Bit-identical to `unpack_bools` followed by a zipped `if b { s } else { -s }`.
+/// Walks the packed sign bytes MSB-first with no intermediate `Vec<bool>`. Each
+/// of the 8 bit positions accumulates into its own lane, breaking the loop-carried
+/// dependency for ILP; the lanes are summed at the end. The per-element sign is
+/// exact (`sign_apply`), but the 8-way accumulation REASSOCIATES the sum, so the
+/// result is not bit-identical to a strict position-ordered fold.
 #[inline]
 fn correction_dot_fused(signs: &[u8], sq: &[f32]) -> f32 {
     let dims = sq.len();
     let full = dims / 8;
-    let mut acc = 0.0f32;
+    let mut a = [0.0f32; 8];
     for (byte_i, &b) in signs[..full].iter().enumerate() {
         let base = byte_i * 8;
-        acc += sign_apply((b >> 7) & 1, sq[base]);
-        acc += sign_apply((b >> 6) & 1, sq[base + 1]);
-        acc += sign_apply((b >> 5) & 1, sq[base + 2]);
-        acc += sign_apply((b >> 4) & 1, sq[base + 3]);
-        acc += sign_apply((b >> 3) & 1, sq[base + 4]);
-        acc += sign_apply((b >> 2) & 1, sq[base + 5]);
-        acc += sign_apply((b >> 1) & 1, sq[base + 6]);
-        acc += sign_apply(b & 1, sq[base + 7]);
+        a[0] += sign_apply((b >> 7) & 1, sq[base]);
+        a[1] += sign_apply((b >> 6) & 1, sq[base + 1]);
+        a[2] += sign_apply((b >> 5) & 1, sq[base + 2]);
+        a[3] += sign_apply((b >> 4) & 1, sq[base + 3]);
+        a[4] += sign_apply((b >> 3) & 1, sq[base + 4]);
+        a[5] += sign_apply((b >> 2) & 1, sq[base + 5]);
+        a[6] += sign_apply((b >> 1) & 1, sq[base + 6]);
+        a[7] += sign_apply(b & 1, sq[base + 7]);
     }
+    let mut acc = ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
     let rem = dims % 8;
     if rem > 0 {
         let b = signs[full];
@@ -1290,12 +1391,15 @@ mod tests {
         assert_eq!(quantizer.codebook.boundaries, restored.codebook.boundaries);
     }
 
-    /// The fused, allocation-free kernel must produce *bit-identical* results to
-    /// the original materialize-then-zip implementation, for every bit width and
-    /// for dims that are odd / not a multiple of 8 (exercising the tail paths).
-    /// Bit-identity is what guarantees recall is unchanged by the optimization.
+    /// The fused kernel must match the materialize-then-zip reference to within
+    /// floating-point reassociation error, for every bit width and for dims that
+    /// are odd / not a multiple of 8 (exercising the tail paths). The multi-
+    /// accumulator / AVX2-gather kernel reassociates the sum (so NOT bit-identical),
+    /// but the *index decode* is exact (see `decode8_indices_matches_bit_unpack`);
+    /// the tolerance is conditioning-aware (`Σ|term|`), far below the quantization
+    /// noise floor, and a real decode/gather bug diverges by `O(magnitude)`.
     #[test]
-    fn fused_kernel_bit_identical_to_materialized() {
+    fn fused_kernel_matches_materialized() {
         let mut rng = rand::rng();
         for &dims in &[16usize, 30, 31, 32, 33, 64, 127, 384] {
             for &bits in &[2u8, 3, 4] {
@@ -1308,7 +1412,7 @@ mod tests {
                     let prepared = quantizer.prepare_query(&query);
                     let cv = quantizer.compress(&target);
 
-                    // Reference: the exact computation the kernel used to perform.
+                    // Reference: materialize the indices/signs and sum directly.
                     let indices = bit_unpack(cv.data(), bits, dims);
                     let ref_mse: f32 = indices
                         .iter()
@@ -1325,18 +1429,30 @@ mod tests {
                     let qjl_scale = (std::f32::consts::FRAC_PI_2).sqrt() / dims as f32;
                     let ref_ip = ref_mse + cv.residual_norm * cv.norm * qjl_scale * ref_corr_dot;
 
+                    // Conditioning bound: rounding error scales with Σ|term|.
+                    let mse_mag: f32 = indices
+                        .iter()
+                        .zip(prepared.rq.iter())
+                        .map(|(&i, &rqi)| (quantizer.codebook.centroids[i as usize] * rqi).abs())
+                        .sum::<f32>()
+                        * cv.norm;
+                    let corr_mag: f32 = prepared.sq.iter().map(|s| s.abs()).sum();
+                    let mag = mse_mag + cv.residual_norm * cv.norm * qjl_scale * corr_mag;
+                    let tol = 1e-4 * mag + 1e-5;
+
                     let got = quantizer.inner_product_estimate_prepared(&prepared, &cv);
-                    assert_eq!(
-                        got.to_bits(),
-                        ref_ip.to_bits(),
-                        "fused kernel diverged: dims={dims} bits={bits} got={got} ref={ref_ip}"
+                    assert!(
+                        (got - ref_ip).abs() <= tol,
+                        "fused kernel diverged: dims={dims} bits={bits} got={got} \
+                         ref={ref_ip} tol={tol}"
                     );
                 }
             }
         }
     }
 
-    /// The fused helpers in isolation must match the materialized helpers exactly.
+    /// The fused helpers must match the materialized helpers to within
+    /// reassociation tolerance (they now use multiple accumulators).
     #[test]
     fn fused_helpers_match_materialized() {
         let mut rng = rand::rng();
@@ -1356,11 +1472,15 @@ mod tests {
                     .zip(rq.iter())
                     .map(|(&i, &r)| centroids[i as usize] * r)
                     .sum();
+                let mag: f32 = indices
+                    .iter()
+                    .zip(rq.iter())
+                    .map(|(&i, &r)| (centroids[i as usize] * r).abs())
+                    .sum();
                 let fused = mse_dot_fused(&packed, bits, &centroids, &rq);
-                assert_eq!(
-                    fused.to_bits(),
-                    reference.to_bits(),
-                    "mse_dot_fused mismatch: dims={dims} bits={bits}"
+                assert!(
+                    (fused - reference).abs() <= 1e-4 * mag + 1e-6,
+                    "mse_dot_fused mismatch: dims={dims} bits={bits} fused={fused} ref={reference}"
                 );
             }
 
@@ -1373,12 +1493,38 @@ mod tests {
                 .zip(sq.iter())
                 .map(|(&b, &s)| if b { s } else { -s })
                 .sum();
+            let mag: f32 = sq.iter().map(|s| s.abs()).sum();
             let fused = correction_dot_fused(&packed_signs, &sq);
-            assert_eq!(
-                fused.to_bits(),
-                reference.to_bits(),
-                "correction_dot_fused mismatch: dims={dims}"
+            assert!(
+                (fused - reference).abs() <= 1e-4 * mag + 1e-6,
+                "correction_dot_fused mismatch: dims={dims} fused={fused} ref={reference}"
             );
+        }
+    }
+
+    /// `decode8_indices` must reproduce `bit_unpack`'s indices EXACTLY for every
+    /// full 8-index group — the decode is the part that must stay bit-exact (only
+    /// the subsequent accumulation reassociates). Covers all bit widths.
+    #[test]
+    fn decode8_indices_matches_bit_unpack() {
+        let mut rng = rand::rng();
+        for &bits in &[2u8, 3, 4] {
+            let max_idx = 1u8 << bits;
+            let n = 8 * 6; // several full groups
+            for _ in 0..50 {
+                let indices: Vec<u8> = (0..n).map(|_| rng.random_range(0..max_idx)).collect();
+                let packed = bit_pack(&indices, bits);
+                for g in 0..(n / 8) {
+                    let got = decode8_indices(&packed, bits, g);
+                    for l in 0..8 {
+                        assert_eq!(
+                            got[l] as u8,
+                            indices[8 * g + l],
+                            "decode8 mismatch bits={bits} group={g} lane={l}"
+                        );
+                    }
+                }
+            }
         }
     }
 

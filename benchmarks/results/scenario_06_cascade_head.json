@@ -1,0 +1,67 @@
+[
+  {
+    "scenario": "1.6 cascade_delete_user",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 34.278647,
+      "p50_ms": 57.628835,
+      "p95_ms": 60.242126,
+      "p99_ms": 60.242126,
+      "max_ms": 60.242126,
+      "mean_ms": 50.716536
+    },
+    "operation_stats": {
+      "n": 300,
+      "min_us": 286.932,
+      "p50_us": 333.049,
+      "p95_us": 578.531,
+      "p99_us": 689.842,
+      "max_us": 24594.876,
+      "mean_us": 506.67852,
+      "total_ms": 152.003556
+    },
+    "rss_cold_mb": 14.89453125,
+    "rss_post_load_mb": 70.05078125,
+    "rss_peak_mb": 73.89453125,
+    "rss_steady_mb": 70.05078125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_deletes": 100,
+      "ratings_per_user": 100
+    }
+  },
+  {
+    "scenario": "1.6 cascade_delete_user",
+    "implementation": "pg-idiomatic",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 20.355948,
+      "p50_ms": 20.894704,
+      "p95_ms": 23.687864,
+      "p99_ms": 23.687864,
+      "max_ms": 23.687864,
+      "mean_ms": 21.646172
+    },
+    "operation_stats": {
+      "n": 300,
+      "min_us": 172.285,
+      "p50_us": 197.152,
+      "p95_us": 345.231,
+      "p99_us": 593.15,
+      "max_us": 720.349,
+      "mean_us": 215.78493666666665,
+      "total_ms": 64.735481
+    },
+    "rss_cold_mb": 43.48828125,
+    "rss_post_load_mb": 43.48828125,
+    "rss_peak_mb": 43.48828125,
+    "rss_steady_mb": 43.48828125,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_deletes": 100,
+      "ratings_per_user": 100,
+      "note": "optimal == idiomatic for DELETE+FK cascade"
+    }
+  }
+]

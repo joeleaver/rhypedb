@@ -1,0 +1,65 @@
+[
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "rhypedb-tcp",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 1802.713426,
+      "p50_ms": 1835.359995,
+      "p95_ms": 1843.062179,
+      "p99_ms": 1843.062179,
+      "max_ms": 1843.062179,
+      "mean_ms": 1827.0452
+    },
+    "operation_stats": {
+      "n": 150000,
+      "min_us": 28.844,
+      "p50_us": 31.379,
+      "p95_us": 46.298,
+      "p99_us": 63.68,
+      "max_us": 21939.587,
+      "mean_us": 35.84385972,
+      "total_ms": 5376.578958
+    },
+    "rss_cold_mb": 14.6484375,
+    "rss_post_load_mb": 105.9140625,
+    "rss_peak_mb": 105.9140625,
+    "rss_steady_mb": 105.9140625,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 50000
+    }
+  },
+  {
+    "scenario": "1.1 bulk_insert_users",
+    "implementation": "rhypedb-tcp-batch",
+    "iterations": 3,
+    "iteration_stats": {
+      "min_ms": 344.154862,
+      "p50_ms": 372.802887,
+      "p95_ms": 397.027906,
+      "p99_ms": 397.027906,
+      "max_ms": 397.027906,
+      "mean_ms": 371.32855166666667
+    },
+    "operation_stats": {
+      "n": 150,
+      "min_us": 5128.877,
+      "p50_us": 6397.421,
+      "p95_us": 10962.945,
+      "p99_us": 26275.748,
+      "max_us": 26581.315,
+      "mean_us": 7193.790626666667,
+      "total_ms": 1079.068594
+    },
+    "rss_cold_mb": 105.9140625,
+    "rss_post_load_mb": 105.84765625,
+    "rss_peak_mb": 165.640625,
+    "rss_steady_mb": 105.84765625,
+    "disk_mb": 0.0,
+    "metadata": {
+      "n_users": 50000,
+      "batch_size": 1000
+    }
+  }
+]
