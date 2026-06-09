@@ -62,6 +62,33 @@ def rss_mb(pid: int) -> float:
     return 0.0
 
 
+def rss_breakdown(pid: int) -> dict:
+    """Split resident memory into anonymous (heap — the non-reclaimable working
+    set) vs file-backed (e.g. mmap'd SST page cache — reclaimable under pressure).
+
+    VmRSS conflates the two, which overstates a vector engine's real footprint:
+    rhypedb mmaps its SST files, so the durable raw-f32 copy shows up as file-backed
+    RSS even though it is reclaimable and never part of the k-NN serving heap. The
+    honest "RAM to serve" number is RssAnon. Returns MB for each field present in
+    /proc/<pid>/status (RssAnon/RssFile/RssShmem land there on Linux >= 4.5)."""
+    out = {"rss_mb": 0.0, "anon_mb": 0.0, "file_mb": 0.0, "shmem_mb": 0.0}
+    fields = {
+        "VmRSS:": "rss_mb",
+        "RssAnon:": "anon_mb",
+        "RssFile:": "file_mb",
+        "RssShmem:": "shmem_mb",
+    }
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                key = line.split(None, 1)[0] if line else ""
+                if key in fields:
+                    out[fields[key]] = int(line.split()[1]) / 1024
+    except FileNotFoundError:
+        pass
+    return out
+
+
 def find_pid(process_name: str) -> int:
     """Find the PID of a running process by name (first match)."""
     result = subprocess.run(

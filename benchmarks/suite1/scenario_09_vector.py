@@ -129,6 +129,16 @@ def run_rhypedb(
         )
         if server_pid:
             result.rss_steady_mb = common.rss_mb(server_pid)
+            # Honest split: RssAnon is the non-reclaimable serving heap (the HNSW
+            # index); RssFile is reclaimable mmap'd SST page cache (the durable
+            # raw-f32 copy), which inflates VmRSS but yields under memory pressure.
+            steady = common.rss_breakdown(server_pid)
+            n_train = max(1, ds.train.shape[0])
+            result.metadata["rss_steady_anon_mb"] = steady["anon_mb"]
+            result.metadata["rss_steady_file_mb"] = steady["file_mb"]
+            result.metadata["bytes_per_vector_anon_steady"] = (
+                steady["anon_mb"] * 1024 * 1024 / n_train
+            )
     finally:
         client.close()
 

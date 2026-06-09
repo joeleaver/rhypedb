@@ -1,9 +1,12 @@
 //! In-memory footprint of the TurboQuant HNSW index, ISOLATED from the server's
-//! LSM/durability layer. The full rhypedb-server RSS includes a second copy of
-//! the compressed vectors in the LSM (the `v:` keyspace, for restart) plus block
-//! cache — but k-NN search only touches the in-memory HNSW index (nodes hold the
-//! `CompressedVector` inline). This bench measures just that index, so we can
-//! compare "RAM to serve" against pgvector's HNSW index size honestly.
+//! LSM/durability layer. The full rhypedb-server RSS additionally includes a copy
+//! of the RAW f32 vectors in the LSM (the `v:` keyspace, the durable source for
+//! rebuild-on-restart) — but those live in mmap'd SST files as reclaimable,
+//! file-backed page cache (there is NO block cache), so they inflate VmRSS yet
+//! are NOT part of the non-reclaimable serving heap and yield under memory
+//! pressure. k-NN search only touches the in-memory HNSW index (nodes hold the
+//! `CompressedVector` inline). This bench measures just that index — the honest
+//! "RAM to serve" (RssAnon) number — to compare against pgvector's HNSW index size.
 //!
 //! It reports the index's footprint computed PRECISELY (walking the structure —
 //! codes + graph + overhead), not via process RSS, which proved unreliable for an
