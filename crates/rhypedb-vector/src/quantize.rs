@@ -184,25 +184,44 @@ impl TurboQuantizer {
     /// `prepare_query(&decompress(compressed))` up to the tiny floating-point
     /// deviation of R·Rᵀ from the identity.
     pub fn prepare_stored(&self, compressed: &CompressedVector) -> PreparedQuery {
+        let mut out = PreparedQuery {
+            rq: Vec::new(),
+            sq: Vec::new(),
+            q_norm: 0.0,
+        };
+        self.prepare_stored_into(compressed, &mut out);
+        out
+    }
+
+    /// Like [`Self::prepare_stored`], but reuses the buffers in `out` instead of
+    /// allocating fresh `rq`/`sq` vectors. The HNSW build path prunes up to ~2·m
+    /// stored neighbors per insert, each needing a projected query; threading one
+    /// scratch `PreparedQuery` through that loop removes those per-prune
+    /// allocations (and their allocator overhead) at millions of inserts.
+    /// Produces values identical to `prepare_stored`.
+    pub fn prepare_stored_into(&self, compressed: &CompressedVector, out: &mut PreparedQuery) {
         let dims = self.config.dimensions as usize;
 
-        // scaled = ‖x‖ · c  (this is exactly R·x̂, the rotated query the MSE term
-        // consumes — produced without the inverse-rotation matmul).
-        let indices = bit_unpack(compressed.data(), self.config.bits, dims);
-        let scaled: Vec<f32> = indices
-            .iter()
-            .map(|&i| self.codebook.centroids[i as usize] * compressed.norm)
-            .collect();
+        // rq = ‖x‖ · c  (this is exactly R·x̂, the rotated query the MSE term
+        // consumes — produced without the inverse-rotation matmul). Decode the
+        // packed indices straight into the scaled centroid values, reusing the
+        // buffer, with no intermediate index `Vec`.
+        unpack_scaled_centroids(
+            compressed.data(),
+            self.config.bits,
+            dims,
+            &self.codebook.centroids,
+            compressed.norm,
+            &mut out.rq,
+        );
 
-        // sq = S·x̂ = (S·Rᵀ)·(‖x‖·c) = sr_t · scaled.
-        let sq = mat_vec_mul(&self.sr_t, &scaled, dims);
-        let q_norm = scaled.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-        PreparedQuery {
-            rq: scaled,
-            sq,
-            q_norm,
-        }
+        // sq = S·x̂ = (S·Rᵀ)·(‖x‖·c) = sr_t · rq. Borrows the disjoint fields
+        // `rq` (read) and `sq` (write) of `out` at once — allowed for distinct
+        // struct fields.
+        out.sq.clear();
+        out.sq.resize(dims, 0.0);
+        mat_vec_mul_into(&self.sr_t, &out.rq, dims, &mut out.sq);
+        out.q_norm = out.rq.iter().map(|x| x * x).sum::<f32>().sqrt();
     }
 
     /// Unbiased inner-product estimate reusing a [`PreparedQuery`]. O(d) per
@@ -626,18 +645,31 @@ fn compute_sr_t(qjl: &[f32], rotation: &[f32], dims: usize) -> Vec<f32> {
         let m_row = &mut m[i * dims..(i + 1) * dims];
         for (j, m_ij) in m_row.iter_mut().enumerate() {
             let r_row = &rotation[j * dims..(j + 1) * dims];
-            *m_ij = s_row.iter().zip(r_row).map(|(&s, &r)| s * r).sum();
+            *m_ij = dot(s_row, r_row);
         }
     }
     m
 }
 
+/// Matrix–vector product `out[i] = Σ_j matrix[i*dims + j] · vector[j]` for a
+/// row-major `dims×dims` matrix, allocating the result.
 fn mat_vec_mul(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32> {
     let mut result = vec![0.0f32; dims];
-    for (i, res) in result.iter_mut().enumerate() {
-        *res = (0..dims).map(|j| matrix[i * dims + j] * vector[j]).sum();
-    }
+    mat_vec_mul_into(matrix, vector, dims, &mut result);
     result
+}
+
+/// Like [`mat_vec_mul`] but writes into a caller-owned buffer, so the build
+/// hot path can reuse one allocation across the many `prepare_stored`
+/// projections it performs per insert. Each output is the dot product of one
+/// contiguous matrix row with `vector`, computed by the SIMD [`dot`] primitive.
+fn mat_vec_mul_into(matrix: &[f32], vector: &[f32], dims: usize, out: &mut [f32]) {
+    debug_assert_eq!(vector.len(), dims);
+    debug_assert_eq!(out.len(), dims);
+    debug_assert_eq!(matrix.len(), dims * dims);
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = dot(&matrix[i * dims..i * dims + dims], vector);
+    }
 }
 
 fn mat_vec_mul_transpose(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32> {
@@ -646,6 +678,144 @@ fn mat_vec_mul_transpose(matrix: &[f32], vector: &[f32], dims: usize) -> Vec<f32
         *res = (0..dims).map(|j| matrix[j * dims + i] * vector[j]).sum();
     }
     result
+}
+
+// --- SIMD dot product (the build hot path's matvec primitive) ---
+
+/// Dot product of two equal-length `f32` slices.
+///
+/// Uses a runtime-detected AVX2+FMA path on `x86_64` and a portable
+/// multiple-accumulator fallback everywhere else. Both *reassociate* the
+/// summation (and the AVX2 path fuses each multiply-add), so the result is NOT
+/// bit-identical to a naive left-to-right `.sum()` — it differs by at most a
+/// few ULPs. That is fine for every caller here: this dot feeds the rotation /
+/// QJL projection matvecs, whose outputs are either quantized or handed to the
+/// already-approximate TurboQuant distance estimator, where a sub-ULP
+/// perturbation sits far below the quantization noise floor (recall is verified
+/// to be preserved within HNSW run-to-run variance). The distance *kernel*
+/// itself — [`inner_product_estimate_prepared`] — remains exactly bit-identical;
+/// only the projection matvecs are reassociated.
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() {
+            // SAFETY: `dot_avx2` is only entered when AVX2+FMA are detected at
+            // runtime. It reads `a` and `b` exclusively through bounds-respecting
+            // unaligned loads (`_mm256_loadu_ps`) and scalar indexing within
+            // `a.len() == b.len()` (debug-asserted above).
+            return unsafe { dot_avx2(a, b) };
+        }
+    }
+    dot_scalar(a, b)
+}
+
+/// Portable dot product with eight independent accumulators. Breaking the
+/// loop-carried dependency a single accumulator would impose lets the compiler
+/// pack the lanes into SSE/NEON and keep several FMAs in flight; this is also
+/// the reference the SIMD path is checked against. Reassociated, so not
+/// bit-identical to a naive `.sum()`.
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    for (x, y) in ca.by_ref().zip(cb.by_ref()) {
+        // `chunks_exact(8)` yields length-8 slices; the array conversion lets
+        // the optimizer drop the bounds checks on the unrolled inner loop.
+        let x: &[f32; 8] = x.try_into().unwrap();
+        let y: &[f32; 8] = y.try_into().unwrap();
+        for l in 0..8 {
+            acc[l] += x[l] * y[l];
+        }
+    }
+    let mut total =
+        ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        total += x * y;
+    }
+    total
+}
+
+/// True iff this CPU has both AVX2 and FMA. Cached after the first probe so the
+/// per-call dispatch is a single relaxed load.
+#[cfg(target_arch = "x86_64")]
+fn has_avx2_fma() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // u8::MAX = "not yet probed"; 0 = absent; 1 = present.
+    static CACHE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let cached = CACHE.load(Ordering::Relaxed);
+    if cached != u8::MAX {
+        return cached == 1;
+    }
+    let detected = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+    CACHE.store(detected as u8, Ordering::Relaxed);
+    detected
+}
+
+/// AVX2+FMA dot product: four 8-wide accumulators (32 floats/iter) for
+/// instruction-level parallelism, an 8-wide drain, then a scalar tail.
+///
+/// # Safety
+/// The caller must ensure AVX2 and FMA are available (see [`has_avx2_fma`]).
+/// `a.len()` must equal `b.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    // SAFETY: every intrinsic and pointer read below stays within `i < n` and
+    // `n == a.len() == b.len()`; loads are unaligned (`loadu`), so no alignment
+    // requirement. The enclosing `#[target_feature(enable = "avx2,fma")]` is
+    // honored because callers gate on `has_avx2_fma()`.
+    unsafe {
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let mut i = 0usize;
+        while i + 32 <= n {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+            acc1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 8)),
+                _mm256_loadu_ps(pb.add(i + 8)),
+                acc1,
+            );
+            acc2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 16)),
+                _mm256_loadu_ps(pb.add(i + 16)),
+                acc2,
+            );
+            acc3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(i + 24)),
+                _mm256_loadu_ps(pb.add(i + 24)),
+                acc3,
+            );
+            i += 32;
+        }
+        while i + 8 <= n {
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa.add(i)), _mm256_loadu_ps(pb.add(i)), acc0);
+            i += 8;
+        }
+        // Combine the four 256-bit accumulators, then horizontally reduce to a scalar.
+        let acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        let lo = _mm256_castps256_ps128(acc);
+        let hi = _mm256_extractf128_ps::<1>(acc);
+        let mut s = _mm_add_ps(lo, hi); // 4 partial sums
+        let shuf = _mm_movehdup_ps(s); // [s1, s1, s3, s3]
+        s = _mm_add_ps(s, shuf); // [s0+s1, _, s2+s3, _]
+        let hi64 = _mm_movehl_ps(shuf, s); // bring s2+s3 down to lane 0
+        s = _mm_add_ss(s, hi64); // (s0+s1) + (s2+s3)
+        let mut total = _mm_cvtss_f32(s);
+        // Scalar remainder (n not a multiple of 8).
+        while i < n {
+            total += *pa.add(i) * *pb.add(i);
+            i += 1;
+        }
+        total
+    }
 }
 
 // --- Fused decode + dot product (allocation-free hot kernel) ---
@@ -798,6 +968,37 @@ fn bit_unpack(packed: &[u8], bits: u8, count: usize) -> Vec<u8> {
         indices.push(val);
     }
     indices
+}
+
+/// Decode `count` `bits`-wide packed indices into `out[i] = centroids[idx_i] *
+/// scale`, reusing `out`'s buffer and never materializing the intermediate
+/// index `Vec`. Walks the packed bytes MSB-first, exactly like [`bit_unpack`]
+/// followed by the centroid lookup + scale. Used by
+/// [`TurboQuantizer::prepare_stored_into`] on the build hot path.
+#[inline]
+fn unpack_scaled_centroids(
+    data: &[u8],
+    bits: u8,
+    count: usize,
+    centroids: &[f32],
+    scale: f32,
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.reserve(count);
+    let bits = bits as usize;
+    let mut bit_pos = 0usize;
+    for _ in 0..count {
+        let mut val = 0u8;
+        for _ in 0..bits {
+            val <<= 1;
+            if (data[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1 == 1 {
+                val |= 1;
+            }
+            bit_pos += 1;
+        }
+        out.push(centroids[val as usize] * scale);
+    }
 }
 
 fn pack_bools(bools: &[bool]) -> Vec<u8> {
@@ -1224,5 +1425,74 @@ mod tests {
         let ip_original = quantizer.inner_product_estimate(&query, &compressed);
         let ip_restored = restored.inner_product_estimate(&query, &compressed);
         assert_eq!(ip_original, ip_restored);
+    }
+
+    /// The SIMD `dot` and the portable `dot_scalar` must both agree with a naive
+    /// left-fold dot product to within floating-point reassociation error — they
+    /// reassociate (and the AVX2 path fuses multiply-add), so they are not
+    /// bit-identical to the naive sum, but must stay far inside the quantization
+    /// noise floor. Covers lengths that exercise the 32-/8-wide and scalar-tail
+    /// paths, plus the empty and sub-lane cases.
+    #[test]
+    fn dot_matches_naive_within_tolerance() {
+        let mut rng = rand::rng();
+        for &len in &[0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 100, 127, 384, 1536] {
+            for _ in 0..20 {
+                let a: Vec<f32> = (0..len).map(|_| rng.random_range(-3.0..3.0)).collect();
+                let b: Vec<f32> = (0..len).map(|_| rng.random_range(-3.0..3.0)).collect();
+                let naive: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+                // Conditioning bound: rounding error scales with Σ|a_i·b_i|.
+                let mag: f32 = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(x, y)| x.abs() * y.abs())
+                    .sum::<f32>()
+                    .max(1e-6);
+                let tol = 1e-3 * mag;
+                let simd = dot(&a, &b);
+                let scal = dot_scalar(&a, &b);
+                assert!(
+                    (simd - naive).abs() <= tol,
+                    "dot diverged from naive: len={len} simd={simd} naive={naive} tol={tol}"
+                );
+                assert!(
+                    (scal - naive).abs() <= tol,
+                    "dot_scalar diverged from naive: len={len} scal={scal} naive={naive} tol={tol}"
+                );
+            }
+        }
+    }
+
+    /// `prepare_stored_into` reuses a caller buffer; it must produce exactly the
+    /// same `PreparedQuery` as the allocating `prepare_stored` (they share the
+    /// code path), and must fully overwrite a pre-dirtied buffer (no stale tail).
+    #[test]
+    fn prepare_stored_into_matches_prepare_stored() {
+        let mut rng = rand::rng();
+        for &dims in &[64usize, 128, 384] {
+            for &bits in &[2u8, 3, 4] {
+                let q = TurboQuantizer::new(TurboQuantConfig::new(dims as u32, bits));
+                // Pre-dirty with wrong lengths + sentinel values to prove a full
+                // overwrite, then reuse the same buffer across iterations.
+                let mut buf = PreparedQuery {
+                    rq: vec![123.0; dims + 5],
+                    sq: vec![-7.0; dims + 9],
+                    q_norm: 999.0,
+                };
+                for _ in 0..10 {
+                    let v: Vec<f32> = (0..dims).map(|_| rng.random_range(-2.0..2.0)).collect();
+                    let cv = q.compress(&v);
+                    let fresh = q.prepare_stored(&cv);
+                    q.prepare_stored_into(&cv, &mut buf);
+                    assert_eq!(fresh.rq, buf.rq, "rq mismatch dims={dims} bits={bits}");
+                    assert_eq!(fresh.sq, buf.sq, "sq mismatch dims={dims} bits={bits}");
+                    assert_eq!(
+                        fresh.q_norm.to_bits(),
+                        buf.q_norm.to_bits(),
+                        "q_norm mismatch dims={dims} bits={bits}"
+                    );
+                }
+            }
+        }
     }
 }

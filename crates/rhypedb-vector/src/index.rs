@@ -40,6 +40,10 @@ impl DistanceProvider for TurboQuantDistance {
         self.quantizer.prepare_stored(stored)
     }
 
+    fn prepare_stored_into(&self, stored: &CompressedVector, buf: &mut PreparedQuery) {
+        self.quantizer.prepare_stored_into(stored, buf);
+    }
+
     fn store(&self, vector: &[f32]) -> CompressedVector {
         self.quantizer.compress(vector)
     }

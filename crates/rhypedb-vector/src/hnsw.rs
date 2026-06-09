@@ -63,6 +63,15 @@ pub trait DistanceProvider: Send + Sync {
     /// the loop. Equivalent to preparing its reconstruction.
     fn prepare_stored(&self, stored: &Self::Stored) -> Self::Query;
 
+    /// Like [`Self::prepare_stored`] but reuses `buf` instead of allocating a
+    /// fresh query. The build-time prune loop prepares up to ~2·m stored vectors
+    /// per insert; reusing one scratch query removes those allocations. The
+    /// default just overwrites via `prepare_stored`; providers with reusable
+    /// internal buffers (e.g. projection vectors) should override it.
+    fn prepare_stored_into(&self, stored: &Self::Stored, buf: &mut Self::Query) {
+        *buf = self.prepare_stored(stored);
+    }
+
     /// Convert a full-precision vector into the stored representation.
     fn store(&self, vector: &[f32]) -> Self::Stored;
 
@@ -332,6 +341,12 @@ impl<D: DistanceProvider> HnswIndex<D> {
         }
         drop(nodes);
 
+        // Reusable projected-query buffer for the neighbor-pruning step below.
+        // One scratch query is filled in place for every full-slot neighbor across
+        // all layers of this insert, instead of allocating a fresh projection each
+        // time (see DistanceProvider::prepare_stored_into).
+        let mut prune_q: Option<D::Query> = None;
+
         // Phase 2: At each layer from insertion level down to 0, find neighbors.
         for layer in (0..num_layers).rev() {
             let ef = self.config.ef_construction;
@@ -371,9 +386,16 @@ impl<D: DistanceProvider> HnswIndex<D> {
                         // against the (fixed) neighbor vector and keep the closest
                         // max_neighbors. Equivalent to push-then-prune, but never
                         // exceeds the arena slot stride. prepare_stored hoists the
-                        // projection matvecs out of the inner loop.
-                        let prepared =
-                            self.distance.prepare_stored(&g.nodes[neighbor_idx].stored);
+                        // projection matvecs out of the inner loop; reuse one scratch
+                        // query across prunes rather than allocating each time.
+                        if let Some(buf) = prune_q.as_mut() {
+                            self.distance
+                                .prepare_stored_into(&g.nodes[neighbor_idx].stored, buf);
+                        } else {
+                            prune_q =
+                                Some(self.distance.prepare_stored(&g.nodes[neighbor_idx].stored));
+                        }
+                        let prepared = prune_q.as_ref().unwrap();
                         let mut cand: Vec<u32> = g.neighbors(neighbor_idx, layer).to_vec();
                         cand.push(node_idx as u32);
                         let mut scored: Vec<(f32, u32)> = cand
@@ -381,7 +403,7 @@ impl<D: DistanceProvider> HnswIndex<D> {
                             .map(|&nidx| {
                                 let dist = self
                                     .distance
-                                    .distance(&prepared, &g.nodes[nidx as usize].stored);
+                                    .distance(prepared, &g.nodes[nidx as usize].stored);
                                 (dist, nidx)
                             })
                             .collect();
