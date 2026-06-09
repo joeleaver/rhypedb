@@ -1373,11 +1373,20 @@ mod tests {
                             q.distance_estimate_prepared(&old_prepared, &b, metric);
                         let new_d =
                             q.distance_estimate_prepared(&new_prepared, &b, metric);
-                        let denom = old_d.abs().max(1e-3);
+                        // `prepare_stored` equals `prepare_query(decompress)` only up
+                        // to R's f32 orthonormality residual (R·Rᵀ ≈ I), which is an
+                        // ABSOLUTE error on the inner product — it does NOT shrink when
+                        // a DotProduct/Cosine distance happens to land near zero. A
+                        // purely relative tolerance therefore false-fails on those
+                        // near-zero ties (~3% of runs; reproduces identically on the
+                        // pre-SIMD code). Require 2% relative agreement OR a small
+                        // absolute floor (~10× the observed residual); a genuinely
+                        // wrong sr_t path diverges by O(distance), far above the floor.
+                        let diff = (old_d - new_d).abs();
                         assert!(
-                            (old_d - new_d).abs() / denom < 0.02,
+                            diff <= 0.02 * old_d.abs() + 5e-3,
                             "prepare_stored diverged: dims={dims} bits={bits} \
-                             metric={metric:?} old={old_d} new={new_d}"
+                             metric={metric:?} old={old_d} new={new_d} diff={diff}"
                         );
                     }
                 }
