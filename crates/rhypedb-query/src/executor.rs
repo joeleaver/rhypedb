@@ -70,8 +70,11 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
     let (mut result, first_step) = match (&query.source, query.steps.first()) {
         (
             Source::All { type_name },
-            Some(Step::Similar { field_name, query: sq, k }),
-        ) => (run_similar(ctx, type_name, field_name, sq, *k, None)?, 1),
+            Some(Step::Similar { field_name, query: sq, k, ef, rerank }),
+        ) => (
+            run_similar(ctx, type_name, field_name, sq, *k, None, *ef, *rerank)?,
+            1,
+        ),
         _ => (execute_source(ctx.db, &query.source, &query.steps)?, 0),
     };
 
@@ -482,6 +485,8 @@ fn execute_step(
             field_name,
             query,
             k,
+            ef,
+            rerank,
         } => {
             // Type AND candidate set come from the live pipeline:
             // `A.filter(...).similar(...)` restricts to the filtered rows;
@@ -489,7 +494,16 @@ fn execute_step(
             // `Type.similar(...)` is handled in `execute` as a global search.)
             let (type_name, incoming_ids) = ids_from_output(current, source)?;
             let allowed: HashSet<u64> = incoming_ids.into_iter().collect();
-            run_similar(ctx, &type_name, field_name, query, *k, Some(&allowed))
+            run_similar(
+                ctx,
+                &type_name,
+                field_name,
+                query,
+                *k,
+                Some(&allowed),
+                *ef,
+                *rerank,
+            )
         }
 
         Step::Limit { count } => match current {
@@ -526,6 +540,11 @@ fn execute_step(
     }
 }
 
+/// Upper bound on the HNSW search width (`ef`) and the candidate pool a single
+/// `.similar()` query may request. Caps the cost of a hostile or fat-fingered
+/// `ef:`/`rerank:` so one query can't exhaust a small (1–4 core) deployment VM.
+const MAX_VECTOR_SEARCH_POOL: usize = 10_000;
+
 /// Run a vector similarity search over `type_name.field_name`.
 ///
 /// `restrict = None` searches the whole type (a bare `Type.similar(...)`), so
@@ -535,6 +554,7 @@ fn execute_step(
 /// An empty restriction short-circuits to no results — which also avoids
 /// calling the vectorizer with a possibly-wrong type when an upstream step
 /// emptied the pipeline after a traversal.
+#[allow(clippy::too_many_arguments)]
 fn run_similar(
     ctx: &ExecContext<'_>,
     type_name: &str,
@@ -542,6 +562,8 @@ fn run_similar(
     query: &SimilarQuery,
     k: usize,
     restrict: Option<&HashSet<u64>>,
+    ef: Option<usize>,
+    rerank: Option<usize>,
 ) -> QueryResult<QueryOutput> {
     // An empty candidate set can never match — return early before touching the
     // vectorizer, so a pipeline that emptied after a traversal doesn't trigger a
@@ -554,23 +576,39 @@ fn run_similar(
         QueryError::Type("vector similarity search requires a vectorizer".into())
     })?;
 
+    // `rerank: 0` (and the absent case) means "no full-precision rerank".
+    let rerank = rerank.filter(|&r| r > 0);
+
     // Over-fetch only when restricting (post-filtering discards some hits); a
     // global search needs just k. Heavy filtering can still yield < k results
     // (a known HNSW post-filtering limitation) — an exact small-set path is a
-    // follow-up.
-    let (search_k, ef) = match restrict {
-        Some(_) => {
-            let sk = k.saturating_mul(4).max(k);
-            (sk, sk.saturating_mul(2).max(64))
-        }
-        None => (k, k.max(50)),
+    // follow-up. `rerank: N` raises the retrieved pool to at least N so the
+    // full-precision re-score has N candidates to work over.
+    let base_k = match restrict {
+        Some(_) => k.saturating_mul(4).max(k),
+        None => k,
     };
+    let search_k = rerank
+        .map_or(base_k, |r| r.max(base_k))
+        .min(MAX_VECTOR_SEARCH_POOL);
+
+    // User-supplied `ef` overrides the heuristic. Floor it to `search_k` (HNSW
+    // can't surface more than `ef` candidates) and cap it for safety.
+    let heuristic_ef = match restrict {
+        Some(_) => search_k.saturating_mul(2).max(64),
+        None => k.max(50),
+    };
+    let ef = ef
+        .unwrap_or(heuristic_ef)
+        .max(search_k)
+        .min(MAX_VECTOR_SEARCH_POOL);
+
     let results = match query {
         SimilarQuery::Text(text) => {
-            vectorizer.search_text(type_name, field_name, text, search_k, ef)?
+            vectorizer.search_text(type_name, field_name, text, search_k, ef, rerank.is_some())?
         }
         SimilarQuery::Vector(vec) => {
-            vectorizer.search_vector(type_name, field_name, vec, search_k, ef)?
+            vectorizer.search_vector(type_name, field_name, vec, search_k, ef, rerank.is_some())?
         }
     };
 

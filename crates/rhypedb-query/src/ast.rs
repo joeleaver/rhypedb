@@ -50,12 +50,21 @@ pub enum Step {
         predicate: Predicate,
     },
 
-    /// `.similar(.field, query, k: N)` — vector similarity search.
-    /// Query can be a text string (encoded by the vectorizer) or a raw vector.
+    /// `.similar(.field, query, k: N [, ef: M] [, rerank: P])` — vector
+    /// similarity search. Query can be a text string (encoded by the
+    /// vectorizer) or a raw vector.
+    ///
+    /// `ef` overrides the HNSW search width (recall/latency knob; `None` =
+    /// engine default). `rerank` is the full-precision rerank pool size:
+    /// `Some(P)` retrieves the top-P ANN candidates and re-scores them against
+    /// the exact f32 vectors before returning the top-k (`None`/`Some(0)` =
+    /// off).
     Similar {
         field_name: String,
         query: SimilarQuery,
         k: usize,
+        ef: Option<usize>,
+        rerank: Option<usize>,
     },
 
     /// `.update({...})` — update matched objects.

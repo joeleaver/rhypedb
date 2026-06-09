@@ -9,7 +9,7 @@ use rhypedb_embed::{Embedder, FastEmbedder, FastReranker, Reranker};
 use rhypedb_schema::{FieldType, Schema, VectorizeDef};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::LsmTree;
-use rhypedb_vector::distance::Metric;
+use rhypedb_vector::distance::{compute_distance, Metric};
 use rhypedb_vector::index::QuantizedIndex;
 use rhypedb_vector::quantize::TurboQuantConfig;
 use rhypedb_vector::hnsw::HnswConfig;
@@ -595,6 +595,7 @@ impl Vectorizer {
         query_text: &str,
         k: usize,
         ef: usize,
+        rerank: bool,
     ) -> EngineResult<Vec<(u64, f32)>> {
         let index_key = format!("{type_name}.{vector_field}");
         let index = self
@@ -655,7 +656,16 @@ impl Vectorizer {
                 .unwrap_or((k * 3).min(48))
                 .max(k)
         };
-        let candidates = index.search(&query_vec[0], retrieval_k, ef.max(retrieval_k));
+        let mut candidates = index.search(&query_vec[0], retrieval_k, ef.max(retrieval_k));
+
+        // Full-precision rerank: replace the TurboQuant estimates with exact
+        // distances against the f32 vectors in the LSM. When a cross-encoder
+        // reranker also runs below it re-sorts by semantic score (so this is a
+        // no-op for that path); when it does not, the exactly-reranked order is
+        // what we return.
+        if rerank {
+            candidates = self.rerank_candidates(&index_key, &index, &query_vec[0], candidates);
+        }
 
         // Find the source field for this vector field.
         let source_field = self
@@ -716,6 +726,12 @@ impl Vectorizer {
     }
 
     /// Search a vector index with a raw vector.
+    ///
+    /// When `rerank` is set, the `k` ANN candidates are re-scored against the
+    /// full-precision f32 vectors in the LSM and returned sorted by exact
+    /// distance (see [`Vectorizer::rerank_candidates`]). The caller is expected
+    /// to have sized `k` to the desired rerank pool and to trim to the final
+    /// top-k itself.
     pub fn search_vector(
         &self,
         type_name: &str,
@@ -723,6 +739,7 @@ impl Vectorizer {
         query_vec: &[f32],
         k: usize,
         ef: usize,
+        rerank: bool,
     ) -> EngineResult<Vec<(u64, f32)>> {
         let index_key = format!("{type_name}.{vector_field}");
         let index = self
@@ -735,7 +752,76 @@ impl Vectorizer {
                 field: vector_field.into(),
             })?;
 
-        Ok(index.search(query_vec, k, ef))
+        let results = index.search(query_vec, k, ef);
+        if rerank {
+            Ok(self.rerank_candidates(&index_key, &index, query_vec, results))
+        } else {
+            Ok(results)
+        }
+    }
+
+    /// Re-score ANN candidates against the full-precision f32 vectors stored in
+    /// the LSM `v:` keyspace and return them sorted ascending by EXACT distance.
+    ///
+    /// The TurboQuant estimator reconstructs original-scale distances from each
+    /// vector's stored norm (see `quantize.rs` `distance_estimate_prepared`), so
+    /// the exact `compute_distance(index.metric(), query, f32)` computed here is
+    /// the same quantity the ANN approximates — and is exactly what
+    /// `brute_force_knn` (the recall ground truth) uses. Reranking therefore
+    /// only ever moves results toward the exact top-k.
+    ///
+    /// Robustness: candidates whose f32 is missing, corrupt, or a mismatched
+    /// dimension are scored `f32::INFINITY` so they sort last — they are never
+    /// dropped, so a rerank can never under-fill relative to the ANN result. A
+    /// single consistent snapshot is used for the whole batch. On a storage
+    /// error the ANN order is returned unchanged (rerank is a best-effort recall
+    /// boost, not a hard guarantee — failing the query would be worse).
+    fn rerank_candidates(
+        &self,
+        index_key: &str,
+        index: &QuantizedIndex,
+        query_vec: &[f32],
+        candidates: Vec<(u64, f32)>,
+    ) -> Vec<(u64, f32)> {
+        if candidates.is_empty() {
+            return candidates;
+        }
+        let (type_id, field_id) = match self.resolve_index_ids(index_key) {
+            Some(ids) => ids,
+            None => return candidates,
+        };
+        // `metric` is the metric the index was built with — using it keeps the
+        // exact re-score order-consistent with the ANN distances.
+        let metric = index.metric();
+
+        let snapshot = self.storage.read_snapshot();
+        let keys: Vec<Bytes> = candidates
+            .iter()
+            .map(|(id, _)| KeyBuilder::vector(type_id, *id, field_id))
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|b| b.as_ref()).collect();
+        let vals = match self.storage.multi_get_at(snapshot, &key_refs) {
+            Ok(vals) => vals,
+            Err(_) => return candidates,
+        };
+
+        let mut scored: Vec<(u64, f32)> = candidates
+            .iter()
+            .zip(vals)
+            .map(|(&(id, _approx), val)| {
+                let dist = val
+                    .as_deref()
+                    .and_then(deserialize_f32_vec)
+                    .filter(|v| v.len() == query_vec.len())
+                    .map(|v| compute_distance(metric, query_vec, &v))
+                    .unwrap_or(f32::INFINITY);
+                (id, dist)
+            })
+            .collect();
+        // `total_cmp` is a total order: finite distances sort ascending and the
+        // `INFINITY`-scored un-rerankable candidates fall to the end.
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+        scored
     }
 
     /// Store one vector under its `v:` key, mark it `Indexed`, and insert it
@@ -1162,7 +1248,7 @@ mod tests {
 
         // Search for ML-related content.
         let results = vectorizer
-            .search_text("Post", "embedding", "artificial intelligence", 2, 50)
+            .search_text("Post", "embedding", "artificial intelligence", 2, 50, false)
             .unwrap();
 
         assert_eq!(results.len(), 2);
@@ -1243,7 +1329,7 @@ mod tests {
 
             // Verify search works.
             let results = vectorizer
-                .search_text("Post", "embedding", "artificial intelligence", 1, 50)
+                .search_text("Post", "embedding", "artificial intelligence", 1, 50, false)
                 .unwrap();
             assert!(!results.is_empty(), "search should return results before restart");
         }
@@ -1261,7 +1347,7 @@ mod tests {
 
             // Search should work immediately — no need to re-process.
             let results = vectorizer
-                .search_text("Post", "embedding", "artificial intelligence", 1, 50)
+                .search_text("Post", "embedding", "artificial intelligence", 1, 50, false)
                 .unwrap();
             assert!(
                 !results.is_empty(),
@@ -1366,7 +1452,7 @@ mod tests {
             .unwrap();
 
             let results = vectorizer
-                .search_text("Post", "embedding", "artificial intelligence", 2, 50)
+                .search_text("Post", "embedding", "artificial intelligence", 2, 50, false)
                 .unwrap();
             assert_eq!(results.len(), 2);
             let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
@@ -1501,7 +1587,7 @@ mod tests {
         .unwrap();
 
         let results = v
-            .search_vector("Doc", "embedding", &[0.9, 0.1, 0.0, 0.0], 1, 16)
+            .search_vector("Doc", "embedding", &[0.9, 0.1, 0.0, 0.0], 1, 16, false)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1537,7 +1623,7 @@ mod tests {
         // index from the `v:` keys — no @vectorize, no embedder, no re-ingest.
         let v2 = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
         let results = v2
-            .search_vector("Doc", "embedding", &[0.1, 0.9, 0.0, 0.0], 1, 16)
+            .search_vector("Doc", "embedding", &[0.1, 0.9, 0.0, 0.0], 1, 16, false)
             .unwrap();
         assert_eq!(
             results[0].0, 2,
@@ -1574,7 +1660,7 @@ mod tests {
             "batch with a bad-dim row must error"
         );
         let results = v
-            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16)
+            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16, false)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -1615,11 +1701,96 @@ mod tests {
             "a batch containing a non-finite row must be rejected"
         );
         let results = v
-            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16)
+            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16, false)
             .unwrap();
         assert!(
             results.is_empty(),
             "no rows should have been applied after rejection, got {results:?}"
         );
+    }
+
+    // --- Full-precision rerank ---
+
+    fn rerank_setup(
+        dir: &std::path::Path,
+    ) -> (Arc<LsmTree>, Schema, HashMap<String, u64>, HashMap<String, u64>) {
+        let schema = parse_schema(
+            r#"
+            type Doc {
+                embedding: Vector<16>
+            }
+            "#,
+        )
+        .unwrap();
+        let storage = LsmTree::open(LsmConfig::new(dir)).unwrap();
+        let mut type_ids = HashMap::new();
+        type_ids.insert("Doc".into(), 1u64);
+        let mut field_ids = HashMap::new();
+        field_ids.insert("Doc.embedding".into(), 1u64);
+        (storage, schema, type_ids, field_ids)
+    }
+
+    /// Deterministic, tie-free 16-d vectors so the test is reproducible.
+    fn synth_vec(seed: f32) -> Vec<f32> {
+        (0..16).map(|j| (seed * 0.7 + j as f32 * 1.3).sin()).collect()
+    }
+
+    #[test]
+    fn rerank_reproduces_exact_cosine_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = rerank_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        let n = 40u64;
+        let rows: Vec<(u64, Vec<f32>)> = (1..=n).map(|i| (i, synth_vec(i as f32))).collect();
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+
+        let query = synth_vec(3.5);
+
+        // Ground truth: exact cosine distance over ALL vectors (the index metric
+        // is hardcoded Cosine — see Vectorizer::new). This is precisely what
+        // rerank must reproduce.
+        let mut exact: Vec<(u64, f32)> = rows
+            .iter()
+            .map(|(id, vec)| (*id, compute_distance(Metric::Cosine, &query, vec)))
+            .collect();
+        exact.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+        // Retrieve a pool covering every vector (k=n, large ef) and rerank it.
+        // With the pool >= n the reranked order IS the exact sort, so the whole
+        // distance sequence must match the brute-force ground truth. Comparing
+        // distances (not ids) is immune to ambiguous ordering at exact ties.
+        let reranked = v
+            .search_vector("Doc", "embedding", &query, n as usize, 256, true)
+            .unwrap();
+        assert_eq!(reranked.len(), n as usize, "rerank must keep the full pool");
+        for (r, e) in reranked.iter().zip(exact.iter()) {
+            assert!(
+                (r.1 - e.1).abs() < 1e-6,
+                "reranked distance {} != exact {}",
+                r.1,
+                e.1
+            );
+        }
+        assert_eq!(reranked[0].0, exact[0].0, "top-1 id must match the exact NN");
+    }
+
+    #[test]
+    fn rerank_never_underfills_when_pool_exceeds_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = rerank_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        let rows: Vec<(u64, Vec<f32>)> = (1..=5u64).map(|i| (i, synth_vec(i as f32))).collect();
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+
+        // Ask for a far larger pool than the index holds: rerank must return all
+        // 5 (no panic, no drops), sorted by exact distance. The query equals
+        // id 2's vector, so id 2 (cosine distance 0) must rank first.
+        let reranked = v
+            .search_vector("Doc", "embedding", &synth_vec(2.0), 100, 200, true)
+            .unwrap();
+        assert_eq!(reranked.len(), 5);
+        assert_eq!(reranked[0].0, 2, "exact nearest to query(seed=2) is id 2");
     }
 }

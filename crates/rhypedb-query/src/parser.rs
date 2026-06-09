@@ -13,7 +13,7 @@ use crate::error::{QueryError, QueryResult};
 ///           | IDENT ".create(" object ")"
 ///           | IDENT
 /// step      = "filter(" predicate ")"
-///           | "similar(" field "," vector "," "k:" INT ")"
+///           | "similar(" field "," vector "," "k:" INT ("," ("ef"|"rerank") ":" INT)* ")"
 ///           | "update(" object ")"
 ///           | "delete()"
 ///           | "link(" IDENT ".get(" INT ")" ["," object] ")"
@@ -539,11 +539,49 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 self.expect_str("k:")?;
                 let k = self.parse_count()?;
+
+                // Optional trailing named params: `, ef: N` and `, rerank: N`,
+                // in any order. A bare `.similar(.f, q, k: N)` parses exactly as
+                // before (the loop sees no comma and exits immediately).
+                let mut ef = None;
+                let mut rerank = None;
+                loop {
+                    self.skip_ws();
+                    if self.peek() != Some(',') {
+                        break;
+                    }
+                    self.advance(); // consume ','
+                    self.skip_ws();
+                    if self.peek() == Some(')') {
+                        break; // tolerate a trailing comma
+                    }
+                    let name = self.parse_ident()?;
+                    self.skip_ws();
+                    self.expect_char(':')?;
+                    let n = self.parse_count()?;
+                    match name.as_str() {
+                        "ef" => {
+                            if n == 0 {
+                                return Err(self.error("ef must be >= 1"));
+                            }
+                            ef = Some(n);
+                        }
+                        "rerank" => rerank = Some(n),
+                        other => {
+                            return Err(self.error(format!(
+                                "unknown similar() parameter '{other}' \
+                                 (expected 'ef' or 'rerank')"
+                            )));
+                        }
+                    }
+                }
                 self.expect_char(')')?;
                 Ok(Step::Similar {
                     field_name,
                     query,
                     k,
+                    ef,
+                    rerank,
                 })
             }
             "update" => {
@@ -718,10 +756,14 @@ mod tests {
                 field_name,
                 query,
                 k,
+                ef,
+                rerank,
             } => {
                 assert_eq!(field_name, "embedding");
                 assert_eq!(*query, SimilarQuery::Vector(vec![1.0, 2.0, 3.0]));
                 assert_eq!(*k, 10);
+                assert_eq!(*ef, None);
+                assert_eq!(*rerank, None);
             }
             _ => panic!("expected Similar step"),
         }
@@ -736,6 +778,8 @@ mod tests {
                 field_name,
                 query,
                 k,
+                ef,
+                rerank,
             } => {
                 assert_eq!(field_name, "embedding");
                 assert_eq!(
@@ -743,9 +787,61 @@ mod tests {
                     SimilarQuery::Text("distributed systems".into())
                 );
                 assert_eq!(*k, 5);
+                assert_eq!(*ef, None);
+                assert_eq!(*rerank, None);
             }
             _ => panic!("expected Similar step"),
         }
+    }
+
+    #[test]
+    fn parse_similar_with_ef_and_rerank() {
+        // Both params, vector query.
+        let q = parse_query("Post.similar(.embedding, [1.0, 0.0], k: 10, ef: 200, rerank: 50)")
+            .unwrap();
+        match &q.steps[0] {
+            Step::Similar { k, ef, rerank, .. } => {
+                assert_eq!(*k, 10);
+                assert_eq!(*ef, Some(200));
+                assert_eq!(*rerank, Some(50));
+            }
+            _ => panic!("expected Similar step"),
+        }
+
+        // Reversed order, text query, rerank then ef.
+        let q = parse_query(r#"Post.similar(.embedding, "hello", k: 3, rerank: 40, ef: 128)"#)
+            .unwrap();
+        match &q.steps[0] {
+            Step::Similar { ef, rerank, .. } => {
+                assert_eq!(*ef, Some(128));
+                assert_eq!(*rerank, Some(40));
+            }
+            _ => panic!("expected Similar step"),
+        }
+
+        // Only ef.
+        let q = parse_query("Post.similar(.embedding, [1.0, 0.0], k: 10, ef: 75)").unwrap();
+        match &q.steps[0] {
+            Step::Similar { ef, rerank, .. } => {
+                assert_eq!(*ef, Some(75));
+                assert_eq!(*rerank, None);
+            }
+            _ => panic!("expected Similar step"),
+        }
+
+        // Trailing comma is tolerated.
+        let q = parse_query("Post.similar(.embedding, [1.0, 0.0], k: 10, ef: 75,)").unwrap();
+        assert!(matches!(&q.steps[0], Step::Similar { ef: Some(75), .. }));
+    }
+
+    #[test]
+    fn parse_similar_rejects_bad_params() {
+        // Unknown parameter name.
+        assert!(parse_query("Post.similar(.embedding, [1.0, 0.0], k: 10, foo: 5)").is_err());
+        // ef must be >= 1.
+        assert!(parse_query("Post.similar(.embedding, [1.0, 0.0], k: 10, ef: 0)").is_err());
+        // Negative count is rejected by parse_count.
+        assert!(parse_query("Post.similar(.embedding, [1.0, 0.0], k: 10, rerank: -1)").is_err());
     }
 
     #[test]
