@@ -152,7 +152,7 @@ impl Vectorizer {
                         ef_construction: 100,
                         metric: Metric::Cosine,
                     };
-                    let quant_config = TurboQuantConfig::new(vt.dimensions, 3);
+                    let quant_config = TurboQuantConfig::new(vt.dimensions, 4);
                     let index = QuantizedIndex::new(hnsw_config, quant_config);
                     indexes.insert(index_key, Arc::new(index));
                 }
