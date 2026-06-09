@@ -130,19 +130,19 @@ impl TurboQuantizer {
         let projected = mat_vec_mul(&self.qjl_matrix, &residual, dims);
         let signs: Vec<bool> = projected.iter().map(|&v| v >= 0.0).collect();
 
-        CompressedVector {
-            data: bit_pack(&indices, self.config.bits),
-            qjl_signs: pack_bools(&signs),
+        CompressedVector::from_parts(
+            bit_pack(&indices, self.config.bits),
+            pack_bools(&signs),
             norm,
             residual_norm,
-        }
+        )
     }
 
     /// Decompress to approximate f32 values (MSE reconstruction only, no QJL correction).
     pub fn decompress(&self, compressed: &CompressedVector) -> Vec<f32> {
         let dims = self.config.dimensions as usize;
 
-        let indices = bit_unpack(&compressed.data, self.config.bits, dims);
+        let indices = bit_unpack(compressed.data(), self.config.bits, dims);
         let rotated: Vec<f32> = indices
             .iter()
             .map(|&i| self.codebook.centroids[i as usize])
@@ -188,7 +188,7 @@ impl TurboQuantizer {
 
         // scaled = ‖x‖ · c  (this is exactly R·x̂, the rotated query the MSE term
         // consumes — produced without the inverse-rotation matmul).
-        let indices = bit_unpack(&compressed.data, self.config.bits, dims);
+        let indices = bit_unpack(compressed.data(), self.config.bits, dims);
         let scaled: Vec<f32> = indices
             .iter()
             .map(|&i| self.codebook.centroids[i as usize] * compressed.norm)
@@ -227,13 +227,13 @@ impl TurboQuantizer {
         // pass. Summation is strictly position-ordered, so the result is
         // bit-identical to the previous materialized path.
         let mse_dot =
-            mse_dot_fused(&compressed.data, self.config.bits, &self.codebook.centroids, &prepared.rq)
+            mse_dot_fused(compressed.data(), self.config.bits, &self.codebook.centroids, &prepared.rq)
                 * compressed.norm;
 
         // QJL correction: ‖r‖ · ‖x‖ · √(π/2)/d · ⟨signs, S·q⟩ (signs are ±1, so a
         // signed sum over the pre-projected sq). Likewise fused: the sign bits are
         // applied to `sq` in place with no intermediate `Vec<bool>`.
-        let correction_dot = correction_dot_fused(&compressed.qjl_signs, &prepared.sq);
+        let correction_dot = correction_dot_fused(compressed.qjl_signs(), &prepared.sq);
 
         let qjl_scale = (std::f32::consts::FRAC_PI_2).sqrt() / dims as f32;
         let correction = compressed.residual_norm * compressed.norm * qjl_scale * correction_dot;
@@ -340,22 +340,63 @@ pub struct PreparedQuery {
 }
 
 /// A compressed vector with all components needed for the unbiased estimator.
+///
+/// The bit-packed quantized indices and the packed QJL sign bits live in ONE
+/// boxed allocation (`buf` = data bytes `[..data_len]` followed by sign bytes
+/// `[data_len..]`), not two `Vec`s. That drops a heap allocation and a `Vec`
+/// header per stored vector — one fewer allocation per HNSW node, which matters
+/// at millions of nodes (less allocator overhead/fragmentation). `Box<[u8]>` also
+/// has no spare capacity and a 16-byte header vs `Vec`'s 24. The on-disk wire
+/// format ([`Self::write_to`]) is unchanged — data and signs are still written as
+/// two length-prefixed byte runs.
 #[derive(Debug, Clone)]
 pub struct CompressedVector {
-    pub data: Vec<u8>,      // bit-packed quantized indices
-    pub qjl_signs: Vec<u8>, // packed sign bits from QJL projection
-    pub norm: f32,           // original vector L2 norm
-    pub residual_norm: f32,  // L2 norm of quantization residual (in rotated space)
+    buf: Box<[u8]>,         // data bytes [..data_len], then qjl sign bytes [data_len..]
+    data_len: u32,
+    pub norm: f32,          // original vector L2 norm
+    pub residual_norm: f32, // L2 norm of quantization residual (in rotated space)
 }
 
 impl CompressedVector {
+    /// Bit-packed quantized indices.
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        &self.buf[..self.data_len as usize]
+    }
+
+    /// Packed QJL projection sign bits.
+    #[inline]
+    pub fn qjl_signs(&self) -> &[u8] {
+        &self.buf[self.data_len as usize..]
+    }
+
+    /// Resident heap bytes of the packed codes (data + signs), excluding the
+    /// inline struct fields (which the caller counts as node overhead).
+    pub fn heap_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Concatenate separate data + sign byte buffers into the single backing
+    /// allocation.
+    fn from_parts(data: Vec<u8>, qjl_signs: Vec<u8>, norm: f32, residual_norm: f32) -> Self {
+        let data_len = data.len() as u32;
+        let mut buf = data;
+        buf.extend_from_slice(&qjl_signs);
+        Self {
+            buf: buf.into_boxed_slice(),
+            data_len,
+            norm,
+            residual_norm,
+        }
+    }
+
     pub fn total_bytes(&self) -> usize {
-        self.data.len() + self.qjl_signs.len() + 8 // + 2 f32 norms
+        self.buf.len() + 8 // + 2 f32 norms
     }
 
     pub fn write_to(&self, w: &mut dyn io::Write) -> io::Result<()> {
-        write_byte_vec(w, &self.data)?;
-        write_byte_vec(w, &self.qjl_signs)?;
+        write_byte_vec(w, self.data())?;
+        write_byte_vec(w, self.qjl_signs())?;
         write_f32(w, self.norm)?;
         write_f32(w, self.residual_norm)
     }
@@ -365,12 +406,7 @@ impl CompressedVector {
         let qjl_signs = read_byte_vec(r)?;
         let norm = read_f32(r)?;
         let residual_norm = read_f32(r)?;
-        Ok(Self {
-            data,
-            qjl_signs,
-            norm,
-            residual_norm,
-        })
+        Ok(Self::from_parts(data, qjl_signs, norm, residual_norm))
     }
 }
 
@@ -978,8 +1014,8 @@ mod tests {
         compressed.write_to(&mut buf).unwrap();
         let restored = CompressedVector::read_from(&mut &buf[..]).unwrap();
 
-        assert_eq!(compressed.data, restored.data);
-        assert_eq!(compressed.qjl_signs, restored.qjl_signs);
+        assert_eq!(compressed.data(), restored.data());
+        assert_eq!(compressed.qjl_signs(), restored.qjl_signs());
         assert_eq!(compressed.norm, restored.norm);
         assert_eq!(compressed.residual_norm, restored.residual_norm);
     }
@@ -1021,14 +1057,14 @@ mod tests {
                     let cv = quantizer.compress(&target);
 
                     // Reference: the exact computation the kernel used to perform.
-                    let indices = bit_unpack(&cv.data, bits, dims);
+                    let indices = bit_unpack(cv.data(), bits, dims);
                     let ref_mse: f32 = indices
                         .iter()
                         .zip(prepared.rq.iter())
                         .map(|(&i, &rqi)| quantizer.codebook.centroids[i as usize] * rqi)
                         .sum::<f32>()
                         * cv.norm;
-                    let sgns = unpack_bools(&cv.qjl_signs, dims);
+                    let sgns = unpack_bools(cv.qjl_signs(), dims);
                     let ref_corr_dot: f32 = sgns
                         .iter()
                         .zip(prepared.sq.iter())

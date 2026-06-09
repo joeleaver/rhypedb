@@ -53,9 +53,9 @@ impl DistanceProvider for TurboQuantDistance {
     }
 
     fn stored_bytes(stored: &CompressedVector) -> usize {
-        // Heap allocations only (codes + QJL signs); the inline struct (Vec
-        // headers + the two f32 norms) is counted in node_overhead.
-        stored.data.len() + stored.qjl_signs.len()
+        // Heap allocation only (codes + QJL signs share one buffer); the inline
+        // struct (the boxed-slice header + the two f32 norms) is node_overhead.
+        stored.heap_bytes()
     }
 }
 
