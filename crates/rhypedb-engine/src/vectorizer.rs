@@ -821,6 +821,24 @@ impl Vectorizer {
         // `total_cmp` is a total order: finite distances sort ascending and the
         // `INFINITY`-scored un-rerankable candidates fall to the end.
         scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+        if std::env::var_os("RHYPEDB_DEBUG_RERANK").is_some() {
+            let missing = scored.iter().filter(|(_, d)| d.is_infinite()).count();
+            let finite: Vec<f32> = scored
+                .iter()
+                .map(|(_, d)| *d)
+                .filter(|d| d.is_finite())
+                .collect();
+            let (min, max) = (
+                finite.first().copied().unwrap_or(f32::NAN),
+                finite.last().copied().unwrap_or(f32::NAN),
+            );
+            eprintln!(
+                "[rerank] key={index_key} qdim={} n={} missing={missing} dist_min={min:.5} dist_max={max:.5} top3={:?}",
+                query_vec.len(),
+                scored.len(),
+                &scored[..scored.len().min(3)]
+            );
+        }
         scored
     }
 
@@ -1773,6 +1791,72 @@ mod tests {
             );
         }
         assert_eq!(reranked[0].0, exact[0].0, "top-1 id must match the exact NN");
+    }
+
+    // Reproduces the benchmark conditions in-process: a higher-dim index, a
+    // candidate pool SMALLER than the index, and recall measured against an
+    // in-test brute-force ground truth. Rerank over a pool must NEVER score
+    // below the plain ANN top-k drawn from the same exploration width.
+    #[test]
+    fn rerank_recall_beats_or_matches_ann_on_subset_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema("type Doc {\n embedding: Vector<64>\n}").unwrap();
+        let storage = LsmTree::open(LsmConfig::new(dir.path())).unwrap();
+        let mut type_ids = HashMap::new();
+        type_ids.insert("Doc".into(), 1u64);
+        let mut field_ids = HashMap::new();
+        field_ids.insert("Doc.embedding".into(), 1u64);
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        // 2000 deterministic unit vectors in 64-d (a few loose clusters).
+        let dims = 64usize;
+        let n = 2000u64;
+        let unit = |seed: f32| -> Vec<f32> {
+            let raw: Vec<f32> = (0..dims)
+                .map(|j| (seed * 0.13 + j as f32 * 0.37).sin() + (seed * 0.05).cos())
+                .collect();
+            let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            raw.iter().map(|x| x / norm).collect()
+        };
+        let rows: Vec<(u64, Vec<f32>)> = (1..=n).map(|i| (i, unit(i as f32))).collect();
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+
+        let k = 10usize;
+        let pool = 200usize; // candidate pool << n, like the bench
+        let mut q_seed = 0.5f32;
+        let (mut ann_hits, mut rr_hits, mut total) = (0usize, 0usize, 0usize);
+        for _ in 0..40 {
+            q_seed += 1.7;
+            let query = unit(q_seed);
+
+            // Brute-force cosine ground truth over ALL vectors.
+            let mut gt: Vec<(u64, f32)> = rows
+                .iter()
+                .map(|(id, vec)| (*id, compute_distance(Metric::Cosine, &query, vec)))
+                .collect();
+            gt.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let gt_set: std::collections::HashSet<u64> =
+                gt.iter().take(k).map(|(id, _)| *id).collect();
+
+            // Plain ANN top-k vs rerank over a `pool`-sized candidate set, both
+            // at the SAME exploration width (ef = pool).
+            let ann = v
+                .search_vector("Doc", "embedding", &query, k, pool, false)
+                .unwrap();
+            let rr = v
+                .search_vector("Doc", "embedding", &query, pool, pool, true)
+                .unwrap();
+            ann_hits += ann.iter().take(k).filter(|(id, _)| gt_set.contains(id)).count();
+            rr_hits += rr.iter().take(k).filter(|(id, _)| gt_set.contains(id)).count();
+            total += k;
+        }
+        let ann_recall = ann_hits as f32 / total as f32;
+        let rr_recall = rr_hits as f32 / total as f32;
+        eprintln!("subset-pool recall: ann={ann_recall:.4} rerank={rr_recall:.4}");
+        assert!(
+            rr_recall >= ann_recall - 1e-6,
+            "rerank recall {rr_recall} must not drop below plain ANN {ann_recall}"
+        );
     }
 
     #[test]

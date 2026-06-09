@@ -59,6 +59,8 @@ def run_rhypedb(
     insert_chunk: int,
     server_pattern: str,
     data_dir: str | None = None,
+    ef: int | None = None,
+    rerank: int | None = None,
 ) -> common.ScenarioResult:
     """Connects to an ALREADY-RUNNING rhypedb server whose schema declares
     `type Vec { embedding: Vector<D> }` with D == ds.dim. The caller (a driver
@@ -75,8 +77,17 @@ def run_rhypedb(
             "n_queries": n_queries,
             "hnsw_m": HNSW_M,
             "hnsw_ef_construction": HNSW_EF_CONSTRUCTION,
+            "rhypedb_ef": ef,
+            "rhypedb_rerank": rerank,
         },
     )
+
+    # Optional `.similar()` recall knobs (defaults reproduce the pre-knob query).
+    similar_params = ""
+    if ef:
+        similar_params += f", ef: {ef}"
+    if rerank:
+        similar_params += f", rerank: {rerank}"
 
     server_pid = common.find_pid(server_pattern)
     result.rss_cold_mb = common.rss_mb(server_pid) if server_pid else 0.0
@@ -122,7 +133,9 @@ def run_rhypedb(
         for qi in range(len(test)):
             q = _fmt_vec(test[qi])
             op_start = common.time_ns()
-            resp = client.query(f"Vec.similar(.embedding, {q}, k: {k})")
+            resp = client.query(
+                f"Vec.similar(.embedding, {q}, k: {k}{similar_params})"
+            )
             result.operation_latency_ns.append(common.time_ns() - op_start)
             if resp.get("error"):
                 raise RuntimeError(f"similar: {resp['error']}")
@@ -275,6 +288,10 @@ def main() -> None:
     parser.add_argument("--queries", type=int, default=1000, help="number of query vectors")
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--ef-search", type=int, default=100, help="pgvector hnsw.ef_search")
+    parser.add_argument("--rhypedb-ef", type=int, default=0,
+                        help="rhypedb .similar() ef override (0 = engine default)")
+    parser.add_argument("--rhypedb-rerank", type=int, default=0,
+                        help="rhypedb .similar() full-precision rerank pool (0 = off)")
     parser.add_argument("--insert-chunk", type=int, default=5000)
     parser.add_argument("--impl", default="tcp,pg", help="comma list: tcp,pg")
     parser.add_argument("--server-pattern", default="vecbench-rhypedb-data",
@@ -301,7 +318,9 @@ def main() -> None:
         t0 = time.time()
         results.append(run_rhypedb(ds, args.tcp_host, args.tcp_port,
                                    args.k, n_queries, args.insert_chunk, args.server_pattern,
-                                   data_dir=args.data_dir))
+                                   data_dir=args.data_dir,
+                                   ef=args.rhypedb_ef or None,
+                                   rerank=args.rhypedb_rerank or None))
         print(f"  rhypedb done in {time.time() - t0:.1f}s")
     if "pg" in impls:
         print("Running pgvector...")

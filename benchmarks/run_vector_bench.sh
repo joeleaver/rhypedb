@@ -49,11 +49,20 @@ echo "server up pid=$SRV"
 
 # 4) Run the scenario (connects to the running server) + tear down.
 # pgvector ef_search matched to rhypedb's internal `.similar` ef (= k.max(50)).
+# RHYPEDB_EF / RHYPEDB_RERANK (env, default 0/off) drive the new `.similar`
+# recall knobs; a non-default value is tagged into the output filename so an
+# A/B (baseline vs rerank) run doesn't clobber.
 EF_SEARCH="${5:-50}"
-OUT="benchmarks/results/scenario_09_${DATASET}_${SUBSET}.json"
+RHYPEDB_EF="${RHYPEDB_EF:-0}"
+RHYPEDB_RERANK="${RHYPEDB_RERANK:-0}"
+TAG=""
+[[ "$RHYPEDB_EF" != "0" ]] && TAG="${TAG}_ef${RHYPEDB_EF}"
+[[ "$RHYPEDB_RERANK" != "0" ]] && TAG="${TAG}_rerank${RHYPEDB_RERANK}"
+OUT="benchmarks/results/scenario_09_${DATASET}_${SUBSET}${TAG}.json"
 .venv-bench/bin/python -m benchmarks.suite1.scenario_09_vector \
   --dataset "$DATASET" --subset "$SUBSET" --queries "$QUERIES" --k "$K" \
-  --ef-search "$EF_SEARCH" --tcp-port "$TCP_PORT" --impl tcp,pg \
+  --ef-search "$EF_SEARCH" --rhypedb-ef "$RHYPEDB_EF" --rhypedb-rerank "$RHYPEDB_RERANK" \
+  --tcp-port "$TCP_PORT" --impl "${IMPL:-tcp,pg}" \
   --data-dir "$DATA" --out "$OUT"
 RC=$?
 

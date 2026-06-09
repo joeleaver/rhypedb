@@ -561,12 +561,20 @@ impl<'a> Parser<'a> {
                     let n = self.parse_count()?;
                     match name.as_str() {
                         "ef" => {
+                            if ef.is_some() {
+                                return Err(self.error("duplicate 'ef' parameter"));
+                            }
                             if n == 0 {
                                 return Err(self.error("ef must be >= 1"));
                             }
                             ef = Some(n);
                         }
-                        "rerank" => rerank = Some(n),
+                        "rerank" => {
+                            if rerank.is_some() {
+                                return Err(self.error("duplicate 'rerank' parameter"));
+                            }
+                            rerank = Some(n);
+                        }
                         other => {
                             return Err(self.error(format!(
                                 "unknown similar() parameter '{other}' \
