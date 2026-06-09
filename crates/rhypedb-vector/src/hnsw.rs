@@ -8,7 +8,11 @@ use rand::Rng;
 use crate::distance::{compute_distance, Metric};
 
 const HNSW_MAGIC: &[u8; 4] = b"RHNS";
-const HNSW_VERSION: u32 = 1;
+// v2: neighbor lists store internal node indices (u32) instead of external IDs
+// (u64). v1 snapshots are rejected on load; the engine then rebuilds the index
+// from the f32 vectors in the LSM `v:` keyspace (the source of truth), so the
+// format change is safe across upgrades and rollbacks.
+const HNSW_VERSION: u32 = 2;
 
 use crate::serial::{
     read_f32_vec, read_i64, read_u32, read_u64, read_u8, write_f32_slice, write_i64, write_u32,
@@ -141,7 +145,7 @@ impl DistanceProvider for ExactDistance {
 struct Node<S> {
     id: u64,
     stored: S,
-    neighbors: Vec<Vec<u64>>, // neighbors[layer] = list of neighbor IDs
+    neighbors: Vec<Vec<u32>>, // neighbors[layer] = internal node indices
     deleted: bool,
 }
 
@@ -198,6 +202,14 @@ impl<D: DistanceProvider> HnswIndex<D> {
 
         let mut nodes = self.nodes.write();
         let node_idx = nodes.len();
+        // Neighbor lists are stored as u32 internal indices; a single index must
+        // fit in u32. 2^32 nodes would need ~860 GB just for codes, so this is a
+        // structural invariant, never a real limit — but assert to rule out silent
+        // graph corruption from a wrapped index.
+        assert!(
+            node_idx <= u32::MAX as usize,
+            "HNSW index exceeds u32 node capacity ({node_idx} nodes)"
+        );
         nodes.push(node);
         drop(nodes);
 
@@ -236,12 +248,12 @@ impl<D: DistanceProvider> HnswIndex<D> {
                 self.config.m
             };
 
-            let neighbors: Vec<u64> = candidates
+            // `candidates` already holds node *indices*; store them directly as
+            // the neighbor list — no id resolution, no per-candidate lock.
+            let neighbors: Vec<u32> = candidates
                 .iter()
                 .take(max_neighbors)
-                .map(|&(_, idx)| {
-                    self.nodes.read()[idx].id
-                })
+                .map(|&(_, idx)| idx as u32)
                 .collect();
 
             {
@@ -250,12 +262,12 @@ impl<D: DistanceProvider> HnswIndex<D> {
             }
 
             // Add bidirectional connections with pruning.
-            for &neighbor_id in &neighbors {
-                let neighbor_idx = self.id_to_idx.read()[&neighbor_id];
+            for &neighbor_idx in &neighbors {
+                let neighbor_idx = neighbor_idx as usize;
                 let mut nodes = self.nodes.write();
 
                 if layer < nodes[neighbor_idx].neighbors.len() {
-                    nodes[neighbor_idx].neighbors[layer].push(id);
+                    nodes[neighbor_idx].neighbors[layer].push(node_idx as u32);
 
                     if nodes[neighbor_idx].neighbors[layer].len() > max_neighbors {
                         // Prepare the fixed neighbor vector once, then score all of
@@ -263,19 +275,19 @@ impl<D: DistanceProvider> HnswIndex<D> {
                         // matvecs out of the inner loop.
                         let prepared =
                             self.distance.prepare_stored(&nodes[neighbor_idx].stored);
-                        let mut scored: Vec<(f32, u64)> = nodes[neighbor_idx].neighbors[layer]
+                        let mut scored: Vec<(f32, u32)> = nodes[neighbor_idx].neighbors[layer]
                             .iter()
-                            .map(|&nid| {
-                                let nidx = self.id_to_idx.read()[&nid];
-                                let dist =
-                                    self.distance.distance(&prepared, &nodes[nidx].stored);
-                                (dist, nid)
+                            .map(|&nidx| {
+                                let dist = self
+                                    .distance
+                                    .distance(&prepared, &nodes[nidx as usize].stored);
+                                (dist, nidx)
                             })
                             .collect();
                         scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                         scored.truncate(max_neighbors);
                         nodes[neighbor_idx].neighbors[layer] =
-                            scored.into_iter().map(|(_, nid)| nid).collect();
+                            scored.into_iter().map(|(_, nidx)| nidx).collect();
                     }
                 }
             }
@@ -347,14 +359,14 @@ impl<D: DistanceProvider> HnswIndex<D> {
     pub fn memory_bytes(&self) -> IndexMemory {
         let nodes = self.nodes.read();
         let node_struct = std::mem::size_of::<Node<D::Stored>>();
-        let vec_hdr = std::mem::size_of::<Vec<u64>>();
+        let vec_hdr = std::mem::size_of::<Vec<u32>>();
         let mut stored_bytes = 0usize;
         let mut graph_bytes = 0usize;
         for node in nodes.iter() {
             stored_bytes += D::stored_bytes(&node.stored);
             graph_bytes += node.neighbors.capacity() * vec_hdr;
             for layer in &node.neighbors {
-                graph_bytes += layer.capacity() * std::mem::size_of::<u64>();
+                graph_bytes += layer.capacity() * std::mem::size_of::<u32>();
             }
         }
         let n = nodes.len();
@@ -402,8 +414,8 @@ impl<D: DistanceProvider> HnswIndex<D> {
             write_u32(w, node.neighbors.len() as u32)?;
             for layer_neighbors in &node.neighbors {
                 write_u32(w, layer_neighbors.len() as u32)?;
-                for &neighbor_id in layer_neighbors {
-                    write_u64(w, neighbor_id)?;
+                for &neighbor_idx in layer_neighbors {
+                    write_u32(w, neighbor_idx)?;
                 }
             }
             self.distance.write_stored(&node.stored, w)?;
@@ -464,7 +476,7 @@ impl<D: DistanceProvider> HnswIndex<D> {
                 let num_neighbors = read_u32(r)? as usize;
                 let mut layer_neighbors = Vec::with_capacity(num_neighbors);
                 for _ in 0..num_neighbors {
-                    layer_neighbors.push(read_u64(r)?);
+                    layer_neighbors.push(read_u32(r)?);
                 }
                 neighbors.push(layer_neighbors);
             }
@@ -510,15 +522,13 @@ impl<D: DistanceProvider> HnswIndex<D> {
             let mut changed = false;
 
             if layer < nodes[current].neighbors.len() {
-                for &neighbor_id in &nodes[current].neighbors[layer] {
-                    if let Some(&neighbor_idx) = self.id_to_idx.read().get(&neighbor_id) {
-                        let dist =
-                            self.distance.distance(query, &nodes[neighbor_idx].stored);
-                        if dist < current_dist {
-                            current = neighbor_idx;
-                            current_dist = dist;
-                            changed = true;
-                        }
+                for &neighbor_idx in &nodes[current].neighbors[layer] {
+                    let neighbor_idx = neighbor_idx as usize;
+                    let dist = self.distance.distance(query, &nodes[neighbor_idx].stored);
+                    if dist < current_dist {
+                        current = neighbor_idx;
+                        current_dist = dist;
+                        changed = true;
                     }
                 }
             }
@@ -557,10 +567,9 @@ impl<D: DistanceProvider> HnswIndex<D> {
             }
 
             if layer < nodes[c_idx].neighbors.len() {
-                for &neighbor_id in &nodes[c_idx].neighbors[layer] {
-                    if let Some(&neighbor_idx) = self.id_to_idx.read().get(&neighbor_id)
-                        && visited.insert(neighbor_idx)
-                    {
+                for &neighbor_idx in &nodes[c_idx].neighbors[layer] {
+                    let neighbor_idx = neighbor_idx as usize;
+                    if visited.insert(neighbor_idx) {
                         let dist = self
                             .distance
                             .distance(query, &nodes[neighbor_idx].stored);
@@ -867,6 +876,20 @@ mod tests {
         let distance = ExactDistance { metric: Metric::L2 };
         let result = HnswIndex::load(&mut &buf[..], distance);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_rejects_v1_snapshot() {
+        // v1 stored neighbor lists as u64 external IDs; v2 stores u32 internal
+        // indices. A v1 snapshot must be rejected (the version check fires before
+        // any node bytes are read) so the engine rebuilds the index from the LSM's
+        // f32 vectors rather than misinterpreting the on-disk layout.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(HNSW_MAGIC);
+        write_u32(&mut buf, 1).unwrap();
+        let distance = ExactDistance { metric: Metric::L2 };
+        let result = HnswIndex::load(&mut &buf[..], distance);
+        assert!(result.is_err(), "v1 HNSW snapshot must be rejected");
     }
 
     #[test]
