@@ -379,8 +379,19 @@ impl CompressedVector {
     /// Concatenate separate data + sign byte buffers into the single backing
     /// allocation.
     fn from_parts(data: Vec<u8>, qjl_signs: Vec<u8>, norm: f32, residual_norm: f32) -> Self {
+        // data_len is u32; data is bit_pack output = (dims*bits).div_ceil(8) which
+        // is well under u32::MAX for any real dim/bit-width, but assert the split
+        // invariant so a future change can't silently truncate the offset.
+        debug_assert!(
+            data.len() <= u32::MAX as usize,
+            "compressed data length exceeds u32"
+        );
         let data_len = data.len() as u32;
+        // Reuse data's buffer and reserve exactly the signs up front, so the
+        // extend doesn't grow past len and into_boxed_slice doesn't reallocate —
+        // one allocation, no transient realloc+copy on the per-vector build path.
         let mut buf = data;
+        buf.reserve_exact(qjl_signs.len());
         buf.extend_from_slice(&qjl_signs);
         Self {
             buf: buf.into_boxed_slice(),
