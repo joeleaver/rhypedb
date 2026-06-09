@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -886,6 +887,16 @@ impl LsmTree {
         // Since each SST is already sorted and SSTs are ordered oldest→newest,
         // we collect all entries and sort. For a production system you'd use
         // a merge iterator, but this is correct and simple.
+        // Capture the EXACT set of SSTs being merged while still holding the
+        // read lock. `flush()` only ever APPENDS to `sst_files`, and the read
+        // lock blocks it from doing so right now — so any SST that appears after
+        // we `drop(ssts)` is a flush that raced the (lock-free) merge below and
+        // carries committed data we must NEITHER merge NOR delete. The old code
+        // replaced the whole list (`clear()`) and deleted every file, silently
+        // destroying those concurrently-flushed SSTs.
+        let merged_paths: Vec<PathBuf> =
+            ssts.iter().map(|s| s.path().to_path_buf()).collect();
+
         let mut all_entries: Vec<(Bytes, Option<Bytes>)> = Vec::new();
         for sst in ssts.iter() {
             for entry in sst.iter() {
@@ -944,30 +955,50 @@ impl LsmTree {
 
         let meta = writer.finish()?;
 
+        // The exact set of files we merged (captured under the read lock). Any
+        // SST NOT in this set was flushed concurrently and must be preserved.
+        let merged: HashSet<&Path> = merged_paths.iter().map(|p| p.as_path()).collect();
+
         if meta.entry_count == 0 {
-            // All entries were compacted away — remove the empty SST.
+            // Everything we merged was compacted away — drop the empty output
+            // and the merged SSTs, but KEEP any concurrently-flushed SSTs.
             let _ = std::fs::remove_file(&sst_path);
-            // Remove old SSTs.
-            let mut ssts = self.sst_files.write();
-            let old_paths: Vec<_> = ssts.iter().map(|s| s.path().to_path_buf()).collect();
-            ssts.clear();
-            drop(ssts);
-            for path in old_paths {
+            {
+                let mut ssts = self.sst_files.write();
+                let kept: Vec<SstReader> = std::mem::take(&mut *ssts)
+                    .into_iter()
+                    .filter(|s| !merged.contains(s.path()))
+                    .collect();
+                *ssts = kept;
+            }
+            for path in &merged_paths {
                 let _ = std::fs::remove_file(path);
             }
             return Ok(());
         }
 
-        // Swap old SSTs for the new compacted one.
+        // Swap the merged SSTs for the new compacted one, PRESERVING any SST
+        // flushed while the merge ran. The merged SST holds the oldest data, so
+        // it goes first; concurrently-flushed (newer) SSTs follow, keeping
+        // `sst_files` oldest→newest so point reads' newest-first `.rev()` and the
+        // scan readers' oldest-first BTreeMap merge both resolve the newest
+        // version of every key. (On restart, `open()` re-sorts SSTs by file id;
+        // since the merged output id is allocated after the snapshot, the order
+        // is reproduced for append-only data and self-heals via version-dedup on
+        // the next compaction for the rare key updated mid-compaction.)
         let new_reader = SstReader::open(&sst_path)?;
-        let mut ssts = self.sst_files.write();
-        let old_paths: Vec<_> = ssts.iter().map(|s| s.path().to_path_buf()).collect();
-        ssts.clear();
-        ssts.push(new_reader);
-        drop(ssts);
+        {
+            let mut ssts = self.sst_files.write();
+            let kept: Vec<SstReader> = std::mem::take(&mut *ssts)
+                .into_iter()
+                .filter(|s| !merged.contains(s.path()))
+                .collect();
+            ssts.push(new_reader);
+            ssts.extend(kept);
+        }
 
-        // Delete old SST files.
-        for path in old_paths {
+        // Delete ONLY the files we actually merged.
+        for path in &merged_paths {
             let _ = std::fs::remove_file(path);
         }
 
@@ -1086,6 +1117,93 @@ mod tests {
             // tests below opt this back on to exercise the worker.
             background_compaction: false,
         }
+    }
+
+    // Regression: background compaction must not drop committed data. With
+    // small flushes + background compaction, the writer flushes new SSTs WHILE
+    // the compaction worker is merging an earlier snapshot. The buggy
+    // `compact_inner` `clear()`d the whole SST list and deleted every file at
+    // swap time, destroying those concurrently-flushed SSTs (and their data was
+    // already out of the WAL) — so both point reads AND scans lost ~77% of keys.
+    // This drives that race hard and asserts every key survives, including
+    // across a reopen (durability).
+    #[test]
+    fn compaction_preserves_concurrently_flushed_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 16 * 1024, // force many flushes
+            compact_trigger_ssts: 4,        // and background compaction -> merge
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: true,
+        };
+        let tree = LsmTree::open(cfg).unwrap();
+
+        let n: u64 = 20_000;
+        let val = Bytes::from(vec![7u8; 256]);
+        let key = |id: u64| {
+            let mut k = b"v:".to_vec();
+            k.extend_from_slice(&id.to_be_bytes());
+            k
+        };
+        // Commit in batches, like the ingest path.
+        for chunk in (0..n).collect::<Vec<_>>().chunks(2000) {
+            let mut txn = tree.begin_txn();
+            for &id in chunk {
+                tree.put(&mut txn, &key(id), val.clone()).unwrap();
+            }
+            tree.commit(&mut txn).unwrap();
+        }
+
+        let count_misses = || {
+            let snap = tree.read_snapshot();
+            let mut miss_single = 0;
+            for id in 0..n {
+                if tree.get_at(snap, &key(id)).unwrap().is_none() {
+                    miss_single += 1;
+                }
+            }
+            let keys: Vec<Vec<u8>> = (0..n).map(key).collect();
+            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+            let batch = tree.multi_get_at(snap, &refs).unwrap();
+            let miss_batch = batch.iter().filter(|v| v.is_none()).count();
+            (miss_single, miss_batch)
+        };
+
+        // Read immediately (possibly mid-compaction) — the query does not wait.
+        let (ms_imm, mb_imm) = count_misses();
+        // Then quiesce compaction and read again.
+        tree.wait_for_compaction();
+        let (ms_settled, mb_settled) = count_misses();
+        // Scans must also see every key (data is on disk, not just point-read).
+        let snap = tree.read_snapshot();
+        let scanned = tree.scan_prefix_at(snap, b"v:").unwrap().len();
+
+        assert_eq!(
+            (ms_imm, mb_imm, ms_settled, mb_settled),
+            (0, 0, 0, 0),
+            "point reads lost committed keys after background compaction"
+        );
+        assert_eq!(scanned, n as usize, "scan lost committed keys after compaction");
+
+        // Durability: reopen the tree from disk and confirm nothing was lost.
+        drop(tree);
+        let reopened = LsmTree::open(LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 16 * 1024,
+            compact_trigger_ssts: 4,
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: false,
+        })
+        .unwrap();
+        let snap = reopened.read_snapshot();
+        let reopened_scanned = reopened.scan_prefix_at(snap, b"v:").unwrap().len();
+        assert_eq!(
+            reopened_scanned, n as usize,
+            "keys lost across reopen after background compaction"
+        );
     }
 
     #[test]
