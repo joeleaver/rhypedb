@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 parking_lot = { workspace = true }
+boxcar = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 

@@ -125,13 +125,6 @@ pub struct Vectorizer {
     running: Arc<AtomicBool>,
     worker_handles: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
     claim_mutex: parking_lot::Mutex<()>,
-    /// Serializes HNSW `index.insert` calls. `HnswIndex::insert` is not atomic
-    /// (it wires bidirectional neighbors across several independent lock
-    /// acquisitions), so two concurrent inserts into the same index can corrupt
-    /// graph connectivity. Inserts were historically single-threaded (one embed
-    /// worker); BYO `ingest_vectors` adds a concurrent surface (one task per TCP
-    /// connection), so all inserts take this lock.
-    insert_lock: parking_lot::Mutex<()>,
 }
 
 impl Vectorizer {
@@ -192,7 +185,6 @@ impl Vectorizer {
             running: Arc::new(AtomicBool::new(false)),
             worker_handles: parking_lot::Mutex::new(Vec::new()),
             claim_mutex: parking_lot::Mutex::new(()),
-            insert_lock: parking_lot::Mutex::new(()),
         };
 
         vectorizer.rebuild_indexes()?;
@@ -280,14 +272,13 @@ impl Vectorizer {
         };
 
         let vectors = self.scan_vectors_for_field(type_id, field_id)?;
-        let mut delta = 0usize;
-
-        for (object_id, vector) in &vectors {
-            if !index.contains_id(*object_id) {
-                index.insert(*object_id, vector);
-                delta += 1;
-            }
-        }
+        // Only the vectors not already in the loaded index; insert them in parallel.
+        let missing: Vec<(u64, Vec<f32>)> = vectors
+            .into_iter()
+            .filter(|(object_id, _)| !index.contains_id(*object_id))
+            .collect();
+        let delta = missing.len();
+        index.insert_parallel(&missing);
 
         Ok(delta)
     }
@@ -305,11 +296,10 @@ impl Vectorizer {
         };
 
         let vectors = self.scan_vectors_for_field(type_id, field_id)?;
-        for (object_id, vector) in &vectors {
-            index.insert(*object_id, vector);
-        }
+        let count = vectors.len();
+        index.insert_parallel(&vectors);
 
-        Ok(vectors.len())
+        Ok(count)
     }
 
     fn resolve_index_ids(&self, index_key: &str) -> Option<(u64, u64)> {
@@ -768,10 +758,10 @@ impl Vectorizer {
                 type_name: type_name.into(),
                 field: vector_field.into(),
             })?;
-        {
-            let _guard = self.insert_lock.lock();
-            index.insert(object_id, vector);
-        }
+        // `HnswIndex::insert` is safe to call concurrently (per-node locks, no
+        // global graph lock), so the embed worker and any in-flight `ingest_vectors`
+        // may insert at once without a serializing lock.
+        index.insert(object_id, vector);
 
         let type_id = self.type_ids[type_name];
         let field_id = self.field_ids[&index_key];
@@ -858,14 +848,9 @@ impl Vectorizer {
         let type_id = self.type_ids[type_name];
         let field_id = self.field_ids[&index_key];
 
-        // All HNSW inserts for the batch under the insert lock (serialized vs
-        // other ingests + the embed worker), then persist outside the lock.
-        {
-            let _guard = self.insert_lock.lock();
-            for (object_id, vector) in rows {
-                index.insert(*object_id, vector);
-            }
-        }
+        // Build the HNSW edges for the whole batch in parallel across cores
+        // (inserts are concurrency-safe), then persist outside the index.
+        index.insert_parallel(rows);
         let mut txn = self.storage.begin_txn();
         for (object_id, vector) in rows {
             self.storage.put(

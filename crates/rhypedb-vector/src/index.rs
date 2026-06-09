@@ -95,6 +95,13 @@ impl QuantizedIndex {
         self.hnsw.insert(id, vector);
     }
 
+    /// Insert a batch of vectors in parallel across available cores. See
+    /// [`HnswIndex::insert_parallel`] — concurrent inserts are safe (per-node
+    /// locks) and the graph is topologically equivalent to a serial build.
+    pub fn insert_parallel(&self, items: &[(u64, Vec<f32>)]) {
+        self.hnsw.insert_parallel(items);
+    }
+
     /// Search for the k nearest neighbors using TurboQuant distance estimates.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         self.hnsw.search(query, k, ef)

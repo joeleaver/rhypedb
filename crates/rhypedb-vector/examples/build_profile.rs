@@ -54,24 +54,33 @@ fn main() {
     }
     let t_prepare = t.elapsed().as_secs_f64();
 
-    // 3) full index build (compress + prepare + search_layer + prune + link + locks).
-    let index = QuantizedIndex::new(
-        HnswConfig { m: 16, m_max0: 32, ef_construction: 100, metric: Metric::Cosine },
-        cfg,
-    );
+    // 3) full SERIAL index build.
+    let hnsw_cfg = HnswConfig { m: 16, m_max0: 32, ef_construction: 100, metric: Metric::Cosine };
+    let index = QuantizedIndex::new(hnsw_cfg.clone(), cfg.clone());
     let t = Instant::now();
     for (i, v) in vecs.iter().enumerate() {
         index.insert(i as u64, v);
     }
     let t_build = t.elapsed().as_secs_f64();
 
+    // 4) full PARALLEL index build (per-node-locked fine-grained insert).
+    let items: Vec<(u64, Vec<f32>)> =
+        vecs.iter().enumerate().map(|(i, v)| (i as u64, v.clone())).collect();
+    let index_p = QuantizedIndex::new(hnsw_cfg, cfg);
+    let t = Instant::now();
+    index_p.insert_parallel(&items);
+    let t_build_p = t.elapsed().as_secs_f64();
+    let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(1);
+    assert_eq!(index_p.len(), n, "parallel build dropped vectors");
+
     let graph = t_build - t_compress - t_prepare;
     let us = |s: f64| s / n as f64 * 1e6;
     println!("--- build profile  n={n} dims={dims} bits={bits} ---");
     println!("  compress():        {t_compress:8.2}s  ({:7.1} us/vec)", us(t_compress));
     println!("  prepare_query():   {t_prepare:8.2}s  ({:7.1} us/vec)", us(t_prepare));
-    println!("  full build:        {t_build:8.2}s  ({:7.1} us/vec)  = {:.0} ins/s", us(t_build), n as f64 / t_build);
+    println!("  full build SERIAL: {t_build:8.2}s  ({:7.1} us/vec)  = {:.0} ins/s", us(t_build), n as f64 / t_build);
     println!("  graph ops (build - compress - prepare): {graph:8.2}s  ({:7.1} us/vec, {:.0}%)",
         us(graph), 100.0 * graph / t_build);
-    println!("    ^ graph ops = search_layer distance calls + prepare_stored prunes + neighbor linking + id_to_idx lookups + locks");
+    println!("  full build PARALLEL ({cores} cores): {t_build_p:8.2}s  = {:.0} ins/s  (speedup {:.2}x)",
+        n as f64 / t_build_p, t_build / t_build_p);
 }

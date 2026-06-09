@@ -1,6 +1,7 @@
 use std::collections::{BinaryHeap, HashSet};
 use std::cmp::Reverse;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 use rand::Rng;
@@ -150,102 +151,158 @@ impl DistanceProvider for ExactDistance {
     }
 }
 
-/// A node in the HNSW graph. Layer-0 neighbors (every node has them, and they are
-/// the bulk of the graph) live in the parent [`Graph`]'s shared arena, not here —
-/// only the count (`len0`) is stored inline. Higher layers (rare: ~6% of nodes at
-/// m=16) keep their own small `Vec`s.
+/// Debug-only enforcement of the lock discipline that keeps the per-node-locked
+/// graph deadlock-free: at most ONE node `links` lock is held at a time, and the
+/// leaf locks (`entry`, `id_to_idx`) are never taken while a node lock is held.
+/// Compiled to nothing in release builds.
+#[cfg(debug_assertions)]
+mod lockcheck {
+    use std::cell::Cell;
+    thread_local! {
+        static NODE_LOCKS: Cell<u32> = const { Cell::new(0) };
+    }
+    /// RAII scope marking one node `links` lock held; asserts none was already held
+    /// (taking a second would risk an A-locks-B / B-locks-A deadlock).
+    pub(super) struct NodeLockScope;
+    impl NodeLockScope {
+        pub(super) fn enter() -> Self {
+            NODE_LOCKS.with(|c| {
+                assert_eq!(c.get(), 0, "two node `links` locks held at once — deadlock risk");
+                c.set(1);
+            });
+            NodeLockScope
+        }
+    }
+    impl Drop for NodeLockScope {
+        fn drop(&mut self) {
+            NODE_LOCKS.with(|c| c.set(c.get() - 1));
+        }
+    }
+    /// Assert no node lock is held — call before taking a leaf lock (`entry`,
+    /// `id_to_idx`) so the leaf/node lock order can never form a cycle.
+    pub(super) fn assert_no_node_lock() {
+        NODE_LOCKS.with(|c| {
+            assert_eq!(c.get(), 0, "leaf lock taken while holding a node `links` lock — lock-order violation");
+        });
+    }
+}
+#[cfg(not(debug_assertions))]
+mod lockcheck {
+    pub(super) struct NodeLockScope;
+    impl NodeLockScope {
+        #[inline(always)]
+        pub(super) fn enter() -> Self {
+            NodeLockScope
+        }
+    }
+    #[inline(always)]
+    pub(super) fn assert_no_node_lock() {}
+}
+
+/// The graph's entry point and its layer, kept as ONE value behind a single lock
+/// so concurrent inserts always observe a consistent `(node, max_layer)` pair and
+/// update it atomically. `None` = empty index.
+#[derive(Debug, Clone, Copy)]
+struct EntryState {
+    node: usize,
+    max_layer: usize,
+}
+
+/// A node in the HNSW graph. `stored` (the compressed/raw vector) is IMMUTABLE
+/// after construction, so distance computations read it LOCK-FREE via the stable
+/// address `boxcar::Vec` guarantees. Only the neighbor lists are mutable, behind
+/// the per-node `links` lock. `ready` is set (Release) once the node is fully
+/// linked at all layers; concurrent traversals skip a node until then, so they
+/// never route through a half-built node.
 struct Node<S> {
     id: u64,
     stored: S,
-    len0: u32,            // # of layer-0 neighbors in this node's arena slot
-    upper: Vec<Vec<u32>>, // layers 1..; empty (no heap alloc) for single-layer nodes
-    deleted: bool,
+    links: RwLock<NodeLinks>,
+    deleted: std::sync::atomic::AtomicBool,
+    ready: std::sync::atomic::AtomicBool,
 }
 
-/// The HNSW graph: node metadata plus a single contiguous arena holding every
-/// node's layer-0 neighbor list. Node `i`'s layer-0 neighbors occupy
-/// `layer0[i*m_max0 .. i*m_max0 + nodes[i].len0]` (fixed stride `m_max0`). This
-/// turns the dominant per-node `Vec<u32>` (one allocation each) into a single big
-/// allocation — slashing allocator overhead (mimalloc per-allocation rounding +
-/// metadata) at scale, where the in-memory index footprint is dominated by the
-/// graph. Higher layers stay as per-node `Vec`s (rare). The on-disk snapshot
-/// format is unchanged (still per-layer neighbor lists) — the arena is purely an
-/// in-memory layout, so v2 snapshots load directly.
-struct Graph<S> {
-    nodes: Vec<Node<S>>,
-    layer0: Vec<u32>,
-    m_max0: usize,
+impl<S> Node<S> {
+    /// Run `f` with a brief read lock on the neighbor lists. The closure must NOT
+    /// lock another node's `links` (the scope's debug assert enforces it); copy the
+    /// indices out and release before any further graph traversal.
+    #[inline]
+    fn with_links_read<R>(&self, f: impl FnOnce(&NodeLinks) -> R) -> R {
+        let _scope = lockcheck::NodeLockScope::enter();
+        let g = self.links.read();
+        f(&g)
+    }
+
+    /// Run `f` with a write lock on the neighbor lists — used for the atomic
+    /// read-modify-write of a back-edge prune. Same one-lock-at-a-time rule.
+    #[inline]
+    fn with_links_write<R>(&self, f: impl FnOnce(&mut NodeLinks) -> R) -> R {
+        let _scope = lockcheck::NodeLockScope::enter();
+        let mut g = self.links.write();
+        f(&mut g)
+    }
 }
 
-impl<S> Graph<S> {
-    fn new(m_max0: usize) -> Self {
-        Self { nodes: Vec::new(), layer0: Vec::new(), m_max0 }
-    }
+/// A node's mutable neighbor lists (guarded by [`Node::links`]). Layer 0 is a
+/// fixed-capacity `Box<[u32]>` of length `m_max0` with an inline count — one small
+/// allocation per node, no `Vec` header/growth slack, recovering most of the old
+/// shared arena's compactness while being trivially safe under per-node locking.
+/// Higher layers (rare: ~6% of nodes at m=16) are small `Vec`s.
+struct NodeLinks {
+    layer0: Box<[u32]>, // length == m_max0; first `len0` entries are the neighbors
+    len0: u32,
+    upper: Vec<Vec<u32>>, // upper[l-1] = layer l neighbors; empty for single-layer nodes
+}
 
-    fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
-    /// Append a node, allocating its (empty) layer-0 arena slot. Returns its index.
-    fn push_node(&mut self, node: Node<S>) -> usize {
-        let idx = self.nodes.len();
-        self.nodes.push(node);
-        self.layer0.resize(self.layer0.len() + self.m_max0, 0);
-        idx
-    }
-
-    /// Number of layers node `i` participates in (always >= 1).
-    fn num_layers(&self, i: usize) -> usize {
-        1 + self.nodes[i].upper.len()
-    }
-
-    /// Neighbor list of node `i` at `layer` (layer 0 from the arena slot).
-    fn neighbors(&self, i: usize, layer: usize) -> &[u32] {
-        if layer == 0 {
-            let s = i * self.m_max0;
-            &self.layer0[s..s + self.nodes[i].len0 as usize]
-        } else {
-            &self.nodes[i].upper[layer - 1]
+impl NodeLinks {
+    fn new(num_layers: usize, m_max0: usize) -> Self {
+        Self {
+            layer0: vec![0u32; m_max0].into_boxed_slice(),
+            len0: 0,
+            upper: vec![Vec::new(); num_layers - 1],
         }
     }
 
-    fn neighbor_len(&self, i: usize, layer: usize) -> usize {
+    fn num_layers(&self) -> usize {
+        1 + self.upper.len()
+    }
+
+    fn neighbors(&self, layer: usize) -> &[u32] {
         if layer == 0 {
-            self.nodes[i].len0 as usize
+            &self.layer0[..self.len0 as usize]
         } else {
-            self.nodes[i].upper[layer - 1].len()
+            &self.upper[layer - 1]
         }
     }
 
-    /// Replace node `i`'s neighbor list at `layer`. For layer 0, `list.len()` must
-    /// be <= m_max0 (the slot stride).
-    fn set_neighbors(&mut self, i: usize, layer: usize, list: &[u32]) {
+    fn neighbor_len(&self, layer: usize) -> usize {
         if layer == 0 {
-            debug_assert!(list.len() <= self.m_max0);
-            let s = i * self.m_max0;
-            self.layer0[s..s + list.len()].copy_from_slice(list);
-            self.nodes[i].len0 = list.len() as u32;
+            self.len0 as usize
         } else {
-            let v = &mut self.nodes[i].upper[layer - 1];
+            self.upper[layer - 1].len()
+        }
+    }
+
+    fn set(&mut self, layer: usize, list: &[u32]) {
+        if layer == 0 {
+            debug_assert!(list.len() <= self.layer0.len());
+            self.layer0[..list.len()].copy_from_slice(list);
+            self.len0 = list.len() as u32;
+        } else {
+            let v = &mut self.upper[layer - 1];
             v.clear();
             v.extend_from_slice(list);
         }
     }
 
-    /// Append one neighbor to node `i`'s `layer`. Caller guarantees room (layer 0:
-    /// `len0 < m_max0`).
-    fn push_neighbor(&mut self, i: usize, layer: usize, n: u32) {
+    fn push(&mut self, layer: usize, n: u32) {
         if layer == 0 {
-            let len = self.nodes[i].len0 as usize;
-            debug_assert!(len < self.m_max0);
-            self.layer0[i * self.m_max0 + len] = n;
-            self.nodes[i].len0 += 1;
+            let len = self.len0 as usize;
+            debug_assert!(len < self.layer0.len());
+            self.layer0[len] = n;
+            self.len0 += 1;
         } else {
-            self.nodes[i].upper[layer - 1].push(n);
+            self.upper[layer - 1].push(n);
         }
     }
 }
@@ -255,10 +312,12 @@ impl<S> Graph<S> {
 pub struct HnswIndex<D: DistanceProvider = ExactDistance> {
     config: HnswConfig,
     distance: D,
-    nodes: RwLock<Graph<D::Stored>>,
+    /// Append-only, never-reallocating node store. Gives STABLE element addresses
+    /// (so `&node.stored` is read lock-free) and lock-free concurrent `push`/`get`.
+    /// Each node carries its own `links` lock; there is no global graph lock.
+    nodes: boxcar::Vec<Node<D::Stored>>,
     id_to_idx: RwLock<std::collections::HashMap<u64, usize>>,
-    entry_point: RwLock<Option<usize>>,
-    max_layer: RwLock<usize>,
+    entry: RwLock<Option<EntryState>>,
     ml: f64,
 }
 
@@ -275,144 +334,170 @@ impl HnswIndex<ExactDistance> {
 impl<D: DistanceProvider> HnswIndex<D> {
     /// Create an HNSW index with a custom distance provider.
     pub fn with_distance(config: HnswConfig, distance: D) -> Self {
-        // The layer-0 arena uses m_max0 as a fixed slot stride; a zero stride would
-        // alias every node's slot. Real configs use m_max0 = 2*m (>= 1).
+        // m_max0 is the fixed capacity of each node's layer-0 list; must be >= 1.
         assert!(config.m_max0 >= 1, "HnswConfig.m_max0 must be >= 1");
         let ml = 1.0 / (config.m as f64).ln();
-        let m_max0 = config.m_max0;
         Self {
             config,
             distance,
-            nodes: RwLock::new(Graph::new(m_max0)),
+            nodes: boxcar::Vec::new(),
             id_to_idx: RwLock::new(std::collections::HashMap::new()),
-            entry_point: RwLock::new(None),
-            max_layer: RwLock::new(0),
+            entry: RwLock::new(None),
             ml,
         }
     }
 
-    /// Insert a vector with the given ID.
+    /// Look up node `idx` that we KNOW is published (our own freshly-pushed node,
+    /// or an index from a synchronized edge). Panics on a fabricated/in-flight
+    /// index — callers traversing neighbor lists must use `self.nodes.get` + skip
+    /// `None` instead (the boxcar in-flight window).
+    #[inline]
+    fn own_node(&self, idx: usize) -> &Node<D::Stored> {
+        self.nodes
+            .get(idx)
+            .expect("node index must be published before use")
+    }
+
+    /// Insert a vector with the given ID. Safe to call concurrently from many
+    /// threads (see [`Self::insert_parallel`]): the graph has no global lock — each
+    /// node carries its own `links` lock, taken ONE AT A TIME, and the entry point
+    /// is updated atomically under a single leaf lock. A node is only published as
+    /// reachable (`ready`) after it is fully linked at all its layers.
     pub fn insert(&self, id: u64, vector: &[f32]) {
         let level = self.random_level();
         let num_layers = level + 1;
+        let m_max0 = self.config.m_max0;
 
         let stored = self.distance.store(vector);
-
         let node = Node {
             id,
             stored,
-            len0: 0,
-            upper: vec![Vec::new(); num_layers - 1],
-            deleted: false,
+            links: RwLock::new(NodeLinks::new(num_layers, m_max0)),
+            deleted: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
         };
-
-        let mut nodes = self.nodes.write();
-        let node_idx = nodes.len();
-        // Neighbor lists are stored as u32 internal indices; a single index must
-        // fit in u32. 2^32 nodes would need ~860 GB just for codes, so this is a
-        // structural invariant, never a real limit — but assert to rule out silent
-        // graph corruption from a wrapped index.
+        // Lock-free append; returns a stable, never-reused index.
+        let node_idx = self.nodes.push(node);
+        // u32 internal-index invariant (2^32 nodes ≈ 860 GB of codes — structural,
+        // never a real limit, but assert to rule out a wrapped index).
         assert!(
             node_idx <= u32::MAX as usize,
             "HNSW index exceeds u32 node capacity ({node_idx} nodes)"
         );
-        nodes.push_node(node);
-        drop(nodes);
 
+        lockcheck::assert_no_node_lock();
         self.id_to_idx.write().insert(id, node_idx);
 
-        let entry_point = *self.entry_point.read();
+        // Atomic empty-init: if the index is still empty, become the entry point and
+        // finish (the first node has no edges but is where every search starts). Two
+        // concurrent inserts into an empty index can't both early-return: one wins
+        // the `entry` write lock, the other observes it and links normally.
+        lockcheck::assert_no_node_lock();
+        let (ep, current_max_layer) = {
+            let mut entry = self.entry.write();
+            match *entry {
+                None => {
+                    self.own_node(node_idx).ready.store(true, Ordering::Release);
+                    *entry = Some(EntryState {
+                        node: node_idx,
+                        max_layer: level,
+                    });
+                    return;
+                }
+                Some(st) => (st.node, st.max_layer),
+            }
+        };
 
-        if entry_point.is_none() {
-            *self.entry_point.write() = Some(node_idx);
-            *self.max_layer.write() = level;
-            return;
-        }
-
-        let ep = entry_point.unwrap();
-        let current_max_layer = *self.max_layer.read();
         let prepared = self.distance.prepare(vector);
+        let mut scratch: Vec<u32> = Vec::with_capacity(m_max0);
 
-        // Phase 1: Greedily traverse from top to the node's insertion level.
+        // Phase 1: greedy descent from the top down to the node's insertion level.
         let mut current_ep = ep;
-        let nodes = self.nodes.read();
         for layer in (num_layers..=current_max_layer).rev() {
-            current_ep = self.greedy_closest(&nodes, &prepared, current_ep, layer);
+            current_ep = self.greedy_closest(&prepared, current_ep, layer, &mut scratch);
         }
-        drop(nodes);
 
-        // Reusable projected-query buffer for the neighbor-pruning step below.
-        // One scratch query is filled in place for every full-slot neighbor across
-        // all layers of this insert, instead of allocating a fresh projection each
-        // time (see DistanceProvider::prepare_stored_into).
+        // Reusable projected-query buffer for the prune step (one scratch query
+        // refilled per full-slot neighbor instead of allocating each time).
         let mut prune_q: Option<D::Query> = None;
 
-        // Phase 2: At each layer from insertion level down to 0, find neighbors.
+        // Phase 2: at each layer from insertion level to 0, find + link neighbors.
         for layer in (0..num_layers).rev() {
-            let ef = self.config.ef_construction;
-            let nodes = self.nodes.read();
-            let candidates = self.search_layer(&nodes, &prepared, current_ep, ef, layer);
-            drop(nodes);
+            let candidates =
+                self.search_layer(&prepared, current_ep, self.config.ef_construction, layer, &mut scratch);
+            let max_neighbors = if layer == 0 { m_max0 } else { self.config.m };
 
-            let max_neighbors = if layer == 0 {
-                self.config.m_max0
-            } else {
-                self.config.m
-            };
-
-            // `candidates` already holds node *indices*; store them directly as
-            // the neighbor list — no id resolution, no per-candidate lock.
-            let neighbors: Vec<u32> = candidates
-                .iter()
-                .take(max_neighbors)
-                .map(|&(_, idx)| idx as u32)
-                .collect();
-
-            {
-                let mut g = self.nodes.write();
-                g.set_neighbors(node_idx, layer, &neighbors);
-            }
-
-            // Add bidirectional connections with pruning.
-            for &neighbor_idx in &neighbors {
-                let neighbor_idx = neighbor_idx as usize;
-                let mut g = self.nodes.write();
-
-                if layer < g.num_layers(neighbor_idx) {
-                    if g.neighbor_len(neighbor_idx, layer) < max_neighbors {
-                        g.push_neighbor(neighbor_idx, layer, node_idx as u32);
-                    } else {
-                        // Slot full: score the existing edges plus the new candidate
-                        // against the (fixed) neighbor vector and keep the closest
-                        // max_neighbors. Equivalent to push-then-prune, but never
-                        // exceeds the arena slot stride. prepare_stored hoists the
-                        // projection matvecs out of the inner loop; reuse one scratch
-                        // query across prunes rather than allocating each time.
-                        if let Some(buf) = prune_q.as_mut() {
-                            self.distance
-                                .prepare_stored_into(&g.nodes[neighbor_idx].stored, buf);
-                        } else {
-                            prune_q =
-                                Some(self.distance.prepare_stored(&g.nodes[neighbor_idx].stored));
-                        }
-                        let prepared = prune_q.as_ref().unwrap();
-                        let mut cand: Vec<u32> = g.neighbors(neighbor_idx, layer).to_vec();
-                        cand.push(node_idx as u32);
-                        let mut scored: Vec<(f32, u32)> = cand
-                            .iter()
-                            .map(|&nidx| {
-                                let dist = self
-                                    .distance
-                                    .distance(prepared, &g.nodes[nidx as usize].stored);
-                                (dist, nidx)
-                            })
-                            .collect();
-                        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                        scored.truncate(max_neighbors);
-                        let kept: Vec<u32> = scored.into_iter().map(|(_, nidx)| nidx).collect();
-                        g.set_neighbors(neighbor_idx, layer, &kept);
+            // Our forward edges = closest candidates (skip self + dedup defensively).
+            let mut neighbors: Vec<u32> = Vec::with_capacity(max_neighbors);
+            for &(_, idx) in &candidates {
+                if idx == node_idx {
+                    continue;
+                }
+                let u = idx as u32;
+                if !neighbors.contains(&u) {
+                    neighbors.push(u);
+                    if neighbors.len() >= max_neighbors {
+                        break;
                     }
                 }
+            }
+
+            // Write our OWN edges (lock self only, then release).
+            self.own_node(node_idx)
+                .with_links_write(|l| l.set(layer, &neighbors));
+
+            // Back-edges: lock ONE neighbor at a time across its FULL read-modify-
+            // write (re-read its list, prune, write back) — releasing between the
+            // read and write-back would let a concurrent insert clobber our edge and
+            // progressively disconnect the graph. Hoist only the neighbor's own
+            // (immutable) projection out of the lock.
+            for &nbr_u in &neighbors {
+                let nbr = nbr_u as usize;
+                let nbr_node = match self.nodes.get(nbr) {
+                    Some(n) => n,
+                    None => continue, // in-flight; can't yet be a useful graph member
+                };
+                match prune_q.as_mut() {
+                    Some(buf) => self.distance.prepare_stored_into(&nbr_node.stored, buf),
+                    None => prune_q = Some(self.distance.prepare_stored(&nbr_node.stored)),
+                }
+                let prepared_nbr = prune_q.as_ref().unwrap();
+                nbr_node.with_links_write(|l| {
+                    if layer >= l.num_layers() {
+                        return; // neighbor doesn't participate at this layer
+                    }
+                    let already = l.neighbors(layer).contains(&(node_idx as u32));
+                    if already {
+                        return;
+                    }
+                    if l.neighbor_len(layer) < max_neighbors {
+                        l.push(layer, node_idx as u32);
+                        return;
+                    }
+                    // Slot full: score current members + the new node against the
+                    // neighbor (distances read immutable `stored` lock-free — no
+                    // second links lock), keep the closest `max_neighbors`.
+                    let mut scored: Vec<(f32, u32)> = l
+                        .neighbors(layer)
+                        .iter()
+                        .map(|&c| {
+                            let d = self
+                                .nodes
+                                .get(c as usize)
+                                .map(|n| self.distance.distance(prepared_nbr, &n.stored))
+                                .unwrap_or(f32::MAX);
+                            (d, c)
+                        })
+                        .collect();
+                    let d_new = self
+                        .distance
+                        .distance(prepared_nbr, &self.own_node(node_idx).stored);
+                    scored.push((d_new, node_idx as u32));
+                    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    scored.truncate(max_neighbors);
+                    let kept: Vec<u32> = scored.into_iter().map(|(_, c)| c).collect();
+                    l.set(layer, &kept);
+                });
             }
 
             if !candidates.is_empty() {
@@ -420,84 +505,167 @@ impl<D: DistanceProvider> HnswIndex<D> {
             }
         }
 
+        // Publish: fully linked at all layers, now safe for others to traverse to.
+        self.own_node(node_idx).ready.store(true, Ordering::Release);
+
+        // Raise the entry point if this node is taller than the current max — under
+        // the single `entry` lock, re-checking in case a concurrent insert already
+        // raised it past our level.
         if level > current_max_layer {
-            *self.entry_point.write() = Some(node_idx);
-            *self.max_layer.write() = level;
+            lockcheck::assert_no_node_lock();
+            let mut entry = self.entry.write();
+            match *entry {
+                Some(st) if level <= st.max_layer => {}
+                _ => {
+                    *entry = Some(EntryState {
+                        node: node_idx,
+                        max_layer: level,
+                    })
+                }
+            }
         }
+    }
+
+    /// Insert a batch of vectors, fanning the work across a scoped thread pool.
+    /// `insert` is concurrency-safe (per-node locks, no global graph lock), so this
+    /// runs chunks on separate threads. The resulting graph is topologically
+    /// equivalent to a serial build (insertion order is nondeterministic either way,
+    /// like HNSW's random levels), so recall is preserved within run-to-run variance.
+    pub fn insert_parallel(&self, items: &[(u64, Vec<f32>)]) {
+        if items.is_empty() {
+            return;
+        }
+        let cores = std::env::var("RHYPE_BUILD_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            });
+        const MIN_PARALLEL: usize = 256;
+        if cores <= 1 || items.len() < MIN_PARALLEL {
+            for (id, v) in items {
+                self.insert(*id, v);
+            }
+            return;
+        }
+        // Seed the entry point with one insert before fanning out, so workers build
+        // against a non-empty graph (not required for correctness — empty-init is
+        // atomic — just avoids every thread racing to initialize at once).
+        let start = if self.entry.read().is_none() {
+            self.insert(items[0].0, &items[0].1);
+            1
+        } else {
+            0
+        };
+        let rest = &items[start..];
+        if rest.is_empty() {
+            return;
+        }
+        let n_threads = cores.min(rest.len());
+        let chunk = rest.len().div_ceil(n_threads);
+        std::thread::scope(|s| {
+            for c in rest.chunks(chunk) {
+                s.spawn(move || {
+                    for (id, v) in c {
+                        self.insert(*id, v);
+                    }
+                });
+            }
+        });
     }
 
     /// Search for the k nearest neighbors of the query vector.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
-        let entry_point = *self.entry_point.read();
-        let ep = match entry_point {
-            Some(ep) => ep,
+        lockcheck::assert_no_node_lock();
+        let (ep, max_layer) = match *self.entry.read() {
+            Some(st) => (st.node, st.max_layer),
             None => return Vec::new(),
         };
 
         let prepared = self.distance.prepare(query);
-        let max_layer = *self.max_layer.read();
-        let nodes = self.nodes.read();
+        let mut scratch: Vec<u32> = Vec::with_capacity(self.config.m_max0);
 
         let mut current_ep = ep;
         for layer in (1..=max_layer).rev() {
-            current_ep = self.greedy_closest(&nodes, &prepared, current_ep, layer);
+            current_ep = self.greedy_closest(&prepared, current_ep, layer, &mut scratch);
         }
 
         let search_ef = ef.max(k);
-        let candidates = self.search_layer(&nodes, &prepared, current_ep, search_ef, 0);
+        let candidates = self.search_layer(&prepared, current_ep, search_ef, 0, &mut scratch);
 
+        // Filter deletes (routing-only nodes) at the result stage, then take k.
         candidates
             .into_iter()
-            .filter(|&(_, idx)| !nodes.nodes[idx].deleted)
+            .filter_map(|(dist, idx)| {
+                let n = self.nodes.get(idx)?;
+                if n.deleted.load(Ordering::Acquire) {
+                    None
+                } else {
+                    Some((n.id, dist))
+                }
+            })
             .take(k)
-            .map(|(dist, idx)| (nodes.nodes[idx].id, dist))
             .collect()
     }
 
     pub fn delete(&self, id: u64) -> bool {
+        lockcheck::assert_no_node_lock();
         let idx = match self.id_to_idx.read().get(&id).copied() {
             Some(idx) => idx,
             None => return false,
         };
-        self.nodes.write().nodes[idx].deleted = true;
-        true
+        match self.nodes.get(idx) {
+            Some(n) => {
+                n.deleted.store(true, Ordering::Release);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.nodes.read().len()
+        self.nodes.count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.nodes.read().is_empty()
+        self.nodes.count() == 0
     }
 
     pub fn active_count(&self) -> usize {
-        self.nodes.read().nodes.iter().filter(|n| !n.deleted).count()
+        // boxcar's iterator only yields published elements (never the in-flight
+        // window), so this is safe to call concurrently with insert.
+        self.nodes
+            .iter()
+            .filter(|(_, n)| !n.deleted.load(Ordering::Acquire))
+            .count()
     }
 
     /// Precise in-memory footprint of the index (codes + graph + overhead),
     /// computed by walking the structure — not via process RSS. This is the RAM
     /// needed to serve k-NN; it excludes any durability layer (e.g. the LSM the
-    /// server persists the vectors into for restart).
+    /// server persists the vectors into for restart). Intended for quiescent use.
     pub fn memory_bytes(&self) -> IndexMemory {
-        let g = self.nodes.read();
         let node_struct = std::mem::size_of::<Node<D::Stored>>();
         let vec_hdr = std::mem::size_of::<Vec<u32>>();
+        let u32_sz = std::mem::size_of::<u32>();
         let mut stored_bytes = 0usize;
         let mut graph_bytes = 0usize;
-        for node in &g.nodes {
+        let mut n = 0usize;
+        for (_, node) in self.nodes.iter() {
+            n += 1;
             stored_bytes += D::stored_bytes(&node.stored);
-            // Higher layers are per-node Vecs (rare); layer 0 lives in the shared
-            // arena, counted once below.
-            graph_bytes += node.upper.capacity() * vec_hdr;
-            for layer in &node.upper {
-                graph_bytes += layer.capacity() * std::mem::size_of::<u32>();
-            }
+            node.with_links_read(|l| {
+                // Layer-0 fixed Box<[u32]> (m_max0 entries) + higher-layer Vecs.
+                graph_bytes += l.layer0.len() * u32_sz;
+                graph_bytes += l.upper.capacity() * vec_hdr;
+                for layer in &l.upper {
+                    graph_bytes += layer.capacity() * u32_sz;
+                }
+            });
         }
-        // Layer-0 arena: one allocation, fixed stride m_max0/node — count the full
-        // capacity (including unused slot tails) as honest resident bytes.
-        graph_bytes += g.layer0.capacity() * std::mem::size_of::<u32>();
-        let n = g.nodes.len();
         // HashMap<u64, usize>: a bucket per slot at current capacity, ~1 control
         // byte + the (key, value) pair; a reasonable resident estimate.
         let entry = std::mem::size_of::<u64>() + std::mem::size_of::<usize>() + 1;
@@ -512,6 +680,7 @@ impl<D: DistanceProvider> HnswIndex<D> {
     }
 
     pub fn contains_id(&self, id: u64) -> bool {
+        lockcheck::assert_no_node_lock();
         self.id_to_idx.read().contains_key(&id)
     }
 
@@ -528,29 +697,30 @@ impl<D: DistanceProvider> HnswIndex<D> {
         write_u32(w, self.config.ef_construction as u32)?;
         write_u8(w, self.config.metric.to_u8())?;
 
-        let g = self.nodes.read();
-        let entry_point = *self.entry_point.read();
-        let max_layer = *self.max_layer.read();
+        let entry = *self.entry.read();
 
-        write_u64(w, g.len() as u64)?;
-        write_i64(w, entry_point.map_or(-1, |ep| ep as i64))?;
-        write_u32(w, max_layer as u32)?;
+        // On-disk layout unchanged: node count, entry-point index (-1 if empty),
+        // max_layer, then per-node per-layer neighbor lists. boxcar's iterator
+        // yields nodes in index order (0..n), which is what neighbor indices
+        // reference. Intended for quiescent (non-concurrent-insert) save.
+        write_u64(w, self.nodes.count() as u64)?;
+        write_i64(w, entry.map_or(-1, |st| st.node as i64))?;
+        write_u32(w, entry.map_or(0, |st| st.max_layer) as u32)?;
 
-        // Per-layer neighbor lists — the same on-disk layout as before the arena
-        // (the arena is an in-memory detail), so the format/version is unchanged.
-        for i in 0..g.nodes.len() {
-            write_u64(w, g.nodes[i].id)?;
-            write_u8(w, u8::from(g.nodes[i].deleted))?;
-            let num_layers = g.num_layers(i);
-            write_u32(w, num_layers as u32)?;
-            for layer in 0..num_layers {
-                let nbrs = g.neighbors(i, layer);
+        for (_, node) in self.nodes.iter() {
+            write_u64(w, node.id)?;
+            write_u8(w, u8::from(node.deleted.load(Ordering::Acquire)))?;
+            // Snapshot the neighbor lists under the per-node lock, then write outside.
+            let layers: Vec<Vec<u32>> =
+                node.with_links_read(|l| (0..l.num_layers()).map(|ly| l.neighbors(ly).to_vec()).collect());
+            write_u32(w, layers.len() as u32)?;
+            for nbrs in &layers {
                 write_u32(w, nbrs.len() as u32)?;
                 for &nidx in nbrs {
                     write_u32(w, nidx)?;
                 }
             }
-            self.distance.write_stored(&g.nodes[i].stored, w)?;
+            self.distance.write_stored(&node.stored, w)?;
         }
 
         Ok(())
@@ -587,20 +757,24 @@ impl<D: DistanceProvider> HnswIndex<D> {
         };
         let ml = 1.0 / (m as f64).ln();
 
+        // Bound m_max0: it sizes a per-node `Box<[u32]>`, so a corrupt huge value
+        // would OOM before the body could fail. Real configs are m_max0 = 2*m,
+        // well under 2^16. 0 is invalid (every node needs a layer-0 slot).
+        if m_max0 == 0 || m_max0 > (1 << 16) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HNSW m_max0 out of range",
+            ));
+        }
+
         let num_nodes = read_u64(r)? as usize;
         let ep_val = read_i64(r)?;
-        let entry_point = if ep_val < 0 {
-            None
-        } else {
-            Some(ep_val as usize)
-        };
-        // A corrupt/partially-written snapshot (no checksum) could carry an
-        // entry point or neighbor index that does not address a real node.
-        // Neighbor indices are used as unchecked slice indices in the hot loops,
-        // so reject any out-of-range index here with InvalidData — that routes
-        // the engine to its LSM rebuild fallback instead of panicking on the
-        // first traversal.
-        if let Some(ep) = entry_point
+        let entry_node = if ep_val < 0 { None } else { Some(ep_val as usize) };
+        // A corrupt/partially-written snapshot (no checksum) could carry an entry
+        // point or neighbor index that doesn't address a real node. Reject any
+        // out-of-range index with InvalidData so the engine routes to its LSM
+        // rebuild fallback instead of panicking on the first traversal.
+        if let Some(ep) = entry_node
             && ep >= num_nodes
         {
             return Err(io::Error::new(
@@ -610,39 +784,24 @@ impl<D: DistanceProvider> HnswIndex<D> {
         }
         let max_layer = read_u32(r)? as usize;
 
-        if m_max0 == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "HNSW m_max0 must be >= 1",
-            ));
-        }
-
-        // Cap the speculative reserve: `num_nodes` is an unchecked header value,
-        // so reserving it directly lets a corrupt/huge count abort the process
-        // (capacity overflow / OOM) before the read loop can fail with Err. A
-        // valid larger snapshot just grows these as nodes are read.
-        let reserve = num_nodes.min(4096);
-        let mut nodes = Vec::with_capacity(reserve);
-        // Layer-0 arena, built incrementally: one m_max0-wide slot is appended as
-        // each node is read. This avoids computing `num_nodes * m_max0` (which a
-        // corrupt header could overflow → a too-small arena → an out-of-bounds
-        // panic) and avoids a giant up-front allocation — the stream length bounds
-        // growth, and a truncated/corrupt body fails fast with Err (routing to the
-        // LSM rebuild) instead of panicking on the first traversal.
-        let mut layer0: Vec<u32> = Vec::new();
-        let mut id_to_idx = std::collections::HashMap::with_capacity(reserve);
+        let nodes: boxcar::Vec<Node<D::Stored>> = boxcar::Vec::new();
+        // Cap the id-map reserve: `num_nodes` is unchecked, so a corrupt count must
+        // not pre-allocate a giant map. A valid larger snapshot just grows it.
+        let mut id_to_idx = std::collections::HashMap::with_capacity(num_nodes.min(4096));
 
         for idx in 0..num_nodes {
             let id = read_u64(r)?;
             let deleted = read_u8(r)? != 0;
             let num_layers = read_u32(r)? as usize;
-            if num_layers == 0 {
+            // Real max_layer is ~log_m(N) (well under 64); bound it so a corrupt
+            // count can't allocate a huge `upper` vec.
+            if num_layers == 0 || num_layers > 64 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "HNSW node has zero layers",
+                    "HNSW node layer count out of range",
                 ));
             }
-            // Layer 0 -> this node's arena slot.
+            // Layer 0 -> this node's fixed Box<[u32]> slot.
             let l0_count = read_u32(r)? as usize;
             if l0_count > m_max0 {
                 return Err(io::Error::new(
@@ -650,8 +809,8 @@ impl<D: DistanceProvider> HnswIndex<D> {
                     "HNSW layer-0 neighbor count exceeds m_max0",
                 ));
             }
-            debug_assert_eq!(layer0.len(), idx * m_max0);
-            for _ in 0..l0_count {
+            let mut layer0 = vec![0u32; m_max0].into_boxed_slice();
+            for slot in layer0.iter_mut().take(l0_count) {
                 let nidx = read_u32(r)?;
                 if nidx as usize >= num_nodes {
                     return Err(io::Error::new(
@@ -659,17 +818,16 @@ impl<D: DistanceProvider> HnswIndex<D> {
                         "HNSW neighbor index out of range",
                     ));
                 }
-                layer0.push(nidx);
+                *slot = nidx;
             }
-            // Pad the rest of the slot to maintain the fixed m_max0 stride.
-            layer0.resize(layer0.len() + (m_max0 - l0_count), 0);
             let len0 = l0_count as u32;
-            // Higher layers -> per-node Vecs.
+            // Higher layers -> per-node Vecs. Do NOT pre-reserve from the unchecked
+            // count; push and let a truncated stream fail fast on read_u32.
             let mut upper = Vec::with_capacity(num_layers - 1);
             for _ in 1..num_layers {
-                let num_neighbors = read_u32(r)? as usize;
-                let mut layer_neighbors = Vec::with_capacity(num_neighbors);
-                for _ in 0..num_neighbors {
+                let count = read_u32(r)? as usize;
+                let mut layer_neighbors = Vec::new();
+                for _ in 0..count {
                     let nidx = read_u32(r)?;
                     if nidx as usize >= num_nodes {
                         return Err(io::Error::new(
@@ -684,26 +842,22 @@ impl<D: DistanceProvider> HnswIndex<D> {
             let stored = distance.read_stored(r)?;
 
             id_to_idx.insert(id, idx);
-            nodes.push(Node {
+            let pushed = nodes.push(Node {
                 id,
                 stored,
-                len0,
-                upper,
-                deleted,
+                links: RwLock::new(NodeLinks { layer0, len0, upper }),
+                deleted: AtomicBool::new(deleted),
+                ready: AtomicBool::new(true), // loaded nodes are fully linked
             });
+            debug_assert_eq!(pushed, idx);
         }
 
         Ok(Self {
             config,
             distance,
-            nodes: RwLock::new(Graph {
-                nodes,
-                layer0,
-                m_max0,
-            }),
+            nodes,
             id_to_idx: RwLock::new(id_to_idx),
-            entry_point: RwLock::new(entry_point),
-            max_layer: RwLock::new(max_layer),
+            entry: RwLock::new(entry_node.map(|node| EntryState { node, max_layer })),
             ml,
         })
     }
@@ -714,31 +868,56 @@ impl<D: DistanceProvider> HnswIndex<D> {
         (-r.ln() * self.ml).floor() as usize
     }
 
+    /// Copy node `idx`'s layer-`layer` neighbor indices into `out` under a brief
+    /// per-node read lock, then RELEASE — so distance computation against those
+    /// neighbors happens lock-free (immutable `stored`) and never holds two node
+    /// locks. `out` is cleared first. No-op if the node is absent (in-flight) or
+    /// doesn't reach `layer`.
+    #[inline]
+    fn copy_neighbors(&self, idx: usize, layer: usize, out: &mut Vec<u32>) {
+        out.clear();
+        if let Some(node) = self.nodes.get(idx) {
+            node.with_links_read(|l| {
+                if layer < l.num_layers() {
+                    out.extend_from_slice(l.neighbors(layer));
+                }
+            });
+        }
+    }
+
     fn greedy_closest(
         &self,
-        g: &Graph<D::Stored>,
         query: &D::Query,
         start: usize,
         layer: usize,
+        scratch: &mut Vec<u32>,
     ) -> usize {
         let mut current = start;
-        let mut current_dist = self.distance.distance(query, &g.nodes[current].stored);
+        let mut current_dist = match self.nodes.get(current) {
+            Some(n) => self.distance.distance(query, &n.stored),
+            None => return current,
+        };
 
         loop {
+            self.copy_neighbors(current, layer, scratch);
             let mut changed = false;
-
-            if layer < g.num_layers(current) {
-                for &neighbor_idx in g.neighbors(current, layer) {
-                    let neighbor_idx = neighbor_idx as usize;
-                    let dist = self.distance.distance(query, &g.nodes[neighbor_idx].stored);
-                    if dist < current_dist {
-                        current = neighbor_idx;
-                        current_dist = dist;
-                        changed = true;
-                    }
+            // Distances are computed AFTER the lock is released (immutable stored).
+            for &nbr_u in scratch.iter() {
+                let nbr = nbr_u as usize;
+                let n = match self.nodes.get(nbr) {
+                    Some(n) => n,
+                    None => continue, // in-flight; skip
+                };
+                if !n.ready.load(Ordering::Acquire) {
+                    continue; // mid-construction; not a safe routing target yet
+                }
+                let dist = self.distance.distance(query, &n.stored);
+                if dist < current_dist {
+                    current = nbr;
+                    current_dist = dist;
+                    changed = true;
                 }
             }
-
             if !changed {
                 break;
             }
@@ -749,13 +928,16 @@ impl<D: DistanceProvider> HnswIndex<D> {
 
     fn search_layer(
         &self,
-        g: &Graph<D::Stored>,
         query: &D::Query,
         entry_point: usize,
         ef: usize,
         layer: usize,
+        scratch: &mut Vec<u32>,
     ) -> Vec<(f32, usize)> {
-        let entry_dist = self.distance.distance(query, &g.nodes[entry_point].stored);
+        let entry_dist = match self.nodes.get(entry_point) {
+            Some(n) => self.distance.distance(query, &n.stored),
+            None => return Vec::new(),
+        };
 
         let mut visited = HashSet::new();
         visited.insert(entry_point);
@@ -772,27 +954,31 @@ impl<D: DistanceProvider> HnswIndex<D> {
                 break;
             }
 
-            if layer < g.num_layers(c_idx) {
-                for &neighbor_idx in g.neighbors(c_idx, layer) {
-                    let neighbor_idx = neighbor_idx as usize;
-                    if visited.insert(neighbor_idx) {
-                        let dist = self
-                            .distance
-                            .distance(query, &g.nodes[neighbor_idx].stored);
-                        let worst_dist = results
-                            .peek()
-                            .map(|(OrderedFloat(d), _)| *d)
-                            .unwrap_or(f32::MAX);
-
-                        if dist < worst_dist || results.len() < ef {
-                            candidates
-                                .push(Reverse((OrderedFloat(dist), neighbor_idx)));
-                            results.push((OrderedFloat(dist), neighbor_idx));
-
-                            if results.len() > ef {
-                                results.pop();
-                            }
-                        }
+            // Snapshot c_idx's neighbors under a brief read lock, then score them
+            // lock-free.
+            self.copy_neighbors(c_idx, layer, scratch);
+            for &nbr_u in scratch.iter() {
+                let nbr = nbr_u as usize;
+                if !visited.insert(nbr) {
+                    continue;
+                }
+                let n = match self.nodes.get(nbr) {
+                    Some(n) => n,
+                    None => continue, // in-flight; skip
+                };
+                if !n.ready.load(Ordering::Acquire) {
+                    continue; // mid-construction; not a safe routing target yet
+                }
+                let dist = self.distance.distance(query, &n.stored);
+                let worst_dist = results
+                    .peek()
+                    .map(|(OrderedFloat(d), _)| *d)
+                    .unwrap_or(f32::MAX);
+                if dist < worst_dist || results.len() < ef {
+                    candidates.push(Reverse((OrderedFloat(dist), nbr)));
+                    results.push((OrderedFloat(dist), nbr));
+                    if results.len() > ef {
+                        results.pop();
                     }
                 }
             }
@@ -936,6 +1122,110 @@ mod tests {
             recall >= 0.7,
             "recall {recall} too low (found {found:?} vs truth {truth:?})"
         );
+    }
+
+    /// A parallel build must produce a complete, well-connected index whose recall
+    /// is on par with a serial build (topologically equivalent up to the
+    /// nondeterministic insertion order). Run in DEBUG too, so the lock-discipline
+    /// guard (one node lock at a time, leaf-lock ordering) is actively checked.
+    #[test]
+    fn parallel_build_matches_serial_recall() {
+        let dims = 32;
+        let n = 3000;
+        let k = 10;
+        let cfg = HnswConfig {
+            m: 16,
+            m_max0: 32,
+            ef_construction: 100,
+            metric: Metric::L2,
+        };
+        let vectors = random_vectors(n, dims);
+
+        let serial = HnswIndex::new(cfg.clone());
+        for (id, v) in &vectors {
+            serial.insert(*id, v);
+        }
+
+        let parallel = HnswIndex::new(cfg.clone());
+        parallel.insert_parallel(&vectors);
+
+        assert_eq!(parallel.len(), n);
+        assert_eq!(parallel.active_count(), n);
+        for (id, _) in &vectors {
+            assert!(parallel.contains_id(*id), "missing id {id} after parallel build");
+        }
+
+        let recall = |idx: &HnswIndex<ExactDistance>| -> f32 {
+            let nq = 40;
+            let mut total = 0.0f32;
+            for qi in 0..nq {
+                let query = &vectors[qi * 13 % n].1;
+                let mut exact: Vec<(f32, u64)> = vectors
+                    .iter()
+                    .map(|(id, v)| (crate::distance::l2_squared(query, v), *id))
+                    .collect();
+                exact.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let truth: HashSet<u64> = exact.iter().take(k).map(|(_, id)| *id).collect();
+                let found: HashSet<u64> =
+                    idx.search(query, k, 100).iter().map(|(id, _)| *id).collect();
+                total += truth.intersection(&found).count() as f32 / k as f32;
+            }
+            total / nq as f32
+        };
+        let serial_recall = recall(&serial);
+        let parallel_recall = recall(&parallel);
+        assert!(
+            parallel_recall >= serial_recall - 0.1,
+            "parallel recall {parallel_recall} too far below serial {serial_recall}"
+        );
+    }
+
+    /// Stress the concurrent-insert paths directly: many threads calling `insert`
+    /// on a FRESH index (hammering the atomic empty-init), then on a shared one.
+    /// Asserts completeness + connectivity; the in-debug lock-discipline guard
+    /// turns any nested/mis-ordered lock into a panic here. A `save`/`load`
+    /// round-trip confirms the concurrently-built graph serializes correctly.
+    #[test]
+    fn concurrent_insert_stress() {
+        let cfg = HnswConfig {
+            m: 16,
+            m_max0: 32,
+            ef_construction: 100,
+            metric: Metric::L2,
+        };
+        let index = HnswIndex::new(cfg.clone());
+        let vectors = random_vectors(800, 16);
+
+        std::thread::scope(|s| {
+            for chunk in vectors.chunks(25) {
+                let index = &index;
+                s.spawn(move || {
+                    for (id, v) in chunk {
+                        index.insert(*id, v);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(index.len(), 800);
+        assert_eq!(index.active_count(), 800);
+        for (id, _) in &vectors {
+            assert!(index.contains_id(*id), "missing id {id} after concurrent build");
+        }
+        // Connectivity: a search should reach a large fraction of the graph.
+        let results = index.search(&vectors[0].1, 50, 200);
+        assert!(
+            results.len() >= 45,
+            "concurrent build left the graph poorly connected: search returned {}",
+            results.len()
+        );
+
+        // save/load round-trip of the concurrently-built graph.
+        let mut buf = Vec::new();
+        index.save(&mut buf).unwrap();
+        let loaded = HnswIndex::load(&mut &buf[..], ExactDistance { metric: Metric::L2 }).unwrap();
+        assert_eq!(loaded.len(), 800);
+        assert_eq!(loaded.search(&vectors[0].1, 50, 200).len(), results.len());
     }
 
     #[test]
