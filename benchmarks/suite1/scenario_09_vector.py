@@ -80,6 +80,8 @@ def run_rhypedb(
 
     server_pid = common.find_pid(server_pattern)
     result.rss_cold_mb = common.rss_mb(server_pid) if server_pid else 0.0
+    cold_anon = common.rss_breakdown(server_pid)["anon_mb"] if server_pid else 0.0
+    result.metadata["rss_cold_anon_mb"] = cold_anon
 
     client = RhypedbTcpClient(tcp_host, tcp_port)
     client.connect()
@@ -110,6 +112,9 @@ def run_rhypedb(
         if server_pid:
             result.rss_post_load_mb = common.rss_mb(server_pid)
             result.rss_peak_mb = result.rss_post_load_mb
+            post = common.rss_breakdown(server_pid)
+            result.metadata["rss_post_load_anon_mb"] = post["anon_mb"]
+            result.metadata["rss_post_load_file_mb"] = post["file_mb"]
 
         # Search + recall.
         test = ds.test[:n_queries]
@@ -136,8 +141,11 @@ def run_rhypedb(
             n_train = max(1, ds.train.shape[0])
             result.metadata["rss_steady_anon_mb"] = steady["anon_mb"]
             result.metadata["rss_steady_file_mb"] = steady["file_mb"]
+            # Marginal serving heap per vector: steady anon minus the fixed cold
+            # baseline (loaded binary/runtime), divided by n. This is the honest
+            # "RAM to serve" figure to compare against the in-process index_mem_bench.
             result.metadata["bytes_per_vector_anon_steady"] = (
-                steady["anon_mb"] * 1024 * 1024 / n_train
+                max(0.0, steady["anon_mb"] - cold_anon) * 1024 * 1024 / n_train
             )
     finally:
         client.close()
