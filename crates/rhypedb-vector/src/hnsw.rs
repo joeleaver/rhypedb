@@ -266,6 +266,9 @@ impl HnswIndex<ExactDistance> {
 impl<D: DistanceProvider> HnswIndex<D> {
     /// Create an HNSW index with a custom distance provider.
     pub fn with_distance(config: HnswConfig, distance: D) -> Self {
+        // The layer-0 arena uses m_max0 as a fixed slot stride; a zero stride would
+        // alias every node's slot. Real configs use m_max0 = 2*m (>= 1).
+        assert!(config.m_max0 >= 1, "HnswConfig.m_max0 must be >= 1");
         let ml = 1.0 / (config.m as f64).ln();
         let m_max0 = config.m_max0;
         Self {
@@ -585,10 +588,27 @@ impl<D: DistanceProvider> HnswIndex<D> {
         }
         let max_layer = read_u32(r)? as usize;
 
-        let mut nodes = Vec::with_capacity(num_nodes);
-        // Layer-0 arena: one slot of m_max0 indices per node.
-        let mut layer0 = vec![0u32; num_nodes * m_max0];
-        let mut id_to_idx = std::collections::HashMap::with_capacity(num_nodes);
+        if m_max0 == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HNSW m_max0 must be >= 1",
+            ));
+        }
+
+        // Cap the speculative reserve: `num_nodes` is an unchecked header value,
+        // so reserving it directly lets a corrupt/huge count abort the process
+        // (capacity overflow / OOM) before the read loop can fail with Err. A
+        // valid larger snapshot just grows these as nodes are read.
+        let reserve = num_nodes.min(4096);
+        let mut nodes = Vec::with_capacity(reserve);
+        // Layer-0 arena, built incrementally: one m_max0-wide slot is appended as
+        // each node is read. This avoids computing `num_nodes * m_max0` (which a
+        // corrupt header could overflow → a too-small arena → an out-of-bounds
+        // panic) and avoids a giant up-front allocation — the stream length bounds
+        // growth, and a truncated/corrupt body fails fast with Err (routing to the
+        // LSM rebuild) instead of panicking on the first traversal.
+        let mut layer0: Vec<u32> = Vec::new();
+        let mut id_to_idx = std::collections::HashMap::with_capacity(reserve);
 
         for idx in 0..num_nodes {
             let id = read_u64(r)?;
@@ -608,8 +628,8 @@ impl<D: DistanceProvider> HnswIndex<D> {
                     "HNSW layer-0 neighbor count exceeds m_max0",
                 ));
             }
-            let slot = idx * m_max0;
-            for j in 0..l0_count {
+            debug_assert_eq!(layer0.len(), idx * m_max0);
+            for _ in 0..l0_count {
                 let nidx = read_u32(r)?;
                 if nidx as usize >= num_nodes {
                     return Err(io::Error::new(
@@ -617,8 +637,10 @@ impl<D: DistanceProvider> HnswIndex<D> {
                         "HNSW neighbor index out of range",
                     ));
                 }
-                layer0[slot + j] = nidx;
+                layer0.push(nidx);
             }
+            // Pad the rest of the slot to maintain the fixed m_max0 stride.
+            layer0.resize(layer0.len() + (m_max0 - l0_count), 0);
             let len0 = l0_count as u32;
             // Higher layers -> per-node Vecs.
             let mut upper = Vec::with_capacity(num_layers - 1);
