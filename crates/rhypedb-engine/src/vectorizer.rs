@@ -758,9 +758,12 @@ impl Vectorizer {
                 type_name: type_name.into(),
                 field: vector_field.into(),
             })?;
-        // `HnswIndex::insert` is safe to call concurrently (per-node locks, no
-        // global graph lock), so the embed worker and any in-flight `ingest_vectors`
-        // may insert at once without a serializing lock.
+        // `HnswIndex::insert` is safe to call concurrently for the graph structure
+        // (per-node locks, no global graph lock), so the embed worker and any
+        // in-flight `ingest_vectors` may insert at once without a serializing lock.
+        // Re-inserting the same object_id (an update) tombstones the prior node and
+        // the new vector wins (HnswIndex::insert handles this atomically) — so
+        // dropping the old insert_lock doesn't change update semantics.
         index.insert(object_id, vector);
 
         let type_id = self.type_ids[type_name];

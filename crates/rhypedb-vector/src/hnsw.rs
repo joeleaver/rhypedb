@@ -363,6 +363,13 @@ impl<D: DistanceProvider> HnswIndex<D> {
     /// node carries its own `links` lock, taken ONE AT A TIME, and the entry point
     /// is updated atomically under a single leaf lock. A node is only published as
     /// reachable (`ready`) after it is fully linked at all its layers.
+    ///
+    /// Re-inserting an existing ID (an "update", whether serial or a concurrent
+    /// same-ID race) creates a new node and tombstones the prior one: the new
+    /// vector wins (matching the LSM `v:` last-writer semantics) and search never
+    /// returns a duplicate ID. The tombstoned node lingers as a routing-only graph
+    /// member until the next rebuild reclaims it. Distinct IDs (the bulk-build case)
+    /// never hit this path.
     pub fn insert(&self, id: u64, vector: &[f32]) {
         let level = self.random_level();
         let num_layers = level + 1;
@@ -386,7 +393,14 @@ impl<D: DistanceProvider> HnswIndex<D> {
         );
 
         lockcheck::assert_no_node_lock();
-        self.id_to_idx.write().insert(id, node_idx);
+        // Claim the id atomically (the RwLock serializes concurrent same-id inserts).
+        // If it was already indexed (a re-insert/update, or a same-id race), tombstone
+        // the prior node so search won't return a duplicate id — the new node wins.
+        if let Some(prev) = self.id_to_idx.write().insert(id, node_idx)
+            && let Some(old) = self.nodes.get(prev)
+        {
+            old.deleted.store(true, Ordering::Release);
+        }
 
         // Atomic empty-init: if the index is still empty, become the entry point and
         // finish (the first node has no edges but is where every search starts). Two
@@ -783,6 +797,16 @@ impl<D: DistanceProvider> HnswIndex<D> {
             ));
         }
         let max_layer = read_u32(r)? as usize;
+        // Bound max_layer: it drives the top-down descent loops in search()/insert()
+        // (`for layer in (1..=max_layer).rev()`), so a corrupt huge value would hang
+        // the process rather than fail fast. Real max_layer is ~log_m(N), well under
+        // 64 (same bound as per-node num_layers).
+        if max_layer > 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HNSW max_layer out of range",
+            ));
+        }
 
         let nodes: boxcar::Vec<Node<D::Stored>> = boxcar::Vec::new();
         // Cap the id-map reserve: `num_nodes` is unchecked, so a corrupt count must
@@ -1226,6 +1250,63 @@ mod tests {
         let loaded = HnswIndex::load(&mut &buf[..], ExactDistance { metric: Metric::L2 }).unwrap();
         assert_eq!(loaded.len(), 800);
         assert_eq!(loaded.search(&vectors[0].1, 50, 200).len(), results.len());
+    }
+
+    /// Re-inserting an existing id (an update, incl. a concurrent same-id race)
+    /// must tombstone the prior node so search returns the id at most once with the
+    /// NEW vector — not a stale/duplicate result.
+    #[test]
+    fn reinsert_same_id_tombstones_old() {
+        let cfg = HnswConfig {
+            m: 16,
+            m_max0: 32,
+            ef_construction: 100,
+            metric: Metric::L2,
+        };
+        let index = HnswIndex::new(cfg);
+        let vectors = random_vectors(200, 16);
+        for (id, v) in &vectors {
+            index.insert(*id, v);
+        }
+        // Update id 5 to sit right next to id 7 (so it stays well-connected and
+        // findable — the point here is the tombstone, not recall on an outlier).
+        let new5 = vectors[7].1.clone();
+        index.insert(5, &new5);
+
+        assert!(index.contains_id(5));
+        assert_eq!(index.len(), 201, "re-insert pushes a new node");
+        assert_eq!(index.active_count(), 200, "the prior id-5 node is tombstoned");
+
+        // The updated id 5 is found (co-located with id 7) and appears AT MOST once
+        // — the old node is tombstoned, so no duplicate / stale id 5.
+        let res = index.search(&new5, 10, 100);
+        let count5 = res.iter().filter(|(id, _)| *id == 5).count();
+        assert!(count5 <= 1, "id 5 duplicated in results (tombstone failed): {count5}");
+        assert!(
+            res.iter().any(|(id, _)| *id == 5),
+            "updated id 5 (now co-located with id 7) should be found"
+        );
+    }
+
+    /// A corrupt snapshot with an implausible `max_layer` must be rejected (it drives
+    /// the descent loops; a huge value would hang rather than fail fast).
+    #[test]
+    fn load_rejects_huge_max_layer() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(HNSW_MAGIC);
+        write_u32(&mut buf, 2).unwrap(); // version 2
+        write_u32(&mut buf, 8).unwrap(); // m
+        write_u32(&mut buf, 16).unwrap(); // m_max0
+        write_u32(&mut buf, 50).unwrap(); // ef_construction
+        write_u8(&mut buf, Metric::L2.to_u8()).unwrap();
+        write_u64(&mut buf, 1).unwrap(); // num_nodes
+        write_i64(&mut buf, 0).unwrap(); // entry_point = 0
+        write_u32(&mut buf, 1000).unwrap(); // max_layer = 1000 (>> 64): invalid
+        let distance = ExactDistance { metric: Metric::L2 };
+        assert!(
+            HnswIndex::load(&mut &buf[..], distance).is_err(),
+            "snapshot with out-of-range max_layer must be rejected"
+        );
     }
 
     #[test]
