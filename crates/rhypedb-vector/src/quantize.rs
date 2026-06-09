@@ -869,6 +869,46 @@ fn mse_dot_fused(data: &[u8], bits: u8, centroids: &[f32], rq: &[f32]) -> f32 {
             }
             acc
         }
+        3 => {
+            // 3-bit is not byte-aligned, but 8 indices pack into exactly 3 bytes,
+            // so decode them as a group with fixed shifts/masks instead of the
+            // bit-by-bit walker. MSB-first, byte order b0,b1,b2 — bit-identical to
+            // `mse_dot_generic` (same index values, same position-ordered sum), so
+            // recall is unchanged; this just removes the inner per-bit branch.
+            let groups = dims / 8;
+            let mut acc = 0.0f32;
+            for g in 0..groups {
+                let b0 = data[3 * g];
+                let b1 = data[3 * g + 1];
+                let b2 = data[3 * g + 2];
+                let base = 8 * g;
+                acc += centroids[((b0 >> 5) & 7) as usize] * rq[base];
+                acc += centroids[((b0 >> 2) & 7) as usize] * rq[base + 1];
+                acc += centroids[((((b0 & 3) << 1) | (b1 >> 7)) & 7) as usize] * rq[base + 2];
+                acc += centroids[((b1 >> 4) & 7) as usize] * rq[base + 3];
+                acc += centroids[((b1 >> 1) & 7) as usize] * rq[base + 4];
+                acc += centroids[((((b1 & 1) << 2) | (b2 >> 6)) & 7) as usize] * rq[base + 5];
+                acc += centroids[((b2 >> 3) & 7) as usize] * rq[base + 6];
+                acc += centroids[(b2 & 7) as usize] * rq[base + 7];
+            }
+            // Tail: the < 8 remaining indices. Continue the SAME `acc` in position
+            // order (bit-walking from the next bit) — summing the tail into its own
+            // accumulator and adding would re-associate and lose bit-identity.
+            let done = groups * 8;
+            let mut bit_pos = groups * 24; // bits consumed by the full groups
+            for &rqi in &rq[done..] {
+                let mut val = 0u8;
+                for _ in 0..3 {
+                    val <<= 1;
+                    if (data[bit_pos / 8] >> (7 - (bit_pos % 8))) & 1 == 1 {
+                        val |= 1;
+                    }
+                    bit_pos += 1;
+                }
+                acc += centroids[val as usize] * rqi;
+            }
+            acc
+        }
         _ => mse_dot_generic(data, bits, centroids, rq),
     }
 }

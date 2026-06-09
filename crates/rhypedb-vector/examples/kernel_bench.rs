@@ -145,7 +145,7 @@ fn main() {
     // Isolated search kernel — unchanged by the build-path work; run small as a
     // sanity check that the distance estimate didn't move.
     println!("-- isolated kernel (sanity) --");
-    for &bits in &[2u8, 4] {
+    for &bits in &[2u8, 3, 4] {
         bench_kernel(384, bits, 10_000, 5);
     }
     // Build + search. `build=… ins/s` is the figure of interest for the build
@@ -153,7 +153,8 @@ fn main() {
     // `prepare_stored`'s O(d²) matmuls during neighbor pruning. `qps` and
     // `recall@10` confirm search throughput and accuracy are preserved. Two
     // dims so the O(d²) win is visible; sizes kept modest for a quick A/B.
-    println!("-- build + search (QuantizedIndex, bits=4) --");
+    println!("-- build + search (QuantizedIndex) --");
+    bench_search(384, 3, 6_000, 300);
     bench_search(384, 4, 6_000, 300);
     bench_search(768, 4, 2_000, 300);
 }
