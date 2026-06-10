@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -139,6 +139,18 @@ const LEGACY_QUANT_BITS: u8 = 4;
 const LEGACY_HNSW_M: usize = 16;
 const LEGACY_HNSW_EF_CONSTRUCTION: usize = 100;
 const LEGACY_METRIC: Metric = Metric::Cosine;
+
+/// Restrict-set size at or below which a filtered `.similar()` is answered by
+/// EXACT brute-force over the set instead of HNSW + post-filter. HNSW
+/// post-filtering under-fills when a selective filter's matches mostly fall
+/// outside the global top-k; brute-forcing a small set is both exact (recall
+/// 1.0 within the filter) and, at this size, cheaper than the graph. Above this
+/// the filter is non-selective enough that the over-fetch path suffices, and a
+/// full scan would dominate latency (a 10k×d rescore is ~the cost of
+/// `rerank: 10000`, the existing accepted upper bound). The brute path reads
+/// each member's f32 from the LSM `v:` keyspace, so its cost scales with the
+/// set size, not the corpus.
+const EXACT_FILTER_MAX: usize = 10_000;
 
 /// Resolve a Vector field's effective `(HnswConfig, TurboQuantConfig)` from its
 /// `@index` directive, filling any omitted parameter from the legacy defaults.
@@ -687,6 +699,7 @@ impl Vectorizer {
     }
 
     /// Search a vector index with a text query (encodes text first).
+    #[allow(clippy::too_many_arguments)]
     pub fn search_text(
         &self,
         type_name: &str,
@@ -695,6 +708,7 @@ impl Vectorizer {
         k: usize,
         ef: usize,
         rerank: bool,
+        restrict: Option<&HashSet<u64>>,
     ) -> EngineResult<Vec<(u64, f32)>> {
         let index_key = format!("{type_name}.{vector_field}");
         let index = self
@@ -755,14 +769,34 @@ impl Vectorizer {
                 .unwrap_or((k * 3).min(48))
                 .max(k)
         };
-        let mut candidates = index.search(&query_vec[0], retrieval_k, ef.max(retrieval_k));
+        // Exact small-set path: a selective filter restricts retrieval to a
+        // bounded set — score it exactly (over the LSM f32) instead of via HNSW,
+        // which under-fills for selective filters. The cross-encoder rerank
+        // below still runs over the resulting candidates, so filtered semantic
+        // search keeps full reranking. `restrict = None` (a global search, incl.
+        // every deployed bible-app query) takes the untouched HNSW path.
+        let use_brute = restrict.is_some_and(|s| s.len() <= EXACT_FILTER_MAX);
+        let mut candidates = if use_brute {
+            let set = restrict.unwrap();
+            if std::env::var_os("RHYPEDB_DEBUG_RERANK").is_some() {
+                eprintln!(
+                    "[brute] key={index_key} restrict={} retrieval_k={retrieval_k} (exact small-set path)",
+                    set.len()
+                );
+            }
+            let mut c = self.brute_force_restricted(&index_key, &index, &query_vec[0], set);
+            c.truncate(retrieval_k);
+            c
+        } else {
+            index.search(&query_vec[0], retrieval_k, ef.max(retrieval_k))
+        };
 
         // Full-precision rerank: replace the TurboQuant estimates with exact
         // distances against the f32 vectors in the LSM. When a cross-encoder
         // reranker also runs below it re-sorts by semantic score (so this is a
         // no-op for that path); when it does not, the exactly-reranked order is
-        // what we return.
-        if rerank {
+        // what we return. Skipped on the brute path (already exact).
+        if rerank && !use_brute {
             candidates = self.rerank_candidates(&index_key, &index, &query_vec[0], candidates);
         }
 
@@ -831,6 +865,12 @@ impl Vectorizer {
     /// distance (see [`Vectorizer::rerank_candidates`]). The caller is expected
     /// to have sized `k` to the desired rerank pool and to trim to the final
     /// top-k itself.
+    ///
+    /// A non-empty `restrict` of at most [`EXACT_FILTER_MAX`] ids takes the exact
+    /// brute-force path over that set (see [`Vectorizer::brute_force_restricted`]),
+    /// ignoring `ef`/`rerank` (the result is already exact); `restrict = None`
+    /// leaves the global HNSW path unchanged.
+    #[allow(clippy::too_many_arguments)]
     pub fn search_vector(
         &self,
         type_name: &str,
@@ -839,6 +879,7 @@ impl Vectorizer {
         k: usize,
         ef: usize,
         rerank: bool,
+        restrict: Option<&HashSet<u64>>,
     ) -> EngineResult<Vec<(u64, f32)>> {
         let index_key = format!("{type_name}.{vector_field}");
         let index = self
@@ -850,6 +891,19 @@ impl Vectorizer {
                 type_name: type_name.into(),
                 field: vector_field.into(),
             })?;
+
+        // Exact small-set path: a selective filter restricts the search to a
+        // bounded set — brute-force exact distances over just those vectors.
+        // Exact recall, never under-fills, and (for a small set) cheaper than
+        // the graph. `ef`/`rerank` are moot here (the result is already exact).
+        if let Some(set) = restrict
+            && set.len() <= EXACT_FILTER_MAX
+        {
+            if std::env::var_os("RHYPEDB_DEBUG_RERANK").is_some() {
+                eprintln!("[brute] key={index_key} restrict={} (exact small-set path)", set.len());
+            }
+            return Ok(self.brute_force_restricted(&index_key, &index, query_vec, set));
+        }
 
         let results = index.search(query_vec, k, ef);
         if rerank {
@@ -875,6 +929,80 @@ impl Vectorizer {
     /// single consistent snapshot is used for the whole batch. On a storage
     /// error the ANN order is returned unchanged (rerank is a best-effort recall
     /// boost, not a hard guarantee — failing the query would be worse).
+    /// Score a set of object ids against `query_vec` using the index `metric`
+    /// and the FULL-PRECISION f32 in the LSM `v:` keyspace. Missing / corrupt /
+    /// dimension-mismatched vectors score `f32::INFINITY` (kept, sorted last —
+    /// never dropped, so a caller can never under-fill relative to its input).
+    /// Sorted ascending by `(distance, id)`: the id tie-break keeps the order
+    /// deterministic across f32 ties (common at low bit-widths) and unordered id
+    /// sources (a filter's `HashSet`). One consistent LSM snapshot covers the
+    /// whole batch. Returns `None` ONLY on a storage error, so the caller can
+    /// pick its own fallback (the ANN order, for rerank). Shared by
+    /// [`Self::rerank_candidates`] and [`Self::brute_force_restricted`].
+    fn exact_rescore(
+        &self,
+        type_id: u64,
+        field_id: u64,
+        metric: Metric,
+        query_vec: &[f32],
+        ids: &[u64],
+    ) -> Option<Vec<(u64, f32)>> {
+        let snapshot = self.storage.read_snapshot();
+        let keys: Vec<Bytes> = ids
+            .iter()
+            .map(|id| KeyBuilder::vector(type_id, *id, field_id))
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|b| b.as_ref()).collect();
+        let vals = self.storage.multi_get_at(snapshot, &key_refs).ok()?;
+
+        let mut scored: Vec<(u64, f32)> = ids
+            .iter()
+            .zip(vals)
+            .map(|(&id, val)| {
+                let dist = val
+                    .as_deref()
+                    .and_then(deserialize_f32_vec)
+                    .filter(|v| v.len() == query_vec.len())
+                    .map(|v| compute_distance(metric, query_vec, &v))
+                    .unwrap_or(f32::INFINITY);
+                (id, dist)
+            })
+            .collect();
+        // `total_cmp` is a total order (finite ascending, `INFINITY` last); the
+        // `id` tie-break makes the result deterministic.
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        Some(scored)
+    }
+
+    /// Exact brute-force k-NN over a *restricted* id set (a selective filter).
+    /// HNSW post-filtering under-fills when few graph hits fall inside the set;
+    /// for a small set it is both exact and cheaper to score every member
+    /// directly. Reuses [`Self::exact_rescore`] (same missing→INFINITY +
+    /// `(distance, id)` order as rerank), so a `.filter().similar()` over a small
+    /// set returns the TRUE top-k within the filter. Returns the full sorted set
+    /// — the caller trims to k. On a storage error returns the ids unscored, in
+    /// id order (best-effort; never fails the query).
+    fn brute_force_restricted(
+        &self,
+        index_key: &str,
+        index: &QuantizedIndex,
+        query_vec: &[f32],
+        restrict: &HashSet<u64>,
+    ) -> Vec<(u64, f32)> {
+        let (type_id, field_id) = match self.resolve_index_ids(index_key) {
+            Some(ids) => ids,
+            None => return Vec::new(),
+        };
+        let ids: Vec<u64> = restrict.iter().copied().collect();
+        self.exact_rescore(type_id, field_id, index.metric(), query_vec, &ids)
+            .unwrap_or_else(|| {
+                let mut v: Vec<(u64, f32)> =
+                    ids.into_iter().map(|id| (id, f32::INFINITY)).collect();
+                v.sort_by_key(|(id, _)| *id);
+                v
+            })
+    }
+
     fn rerank_candidates(
         &self,
         index_key: &str,
@@ -889,37 +1017,13 @@ impl Vectorizer {
             Some(ids) => ids,
             None => return candidates,
         };
-        // `metric` is the metric the index was built with — using it keeps the
-        // exact re-score order-consistent with the ANN distances.
-        let metric = index.metric();
-
-        let snapshot = self.storage.read_snapshot();
-        let keys: Vec<Bytes> = candidates
-            .iter()
-            .map(|(id, _)| KeyBuilder::vector(type_id, *id, field_id))
-            .collect();
-        let key_refs: Vec<&[u8]> = keys.iter().map(|b| b.as_ref()).collect();
-        let vals = match self.storage.multi_get_at(snapshot, &key_refs) {
-            Ok(vals) => vals,
-            Err(_) => return candidates,
+        let ids: Vec<u64> = candidates.iter().map(|(id, _)| *id).collect();
+        // On a storage error keep the ANN order (best-effort — failing the query
+        // would be worse than returning the approximate distances).
+        let scored = match self.exact_rescore(type_id, field_id, index.metric(), query_vec, &ids) {
+            Some(s) => s,
+            None => return candidates,
         };
-
-        let mut scored: Vec<(u64, f32)> = candidates
-            .iter()
-            .zip(vals)
-            .map(|(&(id, _approx), val)| {
-                let dist = val
-                    .as_deref()
-                    .and_then(deserialize_f32_vec)
-                    .filter(|v| v.len() == query_vec.len())
-                    .map(|v| compute_distance(metric, query_vec, &v))
-                    .unwrap_or(f32::INFINITY);
-                (id, dist)
-            })
-            .collect();
-        // `total_cmp` is a total order: finite distances sort ascending and the
-        // `INFINITY`-scored un-rerankable candidates fall to the end.
-        scored.sort_by(|a, b| a.1.total_cmp(&b.1));
         if std::env::var_os("RHYPEDB_DEBUG_RERANK").is_some() {
             let missing = scored.iter().filter(|(_, d)| d.is_infinite()).count();
             let finite: Vec<f32> = scored
@@ -1365,7 +1469,7 @@ mod tests {
 
         // Search for ML-related content.
         let results = vectorizer
-            .search_text("Post", "embedding", "artificial intelligence", 2, 50, false)
+            .search_text("Post", "embedding", "artificial intelligence", 2, 50, false, None)
             .unwrap();
 
         assert_eq!(results.len(), 2);
@@ -1446,7 +1550,7 @@ mod tests {
 
             // Verify search works.
             let results = vectorizer
-                .search_text("Post", "embedding", "artificial intelligence", 1, 50, false)
+                .search_text("Post", "embedding", "artificial intelligence", 1, 50, false, None)
                 .unwrap();
             assert!(!results.is_empty(), "search should return results before restart");
         }
@@ -1464,7 +1568,7 @@ mod tests {
 
             // Search should work immediately — no need to re-process.
             let results = vectorizer
-                .search_text("Post", "embedding", "artificial intelligence", 1, 50, false)
+                .search_text("Post", "embedding", "artificial intelligence", 1, 50, false, None)
                 .unwrap();
             assert!(
                 !results.is_empty(),
@@ -1569,7 +1673,7 @@ mod tests {
             .unwrap();
 
             let results = vectorizer
-                .search_text("Post", "embedding", "artificial intelligence", 2, 50, false)
+                .search_text("Post", "embedding", "artificial intelligence", 2, 50, false, None)
                 .unwrap();
             assert_eq!(results.len(), 2);
             let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
@@ -1704,7 +1808,7 @@ mod tests {
         .unwrap();
 
         let results = v
-            .search_vector("Doc", "embedding", &[0.9, 0.1, 0.0, 0.0], 1, 16, false)
+            .search_vector("Doc", "embedding", &[0.9, 0.1, 0.0, 0.0], 1, 16, false, None)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1740,7 +1844,7 @@ mod tests {
         // index from the `v:` keys — no @vectorize, no embedder, no re-ingest.
         let v2 = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
         let results = v2
-            .search_vector("Doc", "embedding", &[0.1, 0.9, 0.0, 0.0], 1, 16, false)
+            .search_vector("Doc", "embedding", &[0.1, 0.9, 0.0, 0.0], 1, 16, false, None)
             .unwrap();
         assert_eq!(
             results[0].0, 2,
@@ -1777,7 +1881,7 @@ mod tests {
             "batch with a bad-dim row must error"
         );
         let results = v
-            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16, false)
+            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16, false, None)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -1818,7 +1922,7 @@ mod tests {
             "a batch containing a non-finite row must be rejected"
         );
         let results = v
-            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16, false)
+            .search_vector("Doc", "embedding", &[1.0, 0.0, 0.0, 0.0], 1, 16, false, None)
             .unwrap();
         assert!(
             results.is_empty(),
@@ -1878,7 +1982,7 @@ mod tests {
         // distance sequence must match the brute-force ground truth. Comparing
         // distances (not ids) is immune to ambiguous ordering at exact ties.
         let reranked = v
-            .search_vector("Doc", "embedding", &query, n as usize, 256, true)
+            .search_vector("Doc", "embedding", &query, n as usize, 256, true, None)
             .unwrap();
         assert_eq!(reranked.len(), n as usize, "rerank must keep the full pool");
         for (r, e) in reranked.iter().zip(exact.iter()) {
@@ -1940,10 +2044,10 @@ mod tests {
             // Plain ANN top-k vs rerank over a `pool`-sized candidate set, both
             // at the SAME exploration width (ef = pool).
             let ann = v
-                .search_vector("Doc", "embedding", &query, k, pool, false)
+                .search_vector("Doc", "embedding", &query, k, pool, false, None)
                 .unwrap();
             let rr = v
-                .search_vector("Doc", "embedding", &query, pool, pool, true)
+                .search_vector("Doc", "embedding", &query, pool, pool, true, None)
                 .unwrap();
             ann_hits += ann.iter().take(k).filter(|(id, _)| gt_set.contains(id)).count();
             rr_hits += rr.iter().take(k).filter(|(id, _)| gt_set.contains(id)).count();
@@ -1971,7 +2075,7 @@ mod tests {
         // 5 (no panic, no drops), sorted by exact distance. The query equals
         // id 2's vector, so id 2 (cosine distance 0) must rank first.
         let reranked = v
-            .search_vector("Doc", "embedding", &synth_vec(2.0), 100, 200, true)
+            .search_vector("Doc", "embedding", &synth_vec(2.0), 100, 200, true, None)
             .unwrap();
         assert_eq!(reranked.len(), 5);
         assert_eq!(reranked[0].0, 2, "exact nearest to query(seed=2) is id 2");
@@ -2104,9 +2208,129 @@ mod tests {
             assert_eq!(stat.vectors, 20, "all vectors must survive the rebuild");
             // The rebuilt index is functional: the self-match query ranks first.
             let hits = v
-                .search_vector("Doc", "embedding", &synth_vec(5.0), 3, 64, false)
+                .search_vector("Doc", "embedding", &synth_vec(5.0), 3, 64, false, None)
                 .unwrap();
             assert!(hits.iter().any(|(id, _)| *id == 5), "got {hits:?}");
+        }
+    }
+
+    // --- Exact small-set brute-force for filtered .similar() (Knob B) ---
+
+    #[test]
+    fn filtered_search_is_exact_within_restrict_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = rerank_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        let rows: Vec<(u64, Vec<f32>)> = (1..=30u64).map(|i| (i, synth_vec(i as f32))).collect();
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+
+        let query = synth_vec(3.5);
+        let restrict: HashSet<u64> = [8, 17, 26].into_iter().collect();
+
+        // Independently compute the exact order over the restrict set.
+        let mut expected: Vec<(u64, f32)> = restrict
+            .iter()
+            .map(|&id| (id, compute_distance(Metric::Cosine, &query, &synth_vec(id as f32))))
+            .collect();
+        expected.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let got = v
+            .search_vector("Doc", "embedding", &query, 2, 64, false, Some(&restrict))
+            .unwrap();
+
+        let got_ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
+        let exp_ids: Vec<u64> = expected.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            got_ids, exp_ids,
+            "filtered brute-force order must equal the exact order"
+        );
+    }
+
+    #[test]
+    fn filtered_search_does_not_underfill_when_global_topk_misses_the_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = rerank_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        let rows: Vec<(u64, Vec<f32>)> = (1..=30u64).map(|i| (i, synth_vec(i as f32))).collect();
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+
+        let query = synth_vec(3.5);
+        // synth_vec is periodic in seed (period ~8.98); {8,17,26} are ~anti-phase
+        // to 3.5 → the farthest vectors, so a global ANN search never surfaces
+        // them. This is exactly the selective filter that the old over-fetch +
+        // post-filter path under-fills on.
+        let restrict: HashSet<u64> = [8, 17, 26].into_iter().collect();
+
+        let global = v
+            .search_vector("Doc", "embedding", &query, 8, 64, false, None)
+            .unwrap();
+        let global_ids: HashSet<u64> = global.iter().map(|(id, _)| *id).collect();
+        assert!(
+            restrict.is_disjoint(&global_ids),
+            "precondition: restrict set must lie outside the global top-8, got {global_ids:?}"
+        );
+
+        // The exact small-set path still returns every member of the set (the
+        // caller, run_similar, then trims to the final k). No under-fill.
+        let got = v
+            .search_vector("Doc", "embedding", &query, 2, 64, false, Some(&restrict))
+            .unwrap();
+        let got_ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            got_ids, restrict,
+            "filtered search must return the set's members, not under-fill to the global top-k"
+        );
+    }
+
+    #[test]
+    fn filtered_search_keeps_missing_vector_member_as_infinity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = rerank_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        // Ingest 1..=5; the restrict set also names id 99, which has no vector.
+        let rows: Vec<(u64, Vec<f32>)> = (1..=5u64).map(|i| (i, synth_vec(i as f32))).collect();
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+
+        let query = synth_vec(2.0);
+        let restrict: HashSet<u64> = [2, 4, 99].into_iter().collect();
+        let got = v
+            .search_vector("Doc", "embedding", &query, 3, 64, false, Some(&restrict))
+            .unwrap();
+
+        // All three present (never dropped); id 99 (no vector) scores INFINITY
+        // and sorts last — parity with rerank's never-under-fill rule. id 2 is
+        // the exact self-match to the query.
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].0, 2, "self-match is nearest");
+        assert_eq!(got.last().unwrap().0, 99, "missing-vector member sorts last");
+        assert!(got.last().unwrap().1.is_infinite());
+    }
+
+    #[test]
+    fn filtered_search_is_deterministic_on_ties() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = rerank_setup(dir.path());
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        // ids 10 and 20 share the SAME vector → identical distance to any query.
+        let shared = synth_vec(7.0);
+        let mut rows: Vec<(u64, Vec<f32>)> = (1..=5u64).map(|i| (i, synth_vec(i as f32))).collect();
+        rows.push((10, shared.clone()));
+        rows.push((20, shared.clone()));
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+
+        let restrict: HashSet<u64> = [10, 20].into_iter().collect();
+        // The (distance, id) tie-break must order id 10 before id 20 every run,
+        // despite the unordered HashSet source and the exact distance tie.
+        for _ in 0..8 {
+            let got = v
+                .search_vector("Doc", "embedding", &shared, 2, 64, false, Some(&restrict))
+                .unwrap();
+            let ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
+            assert_eq!(ids, vec![10, 20], "tie-break by id must be deterministic");
         }
     }
 }

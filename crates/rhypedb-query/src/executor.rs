@@ -580,10 +580,13 @@ fn run_similar(
     let rerank = rerank.filter(|&r| r > 0);
 
     // Over-fetch only when restricting (post-filtering discards some hits); a
-    // global search needs just k. Heavy filtering can still yield < k results
-    // (a known HNSW post-filtering limitation) — an exact small-set path is a
-    // follow-up. `rerank: N` raises the retrieved pool to at least N so the
-    // full-precision re-score has N candidates to work over.
+    // global search needs just k. For a SELECTIVE filter (a small restrict set)
+    // the vectorizer takes an exact brute-force path that ignores this over-fetch
+    // and `ef` entirely (it scores the whole set, so it never under-fills); the
+    // over-fetch below only matters for the HNSW post-filter path used when the
+    // restrict set is large (> EXACT_FILTER_MAX), where heavy filtering can still
+    // yield < k (a documented residual). `rerank: N` raises the retrieved pool to
+    // at least N so the full-precision re-score has N candidates to work over.
     let base_k = match restrict {
         Some(_) => k.saturating_mul(4).max(k),
         None => k,
@@ -604,12 +607,24 @@ fn run_similar(
         .min(MAX_VECTOR_SEARCH_POOL);
 
     let results = match query {
-        SimilarQuery::Text(text) => {
-            vectorizer.search_text(type_name, field_name, text, search_k, ef, rerank.is_some())?
-        }
-        SimilarQuery::Vector(vec) => {
-            vectorizer.search_vector(type_name, field_name, vec, search_k, ef, rerank.is_some())?
-        }
+        SimilarQuery::Text(text) => vectorizer.search_text(
+            type_name,
+            field_name,
+            text,
+            search_k,
+            ef,
+            rerank.is_some(),
+            restrict,
+        )?,
+        SimilarQuery::Vector(vec) => vectorizer.search_vector(
+            type_name,
+            field_name,
+            vec,
+            search_k,
+            ef,
+            rerank.is_some(),
+            restrict,
+        )?,
     };
 
     let objects: Vec<Object> = results
