@@ -3262,6 +3262,27 @@ impl Database {
             }
         };
 
+        // Validate edge-field values against the relation's declared edge
+        // fields — the symmetric guarantee to validate_value() for object
+        // fields: every edge field must be declared, and its Value variant must
+        // match the declared scalar type. The query language already coerces
+        // edge literals to the declared type; this also guards direct callers,
+        // so a wrong variant errors instead of silently round-tripping back
+        // wrong.
+        if let Some(ref ef) = edge_fields {
+            for (name, value) in ef {
+                let edge_def = rel
+                    .edge_fields
+                    .iter()
+                    .find(|e| e.name == *name)
+                    .ok_or_else(|| EngineError::FieldNotFound {
+                        type_name: format!("{source_type}.{field_name}"),
+                        field: name.clone(),
+                    })?;
+                validate_edge_value(edge_def, value)?;
+            }
+        }
+
         // Verify the target type isn't tombstoned.
         let target_type_id = self.resolve_type_id(&rel.target_type)?;
 
@@ -4172,6 +4193,38 @@ fn fields_to_json(fields: &FieldMap) -> HashMap<String, serde_json::Value> {
             (k.clone(), json_val)
         })
         .collect()
+}
+
+/// Validate a relation edge-field value against its declared scalar type. The
+/// edge-field analogue of the `FieldType::Scalar` arm of [`validate_value`] —
+/// an exact `Value`/`ScalarType` variant match (Null is always allowed).
+fn validate_edge_value(
+    edge_def: &rhypedb_schema::EdgeFieldDef,
+    value: &Value,
+) -> EngineResult<()> {
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    let ok = matches!(
+        (&edge_def.scalar_type, value),
+        (ScalarType::String, Value::String(_))
+            | (ScalarType::U32, Value::U32(_))
+            | (ScalarType::U64, Value::U64(_))
+            | (ScalarType::I32, Value::I32(_))
+            | (ScalarType::I64, Value::I64(_))
+            | (ScalarType::F32, Value::F32(_))
+            | (ScalarType::F64, Value::F64(_))
+            | (ScalarType::Bool, Value::Bool(_))
+            | (ScalarType::Bytes, Value::Bytes(_))
+    );
+    if !ok {
+        return Err(EngineError::TypeMismatch {
+            field: edge_def.name.clone(),
+            expected: format!("{:?}", edge_def.scalar_type),
+            got: value.type_name().into(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_value(field_def: &rhypedb_schema::FieldDef, value: &Value) -> EngineResult<()> {
@@ -6210,6 +6263,62 @@ mod tests {
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].0, alien.id);
         assert_eq!(links[0].1.get("rating"), Some(&Value::F32(4.5)));
+    }
+
+    fn edge_validation_db(
+        dir: &std::path::Path,
+        rating_type: &str,
+    ) -> (std::sync::Arc<Database>, u64, u64) {
+        let schema = parse_schema(&format!(
+            r#"
+            type User {{
+                name: String
+                favorite_movies: [Movie] {{ rating: {rating_type} }} @on_delete(remove)
+            }}
+            type Movie {{ title: String }}
+            "#
+        ))
+        .unwrap();
+        let db = Database::open(schema, dir).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Alien".into()));
+        let alien = db.create("Movie", mf).unwrap();
+        (db, alice.id, alien.id)
+    }
+
+    #[test]
+    fn link_rejects_wrong_edge_value_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared f64, but a caller passes an F32 value — must be rejected,
+        // not silently stored as the wrong variant.
+        let (db, user, movie) = edge_validation_db(dir.path(), "f64");
+        let mut bad = FieldMap::new();
+        bad.insert("rating".into(), Value::F32(4.5));
+        let err = db.link("User", user, "favorite_movies", movie, Some(bad));
+        assert!(
+            matches!(err, Err(EngineError::TypeMismatch { .. })),
+            "got {err:?}"
+        );
+        // The matching variant is accepted.
+        let mut good = FieldMap::new();
+        good.insert("rating".into(), Value::F64(4.5));
+        db.link("User", user, "favorite_movies", movie, Some(good)).unwrap();
+    }
+
+    #[test]
+    fn link_rejects_undeclared_edge_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, user, movie) = edge_validation_db(dir.path(), "f32");
+        let mut bad = FieldMap::new();
+        bad.insert("bogus".into(), Value::F32(1.0));
+        let err = db.link("User", user, "favorite_movies", movie, Some(bad));
+        assert!(
+            matches!(err, Err(EngineError::FieldNotFound { .. })),
+            "got {err:?}"
+        );
     }
 
     #[test]

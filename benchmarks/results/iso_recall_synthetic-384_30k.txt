@@ -1,0 +1,22 @@
+iso-recall: rhypedb (TurboQuant_mse 4-bit + ef/rerank) vs pgvector (full f32 + ef_search)
+dataset synthetic-384-angular, n=30000, 200 queries, k=10, same HNSW m/ef_construction
+master be9dcd1 (post TurboQuant_mse switch + recall knobs)
+
+build: rhypedb 2858 ms | pgvector 8868 ms  (rhypedb 3.1x faster build)
+
+engine    config              recall@10   mean_us
+--------------------------------------------------
+pgvector  ef_search=10           0.8305       501
+rhypedb   baseline ef=50         0.8440       505
+rhypedb   rerank:50              0.8730       626
+pgvector  ef_search=40           0.8910       904
+rhypedb   ef:200                 0.8925      1182
+rhypedb   rerank:100             0.9090      1028
+rhypedb   ef:500                 0.9130      2496
+pgvector  ef_search=100          0.9370      1740
+rhypedb   rerank:200             0.9450      1805
+pgvector  ef_search=200          0.9695      3144
+rhypedb   rerank:500             0.9820      4340
+pgvector  ef_search=400          0.9905      5724
+rhypedb   rerank:1000            0.9970      7830
+pgvector  ef_search=800          0.9980     10955

@@ -448,21 +448,25 @@ fn execute_step(
             edge_fields,
         } => {
             let (source_type, ids) = ids_from_output(current, source)?;
+            // Resolve the relation field once — every source row has the
+            // same type at this point. (Resolved before coercing the edge
+            // fields, which need the relation's declared edge-field types.)
+            let field_name = resolve_relation_field(db, &source_type, target_type)?;
             let edge_map = if edge_fields.is_empty() {
                 None
             } else {
-                // Edge fields belong to the relation, not the source type's
-                // scalar fields, so they get the best-effort mapping (no
-                // schema-directed coercion).
-                let mut m = FieldMap::new();
-                for (name, lit) in edge_fields {
-                    m.insert(name.clone(), literal_to_value(lit, None)?);
-                }
-                Some(m)
+                // Coerce each edge literal to its DECLARED edge-field type
+                // (RelationType.edge_fields[].scalar_type), mirroring the
+                // schema-directed coercion object fields get — otherwise an
+                // `f64`/`u64`/`i32`/`i64` edge field is stored as the wrong
+                // `Value` variant. `db.link()` validates the result.
+                Some(edge_literal_map_to_field_map(
+                    db,
+                    &source_type,
+                    &field_name,
+                    edge_fields,
+                )?)
             };
-            // Resolve the relation field once — every source row has the
-            // same type at this point.
-            let field_name = resolve_relation_field(db, &source_type, target_type)?;
             for id in ids {
                 db.link(&source_type, id, &field_name, *target_id, edge_map.clone())?;
             }
@@ -841,10 +845,48 @@ fn literal_map_to_field_map(
     Ok(fields)
 }
 
+/// Build an edge-`FieldMap` from parsed literals, coercing each value into the
+/// relation's DECLARED edge-field scalar type (`RelationType.edge_fields[].
+/// scalar_type`). This is the edge-field analogue of [`literal_map_to_field_map`]:
+/// without it, `A.link(B.get(2), { weight: 3.5 })` for a declared `f64` edge
+/// field would store `Value::F32` (the best-effort default). An edge-field name
+/// the relation doesn't declare gets `target = None` (best-effort) — `db.link()`
+/// then rejects it as an unknown edge field, mirroring how `create`/`update`
+/// reject unknown object fields.
+fn edge_literal_map_to_field_map(
+    db: &Database,
+    source_type: &str,
+    field_name: &str,
+    literals: &HashMap<String, Literal>,
+) -> QueryResult<FieldMap> {
+    let edge_types: HashMap<&str, rhypedb_schema::ScalarType> = db
+        .schema()
+        .get_type(source_type)
+        .and_then(|td| td.get_field(field_name))
+        .and_then(|fd| match &fd.field_type {
+            rhypedb_schema::FieldType::Relation(rel) => Some(rel),
+            _ => None,
+        })
+        .map(|rel| {
+            rel.edge_fields
+                .iter()
+                .map(|ef| (ef.name.as_str(), ef.scalar_type.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut fields = FieldMap::new();
+    for (name, lit) in literals {
+        let target = edge_types.get(name.as_str()).cloned();
+        fields.insert(name.clone(), literal_to_value(lit, target)?);
+    }
+    Ok(fields)
+}
+
 /// Convert a literal into a `Value`. When the field's declared scalar type is
 /// known (`target`), the literal is coerced to match it; otherwise (relation
-/// target ids, edge fields, fields the schema doesn't know) a best-effort
-/// mapping is used.
+/// target ids, edge fields the schema doesn't know) a best-effort mapping is
+/// used.
 fn literal_to_value(lit: &Literal, target: Option<rhypedb_schema::ScalarType>) -> QueryResult<Value> {
     use rhypedb_schema::ScalarType as ST;
 
@@ -1288,6 +1330,108 @@ mod tests {
         let links = db.get_links("User", alice.id, "friends").unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].0, bob.id);
+    }
+
+    fn edge_typed_db(dir: &std::path::Path) -> std::sync::Arc<Database> {
+        let schema = parse_schema(
+            r#"
+            type Tag { label: String }
+            type Item {
+                name: String
+                tags: [Tag] {
+                    score: f64
+                    count: u64
+                    rank: i32
+                    big: i64
+                    weight: f32
+                } @on_delete(remove)
+            }
+            "#,
+        )
+        .unwrap();
+        Database::open(schema, dir).unwrap()
+    }
+
+    fn make_item_and_tag(db: &Database) -> (u64, u64) {
+        let mut itf = FieldMap::new();
+        itf.insert("name".into(), Value::String("widget".into()));
+        let item = db.create("Item", itf).unwrap();
+        let mut tgf = FieldMap::new();
+        tgf.insert("label".into(), Value::String("red".into()));
+        let tag = db.create("Tag", tgf).unwrap();
+        (item.id, tag.id)
+    }
+
+    #[test]
+    fn link_edge_literals_coerce_to_declared_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edge_typed_db(dir.path());
+        let (item, tag) = make_item_and_tag(&db);
+
+        let q = parse_query(&format!(
+            "Item.get({item}).link(Tag.get({tag}), \
+             {{ score: 3.5, count: 5, rank: -7, big: 9000000000, weight: 1.25 }})"
+        ))
+        .unwrap();
+        let res = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        assert!(matches!(res, QueryOutput::Done));
+
+        let links = db.get_links("Item", item, "tags").unwrap();
+        assert_eq!(links.len(), 1);
+        let e = &links[0].1;
+        // Each edge literal must land in its DECLARED Value variant — the
+        // best-effort default would store F32/U32/I64 here (the bug).
+        assert_eq!(e.get("score"), Some(&Value::F64(3.5)), "f64 -> F64, not F32");
+        assert_eq!(e.get("count"), Some(&Value::U64(5)), "u64 -> U64, not U32");
+        assert_eq!(e.get("rank"), Some(&Value::I32(-7)), "i32 -> I32, not I64");
+        assert_eq!(e.get("big"), Some(&Value::I64(9_000_000_000)), "i64 -> I64");
+        assert_eq!(e.get("weight"), Some(&Value::F32(1.25)), "f32 -> F32");
+    }
+
+    #[test]
+    fn link_edge_int_literal_widens_into_float_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edge_typed_db(dir.path());
+        let (item, tag) = make_item_and_tag(&db);
+
+        // `score: 5` (an Int literal) must widen into the declared f64 field.
+        let q = parse_query(&format!(
+            "Item.get({item}).link(Tag.get({tag}), {{ score: 5 }})"
+        ))
+        .unwrap();
+        execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+
+        let links = db.get_links("Item", item, "tags").unwrap();
+        assert_eq!(links[0].1.get("score"), Some(&Value::F64(5.0)));
+    }
+
+    #[test]
+    fn link_edge_null_literal_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edge_typed_db(dir.path());
+        let (item, tag) = make_item_and_tag(&db);
+
+        // `null` is valid for any edge-field type (matches validate_edge_value).
+        let q = parse_query(&format!(
+            "Item.get({item}).link(Tag.get({tag}), {{ score: null }})"
+        ))
+        .unwrap();
+        execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        assert_eq!(db.get_links("Item", item, "tags").unwrap()[0].1.get("score"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn link_edge_unknown_field_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = edge_typed_db(dir.path());
+        let (item, tag) = make_item_and_tag(&db);
+
+        let q = parse_query(&format!(
+            "Item.get({item}).link(Tag.get({tag}), {{ nope: 1 }})"
+        ))
+        .unwrap();
+        let res = execute(&ExecContext { db: &db, vectorizer: None }, &q);
+        assert!(res.is_err(), "an undeclared edge field must be rejected");
     }
 
     #[test]
