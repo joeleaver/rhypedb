@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 
 use rhypedb_embed::{Embedder, FastEmbedder, FastReranker, Reranker};
-use rhypedb_schema::{FieldType, Schema, VectorizeDef};
+use rhypedb_schema::{DistanceMetric, FieldType, IndexDef, QuantizationType, Schema, VectorizeDef};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::LsmTree;
 use rhypedb_vector::distance::{compute_distance, Metric};
@@ -127,6 +127,85 @@ pub struct Vectorizer {
     claim_mutex: parking_lot::Mutex<()>,
 }
 
+/// Effective index config for a Vector field with no (or a partial) `@index`
+/// directive. These MUST equal what deployed indexes were built with: a Vector
+/// field that omits a parameter resolves to exactly this, so an existing
+/// snapshot does not spuriously mismatch and trigger a rebuild on upgrade.
+/// Changing any of these is a breaking migration — it rebuilds every index that
+/// relied on the default. (Note: `HnswConfig::default()` uses ef_construction
+/// 200, which is NOT our legacy value — resolve against these constants, never
+/// `Default::default()`.)
+const LEGACY_QUANT_BITS: u8 = 4;
+const LEGACY_HNSW_M: usize = 16;
+const LEGACY_HNSW_EF_CONSTRUCTION: usize = 100;
+const LEGACY_METRIC: Metric = Metric::Cosine;
+
+/// Resolve a Vector field's effective `(HnswConfig, TurboQuantConfig)` from its
+/// `@index` directive, filling any omitted parameter from the legacy defaults.
+/// `m_max0` is always derived as `2*m` (not a user knob). The schema is already
+/// validated (`validate_schema` rejects `quantization: none`, `m`/`ef_construction`
+/// of 0, and `@index` on non-Vector fields), so this mapping is total; the
+/// residual `None`-enum arm defaults to 4-bit defensively for an unvalidated
+/// (e.g. programmatically built) schema rather than panicking.
+fn resolve_index_config(dimensions: u32, index: Option<&IndexDef>) -> (HnswConfig, TurboQuantConfig) {
+    let bits = match index.and_then(|i| i.quantization.as_ref()) {
+        Some(QuantizationType::TurboQuant2Bit) => 2,
+        Some(QuantizationType::TurboQuant3Bit) => 3,
+        Some(QuantizationType::TurboQuant4Bit) => 4,
+        Some(QuantizationType::None) | None => LEGACY_QUANT_BITS,
+    };
+    let metric = match index.and_then(|i| i.metric.as_ref()) {
+        Some(DistanceMetric::Cosine) => Metric::Cosine,
+        Some(DistanceMetric::L2) => Metric::L2,
+        Some(DistanceMetric::DotProduct) => Metric::DotProduct,
+        None => LEGACY_METRIC,
+    };
+    let m = index.and_then(|i| i.m).map_or(LEGACY_HNSW_M, |m| m as usize);
+    let ef_construction = index
+        .and_then(|i| i.ef_construction)
+        .map_or(LEGACY_HNSW_EF_CONSTRUCTION, |e| e as usize);
+    let hnsw_config = HnswConfig {
+        m,
+        m_max0: m * 2,
+        ef_construction,
+        metric,
+    };
+    (hnsw_config, TurboQuantConfig::new(dimensions, bits))
+}
+
+/// Compare a freshly-constructed `target` index (carrying the config the schema's
+/// `@index` directive resolves to) against a `loaded` snapshot. Returns
+/// `Some(human-readable reason)` for the first parameter that differs, or `None`
+/// if every parameter matches. Any difference means the snapshot must be rebuilt
+/// from the LSM to honor the schema (see [`Vectorizer::rebuild_indexes`]). All
+/// four parameters are persisted in the snapshot, so this comparison is exact;
+/// `m_max0` is omitted because it is always `2*m` (a difference in `m` covers it).
+fn index_config_mismatch(target: &QuantizedIndex, loaded: &QuantizedIndex) -> Option<String> {
+    if loaded.quant_bits() != target.quant_bits() {
+        Some(format!(
+            "quantization bits {} -> {}",
+            loaded.quant_bits(),
+            target.quant_bits()
+        ))
+    } else if loaded.metric() != target.metric() {
+        Some(format!(
+            "metric {:?} -> {:?}",
+            loaded.metric(),
+            target.metric()
+        ))
+    } else if loaded.hnsw_m() != target.hnsw_m() {
+        Some(format!("m {} -> {}", loaded.hnsw_m(), target.hnsw_m()))
+    } else if loaded.hnsw_ef_construction() != target.hnsw_ef_construction() {
+        Some(format!(
+            "ef_construction {} -> {}",
+            loaded.hnsw_ef_construction(),
+            target.hnsw_ef_construction()
+        ))
+    } else {
+        None
+    }
+}
+
 impl Vectorizer {
     pub fn new(
         storage: Arc<LsmTree>,
@@ -146,13 +225,11 @@ impl Vectorizer {
             for field in &type_def.fields {
                 if let FieldType::Vector(vt) = &field.field_type {
                     let index_key = format!("{}.{}", type_def.name, field.name);
-                    let hnsw_config = HnswConfig {
-                        m: 16,
-                        m_max0: 32,
-                        ef_construction: 100,
-                        metric: Metric::Cosine,
-                    };
-                    let quant_config = TurboQuantConfig::new(vt.dimensions, 4);
+                    // Effective config comes from the field's `@index` directive,
+                    // defaulting to the legacy hardcoded values for any omitted
+                    // parameter (so existing indexes are unchanged).
+                    let (hnsw_config, quant_config) =
+                        resolve_index_config(vt.dimensions, field.index());
                     let index = QuantizedIndex::new(hnsw_config, quant_config);
                     indexes.insert(index_key, Arc::new(index));
                 }
@@ -219,19 +296,41 @@ impl Vectorizer {
                         let mut reader = std::io::BufReader::new(file);
                         match QuantizedIndex::load(&mut reader) {
                             Ok(loaded) => {
-                                let loaded = Arc::new(loaded);
+                                // The schema is the source of truth: the fresh
+                                // index already in the map carries the config the
+                                // current `@index` directive resolves to. If a
+                                // persisted snapshot was built with a different
+                                // bits/metric/m/ef_construction, it can't be
+                                // reconciled in place — drop it and rebuild from
+                                // the LSM f32 (which `save_single_snapshot` then
+                                // persists with the new config, so the next
+                                // restart matches and does not rebuild again).
+                                let mismatch = {
+                                    let target = indexes.get(index_key).unwrap();
+                                    index_config_mismatch(target, &loaded)
+                                };
+                                if let Some(reason) = mismatch {
+                                    eprintln!(
+                                        "HNSW snapshot for {index_key} was built with a different \
+                                         @index config ({reason}); rebuilding from LSM to match the schema"
+                                    );
+                                    // Fall through to the full LSM rebuild below,
+                                    // which uses the fresh target-config index.
+                                } else {
+                                    let loaded = Arc::new(loaded);
 
-                                // Delta rebuild: insert any vectors in LSM missing from the snapshot.
-                                let delta = self.insert_delta_vectors(
-                                    index_key, &loaded,
-                                )?;
+                                    // Delta rebuild: insert any vectors in LSM missing from the snapshot.
+                                    let delta = self.insert_delta_vectors(
+                                        index_key, &loaded,
+                                    )?;
 
-                                indexes.insert(index_key.clone(), loaded);
-                                eprintln!(
-                                    "loaded HNSW snapshot for {index_key} ({} vectors, {delta} delta)",
-                                    indexes[index_key].len()
-                                );
-                                continue;
+                                    indexes.insert(index_key.clone(), loaded);
+                                    eprintln!(
+                                        "loaded HNSW snapshot for {index_key} ({} vectors, {delta} delta)",
+                                        indexes[index_key].len()
+                                    );
+                                    continue;
+                                }
                             }
                             Err(e) => {
                                 eprintln!(
@@ -1876,5 +1975,138 @@ mod tests {
             .unwrap();
         assert_eq!(reranked.len(), 5);
         assert_eq!(reranked[0].0, 2, "exact nearest to query(seed=2) is id 2");
+    }
+
+    // --- @index SDL directive → per-index config (Knob A) ---
+
+    /// `Doc { embedding: Vector<16> ... }` with a caller-supplied `@index`.
+    fn index_setup(
+        dir: &std::path::Path,
+        schema_str: &str,
+    ) -> (Arc<LsmTree>, Schema, HashMap<String, u64>, HashMap<String, u64>) {
+        let schema = parse_schema(schema_str).unwrap();
+        let storage = LsmTree::open(LsmConfig::new(dir)).unwrap();
+        let mut type_ids = HashMap::new();
+        type_ids.insert("Doc".into(), 1u64);
+        let mut field_ids = HashMap::new();
+        field_ids.insert("Doc.embedding".into(), 1u64);
+        (storage, schema, type_ids, field_ids)
+    }
+
+    fn quant_bits_of(v: &Vectorizer, key: &str) -> u8 {
+        v.indexes.read().get(key).unwrap().quant_bits()
+    }
+
+    #[test]
+    fn resolve_index_config_defaults_to_legacy() {
+        // Absent @index MUST resolve to exactly the legacy hardcoded config, or
+        // every deployed index would mismatch its snapshot and rebuild on upgrade.
+        let (hnsw, quant) = resolve_index_config(384, None);
+        assert_eq!(quant.bits, LEGACY_QUANT_BITS);
+        assert_eq!(quant.dimensions, 384);
+        assert_eq!(hnsw.m, LEGACY_HNSW_M);
+        assert_eq!(hnsw.m_max0, LEGACY_HNSW_M * 2);
+        assert_eq!(hnsw.ef_construction, LEGACY_HNSW_EF_CONSTRUCTION);
+        assert_eq!(hnsw.metric, LEGACY_METRIC);
+    }
+
+    #[test]
+    fn index_directive_sets_quant_bits() {
+        for (q, want) in [
+            ("turboquant_2bit", 2u8),
+            ("turboquant_3bit", 3),
+            ("turboquant_4bit", 4),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let schema =
+                format!("type Doc {{ embedding: Vector<16> @index(hnsw, quantization: {q}) }}");
+            let (storage, schema, type_ids, field_ids) = index_setup(dir.path(), &schema);
+            let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+            assert_eq!(quant_bits_of(&v, "Doc.embedding"), want, "quantization {q}");
+        }
+    }
+
+    #[test]
+    fn index_directive_sets_metric_and_hnsw_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = index_setup(
+            dir.path(),
+            "type Doc { embedding: Vector<16> @index(hnsw, metric: l2, m: 8, ef_construction: 64) }",
+        );
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+        let idx = v.indexes.read().get("Doc.embedding").unwrap().clone();
+        assert_eq!(idx.metric(), Metric::L2);
+        assert_eq!(idx.hnsw_m(), 8);
+        assert_eq!(idx.hnsw_ef_construction(), 64);
+        // bits omitted → legacy default
+        assert_eq!(idx.quant_bits(), LEGACY_QUANT_BITS);
+    }
+
+    #[test]
+    fn index_config_mismatch_detects_difference() {
+        // Two indexes built from the same (default) config never mismatch.
+        let (h1, q1) = resolve_index_config(16, None);
+        let (h2, q2) = resolve_index_config(16, None);
+        let a = QuantizedIndex::new(h1, q1);
+        let b = QuantizedIndex::new(h2, q2);
+        assert!(index_config_mismatch(&a, &b).is_none());
+
+        // A different bit-width is detected as a mismatch.
+        let c = QuantizedIndex::new(
+            HnswConfig { m: 16, m_max0: 32, ef_construction: 100, metric: Metric::Cosine },
+            TurboQuantConfig::new(16, 2),
+        );
+        assert!(index_config_mismatch(&a, &c).is_some());
+
+        // So is a different metric.
+        let d = QuantizedIndex::new(
+            HnswConfig { m: 16, m_max0: 32, ef_construction: 100, metric: Metric::L2 },
+            TurboQuantConfig::new(16, 4),
+        );
+        assert!(index_config_mismatch(&a, &d).is_some());
+    }
+
+    #[test]
+    fn config_change_rebuilds_index_from_lsm() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows: Vec<(u64, Vec<f32>)> = (1..=20u64).map(|i| (i, synth_vec(i as f32))).collect();
+
+        // First run: default (4-bit) index, ingest 20 vectors, save the snapshot.
+        {
+            let (storage, schema, type_ids, field_ids) =
+                index_setup(dir.path(), "type Doc { embedding: Vector<16> }");
+            let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+            assert_eq!(quant_bits_of(&v, "Doc.embedding"), 4);
+            v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+            v.save_snapshots();
+        }
+
+        // Second run: the SDL now asks for 2-bit. The 4-bit snapshot mismatches
+        // the schema, so the index must be dropped and rebuilt from the LSM f32
+        // at 2-bit — without losing any vectors.
+        {
+            let (storage, schema, type_ids, field_ids) = index_setup(
+                dir.path(),
+                "type Doc { embedding: Vector<16> @index(hnsw, quantization: turboquant_2bit) }",
+            );
+            let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+            assert_eq!(
+                quant_bits_of(&v, "Doc.embedding"),
+                2,
+                "index should have been rebuilt at the new 2-bit width"
+            );
+            let stat = v
+                .status()
+                .index_stats
+                .into_iter()
+                .find(|s| s.name == "Doc.embedding")
+                .unwrap();
+            assert_eq!(stat.vectors, 20, "all vectors must survive the rebuild");
+            // The rebuilt index is functional: the self-match query ranks first.
+            let hits = v
+                .search_vector("Doc", "embedding", &synth_vec(5.0), 3, 64, false)
+                .unwrap();
+            assert!(hits.iter().any(|(id, _)| *id == 5), "got {hits:?}");
+        }
     }
 }

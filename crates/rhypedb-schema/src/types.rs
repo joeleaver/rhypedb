@@ -78,6 +78,17 @@ impl FieldDef {
             _ => None,
         })
     }
+
+    /// The `@index(hnsw, ...)` directive configuring this field's vector index
+    /// (metric / quantization bit-width / m / ef_construction), if present.
+    /// Only meaningful on `Vector` fields; `validate_schema` rejects it
+    /// elsewhere.
+    pub fn index(&self) -> Option<&IndexDef> {
+        self.directives.iter().find_map(|d| match d {
+            Directive::Index(i) => Some(i),
+            _ => None,
+        })
+    }
 }
 
 /// The type of a field — scalar, relationship, or vector.

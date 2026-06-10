@@ -126,6 +126,25 @@ impl QuantizedIndex {
         self.metric
     }
 
+    /// TurboQuant bit-width (2/3/4) this index quantizes with. Part of the
+    /// effective config compared against the schema's `@index` directive to
+    /// decide whether a loaded snapshot must be rebuilt.
+    pub fn quant_bits(&self) -> u8 {
+        self.hnsw.distance().quantizer.config().bits
+    }
+
+    /// HNSW `m` (max neighbors per node per upper layer) this index was built
+    /// with. See [`Self::quant_bits`] for why this is exposed.
+    pub fn hnsw_m(&self) -> usize {
+        self.hnsw.config().m
+    }
+
+    /// HNSW `ef_construction` (search width during construction) this index was
+    /// built with. See [`Self::quant_bits`].
+    pub fn hnsw_ef_construction(&self) -> usize {
+        self.hnsw.config().ef_construction
+    }
+
     pub fn contains_id(&self, id: u64) -> bool {
         self.hnsw.contains_id(id)
     }
@@ -243,6 +262,37 @@ mod tests {
                 (i as u64, vec)
             })
             .collect()
+    }
+
+    /// The full effective config (bits/metric/m/ef_construction) must survive a
+    /// save→load round-trip unchanged. The engine compares these accessors on a
+    /// loaded snapshot against the schema's `@index` to decide whether to rebuild;
+    /// if save/load were asymmetric, a freshly-saved snapshot would re-mismatch
+    /// itself and rebuild forever. This pins the symmetry.
+    #[test]
+    fn config_accessors_survive_save_load() {
+        let cfg = HnswConfig {
+            m: 8,
+            m_max0: 16,
+            ef_construction: 64,
+            metric: Metric::L2,
+        };
+        let index = QuantizedIndex::new(cfg, TurboQuantConfig::new(16, 3));
+        for (id, vec) in &random_vectors(30, 16) {
+            index.insert(*id, vec);
+        }
+        assert_eq!(index.quant_bits(), 3);
+        assert_eq!(index.hnsw_m(), 8);
+        assert_eq!(index.hnsw_ef_construction(), 64);
+
+        let mut buf = Vec::new();
+        index.save(&mut buf).unwrap();
+        let loaded = QuantizedIndex::load(&mut &buf[..]).unwrap();
+
+        assert_eq!(loaded.quant_bits(), 3);
+        assert_eq!(loaded.metric(), Metric::L2);
+        assert_eq!(loaded.hnsw_m(), 8);
+        assert_eq!(loaded.hnsw_ef_construction(), 64);
     }
 
     #[test]

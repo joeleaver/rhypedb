@@ -94,6 +94,44 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                 )));
             }
 
+            // Validate @index (the HNSW vector-index config directive). It only
+            // makes sense on a Vector field — the engine builds an HNSW index
+            // for every Vector field and reads this directive for the metric /
+            // quantization bit-width / m / ef_construction. Rejecting it here
+            // (parse time) keeps a misconfiguration from silently no-op'ing or
+            // from failing later at `Vectorizer::new` / server startup.
+            if let Some(idx) = field.index() {
+                if !matches!(field.field_type, FieldType::Vector(_)) {
+                    return Err(SchemaError::Validation(format!(
+                        "@index on '{}.{}' requires a Vector field type",
+                        type_def.name, field.name
+                    )));
+                }
+                // The HNSW vector index always quantizes (TurboQuant_mse); there
+                // is no full-precision in-memory graph path. `quantization: none`
+                // is therefore unsupported — omit the parameter for the 4-bit
+                // default, or pick turboquant_2bit/3bit/4bit.
+                if matches!(idx.quantization, Some(QuantizationType::None)) {
+                    return Err(SchemaError::Validation(format!(
+                        "@index on '{}.{}': `quantization: none` is not supported for HNSW vector \
+                         indexes; omit it for the 4-bit default or use turboquant_2bit/3bit/4bit",
+                        type_def.name, field.name
+                    )));
+                }
+                if matches!(idx.m, Some(0)) {
+                    return Err(SchemaError::Validation(format!(
+                        "@index on '{}.{}': `m` must be >= 1",
+                        type_def.name, field.name
+                    )));
+                }
+                if matches!(idx.ef_construction, Some(0)) {
+                    return Err(SchemaError::Validation(format!(
+                        "@index on '{}.{}': `ef_construction` must be >= 1",
+                        type_def.name, field.name
+                    )));
+                }
+            }
+
             // Validate @inverse references.
             if let Some(inv) = field.inverse() {
                 let target_type = schema
@@ -719,6 +757,36 @@ mod tests {
         assert_eq!(idx.quantization, Some(QuantizationType::TurboQuant3Bit));
         assert_eq!(idx.m, Some(16));
         assert_eq!(idx.ef_construction, Some(200));
+    }
+
+    #[test]
+    fn index_on_non_vector_field_rejected() {
+        let r = parse_schema(
+            r#"type T { title: String @index(hnsw, quantization: turboquant_2bit) }"#,
+        );
+        assert!(r.is_err(), "@index on a String field must be rejected");
+    }
+
+    #[test]
+    fn index_quantization_none_rejected() {
+        let r = parse_schema(r#"type T { e: Vector<8> @index(hnsw, quantization: none) }"#);
+        assert!(r.is_err(), "quantization: none is unsupported for HNSW");
+    }
+
+    #[test]
+    fn index_zero_m_or_ef_construction_rejected() {
+        assert!(parse_schema(r#"type T { e: Vector<8> @index(hnsw, m: 0) }"#).is_err());
+        assert!(parse_schema(r#"type T { e: Vector<8> @index(hnsw, ef_construction: 0) }"#).is_err());
+    }
+
+    #[test]
+    fn index_valid_config_accepted() {
+        assert!(parse_schema(
+            r#"type T { e: Vector<8> @index(hnsw, metric: l2, quantization: turboquant_2bit, m: 8, ef_construction: 64) }"#
+        )
+        .is_ok());
+        // A bare Vector field (no @index) is still valid — it defaults.
+        assert!(parse_schema(r#"type T { e: Vector<8> }"#).is_ok());
     }
 
     #[test]

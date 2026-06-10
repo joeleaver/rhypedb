@@ -702,6 +702,13 @@ impl<D: DistanceProvider> HnswIndex<D> {
         &self.distance
     }
 
+    /// The construction config (m / m_max0 / ef_construction / metric) this
+    /// index was built — or loaded from a snapshot — with. Used to detect when
+    /// a persisted index disagrees with the schema's `@index` directive.
+    pub fn config(&self) -> &HnswConfig {
+        &self.config
+    }
+
     pub fn save(&self, w: &mut dyn io::Write) -> io::Result<()> {
         w.write_all(HNSW_MAGIC)?;
         write_u32(w, HNSW_VERSION)?;

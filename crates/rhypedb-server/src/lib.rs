@@ -339,15 +339,21 @@ pub async fn run() {
         .any(|td| td.vector_fields().next().is_some());
 
     let vectorizer = if has_vector_field {
-        let v = Arc::new(
-            Vectorizer::new(
-                Arc::clone(db.storage()),
-                schema.clone(),
-                db.type_ids().clone(),
-                db.field_ids().clone(),
-            )
-            .unwrap(),
-        );
+        let vectorizer = match Vectorizer::new(
+            Arc::clone(db.storage()),
+            schema.clone(),
+            db.type_ids().clone(),
+            db.field_ids().clone(),
+        ) {
+            Ok(v) => v,
+            // A misconfigured vector index (e.g. an invalid `@index` directive)
+            // should fail startup with a legible message, not a panic backtrace.
+            Err(e) => {
+                eprintln!("failed to initialize vector indexes: {e}");
+                std::process::exit(1);
+            }
+        };
+        let v = Arc::new(vectorizer);
         if has_vectorize {
             v.start_worker(1);
         }
