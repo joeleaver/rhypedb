@@ -145,11 +145,14 @@ const LEGACY_METRIC: Metric = Metric::Cosine;
 /// post-filtering under-fills when a selective filter's matches mostly fall
 /// outside the global top-k; brute-forcing a small set is both exact (recall
 /// 1.0 within the filter) and, at this size, cheaper than the graph. Above this
-/// the filter is non-selective enough that the over-fetch path suffices, and a
-/// full scan would dominate latency (a 10k×d rescore is ~the cost of
-/// `rerank: 10000`, the existing accepted upper bound). The brute path reads
-/// each member's f32 from the LSM `v:` keyspace, so its cost scales with the
-/// set size, not the corpus.
+/// the filter is non-selective enough that the over-fetch path suffices. The
+/// brute path reads each member's f32 from the LSM `v:` keyspace, so its cost
+/// scales with the set size, not the corpus. Measured at 384-d
+/// (`bench_brute_force_restricted_latency`): restrict 100 -> 0.13 ms, 1k -> 1.3
+/// ms, 10k -> 15 ms per query (~linear). 15 ms is the worst case (a filter
+/// selecting ~10k) and buys exactness over the cheaper-but-lossy HNSW
+/// post-filter — the point of the knob; typical selective filters (10s-1000s)
+/// stay sub-2 ms.
 const EXACT_FILTER_MAX: usize = 10_000;
 
 /// Resolve a Vector field's effective `(HnswConfig, TurboQuantConfig)` from its
@@ -2331,6 +2334,44 @@ mod tests {
                 .unwrap();
             let ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
             assert_eq!(ids, vec![10, 20], "tie-break by id must be deterministic");
+        }
+    }
+
+    /// Latency of the exact small-set path at 384-d (the bible-app dimension)
+    /// across restrict-set sizes, to justify `EXACT_FILTER_MAX`. Not a CI gate.
+    /// Run: `cargo test -p rhypedb-engine --release bench_brute_force_restricted_latency -- --ignored --nocapture`
+    #[test]
+    #[ignore = "latency benchmark; run in --release with --ignored --nocapture"]
+    fn bench_brute_force_restricted_latency() {
+        use std::time::Instant;
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) =
+            index_setup(dir.path(), "type Doc { embedding: Vector<384> }");
+        let v = Vectorizer::new(storage, schema, type_ids, field_ids).unwrap();
+
+        let dim = 384usize;
+        let vec_at = |seed: u64| -> Vec<f32> {
+            (0..dim).map(|j| ((seed as f32) * 0.7 + j as f32 * 1.3).sin()).collect()
+        };
+        let n = 10_000u64;
+        let rows: Vec<(u64, Vec<f32>)> = (1..=n).map(|i| (i, vec_at(i))).collect();
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+
+        let query = vec_at(424_242);
+        for &size in &[100usize, 1_000, 10_000] {
+            let restrict: HashSet<u64> = (1..=size as u64).collect();
+            let _ = v
+                .search_vector("Doc", "embedding", &query, 10, 64, false, Some(&restrict))
+                .unwrap(); // warm
+            let iters = 20;
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = v
+                    .search_vector("Doc", "embedding", &query, 10, 64, false, Some(&restrict))
+                    .unwrap();
+            }
+            let per_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+            println!("brute restrict={size:>6} dim={dim}: {per_ms:.3} ms/query");
         }
     }
 }
