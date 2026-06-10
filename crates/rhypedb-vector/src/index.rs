@@ -6,9 +6,12 @@ use crate::quantize::{CompressedVector, PreparedQuery, TurboQuantConfig, TurboQu
 use crate::serial::{read_u8, write_u8};
 
 const QUANTIZED_INDEX_MAGIC: &[u8; 4] = b"RQNT";
-const QUANTIZED_INDEX_VERSION: u32 = 1;
+// v2: TurboQuant_mse — dropped the QJL residual (sign bits + residual norm + the
+// QJL matrix). v1 snapshots are rejected on load; the engine rebuilds the index
+// from the LSM `v:` f32 vectors (source of truth).
+const QUANTIZED_INDEX_VERSION: u32 = 2;
 
-/// Distance provider that uses TurboQuant's unbiased estimator.
+/// Distance provider that uses TurboQuant's MSE estimate.
 /// All distance computations — during both graph construction and search —
 /// go through TurboQuant compression.
 pub struct TurboQuantDistance {
@@ -57,8 +60,8 @@ impl DistanceProvider for TurboQuantDistance {
     }
 
     fn stored_bytes(stored: &CompressedVector) -> usize {
-        // Heap allocation only (codes + QJL signs share one buffer); the inline
-        // struct (the boxed-slice header + the two f32 norms) is node_overhead.
+        // Heap allocation only (the bit-packed codes); the inline struct (the
+        // boxed-slice header + the f32 norm) is counted as node_overhead.
         stored.heap_bytes()
     }
 }
@@ -68,9 +71,9 @@ impl DistanceProvider for TurboQuantDistance {
 /// Unlike the previous implementation which built the HNSW graph with
 /// full-precision vectors and only used TurboQuant for reranking, this
 /// index stores ONLY compressed vectors. Every distance computation
-/// during graph construction and search uses TurboQuant's unbiased
-/// estimator. This reflects production behavior where full-precision
-/// vectors are not kept in memory.
+/// during graph construction and search uses TurboQuant's MSE estimate.
+/// This reflects production behavior where full-precision vectors are not
+/// kept in memory.
 pub struct QuantizedIndex {
     hnsw: HnswIndex<TurboQuantDistance>,
     metric: Metric,

@@ -32,36 +32,29 @@ impl TurboQuantConfig {
         total_bits.div_ceil(8)
     }
 
-    pub fn qjl_size(&self) -> usize {
-        (self.dimensions as usize).div_ceil(8)
-    }
-
     pub fn total_size(&self) -> usize {
-        // quantized data + QJL signs + norm (f32) + residual norm (f32)
-        self.compressed_size() + self.qjl_size() + 4 + 4
+        // quantized data + norm (f32)
+        self.compressed_size() + 4
     }
 }
 
 /// A trained TurboQuant quantizer for a specific vector collection.
 ///
-/// Implements the TurboQuant pipeline from arXiv:2504.19874:
+/// Implements the MSE variant (TurboQuant_mse) of arXiv:2504.19874:
 /// 1. Normalize to unit sphere, store norm
-/// 2. Random orthogonal rotation (QR of Gaussian matrix)
-/// 3. Lloyd-Max scalar quantization with Beta-distribution codebook
-/// 4. QJL residual: project residual through Gaussian matrix, store signs
+/// 2. Random orthogonal rotation (QR of Gaussian matrix) → coords ~ Beta
+/// 3. Lloyd-Max scalar quantization with the analytic Beta-distribution codebook
 ///
-/// The combined estimator is unbiased: E[estimated inner product] = true inner product.
+/// The inner-product estimate is the rotated-query · centroids dot, rescaled by
+/// the stored norm. (The paper's TurboQuant_prod variant adds a 1-bit QJL
+/// residual correction to make the *dot-product* estimate unbiased — valuable
+/// for aggregate inner products like attention, but for k-NN ranking at 2–4
+/// bits it added ~2× build/search cost for no recall gain, so it is intentionally
+/// omitted. See the perf/turboquant-mse change notes.)
 pub struct TurboQuantizer {
     config: TurboQuantConfig,
     rotation_matrix: Vec<f32>, // d x d, row-major — orthogonal via QR
     codebook: Codebook,
-    qjl_matrix: Vec<f32>, // d x d, i.i.d. N(0,1)
-    /// Precomputed S·Rᵀ (d×d, row-major). Lets `prepare_stored` project a
-    /// decompressed vector with ONE matvec instead of an inverse rotation plus
-    /// two projections — see [`Self::prepare_stored`]. Derived from
-    /// `qjl_matrix` and `rotation_matrix`, so it is NOT serialized; it is
-    /// recomputed in `new` and `read_from`.
-    sr_t: Vec<f32>,
 }
 
 /// Precomputed Lloyd-Max codebook for Beta-distributed values.
@@ -80,16 +73,12 @@ impl TurboQuantizer {
         let num_centroids = 1usize << config.bits;
 
         let rotation_matrix = generate_rotation_matrix(dims);
-        let qjl_matrix = generate_qjl_matrix(dims);
         let codebook = compute_beta_codebook(dims, num_centroids);
-        let sr_t = compute_sr_t(&qjl_matrix, &rotation_matrix, dims);
 
         Self {
             config,
             rotation_matrix,
             codebook,
-            qjl_matrix,
-            sr_t,
         }
     }
 
@@ -111,31 +100,11 @@ impl TurboQuantizer {
 
         // Step 3: Lloyd-Max quantize using precomputed Beta codebook.
         let mut indices = Vec::with_capacity(dims);
-        let mut reconstructed = Vec::with_capacity(dims);
-
         for &val in &rotated {
-            let idx = self.codebook.quantize(val);
-            indices.push(idx as u8);
-            reconstructed.push(self.codebook.centroids[idx]);
+            indices.push(self.codebook.quantize(val) as u8);
         }
 
-        // Step 4: QJL residual.
-        let residual: Vec<f32> = rotated
-            .iter()
-            .zip(reconstructed.iter())
-            .map(|(r, q)| r - q)
-            .collect();
-        let residual_norm = residual.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-        let projected = mat_vec_mul(&self.qjl_matrix, &residual, dims);
-        let signs: Vec<bool> = projected.iter().map(|&v| v >= 0.0).collect();
-
-        CompressedVector::from_parts(
-            bit_pack(&indices, self.config.bits),
-            pack_bools(&signs),
-            norm,
-            residual_norm,
-        )
+        CompressedVector::from_parts(bit_pack(&indices, self.config.bits), norm)
     }
 
     /// Decompress to approximate f32 values (MSE reconstruction only, no QJL correction).
@@ -155,17 +124,13 @@ impl TurboQuantizer {
         unit.iter().map(|x| x * compressed.norm).collect()
     }
 
-    /// Project a full-precision query through both matrices ONCE so every
-    /// candidate distance can reuse them. This is the key optimization: it turns
-    /// the per-distance cost from two O(d²) matrix multiplies (the inverse
-    /// rotation inside `decompress`, and the QJL `S^T·signs`) into two O(d) dot
-    /// products, via the identities
-    ///   ⟨q, R^T·cv⟩ = ⟨R·q, cv⟩   and   ⟨S^T·signs, q⟩ = ⟨signs, S·q⟩.
+    /// Project a full-precision query through the rotation ONCE so every
+    /// candidate distance can reuse it: `⟨q, Rᵀ·c⟩ = ⟨R·q, c⟩`, turning the
+    /// per-distance cost from an O(d²) inverse rotation into an O(d) dot product.
     pub fn prepare_query(&self, query: &[f32]) -> PreparedQuery {
         let dims = self.config.dimensions as usize;
         PreparedQuery {
             rq: mat_vec_mul(&self.rotation_matrix, query, dims),
-            sq: mat_vec_mul(&self.qjl_matrix, query, dims),
             q_norm: query.iter().map(|x| x * x).sum::<f32>().sqrt(),
         }
     }
@@ -176,29 +141,22 @@ impl TurboQuantizer {
     ///
     /// A decompressed vector is `x̂ = ‖x‖·Rᵀ·c`, where `c` is the per-dimension
     /// centroid vector. Because R is orthonormal, `R·x̂ = ‖x‖·(R·Rᵀ)·c = ‖x‖·c`
-    /// (the rotated query the MSE term needs — with NO matmul) and
-    /// `S·x̂ = ‖x‖·(S·Rᵀ)·c = sr_t·(‖x‖·c)` (ONE matvec via the precomputed
-    /// `sr_t`). So this costs one O(d²) matvec instead of the three an inverse
-    /// rotation plus R- and S-projections would. Used on the HNSW build path,
-    /// where neighbor pruning re-projects stored nodes. Equivalent to
+    /// (the rotated query the MSE term needs — with NO matmul). Used on the HNSW
+    /// build path, where neighbor pruning re-projects stored nodes. Equivalent to
     /// `prepare_query(&decompress(compressed))` up to the tiny floating-point
     /// deviation of R·Rᵀ from the identity.
     pub fn prepare_stored(&self, compressed: &CompressedVector) -> PreparedQuery {
-        let mut out = PreparedQuery {
-            rq: Vec::new(),
-            sq: Vec::new(),
-            q_norm: 0.0,
-        };
+        let mut out = PreparedQuery { rq: Vec::new(), q_norm: 0.0 };
         self.prepare_stored_into(compressed, &mut out);
         out
     }
 
-    /// Like [`Self::prepare_stored`], but reuses the buffers in `out` instead of
-    /// allocating fresh `rq`/`sq` vectors. The HNSW build path prunes up to ~2·m
+    /// Like [`Self::prepare_stored`], but reuses the buffer in `out` instead of
+    /// allocating a fresh `rq` vector. The HNSW build path prunes up to ~2·m
     /// stored neighbors per insert, each needing a projected query; threading one
     /// scratch `PreparedQuery` through that loop removes those per-prune
-    /// allocations (and their allocator overhead) at millions of inserts.
-    /// Produces values identical to `prepare_stored`.
+    /// allocations at millions of inserts. Produces values identical to
+    /// `prepare_stored`.
     pub fn prepare_stored_into(&self, compressed: &CompressedVector, out: &mut PreparedQuery) {
         let dims = self.config.dimensions as usize;
 
@@ -214,27 +172,17 @@ impl TurboQuantizer {
             compressed.norm,
             &mut out.rq,
         );
-
-        // sq = S·x̂ = (S·Rᵀ)·(‖x‖·c) = sr_t · rq. Borrows the disjoint fields
-        // `rq` (read) and `sq` (write) of `out` at once — allowed for distinct
-        // struct fields.
-        out.sq.clear();
-        out.sq.resize(dims, 0.0);
-        mat_vec_mul_into(&self.sr_t, &out.rq, dims, &mut out.sq);
         out.q_norm = out.rq.iter().map(|x| x * x).sum::<f32>().sqrt();
     }
 
-    /// Unbiased inner-product estimate reusing a [`PreparedQuery`]. O(d) per
-    /// call — no matrix multiplies and no full `decompress`.
+    /// MSE inner-product estimate reusing a [`PreparedQuery`]. O(d) per call —
+    /// no matrix multiplies and no full `decompress`.
     pub fn inner_product_estimate_prepared(
         &self,
         prepared: &PreparedQuery,
         compressed: &CompressedVector,
     ) -> f32 {
-        let dims = self.config.dimensions as usize;
-
-        debug_assert_eq!(prepared.rq.len(), dims);
-        debug_assert_eq!(prepared.sq.len(), dims);
+        debug_assert_eq!(prepared.rq.len(), self.config.dimensions as usize);
 
         // MSE term: ⟨q, x̂_mse⟩ = ‖x‖ · ⟨R·q, cv⟩, where cv[i] is the centroid for
         // the quantized rotated coordinate i (decompress's pre-inverse-rotation
@@ -245,24 +193,13 @@ impl TurboQuantizer {
         // bytes and accumulate `centroids[idx] · rq[i]` in one allocation-free
         // pass. Summation is strictly position-ordered, so the result is
         // bit-identical to the previous materialized path.
-        let mse_dot =
-            mse_dot_fused(compressed.data(), self.config.bits, &self.codebook.centroids, &prepared.rq)
-                * compressed.norm;
-
-        // QJL correction: ‖r‖ · ‖x‖ · √(π/2)/d · ⟨signs, S·q⟩ (signs are ±1, so a
-        // signed sum over the pre-projected sq). Likewise fused: the sign bits are
-        // applied to `sq` in place with no intermediate `Vec<bool>`.
-        let correction_dot = correction_dot_fused(compressed.qjl_signs(), &prepared.sq);
-
-        let qjl_scale = (std::f32::consts::FRAC_PI_2).sqrt() / dims as f32;
-        let correction = compressed.residual_norm * compressed.norm * qjl_scale * correction_dot;
-
-        mse_dot + correction
+        mse_dot_fused(compressed.data(), self.config.bits, &self.codebook.centroids, &prepared.rq)
+            * compressed.norm
     }
 
-    /// Compute the unbiased inner product estimate between a full-precision
-    /// query and a compressed vector. Convenience wrapper that prepares the
-    /// query then delegates; prefer preparing once and reusing
+    /// Compute the inner product estimate between a full-precision query and a
+    /// compressed vector. Convenience wrapper that prepares the query then
+    /// delegates; prefer preparing once and reusing
     /// [`Self::inner_product_estimate_prepared`] across many candidates.
     pub fn inner_product_estimate(
         &self,
@@ -273,7 +210,7 @@ impl TurboQuantizer {
         self.inner_product_estimate_prepared(&prepared, compressed)
     }
 
-    /// Compute approximate distance using the unbiased estimator. Wrapper that
+    /// Compute approximate distance using the MSE estimate. Wrapper that
     /// prepares the query once; prefer [`Self::distance_estimate_prepared`] when
     /// scoring many candidates against the same query.
     pub fn distance_estimate(
@@ -322,8 +259,7 @@ impl TurboQuantizer {
         write_u32(w, self.config.dimensions)?;
         write_u8(w, self.config.bits)?;
         write_f32_slice(w, &self.rotation_matrix)?;
-        self.codebook.write_to(w)?;
-        write_f32_slice(w, &self.qjl_matrix)
+        self.codebook.write_to(w)
     }
 
     pub fn read_from(r: &mut dyn io::Read) -> io::Result<Self> {
@@ -333,110 +269,64 @@ impl TurboQuantizer {
         let dims = dimensions as usize;
         let rotation_matrix = read_f32_vec(r, dims * dims)?;
         let codebook = Codebook::read_from(r)?;
-        let qjl_matrix = read_f32_vec(r, dims * dims)?;
-        let sr_t = compute_sr_t(&qjl_matrix, &rotation_matrix, dims);
         Ok(Self {
             config,
             rotation_matrix,
             codebook,
-            qjl_matrix,
-            sr_t,
         })
     }
 }
 
-/// A query projected through the rotation and QJL matrices once, so that many
-/// candidate distances can be estimated against it in O(d) each. Built by
+/// A query projected through the rotation once, so that many candidate distances
+/// can be estimated against it in O(d) each. Built by
 /// [`TurboQuantizer::prepare_query`].
 #[derive(Debug, Clone)]
 pub struct PreparedQuery {
-    /// R · query — the rotated query (reused by the MSE term).
+    /// R · query — the rotated query (consumed by the MSE estimate).
     pub rq: Vec<f32>,
-    /// S · query — the QJL-projected query (reused by the correction term).
-    pub sq: Vec<f32>,
     /// ‖query‖ — cached for the cosine/L2 conversions.
     pub q_norm: f32,
 }
 
-/// A compressed vector with all components needed for the unbiased estimator.
-///
-/// The bit-packed quantized indices and the packed QJL sign bits live in ONE
-/// boxed allocation (`buf` = data bytes `[..data_len]` followed by sign bytes
-/// `[data_len..]`), not two `Vec`s. That drops a heap allocation and a `Vec`
-/// header per stored vector — one fewer allocation per HNSW node, which matters
-/// at millions of nodes (less allocator overhead/fragmentation). `Box<[u8]>` also
-/// has no spare capacity and a 16-byte header vs `Vec`'s 24. The on-disk wire
-/// format ([`Self::write_to`]) is unchanged — data and signs are still written as
-/// two length-prefixed byte runs.
+/// A compressed vector: the bit-packed Lloyd-Max quantized indices plus the
+/// original L2 norm. The MSE-variant quantizer keeps no QJL residual, so there
+/// are no sign bits or residual norm (see [`TurboQuantizer`]).
 #[derive(Debug, Clone)]
 pub struct CompressedVector {
-    buf: Box<[u8]>,         // data bytes [..data_len], then qjl sign bytes [data_len..]
-    data_len: u32,
-    pub norm: f32,          // original vector L2 norm
-    pub residual_norm: f32, // L2 norm of quantization residual (in rotated space)
+    data: Box<[u8]>, // bit-packed quantized indices
+    pub norm: f32,   // original vector L2 norm
 }
 
 impl CompressedVector {
     /// Bit-packed quantized indices.
     #[inline]
     pub fn data(&self) -> &[u8] {
-        &self.buf[..self.data_len as usize]
+        &self.data
     }
 
-    /// Packed QJL projection sign bits.
-    #[inline]
-    pub fn qjl_signs(&self) -> &[u8] {
-        &self.buf[self.data_len as usize..]
-    }
-
-    /// Resident heap bytes of the packed codes (data + signs), excluding the
-    /// inline struct fields (which the caller counts as node overhead).
+    /// Resident heap bytes of the packed codes, excluding the inline struct
+    /// fields (which the caller counts as node overhead).
     pub fn heap_bytes(&self) -> usize {
-        self.buf.len()
+        self.data.len()
     }
 
-    /// Concatenate separate data + sign byte buffers into the single backing
-    /// allocation.
-    fn from_parts(data: Vec<u8>, qjl_signs: Vec<u8>, norm: f32, residual_norm: f32) -> Self {
-        // data_len is u32; data is bit_pack output = (dims*bits).div_ceil(8) which
-        // is well under u32::MAX for any real dim/bit-width, but assert the split
-        // invariant so a future change can't silently truncate the offset.
-        debug_assert!(
-            data.len() <= u32::MAX as usize,
-            "compressed data length exceeds u32"
-        );
-        let data_len = data.len() as u32;
-        // Reuse data's buffer and reserve exactly the signs up front, so the
-        // extend doesn't grow past len and into_boxed_slice doesn't reallocate —
-        // one allocation, no transient realloc+copy on the per-vector build path.
-        let mut buf = data;
-        buf.reserve_exact(qjl_signs.len());
-        buf.extend_from_slice(&qjl_signs);
-        Self {
-            buf: buf.into_boxed_slice(),
-            data_len,
-            norm,
-            residual_norm,
-        }
+    fn from_parts(data: Vec<u8>, norm: f32) -> Self {
+        Self { data: data.into_boxed_slice(), norm }
     }
 
     pub fn total_bytes(&self) -> usize {
-        self.buf.len() + 8 // + 2 f32 norms
+        self.data.len() + 4 // + f32 norm
     }
 
     pub fn write_to(&self, w: &mut dyn io::Write) -> io::Result<()> {
-        write_byte_vec(w, self.data())?;
-        write_byte_vec(w, self.qjl_signs())?;
-        write_f32(w, self.norm)?;
-        write_f32(w, self.residual_norm)
+        write_byte_vec(w, &self.data)?;
+        write_f32(w, self.norm)
     }
 
     pub fn read_from(r: &mut dyn io::Read) -> io::Result<Self> {
         let data = read_byte_vec(r)?;
-        let qjl_signs = read_byte_vec(r)?;
         let norm = read_f32(r)?;
-        let residual_norm = read_f32(r)?;
-        Ok(Self::from_parts(data, qjl_signs, norm, residual_norm))
+        Ok(Self::from_parts(data, norm))
     }
 }
 
@@ -624,31 +514,6 @@ fn generate_rotation_matrix(dims: usize) -> Vec<f32> {
     }
 
     matrix
-}
-
-/// Generate QJL projection matrix: i.i.d. N(0,1) entries.
-fn generate_qjl_matrix(dims: usize) -> Vec<f32> {
-    let mut rng = rand::rng();
-    (0..dims * dims)
-        .map(|_| sample_normal(&mut rng))
-        .collect()
-}
-
-/// Precompute `M = S·Rᵀ` (row-major, d×d). Since `Rᵀ`'s column j is R's row j,
-/// `M[i][j] = Σ_k S[i][k]·R[j][k]` — the dot product of row i of the QJL matrix
-/// with row j of the rotation matrix. O(d³), computed once per quantizer; the
-/// contiguous-row inner loop vectorizes well. Used by [`TurboQuantizer::prepare_stored`].
-fn compute_sr_t(qjl: &[f32], rotation: &[f32], dims: usize) -> Vec<f32> {
-    let mut m = vec![0.0f32; dims * dims];
-    for i in 0..dims {
-        let s_row = &qjl[i * dims..(i + 1) * dims];
-        let m_row = &mut m[i * dims..(i + 1) * dims];
-        for (j, m_ij) in m_row.iter_mut().enumerate() {
-            let r_row = &rotation[j * dims..(j + 1) * dims];
-            *m_ij = dot(s_row, r_row);
-        }
-    }
-    m
 }
 
 /// Matrix–vector product `out[i] = Σ_j matrix[i*dims + j] · vector[j]` for a
@@ -1031,49 +896,6 @@ fn mse_dot_generic(data: &[u8], bits: u8, centroids: &[f32], rq: &[f32]) -> f32 
     acc
 }
 
-/// `Σ_i sign_i · sq[i]` where `sign_i = +1` if the packed bit is set, else `-1`.
-/// Walks the packed sign bytes MSB-first with no intermediate `Vec<bool>`. Each
-/// of the 8 bit positions accumulates into its own lane, breaking the loop-carried
-/// dependency for ILP; the lanes are summed at the end. The per-element sign is
-/// exact (`sign_apply`), but the 8-way accumulation REASSOCIATES the sum, so the
-/// result is not bit-identical to a strict position-ordered fold.
-#[inline]
-fn correction_dot_fused(signs: &[u8], sq: &[f32]) -> f32 {
-    let dims = sq.len();
-    let full = dims / 8;
-    let mut a = [0.0f32; 8];
-    for (byte_i, &b) in signs[..full].iter().enumerate() {
-        let base = byte_i * 8;
-        a[0] += sign_apply((b >> 7) & 1, sq[base]);
-        a[1] += sign_apply((b >> 6) & 1, sq[base + 1]);
-        a[2] += sign_apply((b >> 5) & 1, sq[base + 2]);
-        a[3] += sign_apply((b >> 4) & 1, sq[base + 3]);
-        a[4] += sign_apply((b >> 3) & 1, sq[base + 4]);
-        a[5] += sign_apply((b >> 2) & 1, sq[base + 5]);
-        a[6] += sign_apply((b >> 1) & 1, sq[base + 6]);
-        a[7] += sign_apply(b & 1, sq[base + 7]);
-    }
-    let mut acc = ((a[0] + a[1]) + (a[2] + a[3])) + ((a[4] + a[5]) + (a[6] + a[7]));
-    let rem = dims % 8;
-    if rem > 0 {
-        let b = signs[full];
-        let base = full * 8;
-        for (k, &s) in sq[base..].iter().enumerate() {
-            acc += sign_apply((b >> (7 - k)) & 1, s);
-        }
-    }
-    acc
-}
-
-/// `bit == 1 → +s`, `bit == 0 → -s`, branchlessly by XOR-ing the f32 sign bit.
-/// Bit-identical to `if bit { s } else { -s }` (negation also just flips the
-/// sign bit, including for ±0 and ±∞).
-#[inline(always)]
-fn sign_apply(bit: u8, s: f32) -> f32 {
-    let flip = ((bit ^ 1) as u32) << 31;
-    f32::from_bits(s.to_bits() ^ flip)
-}
-
 // --- Bit packing ---
 
 fn bit_pack(indices: &[u8], bits: u8) -> Vec<u8> {
@@ -1142,30 +964,6 @@ fn unpack_scaled_centroids(
     }
 }
 
-fn pack_bools(bools: &[bool]) -> Vec<u8> {
-    let num_bytes = bools.len().div_ceil(8);
-    let mut packed = vec![0u8; num_bytes];
-    for (i, &b) in bools.iter().enumerate() {
-        if b {
-            packed[i / 8] |= 1 << (7 - (i % 8));
-        }
-    }
-    packed
-}
-
-/// Reference (materializing) sign unpack. The hot path no longer uses this —
-/// [`correction_dot_fused`] decodes signs in place — so it is retained only as
-/// the test oracle that the fused decoder is checked against.
-#[cfg(test)]
-fn unpack_bools(packed: &[u8], count: usize) -> Vec<bool> {
-    let mut bools = Vec::with_capacity(count);
-    for i in 0..count {
-        let bit = (packed[i / 8] >> (7 - (i % 8))) & 1;
-        bools.push(bit == 1);
-    }
-    bools
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1175,7 +973,6 @@ mod tests {
     fn config_sizes() {
         let c2 = TurboQuantConfig::new(1536, 2);
         assert_eq!(c2.compressed_size(), 384);
-        assert_eq!(c2.qjl_size(), 192);
 
         let c3 = TurboQuantConfig::new(1536, 3);
         assert_eq!(c3.compressed_size(), 576);
@@ -1206,14 +1003,6 @@ mod tests {
         let packed = bit_pack(&indices, 4);
         let unpacked = bit_unpack(&packed, 4, indices.len());
         assert_eq!(indices, unpacked);
-    }
-
-    #[test]
-    fn bool_pack_roundtrip() {
-        let bools = vec![true, false, true, true, false, false, true, false, true];
-        let packed = pack_bools(&bools);
-        let unpacked = unpack_bools(&packed, bools.len());
-        assert_eq!(bools, unpacked);
     }
 
     #[test]
@@ -1280,40 +1069,34 @@ mod tests {
     }
 
     #[test]
-    fn unbiased_inner_product_estimator() {
-        // The key property: over many random vectors, the estimated inner product
-        // should converge to the true inner product (unbiased).
+    fn mse_estimate_correlates_with_true_inner_product() {
+        // TurboQuant_mse's estimate is biased (no QJL unbiasing) but must track
+        // the true inner product well enough to rank — check Spearman correlation.
         let dims = 64;
-        let config = TurboQuantConfig::new(dims, 3);
-        let quantizer = TurboQuantizer::new(config);
-
+        let quantizer = TurboQuantizer::new(TurboQuantConfig::new(dims, 4));
         let mut rng = rand::rng();
         let query: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
 
-        let n_trials = 200;
-        let mut total_error = 0.0f32;
-
-        for _ in 0..n_trials {
-            let target: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
-            let true_ip = distance::dot_product(&query, &target);
-            let compressed = quantizer.compress(&target);
-            let estimated_ip = quantizer.inner_product_estimate(&query, &compressed);
-            total_error += estimated_ip - true_ip;
-        }
-
-        let mean_error = total_error / n_trials as f32;
-        let true_ip_scale: f32 = {
-            let target: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
-            distance::dot_product(&query, &target).abs()
-        };
-
-        // Mean error should be small relative to typical inner product magnitude.
-        // With 200 trials, bias should be clearly visible if present.
-        let relative_bias = mean_error.abs() / (true_ip_scale + 1.0);
-        assert!(
-            relative_bias < 0.3,
-            "estimator appears biased: mean_error={mean_error}, relative_bias={relative_bias}"
-        );
+        let targets: Vec<Vec<f32>> = (0..200)
+            .map(|_| (0..dims).map(|_| rng.random_range(-1.0f32..1.0)).collect())
+            .collect();
+        let mut exact: Vec<(u64, f32)> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as u64, distance::dot_product(&query, t)))
+            .collect();
+        let mut est: Vec<(u64, f32)> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as u64, quantizer.inner_product_estimate(&query, &quantizer.compress(t))))
+            .collect();
+        // Higher inner product = more similar, so sort descending.
+        exact.sort_by(|a, b| b.1.total_cmp(&a.1));
+        est.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let exact_order: Vec<u64> = exact.iter().map(|(i, _)| *i).collect();
+        let est_order: Vec<u64> = est.iter().map(|(i, _)| *i).collect();
+        let rho = crate::index::rank_correlation(&exact_order, &est_order);
+        assert!(rho > 0.5, "mse estimate ranks poorly: rho={rho}");
     }
 
     #[test]
@@ -1368,9 +1151,7 @@ mod tests {
         let restored = CompressedVector::read_from(&mut &buf[..]).unwrap();
 
         assert_eq!(compressed.data(), restored.data());
-        assert_eq!(compressed.qjl_signs(), restored.qjl_signs());
         assert_eq!(compressed.norm, restored.norm);
-        assert_eq!(compressed.residual_norm, restored.residual_norm);
     }
 
     #[test]
@@ -1386,7 +1167,6 @@ mod tests {
         assert_eq!(quantizer.config.dimensions, restored.config.dimensions);
         assert_eq!(quantizer.config.bits, restored.config.bits);
         assert_eq!(quantizer.rotation_matrix, restored.rotation_matrix);
-        assert_eq!(quantizer.qjl_matrix, restored.qjl_matrix);
         assert_eq!(quantizer.codebook.centroids, restored.codebook.centroids);
         assert_eq!(quantizer.codebook.boundaries, restored.codebook.boundaries);
     }
@@ -1412,32 +1192,22 @@ mod tests {
                     let prepared = quantizer.prepare_query(&query);
                     let cv = quantizer.compress(&target);
 
-                    // Reference: materialize the indices/signs and sum directly.
+                    // Reference: materialize the indices and sum directly.
                     let indices = bit_unpack(cv.data(), bits, dims);
-                    let ref_mse: f32 = indices
+                    let ref_ip: f32 = indices
                         .iter()
                         .zip(prepared.rq.iter())
                         .map(|(&i, &rqi)| quantizer.codebook.centroids[i as usize] * rqi)
                         .sum::<f32>()
                         * cv.norm;
-                    let sgns = unpack_bools(cv.qjl_signs(), dims);
-                    let ref_corr_dot: f32 = sgns
-                        .iter()
-                        .zip(prepared.sq.iter())
-                        .map(|(&b, &s)| if b { s } else { -s })
-                        .sum();
-                    let qjl_scale = (std::f32::consts::FRAC_PI_2).sqrt() / dims as f32;
-                    let ref_ip = ref_mse + cv.residual_norm * cv.norm * qjl_scale * ref_corr_dot;
 
                     // Conditioning bound: rounding error scales with Σ|term|.
-                    let mse_mag: f32 = indices
+                    let mag: f32 = indices
                         .iter()
                         .zip(prepared.rq.iter())
                         .map(|(&i, &rqi)| (quantizer.codebook.centroids[i as usize] * rqi).abs())
                         .sum::<f32>()
                         * cv.norm;
-                    let corr_mag: f32 = prepared.sq.iter().map(|s| s.abs()).sum();
-                    let mag = mse_mag + cv.residual_norm * cv.norm * qjl_scale * corr_mag;
                     let tol = 1e-4 * mag + 1e-5;
 
                     let got = quantizer.inner_product_estimate_prepared(&prepared, &cv);
@@ -1483,22 +1253,6 @@ mod tests {
                     "mse_dot_fused mismatch: dims={dims} bits={bits} fused={fused} ref={reference}"
                 );
             }
-
-            // Correction: random signs + random sq.
-            let bools: Vec<bool> = (0..dims).map(|_| rng.random_bool(0.5)).collect();
-            let sq: Vec<f32> = (0..dims).map(|_| rng.random_range(-2.0..2.0)).collect();
-            let packed_signs = pack_bools(&bools);
-            let reference: f32 = bools
-                .iter()
-                .zip(sq.iter())
-                .map(|(&b, &s)| if b { s } else { -s })
-                .sum();
-            let mag: f32 = sq.iter().map(|s| s.abs()).sum();
-            let fused = correction_dot_fused(&packed_signs, &sq);
-            assert!(
-                (fused - reference).abs() <= 1e-4 * mag + 1e-6,
-                "correction_dot_fused mismatch: dims={dims} fused={fused} ref={reference}"
-            );
         }
     }
 
@@ -1528,9 +1282,9 @@ mod tests {
         }
     }
 
-    /// The fast `prepare_stored` (one matvec via sr_t) must match the original
-    /// `prepare_query(&decompress(cv))` path (inverse rotation + two projections)
-    /// to within the floating-point deviation of R·Rᵀ from identity. We assert on
+    /// The fast `prepare_stored` (direct scaled-centroid decode) must match the
+    /// original `prepare_query(&decompress(cv))` path (inverse rotation) to within
+    /// the floating-point deviation of R·Rᵀ from identity. We assert on
     /// the resulting stored-vs-stored distance estimates across all metrics —
     /// that's the value the build path actually consumes.
     #[test]
@@ -1567,7 +1321,7 @@ mod tests {
                         // near-zero ties (~3% of runs; reproduces identically on the
                         // pre-SIMD code). Require 2% relative agreement OR a small
                         // absolute floor (~10× the observed residual); a genuinely
-                        // wrong sr_t path diverges by O(distance), far above the floor.
+                        // a wrong prepare_stored diverges by O(distance), far above the floor.
                         let diff = (old_d - new_d).abs();
                         assert!(
                             diff <= 0.02 * old_d.abs() + 5e-3,
@@ -1576,28 +1330,6 @@ mod tests {
                         );
                     }
                 }
-            }
-        }
-    }
-
-    /// sr_t must equal S·Rᵀ: i.e. mat_vec_mul(sr_t, v) == qjl·(rotationᵀ·v) for
-    /// any v. Checks the precompute directly, independent of prepare_stored.
-    #[test]
-    fn sr_t_equals_s_times_r_transpose() {
-        let mut rng = rand::rng();
-        let dims = 48usize;
-        let q = TurboQuantizer::new(TurboQuantConfig::new(dims as u32, 4));
-        for _ in 0..10 {
-            let v: Vec<f32> = (0..dims).map(|_| rng.random_range(-1.0..1.0)).collect();
-            let via_sr_t = mat_vec_mul(&q.sr_t, &v, dims);
-            // Reference: Rᵀ·v then S·(…).
-            let rt_v = mat_vec_mul_transpose(&q.rotation_matrix, &v, dims);
-            let reference = mat_vec_mul(&q.qjl_matrix, &rt_v, dims);
-            for (a, b) in via_sr_t.iter().zip(reference.iter()) {
-                assert!(
-                    (a - b).abs() <= 1e-3 * (1.0 + b.abs()),
-                    "sr_t mismatch: {a} vs {b}"
-                );
             }
         }
     }
@@ -1671,7 +1403,6 @@ mod tests {
                 // overwrite, then reuse the same buffer across iterations.
                 let mut buf = PreparedQuery {
                     rq: vec![123.0; dims + 5],
-                    sq: vec![-7.0; dims + 9],
                     q_norm: 999.0,
                 };
                 for _ in 0..10 {
@@ -1680,7 +1411,6 @@ mod tests {
                     let fresh = q.prepare_stored(&cv);
                     q.prepare_stored_into(&cv, &mut buf);
                     assert_eq!(fresh.rq, buf.rq, "rq mismatch dims={dims} bits={bits}");
-                    assert_eq!(fresh.sq, buf.sq, "sq mismatch dims={dims} bits={bits}");
                     assert_eq!(
                         fresh.q_norm.to_bits(),
                         buf.q_norm.to_bits(),
