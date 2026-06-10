@@ -132,7 +132,7 @@ impl LsmTree {
         let mut max_sst_id = 0u64;
         let sst_dir = config.data_dir.join("sst");
         if sst_dir.exists() {
-            let mut entries: Vec<_> = std::fs::read_dir(&sst_dir)?
+            let entries: Vec<_> = std::fs::read_dir(&sst_dir)?
                 .filter_map(|e| e.ok())
                 .filter(|e| {
                     e.path()
@@ -140,21 +140,35 @@ impl LsmTree {
                         .is_some_and(|ext| ext == "sst")
                 })
                 .collect();
-            entries.sort_by_key(|e| e.path());
 
+            // Open every SST, then order them oldest→newest by the highest
+            // version each contains (tie-broken by file id). A pure file-id sort
+            // is WRONG after a compaction: the merged SST is written with a high
+            // file id but holds OLD data (its max version ≤ the pre-compaction
+            // snapshot), so by id it would outrank SSTs flushed concurrently
+            // during the merge — inverting version shadowing across a restart and
+            // serving stale reads. Ordering by max version restores true age (and
+            // matches the in-memory order `compact_inner` maintains: merged
+            // oldest-first, concurrently-flushed newer SSTs after).
+            let mut with_id: Vec<(u64, SstReader)> = Vec::with_capacity(entries.len());
             for entry in entries {
-                if let Some(id) = entry
+                let id = entry
                     .path()
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .and_then(|s| s.parse::<u64>().ok())
-                {
-                    max_sst_id = max_sst_id.max(id);
-                }
+                    .unwrap_or(0);
+                max_sst_id = max_sst_id.max(id);
                 let reader = SstReader::open(entry.path())?;
                 max_version = max_version.max(reader.max_version());
-                sst_readers.push(reader);
+                with_id.push((id, reader));
             }
+            with_id.sort_by(|a, b| {
+                a.1.max_version()
+                    .cmp(&b.1.max_version())
+                    .then(a.0.cmp(&b.0))
+            });
+            sst_readers = with_id.into_iter().map(|(_, r)| r).collect();
         }
 
         // Replay WAL into a memtable, tracking max version.
@@ -982,10 +996,8 @@ impl LsmTree {
         // it goes first; concurrently-flushed (newer) SSTs follow, keeping
         // `sst_files` oldest→newest so point reads' newest-first `.rev()` and the
         // scan readers' oldest-first BTreeMap merge both resolve the newest
-        // version of every key. (On restart, `open()` re-sorts SSTs by file id;
-        // since the merged output id is allocated after the snapshot, the order
-        // is reproduced for append-only data and self-heals via version-dedup on
-        // the next compaction for the rare key updated mid-compaction.)
+        // version of every key. `open()` reconstructs this exact order by max
+        // version (not file id), so it survives a restart too — see `open()`.
         let new_reader = SstReader::open(&sst_path)?;
         {
             let mut ssts = self.sst_files.write();
@@ -1204,6 +1216,63 @@ mod tests {
             reopened_scanned, n as usize,
             "keys lost across reopen after background compaction"
         );
+    }
+
+    // Recovery must order SSTs by the versions they hold, NOT by file id. A
+    // concurrent flush during compaction can leave OLD data in a higher-id file
+    // and NEW data in a lower-id file (the merged output gets a fresh high id but
+    // holds pre-snapshot data). A file-id sort would then shadow the new value
+    // with the old one across a restart. This reproduces that exact on-disk
+    // state directly and asserts the newest version still wins.
+    #[test]
+    fn recovery_orders_ssts_by_version_not_file_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let sst_dir = dir.path().join("sst");
+        std::fs::create_dir_all(&sst_dir).unwrap();
+
+        let key: &[u8] = b"v:\x00\x00\x00\x00\x00\x00\x00\x01";
+        let write_sst = |id: u64, version: u64, value: &str| {
+            let path = sst_dir.join(format!("{id:08}.sst"));
+            let mut w = SstWriter::new(&path).unwrap();
+            // Internal key = user_key || !version (big-endian), matching the
+            // engine's inverted-version encoding (newer versions sort first).
+            let mut ik = key.to_vec();
+            ik.extend_from_slice(&(!version).to_be_bytes());
+            let mv = Some(Bytes::copy_from_slice(value.as_bytes()));
+            w.add(&ik, &mv).unwrap();
+            w.finish().unwrap();
+        };
+
+        // NEWER value (v=200) in the LOWER file id; OLDER value (v=100) in the
+        // HIGHER file id — the post-inversion state.
+        write_sst(3, 200, "new");
+        write_sst(5, 100, "old");
+
+        let tree = LsmTree::open(LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 64 * 1024,
+            compact_trigger_ssts: usize::MAX,
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: false,
+        })
+        .unwrap();
+
+        let snap = tree.read_snapshot();
+        let new = Some(Bytes::copy_from_slice(b"new"));
+        assert_eq!(
+            tree.get_at(snap, key).unwrap(),
+            new,
+            "point read must resolve the newest version regardless of file id"
+        );
+        assert_eq!(
+            tree.multi_get_at(snap, &[key]).unwrap(),
+            vec![new.clone()],
+            "batch read must too"
+        );
+        let scanned = tree.scan_prefix_at(snap, b"v:").unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].1, Bytes::copy_from_slice(b"new"), "scan must too");
     }
 
     #[test]
