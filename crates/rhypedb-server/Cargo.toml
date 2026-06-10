@@ -3,6 +3,29 @@ name = "rhypedb-server"
 version.workspace = true
 edition.workspace = true
 
+# ONNX linking strategy, forwarded to every path that reaches rhypedb-embed
+# (direct, via engine, and via query). default-features=false on those deps so a
+# consumer building with `--no-default-features --features onnx-dynamic` (e.g. the
+# nlnwt buildpack, which embeds this crate as a lib) gets a pure offline build
+# with no path re-enabling the build-time download.
+[features]
+default = ["onnx-download"]
+onnx-download = [
+    "rhypedb-embed/onnx-download",
+    "rhypedb-engine/onnx-download",
+    "rhypedb-query/onnx-download",
+]
+onnx-static = [
+    "rhypedb-embed/onnx-static",
+    "rhypedb-engine/onnx-static",
+    "rhypedb-query/onnx-static",
+]
+onnx-dynamic = [
+    "rhypedb-embed/onnx-dynamic",
+    "rhypedb-engine/onnx-dynamic",
+    "rhypedb-query/onnx-dynamic",
+]
+
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
 rhypedb-storage = { workspace = true }

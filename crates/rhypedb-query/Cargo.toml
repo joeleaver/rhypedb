@@ -3,6 +3,14 @@ name = "rhypedb-query"
 version.workspace = true
 edition.workspace = true
 
+# Forward the ONNX linking choice through to rhypedb-engine → rhypedb-embed.
+# default-features=false so this path doesn't pin onnx-download (feature unification).
+[features]
+default = ["onnx-download"]
+onnx-download = ["rhypedb-engine/onnx-download"]
+onnx-static = ["rhypedb-engine/onnx-static"]
+onnx-dynamic = ["rhypedb-engine/onnx-dynamic"]
+
 [dependencies]
 bytes = { workspace = true }
 rhypedb-schema = { workspace = true }

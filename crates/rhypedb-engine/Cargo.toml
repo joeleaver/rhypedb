@@ -3,6 +3,15 @@ name = "rhypedb-engine"
 version.workspace = true
 edition.workspace = true
 
+# Forward the ONNX linking choice to rhypedb-embed. default-features=false so this
+# path doesn't force `onnx-download` back on when a consumer selects onnx-dynamic
+# (Cargo unifies features across all paths to embed).
+[features]
+default = ["onnx-download"]
+onnx-download = ["rhypedb-embed/onnx-download"]
+onnx-static = ["rhypedb-embed/onnx-static"]
+onnx-dynamic = ["rhypedb-embed/onnx-dynamic"]
+
 [dependencies]
 rhypedb-storage = { workspace = true }
 rhypedb-schema = { workspace = true }

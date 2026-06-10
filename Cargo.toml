@@ -10,10 +10,14 @@ license = "MIT"
 [workspace.dependencies]
 rhypedb-storage = { path = "crates/rhypedb-storage" }
 rhypedb-schema = { path = "crates/rhypedb-schema" }
-rhypedb-engine = { path = "crates/rhypedb-engine" }
+# default-features off on the crates that sit on a path to rhypedb-embed, so the
+# ONNX linking choice (onnx-download / onnx-dynamic) flows from the top binary and
+# no path silently re-enables the build-time download via feature unification.
+# Each of these crates re-adds `default = ["onnx-download"]` for standalone builds.
+rhypedb-engine = { path = "crates/rhypedb-engine", default-features = false }
 rhypedb-vector = { path = "crates/rhypedb-vector" }
-rhypedb-query = { path = "crates/rhypedb-query" }
-rhypedb-embed = { path = "crates/rhypedb-embed" }
+rhypedb-query = { path = "crates/rhypedb-query", default-features = false }
+rhypedb-embed = { path = "crates/rhypedb-embed", default-features = false }
 rhypedb-subscribe = { path = "crates/rhypedb-subscribe" }
 bytes = "1"
 tokio = { version = "1", features = ["full"] }
@@ -24,7 +28,9 @@ clap = { version = "4", features = ["derive"] }
 rustyline = "15"
 ureq = { version = "3", features = ["json"] }
 crc32fast = "1"
-fastembed = "5"
+# default-features off so consumers pick the ONNX linking strategy via the
+# onnx-download / onnx-dynamic features on rhypedb-embed (see that crate).
+fastembed = { version = "5", default-features = false }
 crossbeam-skiplist = "0.1"
 parking_lot = "0.12"
 boxcar = "0.2"
