@@ -181,6 +181,7 @@ fn resolve_index_config(dimensions: u32, index: Option<&IndexDef>) -> (HnswConfi
         .map_or(LEGACY_HNSW_EF_CONSTRUCTION, |e| e as usize);
     let hnsw_config = HnswConfig {
         m,
+        // HNSW convention: layer-0 capacity is 2*m. Derived, not a user knob.
         m_max0: m * 2,
         ef_construction,
         metric,
@@ -774,10 +775,13 @@ impl Vectorizer {
         };
         // Exact small-set path: a selective filter restricts retrieval to a
         // bounded set — score it exactly (over the LSM f32) instead of via HNSW,
-        // which under-fills for selective filters. The cross-encoder rerank
-        // below still runs over the resulting candidates, so filtered semantic
-        // search keeps full reranking. `restrict = None` (a global search, incl.
-        // every deployed bible-app query) takes the untouched HNSW path.
+        // which under-fills for selective filters. The cross-encoder rerank below
+        // then runs over these candidates, truncated to the SAME bounded
+        // `retrieval_k` pool the global path uses (the cross-encoder is one
+        // forward pass per candidate, so the pool is deliberately capped). So a
+        // very large filter only sends its top-`retrieval_k` by exact vector
+        // distance to the cross-encoder. `restrict = None` (a global search,
+        // incl. every deployed bible-app query) takes the untouched HNSW path.
         let use_brute = restrict.is_some_and(|s| s.len() <= EXACT_FILTER_MAX);
         let mut candidates = if use_brute {
             let set = restrict.unwrap();
@@ -815,12 +819,12 @@ impl Vectorizer {
         if let Some(source_field) = source_field.filter(|_| !rerank_disabled) {
             let type_id = self.type_ids.get(type_name).copied();
 
-            // Fetch original text for each candidate.
+            // Fetch original text for each candidate, all under ONE snapshot.
             let mut candidate_texts: Vec<(u64, String)> = Vec::new();
             if let Some(type_id) = type_id {
+                let snapshot = self.storage.read_snapshot();
                 for (obj_id, _dist) in &candidates {
                     let obj_key = KeyBuilder::object(type_id, *obj_id);
-                    let snapshot = self.storage.read_snapshot();
                     if let Ok(Some(data)) = self.storage.get_at(snapshot, &obj_key) {
                         let fields = deserialize_fields(&data);
                         if let Some(Value::String(text)) = fields.get(&source_field) {
@@ -848,10 +852,31 @@ impl Vectorizer {
                         candidate_texts.iter().map(|(_, t)| t.as_str()).collect();
 
                     if let Ok(reranked) = ranker.rerank(query_text, &doc_refs, k) {
-                        return Ok(reranked
+                        let mut out: Vec<(u64, f32)> = reranked
                             .into_iter()
                             .map(|r| (candidate_texts[r.index].0, r.score))
-                            .collect());
+                            .collect();
+                        // The cross-encoder can only rank candidates whose source
+                        // text was readable; a candidate with missing/non-string
+                        // text is invisible to it. Don't silently drop those —
+                        // append any not already chosen (in candidate order, i.e.
+                        // exact-distance order on the brute path) up to k, so a
+                        // reranked result never under-fills relative to the
+                        // no-reranker fallback. No-op when every candidate has
+                        // text (the normal @vectorize case), so global searches
+                        // are unaffected.
+                        if out.len() < k {
+                            let chosen: HashSet<u64> = out.iter().map(|(id, _)| *id).collect();
+                            for (id, dist) in &candidates {
+                                if out.len() >= k {
+                                    break;
+                                }
+                                if !chosen.contains(id) {
+                                    out.push((*id, *dist));
+                                }
+                            }
+                        }
+                        return Ok(out);
                     }
                 }
             }
@@ -1328,6 +1353,7 @@ fn deserialize_f32_vec(data: &[u8]) -> Option<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rhypedb_embed::{EmbedResult, RerankResult};
     use rhypedb_schema::parser::parse_schema;
     use rhypedb_storage::lsm::LsmConfig;
 
@@ -2373,5 +2399,136 @@ mod tests {
             let per_ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
             println!("brute restrict={size:>6} dim={dim}: {per_ms:.3} ms/query");
         }
+    }
+
+    // --- Filtered text search through the cross-encoder (mock models) ---
+    //
+    // A mock embedder + reranker drive `search_text`'s cross-encoder path
+    // deterministically WITHOUT loading any ONNX model, by injecting into the
+    // (test-visible) `embedders` / `reranker` fields.
+
+    struct MockEmbedder {
+        vec: Vec<f32>,
+    }
+    impl Embedder for MockEmbedder {
+        fn embed(&mut self, texts: &[&str]) -> EmbedResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| self.vec.clone()).collect())
+        }
+        fn dimensions(&self) -> usize {
+            self.vec.len()
+        }
+        fn model_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// Ranks documents in the order received (index 0 best) — so the result
+    /// order is the candidate (exact-distance) order, deterministic + model-free.
+    struct MockReranker;
+    impl Reranker for MockReranker {
+        fn rerank(
+            &mut self,
+            _query: &str,
+            documents: &[&str],
+            top_k: usize,
+        ) -> EmbedResult<Vec<RerankResult>> {
+            let n = documents.len().min(top_k);
+            Ok((0..n)
+                .map(|i| RerankResult {
+                    index: i,
+                    score: (documents.len() - i) as f32,
+                })
+                .collect())
+        }
+    }
+
+    fn vectorize_setup(
+        dir: &std::path::Path,
+    ) -> (Arc<LsmTree>, Schema, HashMap<String, u64>, HashMap<String, u64>) {
+        let schema = parse_schema(
+            r#"
+            type Doc {
+                body: String
+                embedding: Vector<4> @vectorize(source: "body", model: "mock")
+            }
+            "#,
+        )
+        .unwrap();
+        let storage = LsmTree::open(LsmConfig::new(dir)).unwrap();
+        let mut type_ids = HashMap::new();
+        type_ids.insert("Doc".into(), 1u64);
+        let mut field_ids = HashMap::new();
+        field_ids.insert("Doc.body".into(), 1u64);
+        field_ids.insert("Doc.embedding".into(), 2u64);
+        (storage, schema, type_ids, field_ids)
+    }
+
+    fn inject_mocks(v: &Vectorizer, query: Vec<f32>) {
+        v.embedders
+            .lock()
+            .insert("mock".into(), Box::new(MockEmbedder { vec: query }));
+        *v.reranker.lock() = Some(Box::new(MockReranker));
+    }
+
+    #[test]
+    fn filtered_text_search_keeps_textless_candidate_via_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+
+        // ids 1,2,3 all get vectors; only 1 and 2 get source text. id 3 has a
+        // vector but NO body → invisible to the cross-encoder.
+        let rows = vec![
+            (1u64, vec![1.0f32, 0.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+        store_object(&storage, 1, 1, "first doc");
+        store_object(&storage, 1, 2, "second doc");
+        // id 3: intentionally no object/body.
+
+        inject_mocks(&v, vec![1.0, 0.0, 0.0, 0.0]);
+
+        let restrict: HashSet<u64> = [1, 2, 3].into_iter().collect();
+        let got = v
+            .search_text("Doc", "embedding", "q", 3, 64, false, Some(&restrict))
+            .unwrap();
+
+        let ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
+        // Without the append-fill, the cross-encoder would drop id 3 (no text)
+        // and return only {1,2}. The result must still contain the textless
+        // member, so a reranked result never under-fills.
+        assert_eq!(
+            ids, restrict,
+            "textless candidate (id 3) must be appended, not dropped"
+        );
+    }
+
+    #[test]
+    fn filtered_text_search_runs_cross_encoder_over_brute_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+
+        let rows = vec![
+            (1u64, vec![1.0f32, 0.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0, 0.0]),
+            (4, vec![0.0, 0.0, 0.0, 1.0]),
+        ];
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+        for (id, _) in &rows {
+            store_object(&storage, 1, *id, &format!("doc {id}"));
+        }
+        inject_mocks(&v, vec![1.0, 0.0, 0.0, 0.0]);
+
+        // Restrict to a selective subset; the cross-encoder ranks exactly those.
+        let restrict: HashSet<u64> = [2, 4].into_iter().collect();
+        let got = v
+            .search_text("Doc", "embedding", "q", 5, 64, false, Some(&restrict))
+            .unwrap();
+        let ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, restrict, "filtered text search returns the filter's members");
     }
 }
