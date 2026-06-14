@@ -351,9 +351,6 @@ pub struct Database {
 /// migration (shadow-field card 2). A writer touching the field stamps a
 /// converted `<field>__shadow` sibling via this hook so the write carries the
 /// migration forward instead of being rejected.
-// converter/target_kind/converter_version are consumed by the producer hook +
-// cutover in card 2b/2c; card 2a only plumbs the struct.
-#[allow(dead_code)]
 pub(crate) struct MigratingFieldHook {
     pub field_name: String,
     /// `None` = the plan's pinned converter is not registered in this
@@ -369,6 +366,14 @@ pub(crate) struct MigratingFieldHook {
     /// so cutover can refuse a shadow written by a stale converter (card 2c).
     pub converter_version: u32,
     pub plan_id: u64,
+}
+
+/// True if `key` is a card-2 migration shadow sibling (`<field>__shadow` or
+/// `<field>__shadow_cv`) — siblings written into the object blob during a
+/// migration that must never leak to callers. (The `__`-infix namespace is
+/// reserved, like the `__cover` covers.)
+pub(crate) fn is_shadow_sibling_key(key: &str) -> bool {
+    key.ends_with("__shadow") || key.ends_with("__shadow_cv")
 }
 
 /// One @indexed scalar field on a type, with everything the write path needs
@@ -1098,6 +1103,18 @@ impl Database {
         {
             fields.retain(|name, _| !retired.contains(name));
         }
+        // Card 2: never expose the migration shadow siblings (`<field>__shadow`,
+        // `<field>__shadow_cv`) to callers. Gated on an active migration so a
+        // non-migrating database pays one atomic load and no scan. This is the
+        // single eager-read chokepoint (get/get_many/scan/filter_scan all call
+        // it); the lazy/raw wire path is handled separately in card 2c.
+        if self
+            .migrating_field_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            fields.retain(|name, _| !is_shadow_sibling_key(name));
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1620,24 +1637,72 @@ impl Database {
         }
     }
 
-    /// Look up the card-2 double-write hook for `(type_id, field_name)`, if the
-    /// field is mid-migration. Hot-path probe — the `migrating_field_count`
-    /// gate (load `Relaxed`, return early on 0) means a non-migrating database
-    /// pays a single atomic load and no lock/map work. Callers already hold
-    /// `migration_lock.read()` so the set can't change under them.
-    #[allow(dead_code)] // consumed by apply_migrating_field_hook (card 2b)
-    pub(crate) fn field_hook(&self, type_id: u64, field_name: &str) -> Option<Arc<MigratingFieldHook>> {
+    /// Card-2 double-write producer hook. Called on the create + update paths
+    /// immediately BEFORE the object blob is serialized: for every field of
+    /// `type_id` currently mid-migration that is present (non-Null) in `fields`,
+    /// stamp a converted `<field>__shadow` sibling (+ `<field>__shadow_cv` =
+    /// the converter version) so the write carries the migration forward. The
+    /// `migration_field_count` gate (load `Relaxed`, early-return on 0) keeps a
+    /// non-migrating database at one atomic load and no lock/map/String work.
+    /// FAILS CLOSED (`MigrationFieldConverterUnresolved`) if a migrating field's
+    /// converter isn't registered — never lands a source-only value that
+    /// cutover would later refuse. Caller holds `migration_lock.read()` so the
+    /// hook set is stable for the whole op.
+    fn apply_migrating_field_hook(
+        &self,
+        type_id: u64,
+        type_name: &str,
+        object_id: u64,
+        fields: &mut FieldMap,
+    ) -> EngineResult<()> {
         if self
             .migrating_field_count
             .load(std::sync::atomic::Ordering::Relaxed)
             == 0
         {
-            return None;
+            return Ok(());
         }
-        self.migrating_fields
-            .load()
-            .get(&type_id)
-            .and_then(|by_field| by_field.get(field_name).cloned())
+        let map = self.migrating_fields.load();
+        let Some(by_field) = map.get(&type_id) else {
+            return Ok(());
+        };
+        let mut shadows: Vec<(String, Value)> = Vec::new();
+        for (field_name, hook) in by_field.iter() {
+            let Some(value) = fields.get(field_name) else {
+                continue; // this write doesn't touch the migrating field
+            };
+            if matches!(value, Value::Null) {
+                continue; // Null/absent source carries no shadow (mirrors the worker)
+            }
+            let converter = hook.converter.as_ref().ok_or_else(|| {
+                EngineError::MigrationFieldConverterUnresolved {
+                    type_name: type_name.to_string(),
+                    field: field_name.clone(),
+                    plan_id: hook.plan_id,
+                }
+            })?;
+            let new_value = converter(object_id, value)?;
+            let got = crate::catalog::value_to_kind_byte_public(&new_value);
+            if got != hook.target_kind {
+                return Err(EngineError::Catalog(
+                    crate::CatalogError::FieldTypeChangeConverterReturnedWrongKind {
+                        qualified: format!("{type_name}.{field_name}"),
+                        object_id,
+                        got_kind: crate::catalog::kind_name_public(got),
+                        want_kind: crate::catalog::kind_name_public(hook.target_kind),
+                    },
+                ));
+            }
+            shadows.push((format!("{field_name}__shadow"), new_value));
+            shadows.push((
+                format!("{field_name}__shadow_cv"),
+                Value::U32(hook.converter_version),
+            ));
+        }
+        for (k, v) in shadows {
+            fields.insert(k, v);
+        }
+        Ok(())
     }
 
     /// Register a named row converter for chunked field-type migrations
@@ -2082,6 +2147,11 @@ impl Database {
                 }
             }
         }
+
+        // Card 2: double-write the shadow for any field mid-migration BEFORE
+        // serialize, so the shadow lands in the single `serialized` blob shared
+        // by the object entry AND every covering-index entry below.
+        self.apply_migrating_field_hook(type_id, type_name, object_id, &mut scalar_fields)?;
 
         let serialized = serialize_fields(&scalar_fields);
 
@@ -3257,6 +3327,11 @@ impl Database {
         for (k, v) in updates {
             fields.insert(k, v);
         }
+
+        // Card 2: double-write the shadow over the MERGED field set (so an
+        // update that doesn't touch the migrating field still re-stamps a
+        // consistent shadow) BEFORE serialize.
+        self.apply_migrating_field_hook(type_id, type_name, object_id, &mut fields)?;
 
         let serialized = serialize_fields(&fields);
 
@@ -7289,6 +7364,167 @@ mod tests {
             err,
             EngineError::Catalog(crate::CatalogError::MigrationFieldHasActivePlan { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // Card 2b: double-write producer hook + reader strip (isolation tests —
+    // quiesce still blocks the live create/update path in 2b, so the hook is
+    // exercised directly and the strip via a hand-written shadow blob)
+    // -----------------------------------------------------------------
+
+    fn f64_conv() -> crate::catalog::RegisteredConverter {
+        std::sync::Arc::new(|_oid: u64, v: &Value| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => Ok(Value::F64(0.0)),
+        })
+    }
+
+    fn f64_target() -> u8 {
+        use rhypedb_schema::{FieldType, ScalarType};
+        crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64))
+    }
+
+    #[test]
+    fn migrating_field_hook_stamps_shadow_and_cv() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64  name: String }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let tid = db.resolve_type_id("User").unwrap();
+        db.arm_field_hook(
+            tid,
+            MigratingFieldHook {
+                field_name: "score".into(),
+                converter: Some(f64_conv()),
+                target_kind: f64_target(),
+                converter_version: 7,
+                plan_id: 1,
+            },
+        );
+        let mut fields = FieldMap::new();
+        fields.insert("score".into(), Value::I64(5));
+        fields.insert("name".into(), Value::String("x".into()));
+        db.apply_migrating_field_hook(tid, "User", 42, &mut fields)
+            .unwrap();
+        // Source preserved; shadow + cv stamped; unrelated field untouched.
+        assert_eq!(fields.get("score"), Some(&Value::I64(5)));
+        assert_eq!(fields.get("score__shadow"), Some(&Value::F64(5.0)));
+        assert_eq!(fields.get("score__shadow_cv"), Some(&Value::U32(7)));
+        assert_eq!(fields.get("name"), Some(&Value::String("x".into())));
+    }
+
+    #[test]
+    fn migrating_field_hook_fails_closed_when_converter_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let tid = db.resolve_type_id("User").unwrap();
+        db.arm_field_hook(
+            tid,
+            MigratingFieldHook {
+                field_name: "score".into(),
+                converter: None, // not registered yet
+                target_kind: f64_target(),
+                converter_version: 1,
+                plan_id: 3,
+            },
+        );
+        let mut fields = FieldMap::new();
+        fields.insert("score".into(), Value::I64(5));
+        assert!(matches!(
+            db.apply_migrating_field_hook(tid, "User", 1, &mut fields),
+            Err(EngineError::MigrationFieldConverterUnresolved { plan_id: 3, .. })
+        ));
+        // No shadow leaked on the fail-closed path.
+        assert!(!fields.contains_key("score__shadow"));
+    }
+
+    #[test]
+    fn migrating_field_hook_skips_null_and_absent_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let tid = db.resolve_type_id("User").unwrap();
+        db.arm_field_hook(
+            tid,
+            MigratingFieldHook {
+                field_name: "score".into(),
+                converter: Some(f64_conv()),
+                target_kind: f64_target(),
+                converter_version: 1,
+                plan_id: 1,
+            },
+        );
+        // Null source → no shadow.
+        let mut nf = FieldMap::new();
+        nf.insert("score".into(), Value::Null);
+        db.apply_migrating_field_hook(tid, "User", 1, &mut nf).unwrap();
+        assert!(!nf.contains_key("score__shadow"));
+        // Field absent from this write → no shadow.
+        let mut af = FieldMap::new();
+        af.insert("other".into(), Value::I64(1));
+        db.apply_migrating_field_hook(tid, "User", 1, &mut af).unwrap();
+        assert!(!af.contains_key("score__shadow"));
+    }
+
+    #[test]
+    fn reader_strips_shadow_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let id = {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(5));
+            db.create("User", f).unwrap().id
+        };
+        // Hand-write a blob carrying shadow siblings (simulates a double-write).
+        let tid = db.resolve_type_id("User").unwrap();
+        let mut blob = FieldMap::new();
+        blob.insert("score".into(), Value::I64(5));
+        blob.insert("score__shadow".into(), Value::F64(5.0));
+        blob.insert("score__shadow_cv".into(), Value::U32(1));
+        let mut txn = db.storage.begin_txn();
+        db.storage
+            .put_batch(
+                &mut txn,
+                &[(
+                    rhypedb_storage::key::KeyBuilder::object(tid, id),
+                    crate::object::serialize_fields(&blob),
+                )],
+            )
+            .unwrap();
+        db.storage.commit(&mut txn).unwrap();
+        // Arm a hook so the strip is active (count > 0).
+        db.arm_field_hook(
+            tid,
+            MigratingFieldHook {
+                field_name: "score".into(),
+                converter: Some(f64_conv()),
+                target_kind: f64_target(),
+                converter_version: 1,
+                plan_id: 1,
+            },
+        );
+        // get() and get_many() must NOT expose the shadow siblings.
+        let obj = db.get("User", id).unwrap();
+        assert_eq!(obj.fields.get("score"), Some(&Value::I64(5)));
+        assert!(!obj.fields.contains_key("score__shadow"));
+        assert!(!obj.fields.contains_key("score__shadow_cv"));
+        let many = db.get_many("User", &[id]).unwrap();
+        assert_eq!(many.len(), 1);
+        assert!(!many[0].fields.contains_key("score__shadow"));
+        assert!(!many[0].fields.contains_key("score__shadow_cv"));
     }
 
     // -----------------------------------------------------------------

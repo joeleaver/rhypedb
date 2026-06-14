@@ -4150,6 +4150,12 @@ pub(crate) fn kind_name_public(k: u8) -> &'static str {
     kind_name(k)
 }
 
+/// Public wrapper so the card-2 double-write hook (in `database.rs`) can
+/// validate that a converter's output matches the migration's target kind.
+pub(crate) fn value_to_kind_byte_public(v: &crate::object::Value) -> u8 {
+    value_to_kind_byte(v)
+}
+
 fn schema_kind_byte(ft: &FieldType) -> u8 {
     use kind_byte::*;
     match ft {

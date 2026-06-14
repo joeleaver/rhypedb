@@ -126,6 +126,19 @@ pub enum EngineError {
     #[error("no migration plan with id {plan_id}")]
     MigrationPlanNotFound { plan_id: u64 },
 
+    /// A write touched a field with an in-flight chunked migration (card 2)
+    /// whose converter is not registered in this `Database` (e.g. a fresh open
+    /// before `register_converter`). The write is rejected — FAIL CLOSED —
+    /// rather than land a source-only value with no shadow, which cutover would
+    /// later refuse. Register the converter to lift this; it is scoped to
+    /// exactly the open-to-register window.
+    #[error("field {type_name}.{field} is migrating under plan {plan_id} but its converter is not registered; register it before writing")]
+    MigrationFieldConverterUnresolved {
+        type_name: String,
+        field: String,
+        plan_id: u64,
+    },
+
     /// On open, an in-flight migration plan was found but the schema passed
     /// to `open` still declares the field at its OLD (source) type. Driving
     /// the migration would flip the catalog to the target kind while this
