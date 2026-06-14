@@ -302,6 +302,18 @@ pub struct Database {
     /// * a future migrate verb can rebuild and atomically swap the table
     ///   without touching `LsmConfig` or rebuilding the closure (PR B).
     zone_field_id_lookup: Arc<arc_swap::ArcSwap<ZoneFieldIdLookup>>,
+    /// `type_id -> plan_id` for types under an active (quiescing) chunked
+    /// field-type migration (shadow-field card 1). While a type is in this
+    /// set every app write to its objects is REJECTED
+    /// (`MigrationTypeQuiesced`) — the card-1 "quiesce the migrating type"
+    /// contract; card 2 replaces the rejection with a cover-aware
+    /// double-write. The source of truth is the persisted `c:P:` plans;
+    /// this is a lock-free read cache rebuilt from them on open (increment
+    /// 4) and mutated ONLY under `migration_lock.write()` via
+    /// `arm_quiesce`/`disarm_quiesce`. Because every writer takes
+    /// `migration_lock.read()` before consulting it, a writer sees a
+    /// consistent set for the whole duration of its operation.
+    migrating: arc_swap::ArcSwap<std::collections::HashMap<u64, u64>>,
 }
 
 /// One @indexed scalar field on a type, with everything the write path needs
@@ -776,6 +788,9 @@ impl Database {
                 None => Arc::new(parking_lot::RwLock::new(())),
             },
             zone_field_id_lookup,
+            // Empty until increment 4 rebuilds it from `c:P:` on open;
+            // create_field_type_migration arms it under migration_lock.write().
+            migrating: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
             opts: options.clone(),
             migrated: std::sync::atomic::AtomicBool::new(false),
         });
@@ -1397,6 +1412,47 @@ impl Database {
     /// built from the in-memory FieldMap (no per-link `scan_prefix` for
     /// other targets, no extra commits). This collapses the historical
     /// `Type.create + link + link` 3-txn dance into one batched txn.
+    /// The plan id quiescing `type_id`, if any. Lock-free read of the
+    /// migrating-type set; callers already hold `migration_lock.read()` so
+    /// the set cannot change under them (it mutates only under `.write()`).
+    fn quiescing_plan(&self, type_id: u64) -> Option<u64> {
+        self.migrating.load().get(&type_id).copied()
+    }
+
+    /// Reject if `type_id` is quiesced by an in-flight field-type migration
+    /// (shadow-field card 1). The single guard every `o:`-writing path
+    /// funnels through — direct writers call it after `resolve_type_id`;
+    /// `delete_inner` calls it per cascaded type so a delete on type A that
+    /// cascades into migrating type B is rejected as a whole.
+    fn guard_not_quiesced(&self, type_id: u64, type_name: &str) -> EngineResult<()> {
+        if let Some(plan_id) = self.quiescing_plan(type_id) {
+            return Err(EngineError::MigrationTypeQuiesced {
+                type_name: type_name.into(),
+                plan_id,
+            });
+        }
+        Ok(())
+    }
+
+    /// Arm write-rejection (quiesce) for `type_id` under `plan_id`. MUST be
+    /// called while holding `migration_lock.write()` so no concurrent
+    /// writer observes a torn set; clone-on-write swap of the read cache.
+    #[allow(dead_code)] // wired into create_field_type_migration (increment 3)
+    pub(crate) fn arm_quiesce(&self, type_id: u64, plan_id: u64) {
+        let mut m = (**self.migrating.load()).clone();
+        m.insert(type_id, plan_id);
+        self.migrating.store(Arc::new(m));
+    }
+
+    /// Release quiesce for `type_id` (migration completed/cancelled). Same
+    /// locking contract as `arm_quiesce`.
+    #[allow(dead_code)] // wired into complete/cancel (increment 3/6)
+    pub(crate) fn disarm_quiesce(&self, type_id: u64) {
+        let mut m = (**self.migrating.load()).clone();
+        m.remove(&type_id);
+        self.migrating.store(Arc::new(m));
+    }
+
     pub fn create(&self, type_name: &str, fields: FieldMap) -> EngineResult<Object> {
         // Block under the migration write-barrier: if a rename / change
         // / run_migrations is in flight, wait until it commits so this
@@ -1409,6 +1465,7 @@ impl Database {
         // entities. Surfacing `TypeRetired` instead tells the operator
         // "you removed this, not typoed it."
         let type_id = self.resolve_type_id(type_name)?;
+        self.guard_not_quiesced(type_id, type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
@@ -1657,6 +1714,7 @@ impl Database {
         }
         let _migration_guard = self.migration_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
+        self.guard_not_quiesced(type_id, type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
@@ -2677,6 +2735,7 @@ impl Database {
     ) -> EngineResult<Object> {
         let _migration_guard = self.migration_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
+        self.guard_not_quiesced(type_id, type_name)?;
         let type_def = self
             .schema
             .get_type(type_name)
@@ -2984,6 +3043,14 @@ impl Database {
                     .unwrap_or_else(|| format!("type_id={type_id}")),
             )
         })?;
+
+        // Quiesce guard (shadow-field card 1). Placed AFTER the meta lookup
+        // (which stages nothing) and BEFORE any tombstone is staged, so a
+        // cascade that reaches a migrating type aborts the WHOLE delete (it
+        // is one txn — the caller never commits on Err) with nothing
+        // written. Covers the top-level delete AND a cascade into the
+        // migrating type from a delete issued against a different type.
+        self.guard_not_quiesced(type_id, &meta.type_name)?;
 
         // Unique-index + secondary-index cleanup. Skipped entirely when the
         // type has neither — for edge-only types (Rating in the bench) the
@@ -6394,6 +6461,96 @@ mod tests {
             db.get("Post", post.id),
             Err(EngineError::ObjectNotFound { .. })
         ));
+    }
+
+    // --- Shadow-field card 1: quiesce keyspace-coverage guards (increment 2) ---
+
+    fn quiesce_cascade_db() -> (Arc<Database>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+            }
+            type Post {
+                title: String
+                author: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        (db, dir)
+    }
+
+    fn named(name: &str) -> FieldMap {
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String(name.into()));
+        f
+    }
+
+    #[test]
+    fn quiesced_type_rejects_every_write_path() {
+        let (db, _dir) = quiesce_cascade_db();
+        let alice = db.create("User", named("Alice")).unwrap();
+
+        let user_tid = db.resolve_type_id("User").unwrap();
+        db.arm_quiesce(user_tid, 7);
+
+        assert!(matches!(
+            db.create("User", named("Bob")),
+            Err(EngineError::MigrationTypeQuiesced { plan_id: 7, .. })
+        ));
+        assert!(matches!(
+            db.create_batch("User", vec![named("Carol")]),
+            Err(EngineError::MigrationTypeQuiesced { plan_id: 7, .. })
+        ));
+        assert!(matches!(
+            db.update("User", alice.id, named("Alice2")),
+            Err(EngineError::MigrationTypeQuiesced { plan_id: 7, .. })
+        ));
+        assert!(matches!(
+            db.delete("User", alice.id),
+            Err(EngineError::MigrationTypeQuiesced { plan_id: 7, .. })
+        ));
+
+        // Disarm → writes flow again.
+        db.disarm_quiesce(user_tid);
+        assert!(db.create("User", named("Bob")).is_ok());
+        assert!(db.update("User", alice.id, named("Alice2")).is_ok());
+        assert!(db.delete("User", alice.id).is_ok());
+    }
+
+    #[test]
+    fn quiesce_is_scoped_to_the_migrating_type() {
+        // Arming Post must NOT block writes to the un-migrating User type.
+        let (db, _dir) = quiesce_cascade_db();
+        let post_tid = db.resolve_type_id("Post").unwrap();
+        db.arm_quiesce(post_tid, 3);
+        assert!(db.create("User", named("Alice")).is_ok());
+    }
+
+    #[test]
+    fn cascade_delete_into_quiesced_type_is_rejected_atomically() {
+        let (db, _dir) = quiesce_cascade_db();
+        let alice = db.create("User", named("Alice")).unwrap();
+        let mut pf = FieldMap::new();
+        pf.insert("title".into(), Value::String("Hello".into()));
+        let post = db.create("Post", pf).unwrap();
+        db.link("Post", post.id, "author", alice.id, None).unwrap();
+
+        // Quiesce the CHILD (Post). Deleting the PARENT (User) cascades into
+        // Post — the guard inside delete_inner must reject the whole delete,
+        // and because it is one txn, BOTH objects survive untouched. This is
+        // the case a create/update-only guard would have missed.
+        let post_tid = db.resolve_type_id("Post").unwrap();
+        db.arm_quiesce(post_tid, 9);
+        assert!(matches!(
+            db.delete("User", alice.id),
+            Err(EngineError::MigrationTypeQuiesced { plan_id: 9, .. })
+        ));
+        assert!(db.get("User", alice.id).is_ok());
+        assert!(db.get("Post", post.id).is_ok());
     }
 
     #[test]

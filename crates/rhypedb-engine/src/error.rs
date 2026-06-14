@@ -99,6 +99,18 @@ pub enum EngineError {
     /// underlying storage shape).
     #[error("database handle has been migrated away — switch to the Arc returned by the migrate verb")]
     DatabaseMigratedAway,
+
+    /// A write was rejected because its target type is under an active
+    /// chunked field-type migration (shadow-field card 1). Card 1 quiesces
+    /// the migrating type — no concurrent writes to its objects — until the
+    /// migration completes or is cancelled. Card 2 lifts this by carrying
+    /// live writes through a double-write hook. Fires for create / update /
+    /// delete, and for a cascade-delete that reaches the migrating type
+    /// from a delete issued against another type.
+    #[error(
+        "type {type_name} is quiesced by in-flight migration plan {plan_id}; writes are rejected until it completes or is cancelled"
+    )]
+    MigrationTypeQuiesced { type_name: String, plan_id: u64 },
 }
 
 /// Failures specific to the persisted schema catalog (see
@@ -241,6 +253,16 @@ pub enum CatalogError {
     /// operator can tell a torn write from a corrupt field value.
     #[error("migration plan {row} is malformed: {reason}")]
     MalformedMigrationPlan { row: String, reason: &'static str },
+
+    /// An offline single-commit field-type change was refused because a
+    /// chunked migration plan is already in flight on the same field
+    /// (shadow-field card 1). Running both would put two independent
+    /// flippers + a foreign converter on the same field — corruption.
+    /// Cancel or finish the plan first.
+    #[error(
+        "field {qualified} has an active migration plan {plan_id}; finish or cancel it before an offline change_field_type"
+    )]
+    MigrationFieldHasActivePlan { qualified: String, plan_id: u64 },
 
     /// A catalog row's `previous_names` TLV has `count = 0`. An empty
     /// chain should be omitted entirely; storing one with count zero

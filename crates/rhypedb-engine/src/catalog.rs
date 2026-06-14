@@ -1653,6 +1653,24 @@ pub(crate) fn apply_field_type_change(
 
         let qual = format!("{}.{}", verb.type_name, verb.field_name);
 
+        // Offline-surface interlock (shadow-field card 1): refuse a
+        // single-commit field-type change while a chunked migration plan is
+        // unsettled on the SAME field. Two independent flippers + a foreign
+        // converter would corrupt the field and double-write its
+        // type_change_history. This one site covers all three offline reach
+        // paths (Database::change_field_type, *_consuming, and
+        // MigrationContext::change_field_type via run_migrations) since they
+        // all funnel here. Settled plans (Completed/Cancelled) don't block.
+        let plans = scan_migration_plans(storage, snap)?;
+        if let Some(plan_id) = active_plan_for_field(&plans, &verb.type_name, &verb.field_name) {
+            return Err(EngineError::Catalog(
+                CatalogError::MigrationFieldHasActivePlan {
+                    qualified: qual,
+                    plan_id,
+                },
+            ));
+        }
+
         // ---- Validation ------------------------------------------------
         let field_entry = cat
             .field_entries
@@ -3480,7 +3498,6 @@ fn read_migration_counter(
 }
 
 /// Decode every `c:P:<id>` plan record visible at `snap`, ascending by id.
-#[allow(dead_code)] // wired into auto-resume + id self-heal in increment 3/4
 fn scan_migration_plans(storage: &LsmTree, snap: u64) -> EngineResult<Vec<MigrationPlan>> {
     let prefix = KeyBuilder::catalog_migration_plan_prefix();
     let mut plans = Vec::new();
@@ -3506,6 +3523,21 @@ fn scan_migration_plans(storage: &LsmTree, snap: u64) -> EngineResult<Vec<Migrat
 fn next_migration_id(counter: u64, plans: &[MigrationPlan]) -> u64 {
     let max_plan = plans.iter().map(|p| p.plan_id).max().unwrap_or(0);
     counter.max(max_plan).saturating_add(1)
+}
+
+/// The plan id of an *unsettled* (`status.quiesces()`) migration on
+/// `type_name.field_name`, if any. Used by the offline-surface interlock:
+/// a single-commit field-type change is refused while such a plan exists.
+/// Settled plans (Completed/Cancelled) don't block — the field is final.
+fn active_plan_for_field(
+    plans: &[MigrationPlan],
+    type_name: &str,
+    field_name: &str,
+) -> Option<u64> {
+    plans
+        .iter()
+        .find(|p| p.status.quiesces() && p.type_name == type_name && p.field_name == field_name)
+        .map(|p| p.plan_id)
 }
 
 // =====================================================================
@@ -4111,6 +4143,45 @@ mod tests {
         assert_eq!(next_migration_id(10, &[p1, p5]), 11);
         // Fresh DB: no plans, no counter.
         assert_eq!(next_migration_id(0, &[]), 1);
+    }
+
+    #[test]
+    fn active_plan_for_field_matches_unsettled_only() {
+        let plan = |id: u64, status: MigrationStatus| {
+            let mut p = sample_plan();
+            p.plan_id = id;
+            p.type_name = "User".into();
+            p.field_name = "age".into();
+            p.status = status;
+            p
+        };
+        // Unsettled (Running / AwaitingConverter / Failed / Pending) blocks
+        // the offline path; settled (Completed / Cancelled) does not.
+        assert_eq!(
+            active_plan_for_field(&[plan(1, MigrationStatus::Running)], "User", "age"),
+            Some(1)
+        );
+        assert_eq!(
+            active_plan_for_field(&[plan(2, MigrationStatus::AwaitingConverter)], "User", "age"),
+            Some(2)
+        );
+        assert_eq!(
+            active_plan_for_field(&[plan(3, MigrationStatus::Completed)], "User", "age"),
+            None
+        );
+        assert_eq!(
+            active_plan_for_field(&[plan(4, MigrationStatus::Cancelled)], "User", "age"),
+            None
+        );
+        // Wrong field / type → no match.
+        assert_eq!(
+            active_plan_for_field(&[plan(5, MigrationStatus::Running)], "User", "name"),
+            None
+        );
+        assert_eq!(
+            active_plan_for_field(&[plan(6, MigrationStatus::Running)], "Post", "age"),
+            None
+        );
     }
 
     #[test]
