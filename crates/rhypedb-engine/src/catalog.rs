@@ -214,8 +214,13 @@ const TLV_MP_CREATED_AT_MS: u8 = 0x09;
 const TLV_MP_CONVERTER_NAME: u8 = 0x0A;
 const TLV_MP_CONVERTER_VERSION: u8 = 0x0B;
 const TLV_MP_OBJECTS_CONVERTED: u8 = 0x0C;
-// 0x20-0x3F reserved for cards 2/4 (double_write_armed, error_policy,
-// quarantine cursor). Unknown tags are preserved verbatim and round-tripped.
+// Card 2 (online migration) additions, in the 0x20-0x3F reserved range so a
+// card-1 binary round-trips them verbatim and decodes their absence as the
+// card-1 defaults (phase=Converting, cutover_cursor=0).
+const TLV_MP_PHASE: u8 = 0x20;
+const TLV_MP_CUTOVER_CURSOR: u8 = 0x21;
+// 0x22-0x3F reserved for cards 2/4 (error_policy, quarantine cursor). Unknown
+// tags are preserved verbatim and round-tripped.
 
 // MigrationStatus payload bytes for TLV_MP_STATUS. The decoder refuses
 // any other value rather than guess.
@@ -225,6 +230,10 @@ const MP_STATUS_COMPLETED: u8 = 0x02;
 const MP_STATUS_CANCELLED: u8 = 0x03;
 const MP_STATUS_FAILED: u8 = 0x04;
 const MP_STATUS_AWAITING_CONVERTER: u8 = 0x05;
+
+// MigrationPhase payload bytes for TLV_MP_PHASE.
+const MP_PHASE_CONVERTING: u8 = 0x00;
+const MP_PHASE_CUTTING_OVER: u8 = 0x01;
 
 /// Default objects processed per chunk commit. Bounds each chunk's
 /// `put_batch` + fsync while amortizing the per-chunk lock/scan overhead;
@@ -861,9 +870,46 @@ pub(crate) struct MigrationPlan {
     /// Observability only — completion is proven by a positive exhaustion
     /// scan, never by this counter (a torn re-scan can double-count).
     pub objects_converted: u64,
+    /// Card 2: which phase of the online migration this plan is in.
+    /// `Converting` = the worker is backfilling `<field>__shadow` siblings (or
+    /// done backfilling, awaiting cutover). `CuttingOver` = the cutover pass is
+    /// renaming `<field>__shadow` → `<field>` per object. A crash mid-cutover
+    /// re-resumes the rename pass, NOT the converter (they are not
+    /// interchangeable). Card-1 rows (no TLV) decode as `Converting`.
+    pub phase: MigrationPhase,
+    /// Card 2: highest `object_id` whose CUTOVER rename is durably committed —
+    /// a cursor dedicated to the cutover pass, distinct from `cursor` (the
+    /// conversion scan). `0` = cutover not started. Card-1 rows decode as `0`.
+    pub cutover_cursor: u64,
     /// Forward-compat: TLV tags this binary doesn't recognise, preserved
     /// verbatim so a card-2/4 row round-trips through a card-1 binary.
     pub unknown_tlvs: Vec<(u8, Bytes)>,
+}
+
+/// Phase of an online (card-2) chunked field-type migration. Persisted in the
+/// `c:P:` plan record so a crash resumes the correct pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationPhase {
+    /// Backfilling `<field>__shadow` siblings (or done, awaiting cutover).
+    Converting,
+    /// Renaming `<field>__shadow` → `<field>` per object (cutover in progress).
+    CuttingOver,
+}
+
+impl MigrationPhase {
+    fn to_byte(self) -> u8 {
+        match self {
+            MigrationPhase::Converting => MP_PHASE_CONVERTING,
+            MigrationPhase::CuttingOver => MP_PHASE_CUTTING_OVER,
+        }
+    }
+    fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            MP_PHASE_CONVERTING => MigrationPhase::Converting,
+            MP_PHASE_CUTTING_OVER => MigrationPhase::CuttingOver,
+            _ => return None,
+        })
+    }
 }
 
 /// One field rename, included in the report. `type_name` is the (possibly
@@ -3453,7 +3499,14 @@ fn encode_migration_plan(plan: &MigrationPlan) -> Bytes {
         TLV_MP_OBJECTS_CONVERTED,
         &plan.objects_converted.to_be_bytes(),
     );
-    // Preserve forward-compat tags (card 2/4) verbatim.
+    // Card 2: phase + cutover cursor.
+    write_tlv(&mut body, TLV_MP_PHASE, &[plan.phase.to_byte()]);
+    write_tlv(
+        &mut body,
+        TLV_MP_CUTOVER_CURSOR,
+        &plan.cutover_cursor.to_be_bytes(),
+    );
+    // Preserve forward-compat tags (card 4) verbatim.
     for (tag, value) in &plan.unknown_tlvs {
         write_tlv(&mut body, *tag, value);
     }
@@ -3522,6 +3575,8 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
     let mut converter_name: Option<String> = None;
     let mut converter_version: Option<u32> = None;
     let mut objects_converted: Option<u64> = None;
+    let mut phase: Option<MigrationPhase> = None;
+    let mut cutover_cursor: Option<u64> = None;
     let mut unknown_tlvs: Vec<(u8, Bytes)> = Vec::new();
     let mut seen_tags: u128 = 0;
 
@@ -3619,6 +3674,16 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
                 converter_version = Some(u32::from_be_bytes(value.try_into().unwrap()));
             }
             TLV_MP_OBJECTS_CONVERTED => objects_converted = Some(read_u64(value)?),
+            TLV_MP_PHASE => {
+                let b = read_u8(value)?;
+                phase = Some(MigrationPhase::from_byte(b).ok_or_else(|| {
+                    EngineError::Catalog(CatalogError::MalformedMigrationPlan {
+                        row: key_debug.into(),
+                        reason: "unknown migration phase byte",
+                    })
+                })?);
+            }
+            TLV_MP_CUTOVER_CURSOR => cutover_cursor = Some(read_u64(value)?),
             other => unknown_tlvs.push((other, Bytes::copy_from_slice(value))),
         }
     }
@@ -3643,6 +3708,10 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
         converter_name: converter_name.ok_or_else(|| require_tag(TLV_MP_CONVERTER_NAME))?,
         converter_version: converter_version.ok_or_else(|| require_tag(TLV_MP_CONVERTER_VERSION))?,
         objects_converted: objects_converted.ok_or_else(|| require_tag(TLV_MP_OBJECTS_CONVERTED))?,
+        // Card-1 rows have no phase/cutover TLV → default to the pre-card-2
+        // semantics (Converting, cutover not started).
+        phase: phase.unwrap_or(MigrationPhase::Converting),
+        cutover_cursor: cutover_cursor.unwrap_or(0),
         unknown_tlvs,
     })
 }
@@ -3812,6 +3881,8 @@ pub(crate) fn create_migration_plan(
             converter_name: converter_name.to_string(),
             converter_version,
             objects_converted: 0,
+            phase: MigrationPhase::Converting,
+            cutover_cursor: 0,
             unknown_tlvs: Vec::new(),
         };
         let puts = vec![
@@ -4608,6 +4679,8 @@ mod tests {
             converter_name: "widen_i32_to_i64".to_string(),
             converter_version: 1,
             objects_converted: 999,
+            phase: MigrationPhase::Converting,
+            cutover_cursor: 0,
             unknown_tlvs: Vec::new(),
         }
     }
@@ -4644,16 +4717,17 @@ mod tests {
 
     #[test]
     fn migration_plan_preserves_unknown_tlvs_byte_identical() {
-        // Simulate a card-2/4 row carrying a reserved tag the card-1 binary
-        // doesn't understand. It must survive a decode→encode cycle verbatim
-        // so a card-1 reopen-and-rewrite doesn't mangle a newer row.
+        // Simulate a future-card row carrying a reserved tag (0x30, still in
+        // the unallocated 0x22-0x3F range) that this binary doesn't understand.
+        // It must survive a decode→encode cycle verbatim so a reopen-and-rewrite
+        // doesn't mangle a newer row.
         let mut p = sample_plan();
-        p.unknown_tlvs.push((0x20, Bytes::from_static(&[0xAB, 0xCD])));
+        p.unknown_tlvs.push((0x30, Bytes::from_static(&[0xAB, 0xCD])));
         let bytes = encode_migration_plan(&p);
         let back = decode_migration_plan(p.plan_id, "c:P:7", &bytes).unwrap();
         assert_eq!(
             back.unknown_tlvs,
-            vec![(0x20u8, Bytes::from_static(&[0xAB, 0xCD]))]
+            vec![(0x30u8, Bytes::from_static(&[0xAB, 0xCD]))]
         );
         assert_eq!(encode_migration_plan(&back), bytes);
     }
