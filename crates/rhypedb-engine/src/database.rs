@@ -409,6 +409,45 @@ impl Default for OpenOptions {
     }
 }
 
+/// Spec for a chunked field-type migration (shadow-field card 1/5). The
+/// converter must already be registered via [`Database::register_converter`]
+/// under `(converter_name, converter_version)` — the pair is pinned in the
+/// persisted plan so a restart re-resolves the same body (a missing or
+/// version-skewed converter parks the plan `AwaitingConverter` on resume
+/// rather than running the wrong logic).
+#[derive(Debug, Clone)]
+pub struct MigrationPlanSpec {
+    pub type_name: String,
+    pub field_name: String,
+    pub target_field_type: rhypedb_schema::FieldType,
+    pub converter_name: String,
+    pub converter_version: u32,
+    /// Objects converted per chunk commit; `0` uses the engine default
+    /// (`DEFAULT_MIGRATION_CHUNK_SIZE`). Smaller = more frequent cursor
+    /// commits (lower re-do on crash) at more fsyncs.
+    pub chunk_size: u64,
+}
+
+/// Operator-facing snapshot of a persisted migration plan
+/// ([`Database::list_migrations`]). Kind bytes and forward-compat TLVs are
+/// deliberately not exposed.
+#[derive(Debug, Clone)]
+pub struct MigrationSummary {
+    pub plan_id: u64,
+    pub type_name: String,
+    pub field_name: String,
+    pub status: crate::catalog::MigrationStatus,
+    /// Highest object id whose conversion is durably committed.
+    pub cursor: u64,
+    /// Observability counter — completion is proven by an exhaustion scan,
+    /// not by this value (a torn re-scan can double-count).
+    pub objects_converted: u64,
+    pub chunk_size: u64,
+    pub converter_name: String,
+    pub converter_version: u32,
+    pub created_at_ms: u64,
+}
+
 impl Database {
     /// Open a database with the given schema and data directory.
     ///
@@ -1454,7 +1493,6 @@ impl Database {
     /// Arm write-rejection (quiesce) for `type_id` under `plan_id`. MUST be
     /// called while holding `migration_lock.write()` so no concurrent
     /// writer observes a torn set; clone-on-write swap of the read cache.
-    #[allow(dead_code)] // wired into create_field_type_migration (increment 3)
     pub(crate) fn arm_quiesce(&self, type_id: u64, plan_id: u64) {
         let mut m = (**self.migrating.load()).clone();
         m.insert(type_id, plan_id);
@@ -1463,7 +1501,6 @@ impl Database {
 
     /// Release quiesce for `type_id` (migration completed/cancelled). Same
     /// locking contract as `arm_quiesce`.
-    #[allow(dead_code)] // wired into complete/cancel (increment 3/6)
     pub(crate) fn disarm_quiesce(&self, type_id: u64) {
         let mut m = (**self.migrating.load()).clone();
         m.remove(&type_id);
@@ -1489,12 +1526,110 @@ impl Database {
 
     /// Resolve a converter by `(name, version)`. `None` if absent or the
     /// registered version differs (→ the caller parks `AwaitingConverter`).
-    #[allow(dead_code)] // wired into create_field_type_migration + resume (increment 3/4)
     fn resolve_converter(&self, name: &str, version: u32) -> Option<crate::catalog::RegisteredConverter> {
         self.converters
             .read()
             .get(name)
             .and_then(|(v, c)| (*v == version).then(|| Arc::clone(c)))
+    }
+
+    /// Create and run a chunked, crash-resumable field-type migration
+    /// (shadow-field card 1/5). Synchronous: converts the whole object
+    /// keyspace in per-chunk commits, then flips the catalog field kind,
+    /// and returns the durable plan id. While it runs, the migrating type is
+    /// QUIESCED — concurrent writes to it are rejected with
+    /// `MigrationTypeQuiesced` (card 2 lifts this with live double-writes);
+    /// writes to other types proceed.
+    ///
+    /// Unlike the single-commit [`Database::change_field_type`], this never
+    /// holds `CATALOG_INIT_LOCK` across the scan-and-rewrite, commits at
+    /// chunk boundaries, and resumes from the last durable cursor after a
+    /// crash (see `open` auto-resume). The converter must be registered
+    /// first via [`Database::register_converter`].
+    ///
+    /// Like the other migrate verbs, on success this handle's in-memory
+    /// schema is STALE (the catalog kind changed underneath it): drop it and
+    /// reopen with the schema where the field has the target type before
+    /// issuing further writes to the migrated type.
+    pub fn create_field_type_migration(&self, spec: MigrationPlanSpec) -> EngineResult<u64> {
+        self.check_not_migrated()?;
+        let target_kind = crate::catalog::schema_kind_byte_public(&spec.target_field_type);
+        // Resolve the converter up front: fail fast rather than persist a
+        // plan that can never run. (The resume-after-restart path, where the
+        // plan already exists, parks `AwaitingConverter` instead.)
+        let converter = self
+            .resolve_converter(&spec.converter_name, spec.converter_version)
+            .ok_or_else(|| EngineError::ConverterNotRegistered {
+                name: spec.converter_name.clone(),
+                version: spec.converter_version,
+            })?;
+
+        // Setup under the migration write-barrier: validate, allocate +
+        // persist the plan, and arm quiesce atomically so no writer slips a
+        // create/update into the migrating type between plan and quiesce.
+        let created = {
+            let _guard = self.migration_lock.write();
+            let created = crate::catalog::create_migration_plan(
+                &self.storage,
+                &self.schema,
+                &spec.type_name,
+                &spec.field_name,
+                target_kind,
+                &spec.converter_name,
+                spec.converter_version,
+                spec.chunk_size,
+            )?;
+            self.arm_quiesce(created.type_id, created.plan_id);
+            created
+        };
+
+        // Drive WITHOUT holding `migration_lock` so writers to OTHER types
+        // proceed during the (potentially long) chunk loop; the migrating
+        // type stays quiesced via the armed set.
+        self.drive_migration_to_completion(created.plan_id, created.type_id, &converter)?;
+        Ok(created.plan_id)
+    }
+
+    /// Run a plan's chunk loop to data-exhaustion (no `migration_lock` held),
+    /// then re-take the barrier to flip the catalog kind and release quiesce.
+    /// On a converter / data error the plan is left `Failed` (quiesce HELD)
+    /// and the error is propagated; quiesce is released only on a clean
+    /// `Completed`.
+    fn drive_migration_to_completion(
+        &self,
+        plan_id: u64,
+        type_id: u64,
+        converter: &crate::catalog::RegisteredConverter,
+    ) -> EngineResult<()> {
+        crate::catalog::run_migration_chunks(&self.storage, plan_id, converter)?;
+        let _guard = self.migration_lock.write();
+        crate::catalog::finalize_migration_cutover(&self.storage, plan_id)?;
+        self.disarm_quiesce(type_id);
+        Ok(())
+    }
+
+    /// Snapshot every persisted migration plan (`c:P:*`), newest semantics
+    /// from the durable record. Cheap observability for tests and operators.
+    pub fn list_migrations(&self) -> EngineResult<Vec<MigrationSummary>> {
+        let _guard = self.migration_lock.read();
+        let txn = self.storage.begin_txn();
+        let snap = txn.snapshot();
+        let plans = crate::catalog::scan_migration_plans(&self.storage, snap)?;
+        Ok(plans
+            .into_iter()
+            .map(|p| MigrationSummary {
+                plan_id: p.plan_id,
+                type_name: p.type_name,
+                field_name: p.field_name,
+                status: p.status,
+                cursor: p.cursor,
+                objects_converted: p.objects_converted,
+                chunk_size: p.chunk_size,
+                converter_name: p.converter_name,
+                converter_version: p.converter_version,
+                created_at_ms: p.created_at_ms,
+            })
+            .collect())
     }
 
     pub fn create(&self, type_name: &str, fields: FieldMap) -> EngineResult<Object> {
@@ -5846,6 +5981,481 @@ mod tests {
         let db2 = Database::open(schema, dir.path()).unwrap();
         let obj = db2.get("User", user.id).unwrap();
         assert_eq!(obj.fields.get("age"), Some(&Value::I64(42)));
+    }
+
+    /// Offline regression: a field-type change with zero objects flips the
+    /// catalog kind, reports `objects_converted == 0`, bumps format to V4,
+    /// and creates NO migration plan (the offline path is plan-free).
+    #[test]
+    fn apply_field_type_change_no_objects_noop_is_unchanged() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let report = db
+            .change_field_type(
+                "User",
+                "score",
+                FieldType::Scalar(ScalarType::F64),
+                |_, v| match v {
+                    Value::I64(i) => Ok(Value::F64(*i as f64)),
+                    _ => Ok(Value::F64(0.0)),
+                },
+            )
+            .unwrap();
+        assert_eq!(report.field_type_changes[0].objects_converted, 0);
+        assert_eq!(report.catalog_format_after, 4);
+        drop(db);
+        let db2 = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        // Catalog flipped (reopen with f64 succeeds); offline path persists
+        // no plan.
+        assert!(db2.list_migrations().unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Chunked field-type migration (shadow-field card 1/5, increment 3)
+    // -----------------------------------------------------------------
+
+    // A converter that widens I64 -> F64; anything else is a hard error
+    // (so a double-conversion or wrong-kind row surfaces, not silently
+    // coerces).
+    fn widen_i64_to_f64(name: &str) -> impl Fn(u64, &Value) -> EngineResult<Value> {
+        let q = name.to_string();
+        move |oid, v| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            other => Err(EngineError::Catalog(
+                crate::CatalogError::FieldTypeChangeConverterFailed {
+                    qualified: q.clone(),
+                    object_id: oid,
+                    reason: format!("expected I64, got {}", other.type_name()),
+                },
+            )),
+        }
+    }
+
+    #[test]
+    fn create_field_type_migration_converts_all_and_completes() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { name: String  score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        let scores = [5i64, 10, 15, 20, 25, 30, 35];
+        let mut ids = Vec::new();
+        for s in scores {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(format!("u{s}")));
+            f.insert("score".into(), Value::I64(s));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 2,
+            })
+            .unwrap();
+        assert_eq!(plan_id, 1);
+        let summary = db.list_migrations().unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(
+            summary[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+        assert_eq!(summary[0].objects_converted, scores.len() as u64);
+        drop(db);
+        let db2 = Database::open(
+            parse_schema(r#"type User { name: String  score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        for (id, s) in ids.iter().zip(scores.iter()) {
+            match db2.get("User", *id).unwrap().fields.get("score") {
+                Some(Value::F64(f)) => assert_eq!(*f, *s as f64),
+                other => panic!("expected F64, got {other:?}"),
+            }
+        }
+    }
+
+    /// Acceptance: chunks commit at chunk boundaries — `ceil(rows/chunk)`
+    /// chunk commits, NOT one big commit.
+    #[test]
+    fn create_field_type_migration_chunks_commit_at_chunk_boundary() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        // Disable the cover-refresh worker so commit counting is
+        // deterministic (it never fires here — no updates — but be explicit).
+        let opts = OpenOptions {
+            background_cover_refresh: false,
+            ..OpenOptions::default()
+        };
+        let db = Database::open_with_options(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+            opts,
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        for i in 0..10i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            db.create("User", f).unwrap();
+        }
+        let before = db.storage.txn_manager().current_version();
+        db.create_field_type_migration(MigrationPlanSpec {
+            type_name: "User".into(),
+            field_name: "score".into(),
+            target_field_type: FieldType::Scalar(ScalarType::F64),
+            converter_name: "widen".into(),
+            converter_version: 1,
+            chunk_size: 4,
+        })
+        .unwrap();
+        let after = db.storage.txn_manager().current_version();
+        let chunks = 10u64.div_ceil(4);
+        assert!(chunks > 1, "test must exercise multiple chunks");
+        // 1 plan-create commit + `chunks` chunk commits + 1 finalize commit.
+        assert_eq!(
+            after - before,
+            1 + chunks + 1,
+            "expected per-chunk commits, not a single batch"
+        );
+    }
+
+    /// Acceptance: crash mid-migration, then resume from the persisted
+    /// cursor — every row ends converted exactly once. Drives the catalog
+    /// worker directly (the synchronous create path's seam) so we can
+    /// inject a converter that fails partway, leaving a `Running`→`Failed`
+    /// plan with a mid-range cursor, then re-drive with a good converter.
+    #[test]
+    fn create_field_type_migration_resumes_from_cursor_after_simulated_crash() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..12i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4,
+        )
+        .unwrap();
+        db.arm_quiesce(created.type_id, created.plan_id);
+
+        // "Crash": a converter that errors once it reaches the back half.
+        let cutoff = ids[ids.len() / 2];
+        let bad: crate::catalog::RegisteredConverter = Arc::new(move |oid: u64, v: &Value| {
+            if oid >= cutoff {
+                return Err(EngineError::Catalog(
+                    crate::CatalogError::FieldTypeChangeConverterFailed {
+                        qualified: "User.score".into(),
+                        object_id: oid,
+                        reason: "boom".into(),
+                    },
+                ));
+            }
+            match v {
+                Value::I64(i) => Ok(Value::F64(*i as f64)),
+                _ => unreachable!(),
+            }
+        });
+        let err =
+            crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &bad).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::FieldTypeChangeConverterFailed { .. })
+        ));
+        let mid = db.list_migrations().unwrap();
+        assert_eq!(mid[0].status, crate::catalog::MigrationStatus::Failed);
+        assert!(
+            mid[0].cursor > 0 && mid[0].cursor < *ids.last().unwrap(),
+            "cursor should be mid-range, got {}",
+            mid[0].cursor
+        );
+        let partial = mid[0].objects_converted;
+        assert!(partial > 0 && partial < 12, "partial progress: {partial}");
+
+        // Resume with a good converter from the persisted cursor, then cut
+        // over. Already-converted rows are idempotently skipped (the good
+        // converter would error on an F64 input; it never sees one).
+        let good: crate::catalog::RegisteredConverter = Arc::new(|_oid: u64, v: &Value| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => unreachable!("already-converted rows must be skipped before the converter"),
+        });
+        crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &good).unwrap();
+        crate::catalog::finalize_migration_cutover(&db.storage, created.plan_id).unwrap();
+        drop(db);
+
+        let db2 = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        for (id, i) in ids.iter().zip(0i64..) {
+            match db2.get("User", *id).unwrap().fields.get("score") {
+                Some(Value::F64(f)) => assert_eq!(*f, i as f64),
+                other => panic!("id {id}: expected F64, got {other:?}"),
+            }
+        }
+    }
+
+    /// A present `Value::Null` (kind UNSET) in the migrating field is skipped
+    /// exactly like an absent field — it must NOT brick the migration.
+    #[test]
+    fn create_field_type_migration_skips_null_rows() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        let normal = {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(7));
+            db.create("User", f).unwrap().id
+        };
+        // Overwrite a second row's blob with a present-Null score, bypassing
+        // create() validation, to exercise the UNSET-skip arm.
+        let null_id = {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(9));
+            db.create("User", f).unwrap().id
+        };
+        let tid = db.resolve_type_id("User").unwrap();
+        let mut nf = FieldMap::new();
+        nf.insert("score".into(), Value::Null);
+        let mut txn = db.storage.begin_txn();
+        db.storage
+            .put_batch(
+                &mut txn,
+                &[(
+                    rhypedb_storage::key::KeyBuilder::object(tid, null_id),
+                    crate::object::serialize_fields(&nf),
+                )],
+            )
+            .unwrap();
+        db.storage.commit(&mut txn).unwrap();
+
+        db.create_field_type_migration(MigrationPlanSpec {
+            type_name: "User".into(),
+            field_name: "score".into(),
+            target_field_type: FieldType::Scalar(ScalarType::F64),
+            converter_name: "widen".into(),
+            converter_version: 1,
+            chunk_size: 4,
+        })
+        .unwrap();
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+        // The Null row converted nothing; only the normal row counts.
+        assert_eq!(db.list_migrations().unwrap()[0].objects_converted, 1);
+        drop(db);
+        let db2 = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(matches!(
+            db2.get("User", normal).unwrap().fields.get("score"),
+            Some(Value::F64(_))
+        ));
+        // The Null row is left Null (read-tolerant), not converted.
+        assert!(matches!(
+            db2.get("User", null_id).unwrap().fields.get("score"),
+            Some(Value::Null) | None
+        ));
+    }
+
+    /// An on-disk row whose migrating-field kind is neither source nor target
+    /// parks the plan `Failed` (quiesce held) rather than guessing.
+    #[test]
+    fn create_field_type_migration_unexpected_kind_fails() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        let id = {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(1));
+            db.create("User", f).unwrap().id
+        };
+        // Overwrite with a String value: kind SCALAR_STRING, neither I64
+        // (src) nor F64 (target).
+        let tid = db.resolve_type_id("User").unwrap();
+        let mut sf = FieldMap::new();
+        sf.insert("score".into(), Value::String("oops".into()));
+        let mut txn = db.storage.begin_txn();
+        db.storage
+            .put_batch(
+                &mut txn,
+                &[(
+                    rhypedb_storage::key::KeyBuilder::object(tid, id),
+                    crate::object::serialize_fields(&sf),
+                )],
+            )
+            .unwrap();
+        db.storage.commit(&mut txn).unwrap();
+
+        let err = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::MigrationRowUnexpectedKind { .. })
+        ));
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Failed
+        );
+    }
+
+    /// Creating a migration against an unregistered converter fails fast and
+    /// persists NO plan.
+    #[test]
+    fn create_field_type_migration_unregistered_converter_refused() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let err = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "missing".into(),
+                converter_version: 1,
+                chunk_size: 0,
+            })
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ConverterNotRegistered { .. }));
+        assert!(db.list_migrations().unwrap().is_empty());
+    }
+
+    /// Plan ids are monotonic and never reused across a restart (the c:N:M
+    /// counter self-heals against the max persisted plan id).
+    #[test]
+    fn migration_id_counter_monotonic_across_restart() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { a: i64  b: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User"));
+        let mut f = FieldMap::new();
+        f.insert("a".into(), Value::I64(1));
+        f.insert("b".into(), Value::I64(2));
+        db.create("User", f).unwrap();
+        let p1 = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "a".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 0,
+            })
+            .unwrap();
+        assert_eq!(p1, 1);
+        drop(db);
+        let db2 = Database::open(
+            parse_schema(r#"type User { a: f64  b: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db2.register_converter("widen", 1, widen_i64_to_f64("User"));
+        let p2 = db2
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "b".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 0,
+            })
+            .unwrap();
+        assert_eq!(p2, 2, "plan id must not reset or reuse across restart");
+    }
+
+    /// A second migration on a field that already has an unsettled plan is
+    /// refused.
+    #[test]
+    fn create_field_type_migration_refused_with_active_plan() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        let mut f = FieldMap::new();
+        f.insert("score".into(), Value::I64(3));
+        db.create("User", f).unwrap();
+        // Persist a Running plan directly (don't drive it to completion).
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4,
+        )
+        .unwrap();
+        db.arm_quiesce(created.type_id, created.plan_id);
+        // A create against the same field now refuses.
+        let err = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::MigrationFieldHasActivePlan { .. })
+        ));
     }
 
     // -----------------------------------------------------------------

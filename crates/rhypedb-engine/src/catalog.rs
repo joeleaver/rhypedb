@@ -229,7 +229,6 @@ const MP_STATUS_AWAITING_CONVERTER: u8 = 0x05;
 /// Default objects processed per chunk commit. Bounds each chunk's
 /// `put_batch` + fsync while amortizing the per-chunk lock/scan overhead;
 /// cancel latency is `<= chunk_size` rows. Overridable per migration.
-#[allow(dead_code)] // wired into create_field_type_migration (increment 3)
 pub(crate) const DEFAULT_MIGRATION_CHUNK_SIZE: u64 = 1024;
 
 /// Discriminants stored in TLV 0x04 of every field/relation id-entry.
@@ -787,7 +786,7 @@ pub enum MigrationStatus {
     AwaitingConverter,
 }
 
-#[allow(dead_code)] // is_terminal/quiesces/is_drivable wired in increments 2-4
+#[allow(dead_code)] // is_terminal wired into auto-resume (increment 4)
 impl MigrationStatus {
     fn to_byte(self) -> u8 {
         match self {
@@ -3333,7 +3332,6 @@ fn decode_format_version(key_debug: &str, bytes: &[u8]) -> EngineResult<u64> {
 // Shadow-field migration plan codec + id allocation (card 1/5)
 // =====================================================================
 
-#[allow(dead_code)] // wired into create_field_type_migration + chunk worker (increment 3)
 fn encode_migration_plan(plan: &MigrationPlan) -> Bytes {
     let mut body: Vec<u8> = Vec::with_capacity(128);
     write_tlv(&mut body, TLV_MP_TYPE_NAME, plan.type_name.as_bytes());
@@ -3551,7 +3549,6 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
 }
 
 /// Read the `c:N:M` migration-id counter within `txn`; absent ⇒ 0.
-#[allow(dead_code)] // wired into create_field_type_migration in increment 3
 fn read_migration_counter(
     storage: &LsmTree,
     txn: &rhypedb_storage::mvcc::Transaction,
@@ -3563,7 +3560,10 @@ fn read_migration_counter(
 }
 
 /// Decode every `c:P:<id>` plan record visible at `snap`, ascending by id.
-fn scan_migration_plans(storage: &LsmTree, snap: u64) -> EngineResult<Vec<MigrationPlan>> {
+pub(crate) fn scan_migration_plans(
+    storage: &LsmTree,
+    snap: u64,
+) -> EngineResult<Vec<MigrationPlan>> {
     let prefix = KeyBuilder::catalog_migration_plan_prefix();
     let mut plans = Vec::new();
     for (key, value) in storage.scan_prefix_at(snap, &prefix)? {
@@ -3584,7 +3584,6 @@ fn scan_migration_plans(storage: &LsmTree, snap: u64) -> EngineResult<Vec<Migrat
 /// the highest plan id actually on disk (incl. terminal plans) so a torn
 /// counter bump can never reissue a live id. Caller persists
 /// `c:N:M = returned id` alongside the new plan in one commit.
-#[allow(dead_code)] // wired into create_field_type_migration in increment 3
 fn next_migration_id(counter: u64, plans: &[MigrationPlan]) -> u64 {
     let max_plan = plans.iter().map(|p| p.plan_id).max().unwrap_or(0);
     counter.max(max_plan).saturating_add(1)
@@ -3631,6 +3630,394 @@ fn drivable_plan_for_kind_change(
                 && p.target_kind == want_kind
         })
         .map(|p| p.plan_id)
+}
+
+// =====================================================================
+// Chunked field-type migration worker (card 1/5, increment 3)
+//
+// The synchronous run-to-completion path: create a durable plan, arm the
+// type quiesce, convert the object keyspace in crash-safe chunks, then flip
+// the catalog kind. Async / cancel / pause are card 5.
+// =====================================================================
+
+/// Outcome of `create_migration_plan`: the durable plan id + its owning
+/// type id, so the Database orchestrator can `arm_quiesce` and drive without
+/// re-loading the catalog.
+pub(crate) struct CreatedMigration {
+    pub plan_id: u64,
+    pub type_id: u64,
+}
+
+/// Validate, allocate, and persist a new chunked field-type migration plan
+/// in ONE commit (`c:P:<id>` + the `c:N:M` counter). Caller holds
+/// `migration_lock.write()`. Refuses if an unsettled plan already covers the
+/// field (same interlock the offline path uses). Status starts `Running`,
+/// cursor `0`; the caller arms quiesce then drives.
+// Each arg is an independent plan field with no natural grouping; a params
+// struct would just move the noise to the single call site.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_migration_plan(
+    storage: &LsmTree,
+    schema: &Schema,
+    type_name: &str,
+    field_name: &str,
+    target_kind: u8,
+    converter_name: &str,
+    converter_version: u32,
+    chunk_size: u64,
+) -> EngineResult<CreatedMigration> {
+    let _guard = CATALOG_INIT_LOCK.lock();
+    let mut txn = storage.begin_txn();
+    let snap = txn.snapshot();
+
+    let result = (|| -> EngineResult<CreatedMigration> {
+        let fv_raw = storage
+            .get(&txn, &KeyBuilder::catalog_format())?
+            .ok_or_else(|| {
+                EngineError::Catalog(CatalogError::MissingRequiredKey {
+                    key_debug: "c:F:".into(),
+                })
+            })?;
+        let format = decode_format_version("c:F:", &fv_raw)?;
+        let cat = load_existing(storage, snap, format)?;
+
+        let qual = format!("{type_name}.{field_name}");
+        let plans = scan_migration_plans(storage, snap)?;
+        if let Some(plan_id) = active_plan_for_field(&plans, type_name, field_name) {
+            return Err(EngineError::Catalog(
+                CatalogError::MigrationFieldHasActivePlan {
+                    qualified: qual,
+                    plan_id,
+                },
+            ));
+        }
+
+        let (field_entry, type_id) =
+            validate_field_type_change(&cat, schema, type_name, field_name, target_kind)?;
+
+        let counter = read_migration_counter(storage, &txn)?;
+        let plan_id = next_migration_id(counter, &plans);
+        let plan = MigrationPlan {
+            plan_id,
+            type_name: type_name.to_string(),
+            field_name: field_name.to_string(),
+            field_id: field_entry.id,
+            src_kind: field_entry.kind,
+            target_kind,
+            status: MigrationStatus::Running,
+            cursor: 0,
+            chunk_size,
+            created_at_ms: now_unix_millis(),
+            converter_name: converter_name.to_string(),
+            converter_version,
+            objects_converted: 0,
+            unknown_tlvs: Vec::new(),
+        };
+        let puts = vec![
+            (
+                KeyBuilder::catalog_migration_plan(plan_id),
+                encode_migration_plan(&plan),
+            ),
+            (KeyBuilder::catalog_next_migration(), encode_counter(plan_id)),
+        ];
+        storage.put_batch(&mut txn, &puts)?;
+        Ok(CreatedMigration { plan_id, type_id })
+    })();
+
+    match result {
+        Ok(created) => {
+            storage.commit(&mut txn)?;
+            Ok(created)
+        }
+        Err(e) => {
+            storage.abort(&mut txn);
+            Err(e)
+        }
+    }
+}
+
+/// Point-load a single plan record `c:P:<plan_id>` within `txn`.
+fn require_migration_plan(
+    storage: &LsmTree,
+    txn: &rhypedb_storage::mvcc::Transaction,
+    plan_id: u64,
+) -> EngineResult<MigrationPlan> {
+    let key = KeyBuilder::catalog_migration_plan(plan_id);
+    let bytes = storage.get(txn, &key)?.ok_or_else(|| {
+        EngineError::Catalog(CatalogError::MissingRequiredKey {
+            key_debug: debug_key(&key),
+        })
+    })?;
+    decode_migration_plan(plan_id, &debug_key(&key), &bytes)
+}
+
+/// Commit a plan record to `c:P:<id>` in its own txn (used for the
+/// status=Failed park, which must persist even though the failing chunk's
+/// data txn is aborted).
+fn persist_migration_plan(storage: &LsmTree, plan: &MigrationPlan) -> EngineResult<()> {
+    let mut txn = storage.begin_txn();
+    let puts = vec![(
+        KeyBuilder::catalog_migration_plan(plan.plan_id),
+        encode_migration_plan(plan),
+    )];
+    storage.put_batch(&mut txn, &puts)?;
+    storage.commit(&mut txn)?;
+    Ok(())
+}
+
+/// The trailing 8 bytes of an object key are its `object_id` (BE).
+fn object_id_from_key(key: &[u8]) -> u64 {
+    u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap())
+}
+
+/// Drive a plan's chunk loop to data-exhaustion. Loads the plan, resolves
+/// the type id once, then converts the object keyspace in chunks. Each chunk
+/// commits as `[converted object blobs..., updated plan record LAST]`, so a
+/// torn WAL tail can only drop the cursor advance — never leave the cursor
+/// AHEAD of its durable blobs. Combined with per-row idempotency-on-target
+/// (a row already at the target kind is skipped), re-running from the last
+/// durable cursor after a crash is correct.
+///
+/// Does NOT flip the catalog kind — the caller invokes
+/// `finalize_migration_cutover` after this returns `Ok`. On a converter
+/// error, a converter that returns the wrong kind, or an on-disk row whose
+/// kind is neither source nor target, the plan is parked `Failed` (quiesce
+/// stays armed for inspection) and the error is returned.
+pub(crate) fn run_migration_chunks(
+    storage: &LsmTree,
+    plan_id: u64,
+    converter: &RegisteredConverter,
+) -> EngineResult<()> {
+    // Load the plan + resolve the owning type id once (the per-chunk commits
+    // touch only `o:` + `c:P:<id>`, never the catalog, so no further catalog
+    // reads are needed inside the loop).
+    let (mut plan, type_id) = {
+        let txn = storage.begin_txn();
+        let snap = txn.snapshot();
+        let plan = require_migration_plan(storage, &txn, plan_id)?;
+        let fv_raw = storage
+            .get(&txn, &KeyBuilder::catalog_format())?
+            .ok_or_else(|| {
+                EngineError::Catalog(CatalogError::MissingRequiredKey {
+                    key_debug: "c:F:".into(),
+                })
+            })?;
+        let format = decode_format_version("c:F:", &fv_raw)?;
+        let cat = load_existing(storage, snap, format)?;
+        let type_id = *cat.type_ids.get(&plan.type_name).ok_or_else(|| {
+            EngineError::Catalog(CatalogError::FieldTypeChangeSourceNotFound {
+                qualified: format!("{}.{}", plan.type_name, plan.field_name),
+            })
+        })?;
+        (plan, type_id)
+    };
+
+    let field_name = plan.field_name.clone();
+    let src_kind = plan.src_kind;
+    let target_kind = plan.target_kind;
+    let chunk_size = if plan.chunk_size == 0 {
+        DEFAULT_MIGRATION_CHUNK_SIZE
+    } else {
+        plan.chunk_size
+    } as usize;
+    let object_prefix = KeyBuilder::object_prefix(type_id);
+    let mut cursor = plan.cursor;
+
+    loop {
+        // Resume strictly AFTER the cursor (idempotency-on-target makes
+        // re-including it harmless, but skipping it is cheaper).
+        let start = if cursor == 0 {
+            object_prefix.clone()
+        } else {
+            match cursor.checked_add(1) {
+                Some(next) => KeyBuilder::object(type_id, next),
+                // Cursor at u64::MAX — no possible key past it. Exhausted.
+                None => break,
+            }
+        };
+
+        let mut txn = storage.begin_txn();
+        let snap = txn.snapshot();
+        let chunk = storage.scan_chunk_raw(snap, &object_prefix, &start, chunk_size)?;
+        let Some(high_water) = chunk.high_water.clone() else {
+            // No key — live or tombstoned — past the cursor: data done.
+            storage.abort(&mut txn);
+            break;
+        };
+
+        let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(chunk.live.len() + 1);
+        let mut converted_this_chunk: u64 = 0;
+        for (key, blob) in &chunk.live {
+            let object_id = object_id_from_key(key);
+            let mut fields = crate::object::deserialize_fields(blob);
+            let Some(old_value) = fields.get(&field_name).cloned() else {
+                continue; // field absent on this row — nothing to convert
+            };
+            let got_kind = value_to_kind_byte(&old_value);
+            if got_kind == target_kind {
+                continue; // already converted (idempotent re-scan after crash)
+            }
+            if got_kind == kind_byte::UNSET {
+                continue; // Null — skip exactly as an absent field is skipped
+            }
+            if got_kind != src_kind {
+                // On-disk data disagrees with the catalog. Park Failed
+                // (quiesce held) rather than guess. Abort this chunk's
+                // uncommitted blobs first; the cursor stays where the last
+                // committed chunk left it.
+                storage.abort(&mut txn);
+                plan.status = MigrationStatus::Failed;
+                persist_migration_plan(storage, &plan)?;
+                return Err(EngineError::Catalog(
+                    CatalogError::MigrationRowUnexpectedKind {
+                        plan_id,
+                        object_id,
+                        got_kind: kind_name(got_kind),
+                        expected_kind: kind_name(src_kind),
+                    },
+                ));
+            }
+            let new_value = match converter(object_id, &old_value) {
+                Ok(v) => v,
+                Err(e) => {
+                    storage.abort(&mut txn);
+                    plan.status = MigrationStatus::Failed;
+                    persist_migration_plan(storage, &plan)?;
+                    return Err(EngineError::Catalog(
+                        CatalogError::FieldTypeChangeConverterFailed {
+                            qualified: format!("{}.{}", plan.type_name, field_name),
+                            object_id,
+                            reason: e.to_string(),
+                        },
+                    ));
+                }
+            };
+            let out_kind = value_to_kind_byte(&new_value);
+            if out_kind != target_kind {
+                storage.abort(&mut txn);
+                plan.status = MigrationStatus::Failed;
+                persist_migration_plan(storage, &plan)?;
+                return Err(EngineError::Catalog(
+                    CatalogError::FieldTypeChangeConverterReturnedWrongKind {
+                        qualified: format!("{}.{}", plan.type_name, field_name),
+                        object_id,
+                        got_kind: kind_name(out_kind),
+                        want_kind: kind_name(target_kind),
+                    },
+                ));
+            }
+            fields.insert(field_name.clone(), new_value);
+            puts.push((key.clone(), crate::object::serialize_fields(&fields)));
+            converted_this_chunk += 1;
+        }
+
+        // Advance the cursor to the tombstone-inclusive high-water mark so a
+        // tombstone run longer than the chunk can't strand live keys past it.
+        cursor = object_id_from_key(&high_water);
+        plan.cursor = cursor;
+        plan.objects_converted = plan.objects_converted.saturating_add(converted_this_chunk);
+        plan.status = MigrationStatus::Running;
+        // CRASH-SAFE ORDER: object blobs FIRST, plan record LAST.
+        puts.push((
+            KeyBuilder::catalog_migration_plan(plan_id),
+            encode_migration_plan(&plan),
+        ));
+        storage.put_batch(&mut txn, &puts)?;
+        storage.commit(&mut txn)?;
+
+        // `!more` is the ONLY sound exhaustion signal (live.len() < chunk
+        // cannot be — a tombstone run shrinks the live count below the cap).
+        if !chunk.more {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+/// Flip the catalog field kind to the plan's target and mark the plan
+/// `Completed`, in ONE commit ordered `[field-entry flip FIRST, plan record
+/// LAST]`. A torn tail thus drops only the plan-status advance (the flip
+/// persists), so resume re-runs this idempotently. Idempotent: if the kind
+/// is already the target (a prior finalize's plan record was torn off), it
+/// skips the flip + history entry and just records `Completed`. Caller holds
+/// `migration_lock.write()`; this takes `CATALOG_INIT_LOCK`. Returns the
+/// plan's `objects_converted`.
+pub(crate) fn finalize_migration_cutover(storage: &LsmTree, plan_id: u64) -> EngineResult<u64> {
+    let _guard = CATALOG_INIT_LOCK.lock();
+    let mut txn = storage.begin_txn();
+    let snap = txn.snapshot();
+
+    let result = (|| -> EngineResult<u64> {
+        let mut plan = require_migration_plan(storage, &txn, plan_id)?;
+        let fv_raw = storage
+            .get(&txn, &KeyBuilder::catalog_format())?
+            .ok_or_else(|| {
+                EngineError::Catalog(CatalogError::MissingRequiredKey {
+                    key_debug: "c:F:".into(),
+                })
+            })?;
+        let format_before = decode_format_version("c:F:", &fv_raw)?;
+        let cat = load_existing(storage, snap, format_before)?;
+        let qual = format!("{}.{}", plan.type_name, plan.field_name);
+
+        let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
+
+        // Idempotent flip — only if the catalog isn't already at the target
+        // (a torn prior finalize, or auto-resume re-running the cutover).
+        if let Some(field_entry) = cat.field_entries.get(&qual)
+            && field_entry.kind != plan.target_kind
+        {
+            let now_ms = now_unix_millis();
+            let from_kind = field_entry.kind;
+            let mut new_entry = field_entry.clone();
+            new_entry.kind = plan.target_kind;
+            new_entry.type_change_history.insert(
+                0,
+                TypeChangeRecord {
+                    from_kind,
+                    to_kind: plan.target_kind,
+                    wall_time_unix_ms: now_ms,
+                },
+            );
+            new_entry.last_type_change_at_ms = Some(now_ms);
+            // Field-entry flip FIRST in the batch.
+            puts.push((
+                KeyBuilder::catalog_field(&plan.type_name, &plan.field_name),
+                encode_id_entry(&new_entry),
+            ));
+            // Bump the catalog format FLOOR to V4 (never downgrade a V5+
+            // catalog — `max(current, V4)`).
+            if format_before < CATALOG_FORMAT_V4 {
+                puts.push((
+                    KeyBuilder::catalog_format(),
+                    encode_format_version(CATALOG_FORMAT_V4),
+                ));
+            }
+            // Leave c:D: stale — the next open recomputes the digest (kind
+            // contributes), reconcile finds no drift, refreshes it.
+        }
+
+        plan.status = MigrationStatus::Completed;
+        // Plan record LAST.
+        puts.push((
+            KeyBuilder::catalog_migration_plan(plan_id),
+            encode_migration_plan(&plan),
+        ));
+        storage.put_batch(&mut txn, &puts)?;
+        Ok(plan.objects_converted)
+    })();
+
+    match result {
+        Ok(n) => {
+            storage.commit(&mut txn)?;
+            Ok(n)
+        }
+        Err(e) => {
+            storage.abort(&mut txn);
+            Err(e)
+        }
+    }
 }
 
 // =====================================================================
