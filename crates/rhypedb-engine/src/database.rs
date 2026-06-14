@@ -3335,90 +3335,19 @@ impl Database {
 
         let serialized = serialize_fields(&fields);
 
-        // Maintain secondary index entries for any @indexed fields. Covering
-        // value = the new serialized fields, so subsequent filter_scans can
-        // read full Objects from the index without per-id LSM probes.
-        //
-        // Three sub-cases per indexed field:
-        //   * Value changed (old != new): delete old entry, insert new (with covering).
-        //   * Value unchanged but ANY field changed: re-write the entry's
-        //     covering payload (same key, fresh value bytes).
-        //   * No update at all: nothing to do (skipped at the outer level).
-        if let Some(idx_fields) = self.indexed_fields.get(type_name) {
-            for (ifd, old_value_opt) in idx_fields.iter().zip(old_indexed_snapshot.iter()) {
-                let new_value_opt = fields.get(&ifd.name).cloned();
-                let value_changed = old_value_opt != &new_value_opt;
-                if value_changed {
-                    if let Some(old_v) = old_value_opt
-                        && !matches!(old_v, Value::Null)
-                    {
-                        self.remove_field_index(
-                            &mut txn,
-                            type_id,
-                            ifd.field_id,
-                            ifd.kind,
-                            old_v,
-                            object_id,
-                        )?;
-                    }
-                    if let Some(new_v) = &new_value_opt
-                        && !matches!(new_v, Value::Null)
-                    {
-                        self.insert_field_index(
-                            &mut txn,
-                            type_id,
-                            ifd.field_id,
-                            ifd.kind,
-                            new_v,
-                            object_id,
-                            serialized.clone(),
-                        )?;
-                    }
-                } else if any_update
-                    && let Some(new_v) = &new_value_opt
-                    && !matches!(new_v, Value::Null)
-                {
-                    // Same key — `put` overwrites the value with the new
-                    // covering payload.
-                    self.insert_field_index(
-                        &mut txn,
-                        type_id,
-                        ifd.field_id,
-                        ifd.kind,
-                        new_v,
-                        object_id,
-                        serialized.clone(),
-                    )?;
-                }
-            }
-        }
-
-        // Phase 1: refresh covering reverse-edges on THIS object's own
-        // outbound forward relations. The rev_edge value stored at each
-        // linked target carries the source object's effective fields (and
-        // covers for OTHER forward-1:1 targets) — both go stale when the
-        // source updates. Bounded cost: number of outbound relation
-        // endpoints, which is at most the schema-declared field count for
-        // forward-1:1 relations and total linked-target count for many
-        // relations. (Phase 2 — refreshing this object's OWN cover in the
-        // rev_edges that INCOMING references hold us under `__cover` — is
-        // handled lazily via the per-object version + reader-side fall-
-        // through, plus a background sweeper that opportunistically rewrites
-        // stale embedded covers — see `cover_refresh_worker`.)
-        self.refresh_outbound_rev_edges(&mut txn, type_name, object_id, Some(&serialized))?;
-
-        // Phase 2: bump this object's generation. Every rev_edge that
-        // embedded us as `<name>__cover` earlier now has a stale snapshot;
-        // the executor's fusion path detects mismatch via a HashMap lookup
-        // against this counter and falls through to a fresh LSM probe for
-        // those specific targets. Bounded write cost (one in-memory bump +
-        // one persisted `g:` put) regardless of how many incoming
-        // references this object has — that fan-in could be millions.
-        let new_version = self.bump_version(type_id, object_id);
-        self.storage.put(
+        // Maintain secondary-index covering payloads, refresh outbound rev-edge
+        // covers, and bump this object's generation — shared with the card-2
+        // cutover via `rewrite_object_and_maintain_covers` so cutover provably
+        // touches every keyspace a normal update touches (see that method).
+        self.rewrite_object_and_maintain_covers(
             &mut txn,
-            &KeyBuilder::object_version(type_id, object_id),
-            Bytes::copy_from_slice(&new_version.to_be_bytes()),
+            type_name,
+            type_id,
+            object_id,
+            &fields,
+            &serialized,
+            &old_indexed_snapshot,
+            any_update,
         )?;
 
         self.storage.put(&mut txn, &key, serialized)?;
@@ -3457,6 +3386,117 @@ impl Database {
             fields,
             raw_fields: None,
         })
+    }
+
+    /// Stage all cover/index maintenance for an object whose `o:` blob is being
+    /// (re)written: rewrite the secondary-index covering payload for every
+    /// `@indexed` field, refresh this object's outbound rev-edge covers, and
+    /// bump its generation so incoming `<name>__cover` snapshots re-probe.
+    ///
+    /// Shared by `update()` and the card-2 cutover (`cutover_field_type_migration`).
+    /// The migrated field's value otherwise goes stale in the `i:` covering
+    /// payloads — which carry no `<field>__cover_v` generation stamp, so the
+    /// cutover generation-bump alone can NOT invalidate them (the covered
+    /// `filter_scan_via_index` reads the payload verbatim). Routing both writers
+    /// through one helper guarantees cutover touches exactly the keyspaces a
+    /// normal update touches.
+    ///
+    /// Stages into `txn`; the CALLER stages the `o:` blob put and commits, and
+    /// owns `rollback_version` on a commit failure (this bumps the in-memory
+    /// generation). Does NOT enqueue the background cover-refresh or publish a
+    /// change event — those are live-write concerns, not part of a cutover.
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_object_and_maintain_covers(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_name: &str,
+        type_id: u64,
+        object_id: u64,
+        new_fields: &FieldMap,
+        serialized: &Bytes,
+        old_indexed_snapshot: &[Option<Value>],
+        any_update: bool,
+    ) -> EngineResult<()> {
+        // Maintain secondary index entries for any @indexed fields. Covering
+        // value = the new serialized fields, so subsequent filter_scans can
+        // read full Objects from the index without per-id LSM probes.
+        //
+        // Three sub-cases per indexed field:
+        //   * Value changed (old != new): delete old entry, insert new (with covering).
+        //   * Value unchanged but ANY field changed: re-write the entry's
+        //     covering payload (same key, fresh value bytes).
+        //   * No update at all: nothing to do (skipped at the outer level).
+        if let Some(idx_fields) = self.indexed_fields.get(type_name) {
+            for (ifd, old_value_opt) in idx_fields.iter().zip(old_indexed_snapshot.iter()) {
+                let new_value_opt = new_fields.get(&ifd.name).cloned();
+                let value_changed = old_value_opt != &new_value_opt;
+                if value_changed {
+                    if let Some(old_v) = old_value_opt
+                        && !matches!(old_v, Value::Null)
+                    {
+                        self.remove_field_index(
+                            txn,
+                            type_id,
+                            ifd.field_id,
+                            ifd.kind,
+                            old_v,
+                            object_id,
+                        )?;
+                    }
+                    if let Some(new_v) = &new_value_opt
+                        && !matches!(new_v, Value::Null)
+                    {
+                        self.insert_field_index(
+                            txn,
+                            type_id,
+                            ifd.field_id,
+                            ifd.kind,
+                            new_v,
+                            object_id,
+                            serialized.clone(),
+                        )?;
+                    }
+                } else if any_update
+                    && let Some(new_v) = &new_value_opt
+                    && !matches!(new_v, Value::Null)
+                {
+                    // Same key — `put` overwrites the value with the new
+                    // covering payload.
+                    self.insert_field_index(
+                        txn,
+                        type_id,
+                        ifd.field_id,
+                        ifd.kind,
+                        new_v,
+                        object_id,
+                        serialized.clone(),
+                    )?;
+                }
+            }
+        }
+
+        // Phase 1: refresh covering reverse-edges on THIS object's own
+        // outbound forward relations. The rev_edge value stored at each
+        // linked target carries the source object's effective fields (and
+        // covers for OTHER forward-1:1 targets) — both go stale when the
+        // source's blob is rewritten. Bounded cost: number of outbound
+        // relation endpoints.
+        self.refresh_outbound_rev_edges(txn, type_name, object_id, Some(serialized))?;
+
+        // Phase 2: bump this object's generation. Every rev_edge that
+        // embedded us as `<name>__cover` earlier now has a stale snapshot;
+        // the executor's fusion path detects mismatch via a HashMap lookup
+        // against this counter and falls through to a fresh LSM probe for
+        // those specific targets. Bounded write cost (one in-memory bump +
+        // one persisted `g:` put) regardless of how many incoming references
+        // this object has — that fan-in could be millions.
+        let new_version = self.bump_version(type_id, object_id);
+        self.storage.put(
+            txn,
+            &KeyBuilder::object_version(type_id, object_id),
+            Bytes::copy_from_slice(&new_version.to_be_bytes()),
+        )?;
+        Ok(())
     }
 
     /// Delete an object, enforcing @on_delete policies on all inbound relationships.
