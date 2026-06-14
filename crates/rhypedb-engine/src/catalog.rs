@@ -1679,113 +1679,16 @@ pub(crate) fn apply_field_type_change(
             ));
         }
 
-        // ---- Validation ------------------------------------------------
-        let field_entry = cat
-            .field_entries
-            .get(&qual)
-            .cloned()
-            .ok_or_else(|| {
-                EngineError::Catalog(CatalogError::FieldTypeChangeSourceNotFound {
-                    qualified: qual.clone(),
-                })
-            })?;
-        if field_entry.status == TombstoneStatus::Tombstoned {
-            return Err(EngineError::Catalog(
-                CatalogError::FieldTypeChangeSourceRetired {
-                    qualified: qual.clone(),
-                    field_id: field_entry.id,
-                    retired_at_ms: field_entry.retired_at_ms.unwrap_or(0),
-                },
-            ));
-        }
-        if field_entry.kind == verb.target_kind {
-            return Err(EngineError::Catalog(CatalogError::FieldTypeChangeNoOp {
-                qualified: qual,
-            }));
-        }
-        // Phase 1 only supports SCALAR → SCALAR.
-        if !is_scalar_kind(field_entry.kind) || !is_scalar_kind(verb.target_kind) {
-            return Err(EngineError::Catalog(
-                CatalogError::FieldTypeChangeNonScalar {
-                    qualified: qual,
-                    current_kind: kind_name(field_entry.kind),
-                    requested_kind: kind_name(verb.target_kind),
-                },
-            ));
-        }
-        // Refuse targets the engine has no writable `Value` for (DateTime /
-        // Json): a converter could never return a value whose kind byte
-        // matches, so the migration would fail every row. Also closes the
-        // latent offline-path bug where, with zero objects, this would
-        // vacuously flip the catalog to an unrepresentable kind.
-        if !is_representable_target_kind(verb.target_kind) {
-            return Err(EngineError::Catalog(
-                CatalogError::FieldTypeChangeUnrepresentableTarget {
-                    qualified: qual,
-                    kind: kind_name(verb.target_kind),
-                },
-            ));
-        }
-        // Refuse @indexed / @unique / @vectorize. We consult the
-        // schema's field definition for the source field: the field
-        // exists in cat (just validated above), so it must exist in
-        // schema (caller passed the in-process Schema).
-        let type_def = schema.types.get(verb.type_name.as_str()).ok_or_else(|| {
-            EngineError::Catalog(CatalogError::FieldTypeChangeSourceNotFound {
-                qualified: qual.clone(),
-            })
-        })?;
-        let field_def = type_def
-            .fields
-            .iter()
-            .find(|f| f.name == verb.field_name)
-            .ok_or_else(|| {
-                EngineError::Catalog(CatalogError::FieldTypeChangeSourceNotFound {
-                    qualified: qual.clone(),
-                })
-            })?;
-        if field_def.is_indexed() {
-            return Err(EngineError::Catalog(
-                CatalogError::FieldTypeChangeDirectiveUnsupported {
-                    qualified: qual,
-                    directive: "@indexed",
-                    planned_phase: "follow-on",
-                },
-            ));
-        }
-        if field_def.is_unique() {
-            return Err(EngineError::Catalog(
-                CatalogError::FieldTypeChangeDirectiveUnsupported {
-                    qualified: qual,
-                    directive: "@unique",
-                    planned_phase: "follow-on",
-                },
-            ));
-        }
-        if field_def.vectorize().is_some() {
-            return Err(EngineError::Catalog(
-                CatalogError::FieldTypeChangeDirectiveUnsupported {
-                    qualified: qual,
-                    directive: "@vectorize",
-                    planned_phase: "follow-on",
-                },
-            ));
-        }
-        if field_entry.type_change_history.len() + 1 > MAX_TYPE_CHANGE_HISTORY {
-            return Err(EngineError::Catalog(
-                CatalogError::FieldTypeChangeHistoryCapExceeded {
-                    qualified: qual,
-                    cap: MAX_TYPE_CHANGE_HISTORY,
-                },
-            ));
-        }
+        // ---- Validation (shared with the chunked migration create path) -
+        let (field_entry, type_id) = validate_field_type_change(
+            &cat,
+            schema,
+            &verb.type_name,
+            &verb.field_name,
+            verb.target_kind,
+        )?;
 
         // ---- Object scan + closure + re-serialize ---------------------
-        let type_id = *cat.type_ids.get(verb.type_name.as_str()).ok_or_else(|| {
-            EngineError::Catalog(CatalogError::FieldTypeChangeSourceNotFound {
-                qualified: qual.clone(),
-            })
-        })?;
         let prefix = KeyBuilder::object_prefix(type_id);
         let entries = storage.scan_prefix_at(snap, &prefix)?;
 
@@ -1896,6 +1799,125 @@ pub(crate) fn apply_field_type_change(
             Err(e)
         }
     }
+}
+
+/// Shared validation for a scalar field-type change, used by BOTH the
+/// offline single-commit path (`apply_field_type_change`) and the chunked
+/// migration create path. Runs every gate EXCEPT the active-plan interlock
+/// (each caller does its own `active_plan_for_field` check — offline refuses
+/// any unsettled plan, create refuses a pre-existing one). Returns the
+/// validated source field entry (cloned) and its owning type id. The error
+/// order is preserved verbatim so the offline-path regression tests stay
+/// byte-identical.
+fn validate_field_type_change(
+    cat: &Catalog,
+    schema: &Schema,
+    type_name: &str,
+    field_name: &str,
+    target_kind: u8,
+) -> EngineResult<(IdEntry, u64)> {
+    let qual = format!("{type_name}.{field_name}");
+    let field_entry = cat.field_entries.get(&qual).cloned().ok_or_else(|| {
+        EngineError::Catalog(CatalogError::FieldTypeChangeSourceNotFound {
+            qualified: qual.clone(),
+        })
+    })?;
+    if field_entry.status == TombstoneStatus::Tombstoned {
+        return Err(EngineError::Catalog(
+            CatalogError::FieldTypeChangeSourceRetired {
+                qualified: qual.clone(),
+                field_id: field_entry.id,
+                retired_at_ms: field_entry.retired_at_ms.unwrap_or(0),
+            },
+        ));
+    }
+    if field_entry.kind == target_kind {
+        return Err(EngineError::Catalog(CatalogError::FieldTypeChangeNoOp {
+            qualified: qual,
+        }));
+    }
+    // Phase 1 only supports SCALAR → SCALAR.
+    if !is_scalar_kind(field_entry.kind) || !is_scalar_kind(target_kind) {
+        return Err(EngineError::Catalog(
+            CatalogError::FieldTypeChangeNonScalar {
+                qualified: qual,
+                current_kind: kind_name(field_entry.kind),
+                requested_kind: kind_name(target_kind),
+            },
+        ));
+    }
+    // Refuse targets the engine has no writable `Value` for (DateTime /
+    // Json): a converter could never return a value whose kind byte matches,
+    // so the migration would fail every row. Also closes the latent
+    // offline-path bug where, with zero objects, this would vacuously flip
+    // the catalog to an unrepresentable kind.
+    if !is_representable_target_kind(target_kind) {
+        return Err(EngineError::Catalog(
+            CatalogError::FieldTypeChangeUnrepresentableTarget {
+                qualified: qual,
+                kind: kind_name(target_kind),
+            },
+        ));
+    }
+    // Refuse @indexed / @unique / @vectorize. We consult the schema's field
+    // definition for the source field: the field exists in cat (just
+    // validated above), so it must exist in schema (caller passed the
+    // in-process Schema).
+    let type_def = schema.types.get(type_name).ok_or_else(|| {
+        EngineError::Catalog(CatalogError::FieldTypeChangeSourceNotFound {
+            qualified: qual.clone(),
+        })
+    })?;
+    let field_def = type_def
+        .fields
+        .iter()
+        .find(|f| f.name == field_name)
+        .ok_or_else(|| {
+            EngineError::Catalog(CatalogError::FieldTypeChangeSourceNotFound {
+                qualified: qual.clone(),
+            })
+        })?;
+    if field_def.is_indexed() {
+        return Err(EngineError::Catalog(
+            CatalogError::FieldTypeChangeDirectiveUnsupported {
+                qualified: qual,
+                directive: "@indexed",
+                planned_phase: "follow-on",
+            },
+        ));
+    }
+    if field_def.is_unique() {
+        return Err(EngineError::Catalog(
+            CatalogError::FieldTypeChangeDirectiveUnsupported {
+                qualified: qual,
+                directive: "@unique",
+                planned_phase: "follow-on",
+            },
+        ));
+    }
+    if field_def.vectorize().is_some() {
+        return Err(EngineError::Catalog(
+            CatalogError::FieldTypeChangeDirectiveUnsupported {
+                qualified: qual,
+                directive: "@vectorize",
+                planned_phase: "follow-on",
+            },
+        ));
+    }
+    if field_entry.type_change_history.len() + 1 > MAX_TYPE_CHANGE_HISTORY {
+        return Err(EngineError::Catalog(
+            CatalogError::FieldTypeChangeHistoryCapExceeded {
+                qualified: qual,
+                cap: MAX_TYPE_CHANGE_HISTORY,
+            },
+        ));
+    }
+    let type_id = *cat.type_ids.get(type_name).ok_or_else(|| {
+        EngineError::Catalog(CatalogError::FieldTypeChangeSourceNotFound {
+            qualified: qual.clone(),
+        })
+    })?;
+    Ok((field_entry, type_id))
 }
 
 fn is_scalar_kind(k: u8) -> bool {
@@ -3580,6 +3602,34 @@ fn active_plan_for_field(
     plans
         .iter()
         .find(|p| p.status.quiesces() && p.type_name == type_name && p.field_name == field_name)
+        .map(|p| p.plan_id)
+}
+
+/// The plan id of a *drivable* (`Pending`/`Running`) migration on
+/// `type_name.field_name` whose src/target kinds exactly match an observed
+/// catalog→schema kind delta, if any. Used by reconcile PASS 2 to recognise
+/// an in-flight field-type cutover and SKIP the `FieldKindChanged` hard
+/// error instead of refusing to open. Stricter than `active_plan_for_field`:
+/// it requires `is_drivable()` (a `Failed`/`AwaitingConverter` plan does NOT
+/// license the kind mismatch — that field is parked, not in motion) AND that
+/// the plan is migrating exactly `cat_kind → want_kind`.
+#[allow(dead_code)] // wired into load_or_initialize reconcile PASS 2 (increment 4)
+fn drivable_plan_for_kind_change(
+    plans: &[MigrationPlan],
+    type_name: &str,
+    field_name: &str,
+    cat_kind: u8,
+    want_kind: u8,
+) -> Option<u64> {
+    plans
+        .iter()
+        .find(|p| {
+            p.status.is_drivable()
+                && p.type_name == type_name
+                && p.field_name == field_name
+                && p.src_kind == cat_kind
+                && p.target_kind == want_kind
+        })
         .map(|p| p.plan_id)
 }
 

@@ -111,6 +111,30 @@ pub enum EngineError {
         "type {type_name} is quiesced by in-flight migration plan {plan_id}; writes are rejected until it completes or is cancelled"
     )]
     MigrationTypeQuiesced { type_name: String, plan_id: u64 },
+
+    /// `create_field_type_migration` was asked for a converter `(name,
+    /// version)` that is not in this `Database`'s converter registry. Fail
+    /// fast at create rather than persist a plan that can never run; the
+    /// operator must `register_converter` first. (After a restart a plan
+    /// whose converter is missing parks `AwaitingConverter` instead — at
+    /// create time we have no plan to park.)
+    #[error("no converter registered as ({name}, v{version}); call register_converter before creating the migration")]
+    ConverterNotRegistered { name: String, version: u32 },
+
+    /// On open, an in-flight migration plan was found but the schema passed
+    /// to `open` still declares the field at its OLD (source) type. Driving
+    /// the migration would flip the catalog to the target kind while this
+    /// handle validates writes against the source kind — silent corruption.
+    /// Reopen with the schema where the field has the TARGET type to let
+    /// auto-resume finish the cutover.
+    #[error(
+        "migration plan {plan_id} is resuming a change to kind {expected} but the open schema still declares the field as kind {found}; reopen with the target schema"
+    )]
+    MigrationResumeSchemaMismatch {
+        plan_id: u64,
+        expected: &'static str,
+        found: &'static str,
+    },
 }
 
 /// Failures specific to the persisted schema catalog (see
@@ -401,6 +425,20 @@ pub enum CatalogError {
     /// The audit chain is already at the per-row cap.
     #[error("change_field_type {qualified:?} would exceed the per-row type-change history cap of {cap} entries")]
     FieldTypeChangeHistoryCapExceeded { qualified: String, cap: usize },
+
+    /// A chunked migration found an object row whose stored value for the
+    /// migrating field is neither the plan's source kind (convertible) nor
+    /// its target kind (already converted — idempotently skipped). The
+    /// on-disk data disagrees with the catalog; the migration parks `Failed`
+    /// (quiesce held) rather than guess. Card 4 introduces a per-row
+    /// ErrorPolicy (quarantine/skip); card 1 fails the whole plan.
+    #[error("migration plan {plan_id}: object id={object_id} has unexpected kind {got_kind} for the migrating field (expected source kind {expected_kind})")]
+    MigrationRowUnexpectedKind {
+        plan_id: u64,
+        object_id: u64,
+        got_kind: &'static str,
+        expected_kind: &'static str,
+    },
 
     /// Card 3/5 phase 2 of rename_field refuses fields carrying
     /// `@indexed`, `@unique`, or `@vectorize`. Each requires follow-on
