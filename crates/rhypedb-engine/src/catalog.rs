@@ -109,6 +109,10 @@ const RECORD_FORMAT_V1: u8 = 0x01;
 const KIND_ID_ENTRY: u8 = 0x01;
 const KIND_COUNTER: u8 = 0x02;
 const KIND_MARKER: u8 = 0x03;
+/// Value kind for a shadow-field migration plan record (`c:P:<id>`,
+/// card 1/5). Its own decoder; `decode_id_entry`/`decode_counter` reject
+/// it via the WrongValueKind arm so a stray plan row can't be misread.
+const KIND_MIGRATION_PLAN: u8 = 0x04;
 
 // TLV tags inside id-entry bodies (phase 1).
 const TLV_ID: u8 = 0x01;
@@ -187,6 +191,46 @@ pub(crate) const MAX_RENAME_HISTORY: usize = 32;
 // reconcile commits) and the catalog header writes (always present in
 // backfill commits). 8 retries is far more than realistic contention.
 const COMMIT_RETRY_BUDGET: usize = 8;
+
+// =====================================================================
+// Shadow-field migration plan records (card 1/5)
+//
+// `c:P:<plan_id BE>` → [RECORD_FORMAT_V1][KIND_MIGRATION_PLAN]
+//   [u16 BE body_len][TLV body]. One row per chunked field-type
+// migration; survives restart to drive auto-resume. The TLV body is
+// unknown-tag preserving (mirroring the id-entry codec) so cards 2/4 can
+// add fields (double-write armed, error policy, quarantine cursor)
+// without a record-format bump or a card-1 binary mangling the row.
+// =====================================================================
+const TLV_MP_TYPE_NAME: u8 = 0x01;
+const TLV_MP_FIELD_NAME: u8 = 0x02;
+const TLV_MP_FIELD_ID: u8 = 0x03;
+const TLV_MP_SRC_KIND: u8 = 0x04;
+const TLV_MP_TARGET_KIND: u8 = 0x05;
+const TLV_MP_STATUS: u8 = 0x06;
+const TLV_MP_CURSOR: u8 = 0x07;
+const TLV_MP_CHUNK_SIZE: u8 = 0x08;
+const TLV_MP_CREATED_AT_MS: u8 = 0x09;
+const TLV_MP_CONVERTER_NAME: u8 = 0x0A;
+const TLV_MP_CONVERTER_VERSION: u8 = 0x0B;
+const TLV_MP_OBJECTS_CONVERTED: u8 = 0x0C;
+// 0x20-0x3F reserved for cards 2/4 (double_write_armed, error_policy,
+// quarantine cursor). Unknown tags are preserved verbatim and round-tripped.
+
+// MigrationStatus payload bytes for TLV_MP_STATUS. The decoder refuses
+// any other value rather than guess.
+const MP_STATUS_PENDING: u8 = 0x00;
+const MP_STATUS_RUNNING: u8 = 0x01;
+const MP_STATUS_COMPLETED: u8 = 0x02;
+const MP_STATUS_CANCELLED: u8 = 0x03;
+const MP_STATUS_FAILED: u8 = 0x04;
+const MP_STATUS_AWAITING_CONVERTER: u8 = 0x05;
+
+/// Default objects processed per chunk commit. Bounds each chunk's
+/// `put_batch` + fsync while amortizing the per-chunk lock/scan overhead;
+/// cancel latency is `<= chunk_size` rows. Overridable per migration.
+#[allow(dead_code)] // wired into create_field_type_migration (increment 3)
+pub(crate) const DEFAULT_MIGRATION_CHUNK_SIZE: u64 = 1024;
 
 /// Discriminants stored in TLV 0x04 of every field/relation id-entry.
 /// Catches scalar-type swaps (Int → String) and scalar↔relation flips
@@ -709,6 +753,110 @@ pub struct MigrationReport {
     pub field_type_changes: Vec<FieldTypeChangePair>,
     pub catalog_format_before: u64,
     pub catalog_format_after: u64,
+}
+
+/// Lifecycle status of a chunked field-type migration plan (`c:P:<id>`).
+///
+/// Quiesce (write-rejection on the migrating type) is in force for every
+/// non-`releases_quiesce` state. `is_terminal` means the worker is not
+/// running and will not auto-resume on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationStatus {
+    /// Committed; worker not yet started (or not yet observed). Quiesced.
+    Pending,
+    /// Worker is converting chunks. Quiesced.
+    Running,
+    /// All rows converted, catalog kind flipped, quiesce released. Terminal.
+    Completed,
+    /// Operator-cancelled. Quiesce released; field left partially
+    /// converted (read-tolerant). Terminal.
+    Cancelled,
+    /// Worker hit an unrecoverable error. Quiesce HELD for inspection.
+    /// Terminal (no auto-resume).
+    Failed,
+    /// Resume found the pinned converter missing or version-changed.
+    /// Parked until re-registered or cancelled. Quiesce HELD; resumable.
+    AwaitingConverter,
+}
+
+#[allow(dead_code)] // is_terminal/quiesces/is_drivable wired in increments 2-4
+impl MigrationStatus {
+    fn to_byte(self) -> u8 {
+        match self {
+            MigrationStatus::Pending => MP_STATUS_PENDING,
+            MigrationStatus::Running => MP_STATUS_RUNNING,
+            MigrationStatus::Completed => MP_STATUS_COMPLETED,
+            MigrationStatus::Cancelled => MP_STATUS_CANCELLED,
+            MigrationStatus::Failed => MP_STATUS_FAILED,
+            MigrationStatus::AwaitingConverter => MP_STATUS_AWAITING_CONVERTER,
+        }
+    }
+
+    fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            MP_STATUS_PENDING => MigrationStatus::Pending,
+            MP_STATUS_RUNNING => MigrationStatus::Running,
+            MP_STATUS_COMPLETED => MigrationStatus::Completed,
+            MP_STATUS_CANCELLED => MigrationStatus::Cancelled,
+            MP_STATUS_FAILED => MigrationStatus::Failed,
+            MP_STATUS_AWAITING_CONVERTER => MigrationStatus::AwaitingConverter,
+            _ => return None,
+        })
+    }
+
+    /// Worker is not running and will not auto-resume on its own.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            MigrationStatus::Completed | MigrationStatus::Cancelled | MigrationStatus::Failed
+        )
+    }
+
+    /// True while the plan still quiesces its type (rejects writes). Only
+    /// `Completed` and `Cancelled` release quiesce; `Failed` HOLDS it so a
+    /// half-converted field isn't silently written to before inspection.
+    pub fn quiesces(self) -> bool {
+        !matches!(self, MigrationStatus::Completed | MigrationStatus::Cancelled)
+    }
+
+    /// Eligible for the worker to (re)drive: `Pending` or `Running`.
+    pub fn is_drivable(self) -> bool {
+        matches!(self, MigrationStatus::Pending | MigrationStatus::Running)
+    }
+}
+
+/// A persisted chunked field-type migration (`c:P:<plan_id>`), the card-1
+/// state machine's durable record. Survives restart; auto-resume rebuilds
+/// the worker + the migrating-type quiesce set from these rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationPlan {
+    pub plan_id: u64,
+    pub type_name: String,
+    pub field_name: String,
+    /// Stable catalog field id, pinned at create so a concurrent rename
+    /// can't misdirect the migration.
+    pub field_id: u64,
+    pub src_kind: u8,
+    pub target_kind: u8,
+    pub status: MigrationStatus,
+    /// Highest `object_id` whose conversion is durably committed. Resume
+    /// re-scans strictly after this id; `0` = not started. Because a torn
+    /// chunk write can leave converted blobs with the cursor un-advanced,
+    /// re-scan from here relies on per-row idempotency-on-target.
+    pub cursor: u64,
+    pub chunk_size: u64,
+    pub created_at_ms: u64,
+    /// Name the converter is resolved by from the per-`Database` registry
+    /// at create AND resume. `version` is pinned so a same-name converter
+    /// with changed semantics parks `AwaitingConverter` instead of running.
+    pub converter_name: String,
+    pub converter_version: u32,
+    /// Observability only — completion is proven by a positive exhaustion
+    /// scan, never by this counter (a torn re-scan can double-count).
+    pub objects_converted: u64,
+    /// Forward-compat: TLV tags this binary doesn't recognise, preserved
+    /// verbatim so a card-2/4 row round-trips through a card-1 binary.
+    pub unknown_tlvs: Vec<(u8, Bytes)>,
 }
 
 /// One field rename, included in the report. `type_name` is the (possibly
@@ -2778,7 +2926,7 @@ fn decode_id_entry(key_debug: &str, bytes: &[u8]) -> EngineResult<IdEntry> {
     }
     match bytes[1] {
         KIND_ID_ENTRY => {}
-        KIND_COUNTER | KIND_MARKER => {
+        KIND_COUNTER | KIND_MARKER | KIND_MIGRATION_PLAN => {
             return Err(EngineError::Catalog(CatalogError::WrongValueKind {
                 key_debug: key_debug.into(),
                 expected: "IdEntry",
@@ -3096,6 +3244,268 @@ fn decode_format_version(key_debug: &str, bytes: &[u8]) -> EngineResult<u64> {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(bytes);
     Ok(u64::from_be_bytes(buf))
+}
+
+// =====================================================================
+// Shadow-field migration plan codec + id allocation (card 1/5)
+// =====================================================================
+
+#[allow(dead_code)] // wired into create_field_type_migration + chunk worker (increment 3)
+fn encode_migration_plan(plan: &MigrationPlan) -> Bytes {
+    let mut body: Vec<u8> = Vec::with_capacity(128);
+    write_tlv(&mut body, TLV_MP_TYPE_NAME, plan.type_name.as_bytes());
+    write_tlv(&mut body, TLV_MP_FIELD_NAME, plan.field_name.as_bytes());
+    write_tlv(&mut body, TLV_MP_FIELD_ID, &plan.field_id.to_be_bytes());
+    write_tlv(&mut body, TLV_MP_SRC_KIND, &[plan.src_kind]);
+    write_tlv(&mut body, TLV_MP_TARGET_KIND, &[plan.target_kind]);
+    write_tlv(&mut body, TLV_MP_STATUS, &[plan.status.to_byte()]);
+    write_tlv(&mut body, TLV_MP_CURSOR, &plan.cursor.to_be_bytes());
+    write_tlv(&mut body, TLV_MP_CHUNK_SIZE, &plan.chunk_size.to_be_bytes());
+    write_tlv(&mut body, TLV_MP_CREATED_AT_MS, &plan.created_at_ms.to_be_bytes());
+    write_tlv(&mut body, TLV_MP_CONVERTER_NAME, plan.converter_name.as_bytes());
+    write_tlv(
+        &mut body,
+        TLV_MP_CONVERTER_VERSION,
+        &plan.converter_version.to_be_bytes(),
+    );
+    write_tlv(
+        &mut body,
+        TLV_MP_OBJECTS_CONVERTED,
+        &plan.objects_converted.to_be_bytes(),
+    );
+    // Preserve forward-compat tags (card 2/4) verbatim.
+    for (tag, value) in &plan.unknown_tlvs {
+        write_tlv(&mut body, *tag, value);
+    }
+    debug_assert!(body.len() <= u16::MAX as usize);
+
+    let mut out: Vec<u8> = Vec::with_capacity(4 + body.len());
+    out.push(RECORD_FORMAT_V1);
+    out.push(KIND_MIGRATION_PLAN);
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(&body);
+    Bytes::from(out)
+}
+
+fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineResult<MigrationPlan> {
+    if bytes.len() < 4 {
+        return Err(EngineError::Catalog(CatalogError::Truncated {
+            key_debug: key_debug.into(),
+            len: bytes.len(),
+            min: 4,
+        }));
+    }
+    if bytes[0] != RECORD_FORMAT_V1 {
+        return Err(EngineError::Catalog(
+            CatalogError::UnsupportedRecordFormat {
+                row: key_debug.into(),
+                got: bytes[0],
+                max_supported: RECORD_FORMAT_V1,
+            },
+        ));
+    }
+    match bytes[1] {
+        KIND_MIGRATION_PLAN => {}
+        KIND_ID_ENTRY | KIND_COUNTER | KIND_MARKER => {
+            return Err(EngineError::Catalog(CatalogError::WrongValueKind {
+                key_debug: key_debug.into(),
+                expected: "MigrationPlan",
+                got_tag: bytes[1],
+            }));
+        }
+        other => {
+            return Err(EngineError::Catalog(CatalogError::UnknownValueKind {
+                key_debug: key_debug.into(),
+                tag: other,
+            }));
+        }
+    }
+    let body_len = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+    if bytes.len() < 4 + body_len {
+        return Err(EngineError::Catalog(CatalogError::Truncated {
+            key_debug: key_debug.into(),
+            len: bytes.len(),
+            min: 4 + body_len,
+        }));
+    }
+    let body = &bytes[4..4 + body_len];
+
+    let mut type_name: Option<String> = None;
+    let mut field_name: Option<String> = None;
+    let mut field_id: Option<u64> = None;
+    let mut src_kind: Option<u8> = None;
+    let mut target_kind: Option<u8> = None;
+    let mut status: Option<MigrationStatus> = None;
+    let mut cursor: Option<u64> = None;
+    let mut chunk_size: Option<u64> = None;
+    let mut created_at_ms: Option<u64> = None;
+    let mut converter_name: Option<String> = None;
+    let mut converter_version: Option<u32> = None;
+    let mut objects_converted: Option<u64> = None;
+    let mut unknown_tlvs: Vec<(u8, Bytes)> = Vec::new();
+    let mut seen_tags: u128 = 0;
+
+    let read_u64 = |value: &[u8]| -> EngineResult<u64> {
+        if value.len() != 8 {
+            return Err(EngineError::Catalog(CatalogError::Truncated {
+                key_debug: key_debug.into(),
+                len: value.len(),
+                min: 8,
+            }));
+        }
+        Ok(u64::from_be_bytes(value.try_into().unwrap()))
+    };
+    let read_u8 = |value: &[u8]| -> EngineResult<u8> {
+        if value.len() != 1 {
+            return Err(EngineError::Catalog(CatalogError::Truncated {
+                key_debug: key_debug.into(),
+                len: value.len(),
+                min: 1,
+            }));
+        }
+        Ok(value[0])
+    };
+    let read_str = |value: &[u8]| -> EngineResult<String> {
+        std::str::from_utf8(value)
+            .map(|s| s.to_string())
+            .map_err(|_| {
+                EngineError::Catalog(CatalogError::MalformedMigrationPlan {
+                    row: key_debug.into(),
+                    reason: "non-utf8 string TLV",
+                })
+            })
+    };
+
+    let mut cur = 0;
+    while cur < body.len() {
+        if body.len() - cur < 3 {
+            return Err(EngineError::Catalog(CatalogError::Truncated {
+                key_debug: key_debug.into(),
+                len: bytes.len(),
+                min: 4 + cur + 3,
+            }));
+        }
+        let tag = body[cur];
+        let len = u16::from_be_bytes([body[cur + 1], body[cur + 2]]) as usize;
+        cur += 3;
+        if body.len() - cur < len {
+            return Err(EngineError::Catalog(CatalogError::Truncated {
+                key_debug: key_debug.into(),
+                len: bytes.len(),
+                min: 4 + cur + len,
+            }));
+        }
+        let value = &body[cur..cur + len];
+        cur += len;
+
+        if tag < 128 {
+            let bit = 1u128 << tag;
+            if seen_tags & bit != 0 {
+                return Err(EngineError::Catalog(CatalogError::DuplicateTlv {
+                    key_debug: key_debug.into(),
+                    tag,
+                }));
+            }
+            seen_tags |= bit;
+        }
+
+        match tag {
+            TLV_MP_TYPE_NAME => type_name = Some(read_str(value)?),
+            TLV_MP_FIELD_NAME => field_name = Some(read_str(value)?),
+            TLV_MP_FIELD_ID => field_id = Some(read_u64(value)?),
+            TLV_MP_SRC_KIND => src_kind = Some(read_u8(value)?),
+            TLV_MP_TARGET_KIND => target_kind = Some(read_u8(value)?),
+            TLV_MP_STATUS => {
+                let b = read_u8(value)?;
+                status = Some(MigrationStatus::from_byte(b).ok_or_else(|| {
+                    EngineError::Catalog(CatalogError::UnknownMigrationStatus {
+                        row: key_debug.into(),
+                        status: b,
+                    })
+                })?);
+            }
+            TLV_MP_CURSOR => cursor = Some(read_u64(value)?),
+            TLV_MP_CHUNK_SIZE => chunk_size = Some(read_u64(value)?),
+            TLV_MP_CREATED_AT_MS => created_at_ms = Some(read_u64(value)?),
+            TLV_MP_CONVERTER_NAME => converter_name = Some(read_str(value)?),
+            TLV_MP_CONVERTER_VERSION => {
+                if value.len() != 4 {
+                    return Err(EngineError::Catalog(CatalogError::Truncated {
+                        key_debug: key_debug.into(),
+                        len: value.len(),
+                        min: 4,
+                    }));
+                }
+                converter_version = Some(u32::from_be_bytes(value.try_into().unwrap()));
+            }
+            TLV_MP_OBJECTS_CONVERTED => objects_converted = Some(read_u64(value)?),
+            other => unknown_tlvs.push((other, Bytes::copy_from_slice(value))),
+        }
+    }
+
+    let require_tag = |tag: u8| {
+        EngineError::Catalog(CatalogError::MissingRequiredTlv {
+            key_debug: key_debug.into(),
+            tag,
+        })
+    };
+    Ok(MigrationPlan {
+        plan_id,
+        type_name: type_name.ok_or_else(|| require_tag(TLV_MP_TYPE_NAME))?,
+        field_name: field_name.ok_or_else(|| require_tag(TLV_MP_FIELD_NAME))?,
+        field_id: field_id.ok_or_else(|| require_tag(TLV_MP_FIELD_ID))?,
+        src_kind: src_kind.ok_or_else(|| require_tag(TLV_MP_SRC_KIND))?,
+        target_kind: target_kind.ok_or_else(|| require_tag(TLV_MP_TARGET_KIND))?,
+        status: status.ok_or_else(|| require_tag(TLV_MP_STATUS))?,
+        cursor: cursor.ok_or_else(|| require_tag(TLV_MP_CURSOR))?,
+        chunk_size: chunk_size.ok_or_else(|| require_tag(TLV_MP_CHUNK_SIZE))?,
+        created_at_ms: created_at_ms.ok_or_else(|| require_tag(TLV_MP_CREATED_AT_MS))?,
+        converter_name: converter_name.ok_or_else(|| require_tag(TLV_MP_CONVERTER_NAME))?,
+        converter_version: converter_version.ok_or_else(|| require_tag(TLV_MP_CONVERTER_VERSION))?,
+        objects_converted: objects_converted.ok_or_else(|| require_tag(TLV_MP_OBJECTS_CONVERTED))?,
+        unknown_tlvs,
+    })
+}
+
+/// Read the `c:N:M` migration-id counter within `txn`; absent ⇒ 0.
+#[allow(dead_code)] // wired into create_field_type_migration in increment 3
+fn read_migration_counter(
+    storage: &LsmTree,
+    txn: &rhypedb_storage::mvcc::Transaction,
+) -> EngineResult<u64> {
+    match storage.get(txn, &KeyBuilder::catalog_next_migration())? {
+        Some(bytes) => decode_counter("c:N:M", &bytes),
+        None => Ok(0),
+    }
+}
+
+/// Decode every `c:P:<id>` plan record visible at `snap`, ascending by id.
+#[allow(dead_code)] // wired into auto-resume + id self-heal in increment 3/4
+fn scan_migration_plans(storage: &LsmTree, snap: u64) -> EngineResult<Vec<MigrationPlan>> {
+    let prefix = KeyBuilder::catalog_migration_plan_prefix();
+    let mut plans = Vec::new();
+    for (key, value) in storage.scan_prefix_at(snap, &prefix)? {
+        let id_bytes = &key[prefix.len()..];
+        if id_bytes.len() != 8 {
+            return Err(EngineError::Catalog(CatalogError::MalformedKey {
+                key_debug: debug_key(&key),
+            }));
+        }
+        let plan_id = u64::from_be_bytes(id_bytes.try_into().unwrap());
+        let kd = debug_key(&key);
+        plans.push(decode_migration_plan(plan_id, &kd, &value)?);
+    }
+    Ok(plans)
+}
+
+/// Allocate the next plan id, self-healing the persisted counter against
+/// the highest plan id actually on disk (incl. terminal plans) so a torn
+/// counter bump can never reissue a live id. Caller persists
+/// `c:N:M = returned id` alongside the new plan in one commit.
+#[allow(dead_code)] // wired into create_field_type_migration in increment 3
+fn next_migration_id(counter: u64, plans: &[MigrationPlan]) -> u64 {
+    let max_plan = plans.iter().map(|p| p.plan_id).max().unwrap_or(0);
+    counter.max(max_plan).saturating_add(1)
 }
 
 // =====================================================================
@@ -3541,6 +3951,166 @@ mod tests {
             err,
             EngineError::Catalog(CatalogError::Truncated { .. })
         ));
+    }
+
+    // --- Shadow-field migration plan codec (card 1/5) ---
+
+    fn sample_plan() -> MigrationPlan {
+        MigrationPlan {
+            plan_id: 7,
+            type_name: "User".to_string(),
+            field_name: "age".to_string(),
+            field_id: 42,
+            src_kind: 0x04,
+            target_kind: 0x05,
+            status: MigrationStatus::Running,
+            cursor: 1000,
+            chunk_size: DEFAULT_MIGRATION_CHUNK_SIZE,
+            created_at_ms: 1_700_000_000_000,
+            converter_name: "widen_i32_to_i64".to_string(),
+            converter_version: 1,
+            objects_converted: 999,
+            unknown_tlvs: Vec::new(),
+        }
+    }
+
+    /// Hand-rolled encoder so a test can plant a chosen raw status byte
+    /// without searching the encoded bytes.
+    fn encode_plan_with_raw_status(status_byte: u8) -> Vec<u8> {
+        let mut body = Vec::new();
+        write_tlv(&mut body, TLV_MP_TYPE_NAME, b"User");
+        write_tlv(&mut body, TLV_MP_FIELD_NAME, b"age");
+        write_tlv(&mut body, TLV_MP_FIELD_ID, &42u64.to_be_bytes());
+        write_tlv(&mut body, TLV_MP_SRC_KIND, &[0x04]);
+        write_tlv(&mut body, TLV_MP_TARGET_KIND, &[0x05]);
+        write_tlv(&mut body, TLV_MP_STATUS, &[status_byte]);
+        write_tlv(&mut body, TLV_MP_CURSOR, &0u64.to_be_bytes());
+        write_tlv(&mut body, TLV_MP_CHUNK_SIZE, &1024u64.to_be_bytes());
+        write_tlv(&mut body, TLV_MP_CREATED_AT_MS, &0u64.to_be_bytes());
+        write_tlv(&mut body, TLV_MP_CONVERTER_NAME, b"c");
+        write_tlv(&mut body, TLV_MP_CONVERTER_VERSION, &1u32.to_be_bytes());
+        write_tlv(&mut body, TLV_MP_OBJECTS_CONVERTED, &0u64.to_be_bytes());
+        let mut out = vec![RECORD_FORMAT_V1, KIND_MIGRATION_PLAN];
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn migration_plan_roundtrip() {
+        let p = sample_plan();
+        let bytes = encode_migration_plan(&p);
+        let back = decode_migration_plan(p.plan_id, "c:P:7", &bytes).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn migration_plan_preserves_unknown_tlvs_byte_identical() {
+        // Simulate a card-2/4 row carrying a reserved tag the card-1 binary
+        // doesn't understand. It must survive a decode→encode cycle verbatim
+        // so a card-1 reopen-and-rewrite doesn't mangle a newer row.
+        let mut p = sample_plan();
+        p.unknown_tlvs.push((0x20, Bytes::from_static(&[0xAB, 0xCD])));
+        let bytes = encode_migration_plan(&p);
+        let back = decode_migration_plan(p.plan_id, "c:P:7", &bytes).unwrap();
+        assert_eq!(
+            back.unknown_tlvs,
+            vec![(0x20u8, Bytes::from_static(&[0xAB, 0xCD]))]
+        );
+        assert_eq!(encode_migration_plan(&back), bytes);
+    }
+
+    #[test]
+    fn decode_migration_plan_rejects_wrong_value_kind() {
+        let counter = encode_counter(5); // KIND_COUNTER, not a plan
+        let err = decode_migration_plan(1, "c:P:1", &counter).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::WrongValueKind { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_id_entry_rejects_migration_plan_kind() {
+        // A stray plan row landing where an id-entry is expected must error,
+        // not be silently misread.
+        let bytes = encode_migration_plan(&sample_plan());
+        let err = decode_id_entry("c:E:User\0age", &bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::WrongValueKind {
+                expected: "IdEntry",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decode_migration_plan_rejects_unknown_status() {
+        let bytes = encode_plan_with_raw_status(0x7F);
+        let err = decode_migration_plan(7, "c:P:7", &bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::UnknownMigrationStatus { status: 0x7F, .. })
+        ));
+        // Sanity: a valid status byte decodes.
+        let ok = decode_migration_plan(7, "c:P:7", &encode_plan_with_raw_status(MP_STATUS_RUNNING));
+        assert_eq!(ok.unwrap().status, MigrationStatus::Running);
+    }
+
+    #[test]
+    fn decode_migration_plan_rejects_missing_required_tlv() {
+        let mut body: Vec<u8> = Vec::new();
+        write_tlv(&mut body, TLV_MP_TYPE_NAME, b"User"); // only one of many
+        let mut out = vec![RECORD_FORMAT_V1, KIND_MIGRATION_PLAN];
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(&body);
+        let err = decode_migration_plan(1, "c:P:1", &out).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::MissingRequiredTlv { .. })
+        ));
+    }
+
+    #[test]
+    fn migration_status_byte_roundtrips_and_semantics() {
+        for s in [
+            MigrationStatus::Pending,
+            MigrationStatus::Running,
+            MigrationStatus::Completed,
+            MigrationStatus::Cancelled,
+            MigrationStatus::Failed,
+            MigrationStatus::AwaitingConverter,
+        ] {
+            assert_eq!(MigrationStatus::from_byte(s.to_byte()), Some(s));
+        }
+        assert_eq!(MigrationStatus::from_byte(0x7F), None);
+        // Quiesce released ONLY by Completed + Cancelled; Failed holds it.
+        assert!(!MigrationStatus::Completed.quiesces());
+        assert!(!MigrationStatus::Cancelled.quiesces());
+        assert!(MigrationStatus::Failed.quiesces());
+        assert!(MigrationStatus::AwaitingConverter.quiesces());
+        assert!(MigrationStatus::Running.quiesces());
+        // Terminal: Completed, Cancelled, Failed (no auto-resume).
+        assert!(MigrationStatus::Failed.is_terminal());
+        assert!(!MigrationStatus::AwaitingConverter.is_terminal());
+        assert!(MigrationStatus::Running.is_drivable());
+        assert!(MigrationStatus::Pending.is_drivable());
+        assert!(!MigrationStatus::Failed.is_drivable());
+    }
+
+    #[test]
+    fn next_migration_id_self_heals_against_max_plan() {
+        let mut p1 = sample_plan();
+        p1.plan_id = 1;
+        let mut p5 = sample_plan();
+        p5.plan_id = 5;
+        // Counter behind the real max plan id (torn counter bump) → heal to max+1.
+        assert_eq!(next_migration_id(2, &[p1.clone(), p5.clone()]), 6);
+        // Counter ahead of all plans → counter+1.
+        assert_eq!(next_migration_id(10, &[p1, p5]), 11);
+        // Fresh DB: no plans, no counter.
+        assert_eq!(next_migration_id(0, &[]), 1);
     }
 
     #[test]

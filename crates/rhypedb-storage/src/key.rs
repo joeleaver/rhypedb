@@ -699,6 +699,48 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.freeze()
     }
+
+    /// Next-migration-id counter: `c:N:M` (parallel to `c:N:T/E/R`).
+    /// Hands out monotonic `plan_id`s for chunked field-type migrations
+    /// (shadow-field card 1/5). Absent before any migration is created
+    /// (treated as 0 then) and self-healed at allocation time against the
+    /// highest `c:P:` plan id, so a torn counter bump cannot reissue a
+    /// live id. Distinct from the `c:M:` metadata header (3rd byte differs).
+    pub fn catalog_next_migration() -> Bytes {
+        let mut buf = BytesMut::with_capacity(5);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'N');
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'M');
+        buf.freeze()
+    }
+
+    /// Migration plan record: `c:P:<u64 BE plan_id>` → encoded
+    /// `MigrationPlan` (record header + TLV body; framing documented in
+    /// `rhypedb-engine/src/catalog.rs`). One row per chunked field-type
+    /// migration; survives restart to drive auto-resume.
+    pub fn catalog_migration_plan(plan_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(4 + 8);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'P');
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(plan_id);
+        buf.freeze()
+    }
+
+    /// Scan prefix for all migration plan records: `c:P:`. Used by
+    /// auto-resume, the migration-id self-heal, and the recovery-clear
+    /// exemption (these rows must NOT be wiped by torn-write recovery).
+    pub fn catalog_migration_plan_prefix() -> Bytes {
+        let mut buf = BytesMut::with_capacity(4);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'P');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
 }
 
 #[cfg(test)]
@@ -835,6 +877,28 @@ mod tests {
         assert_eq!(&r[4..8], b"User");
         assert_eq!(r[8], 0u8);
         assert_eq!(&r[9..], b"friends");
+    }
+
+    #[test]
+    fn migration_plan_and_counter_keys_have_expected_bytes() {
+        // Counter `c:N:M` is distinct from the `c:M:` metadata header and
+        // from the other `c:N:*` counters.
+        assert_eq!(&KeyBuilder::catalog_next_migration()[..], b"c:N:M");
+        assert_ne!(
+            &KeyBuilder::catalog_next_migration()[..],
+            &KeyBuilder::catalog_metadata()[..]
+        );
+
+        // Plan record `c:P:<u64 BE>`; prefix `c:P:` is a true prefix.
+        let p = KeyBuilder::catalog_migration_plan(0x0102_0304_0506_0708);
+        assert_eq!(&p[..4], b"c:P:");
+        assert_eq!(&p[4..], &0x0102_0304_0506_0708u64.to_be_bytes());
+        let prefix_p = KeyBuilder::catalog_migration_plan_prefix();
+        assert_eq!(&prefix_p[..], b"c:P:");
+        assert!(p.starts_with(&prefix_p));
+        assert!(prefix_p.starts_with(&KeyBuilder::catalog_prefix_all()));
+        // BE plan-id ordering = numeric ordering (scan returns ascending ids).
+        assert!(KeyBuilder::catalog_migration_plan(1) < KeyBuilder::catalog_migration_plan(2));
     }
 
     #[test]

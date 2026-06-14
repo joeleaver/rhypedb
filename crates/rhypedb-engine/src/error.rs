@@ -231,6 +231,17 @@ pub enum CatalogError {
     #[error("catalog row {row} has unknown retirement-reason byte 0x{reason:02x}")]
     UnknownRetireReason { row: String, reason: u8 },
 
+    /// A migration plan record (`c:P:<id>`) carries an unknown status
+    /// byte. The decoder refuses rather than guessing a lifecycle state.
+    #[error("migration plan {row} has unknown status byte 0x{status:02x}")]
+    UnknownMigrationStatus { row: String, status: u8 },
+
+    /// A migration plan record (`c:P:<id>`) is structurally malformed
+    /// (e.g. a non-utf8 string TLV). Distinct from `Truncated` so the
+    /// operator can tell a torn write from a corrupt field value.
+    #[error("migration plan {row} is malformed: {reason}")]
+    MalformedMigrationPlan { row: String, reason: &'static str },
+
     /// A catalog row's `previous_names` TLV has `count = 0`. An empty
     /// chain should be omitted entirely; storing one with count zero
     /// indicates external tampering or a writer bug.
