@@ -327,6 +327,48 @@ pub struct Database {
     /// in its plan and re-resolves here at create and at resume; a missing
     /// or version-changed name parks the plan `AwaitingConverter`.
     converters: Arc<parking_lot::RwLock<HashMap<String, (u32, crate::catalog::RegisteredConverter)>>>,
+    /// Per-`(type_id, field_name)` double-write hooks for in-flight chunked
+    /// field-type migrations (shadow-field card 2). While a field is migrating,
+    /// every write to it ALSO stamps a converted `<field>__shadow` sibling so
+    /// writes proceed during the migration instead of being quiesced. Nested
+    /// `type_id -> {field_name -> hook}` so the hot-path probe for a
+    /// non-migrating type is a single Copy-`u64` miss. Lock-free read cache
+    /// (ArcSwap), mutated ONLY under `migration_lock.write()` via
+    /// `arm_field_hook`/`disarm_field_hook`, rebuilt from the `c:P:` plans on
+    /// open/create alongside `migrating`. **Card 2a plumbs it; writers don't
+    /// consume it until card 2b** (quiesce still rejects in 2a).
+    migrating_fields: arc_swap::ArcSwap<
+        std::collections::HashMap<u64, std::collections::HashMap<String, Arc<MigratingFieldHook>>>,
+    >,
+    /// Fast-path gate: total live hook count. Producers load this (`Relaxed`)
+    /// and skip ALL hook work — no lock, no map probe, no `String` — when it's
+    /// `0` (the common case, no migration active). Kept in sync with
+    /// `migrating_fields` under `migration_lock.write()`.
+    migrating_field_count: std::sync::atomic::AtomicUsize,
+}
+
+/// A per-`(type, field)` double-write hook for an in-flight chunked field-type
+/// migration (shadow-field card 2). A writer touching the field stamps a
+/// converted `<field>__shadow` sibling via this hook so the write carries the
+/// migration forward instead of being rejected.
+// converter/target_kind/converter_version are consumed by the producer hook +
+// cutover in card 2b/2c; card 2a only plumbs the struct.
+#[allow(dead_code)]
+pub(crate) struct MigratingFieldHook {
+    pub field_name: String,
+    /// `None` = the plan's pinned converter is not registered in this
+    /// `Database` yet (e.g. a fresh open before `register_converter`). A write
+    /// to the field then FAILS CLOSED (`MigrationFieldConverterUnresolved`,
+    /// card 2b) rather than land source-only with no shadow — which cutover
+    /// would later refuse. Resolves to `Some` once the converter is registered
+    /// and the hook is re-armed.
+    pub converter: Option<crate::catalog::RegisteredConverter>,
+    /// On-disk kind the converter must produce (validates converter output).
+    pub target_kind: u8,
+    /// Pinned converter version; stamped onto each `<field>__shadow_cv` sibling
+    /// so cutover can refuse a shadow written by a stale converter (card 2c).
+    pub converter_version: u32,
+    pub plan_id: u64,
 }
 
 /// One @indexed scalar field on a type, with everything the write path needs
@@ -847,6 +889,12 @@ impl Database {
             // (below); create_field_type_migration arms it under
             // migration_lock.write().
             migrating: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+            // Card 2: double-write hooks. Same lifecycle as `migrating` —
+            // start empty, rebuilt by `auto_resume_migrations` / armed by
+            // create. (Not carried via CarryState: a `_consuming` rebuild is
+            // refused while a plan is unsettled, so carry is always migration-free.)
+            migrating_fields: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+            migrating_field_count: std::sync::atomic::AtomicUsize::new(0),
             converters: match &carry {
                 Some(c) => Arc::clone(&c.converters),
                 None => Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -1534,6 +1582,64 @@ impl Database {
         self.migrating.store(Arc::new(m));
     }
 
+    /// Install (or replace) the card-2 double-write hook for `type_id`'s
+    /// `hook.field_name`. MUST hold `migration_lock.write()`. Clone-on-write
+    /// swap of the ArcSwap; keeps `migrating_field_count` in sync. Replacing an
+    /// existing hook for the same field (e.g. re-arming with a now-resolved
+    /// converter) does not change the count.
+    pub(crate) fn arm_field_hook(&self, type_id: u64, hook: MigratingFieldHook) {
+        let mut m = (**self.migrating_fields.load()).clone();
+        let by_field = m.entry(type_id).or_default();
+        let is_new = !by_field.contains_key(&hook.field_name);
+        by_field.insert(hook.field_name.clone(), Arc::new(hook));
+        self.migrating_fields.store(Arc::new(m));
+        if is_new {
+            self.migrating_field_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Remove the card-2 hook(s) for `plan_id` on `type_id` (its migration
+    /// completed/cancelled). Keyed by plan id so callers needn't thread the
+    /// field name. Same locking contract as `arm_field_hook`.
+    pub(crate) fn disarm_field_hook(&self, type_id: u64, plan_id: u64) {
+        let mut m = (**self.migrating_fields.load()).clone();
+        let mut removed = 0usize;
+        if let Some(by_field) = m.get_mut(&type_id) {
+            let before = by_field.len();
+            by_field.retain(|_, h| h.plan_id != plan_id);
+            removed = before - by_field.len();
+            if by_field.is_empty() {
+                m.remove(&type_id);
+            }
+        }
+        self.migrating_fields.store(Arc::new(m));
+        if removed > 0 {
+            self.migrating_field_count
+                .fetch_sub(removed, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Look up the card-2 double-write hook for `(type_id, field_name)`, if the
+    /// field is mid-migration. Hot-path probe — the `migrating_field_count`
+    /// gate (load `Relaxed`, return early on 0) means a non-migrating database
+    /// pays a single atomic load and no lock/map work. Callers already hold
+    /// `migration_lock.read()` so the set can't change under them.
+    #[allow(dead_code)] // consumed by apply_migrating_field_hook (card 2b)
+    pub(crate) fn field_hook(&self, type_id: u64, field_name: &str) -> Option<Arc<MigratingFieldHook>> {
+        if self
+            .migrating_field_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return None;
+        }
+        self.migrating_fields
+            .load()
+            .get(&type_id)
+            .and_then(|by_field| by_field.get(field_name).cloned())
+    }
+
     /// Register a named row converter for chunked field-type migrations
     /// (shadow-field card 1). A migration is created against a converter
     /// `name`; the `(name, version)` pair is pinned in the persisted plan
@@ -1607,6 +1713,19 @@ impl Database {
                 spec.chunk_size,
             )?;
             self.arm_quiesce(created.type_id, created.plan_id);
+            // Card 2a: also install the double-write hook (converter resolved
+            // above). Not consumed by writers until card 2b; quiesce still
+            // rejects writes for now.
+            self.arm_field_hook(
+                created.type_id,
+                MigratingFieldHook {
+                    field_name: spec.field_name.clone(),
+                    converter: Some(Arc::clone(&converter)),
+                    target_kind,
+                    converter_version: spec.converter_version,
+                    plan_id: created.plan_id,
+                },
+            );
             created
         };
 
@@ -1632,6 +1751,7 @@ impl Database {
         let _guard = self.migration_lock.write();
         crate::catalog::finalize_migration_cutover(&self.storage, plan_id)?;
         self.disarm_quiesce(type_id, plan_id);
+        self.disarm_field_hook(type_id, plan_id);
         Ok(())
     }
 
@@ -1683,13 +1803,26 @@ impl Database {
             let Some(&type_id) = self.type_ids.get(&plan.type_name) else {
                 continue; // type no longer exists — nothing to quiesce
             };
+            // Converter is empty at a fresh open (operator registers AFTER
+            // open) → the hook arms in a REJECTING (converter: None) state.
+            let converter = self.resolve_converter(&plan.converter_name, plan.converter_version);
             {
                 let _guard = self.migration_lock.write();
                 self.arm_quiesce(type_id, plan.plan_id);
+                // Card 2a: rebuild the double-write hook from the plan.
+                self.arm_field_hook(
+                    type_id,
+                    MigratingFieldHook {
+                        field_name: plan.field_name.clone(),
+                        converter: converter.clone(),
+                        target_kind: plan.target_kind,
+                        converter_version: plan.converter_version,
+                        plan_id: plan.plan_id,
+                    },
+                );
             }
             if plan.status.is_drivable()
-                && let Some(converter) =
-                    self.resolve_converter(&plan.converter_name, plan.converter_version)
+                && let Some(converter) = converter
             {
                 // A registered converter at open time (e.g. carried across a
                 // _consuming rebuild) lets us finish the cutover immediately.
@@ -1735,6 +1868,18 @@ impl Database {
         {
             let _guard = self.migration_lock.write();
             self.arm_quiesce(type_id, plan_id); // idempotent if open already armed it
+            // Re-arm the hook with the now-resolved converter (open may have
+            // armed it REJECTING when the converter wasn't registered yet).
+            self.arm_field_hook(
+                type_id,
+                MigratingFieldHook {
+                    field_name: plan.field_name.clone(),
+                    converter: Some(Arc::clone(&converter)),
+                    target_kind: plan.target_kind,
+                    converter_version: plan.converter_version,
+                    plan_id,
+                },
+            );
         }
         self.drive_migration_to_completion(plan_id, type_id, &converter)
     }
