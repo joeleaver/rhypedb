@@ -947,10 +947,19 @@ impl SstReader {
             return Ok(None);
         }
 
-        // Use the user key with version 0 (largest inverted bytes) as the
-        // search target. This is the LARGEST internal key for this user key,
-        // so binary search finds the block at or before where entries end.
-        let search_key = InternalKey::new(user_key, 0);
+        // Seek to the user key's SMALLEST internal key (highest version =
+        // inverted bytes 0x00..00), so the block we land on is at or before
+        // this user key's FIRST (highest-version) entry. We then scan forward
+        // and return the first entry whose version is <= the requested one.
+        //
+        // Using the LARGEST internal key (version 0) here is WRONG: when a
+        // user key's versions straddle a sparse-index block boundary, the
+        // largest-key search lands on the block holding the OLDER version and
+        // the forward scan starts there, silently skipping the newer version
+        // in the previous block — a stale-read data-loss bug. Surfaced by the
+        // chunked field-type migration, which flushes a memtable where every
+        // object carries two versions (create + convert).
+        let search_key = InternalKey::new(user_key, u64::MAX);
         let search_bytes = search_key.as_bytes();
 
         let block_idx = match self

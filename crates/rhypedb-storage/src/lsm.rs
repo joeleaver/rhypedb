@@ -1357,6 +1357,51 @@ mod tests {
         assert_eq!(got, (0..10).collect::<Vec<_>>());
     }
 
+    // Regression: a multi-version user key whose two versions STRADDLE a
+    // sparse-index block boundary (ENTRIES_PER_BLOCK = 16) must point-read
+    // the LATEST after a flush. We place 15 single-version keys (SST entries
+    // 0..14) ahead of the target, so the target's two versions land at
+    // entries 15 (newest) and 16 (oldest) — across the block boundary. The
+    // old `get_versioned` seek (largest internal key) landed on block 1,
+    // started its scan at the OLD version, and returned it — a stale-read
+    // data-loss bug the chunked field-type migration surfaced.
+    #[test]
+    fn flush_of_multi_version_key_straddling_block_boundary_reads_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = b"B:target";
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            // 15 keys sorting BEFORE the target -> SST entries 0..14.
+            for i in 0..15u64 {
+                let mut t = tree.begin_txn();
+                tree.put(&mut t, format!("A:{i:06}").as_bytes(), Bytes::from("a"))
+                    .unwrap();
+                tree.commit(&mut t).unwrap();
+            }
+            // Target, two versions -> entries 15 (v2, newest) and 16 (v1).
+            let mut t = tree.begin_txn();
+            tree.put(&mut t, target, Bytes::from("v1")).unwrap();
+            tree.commit(&mut t).unwrap();
+            let mut t = tree.begin_txn();
+            tree.put(&mut t, target, Bytes::from("v2")).unwrap();
+            tree.commit(&mut t).unwrap();
+            // A few keys sorting AFTER, so the target isn't the last entry.
+            for i in 0..5u64 {
+                let mut t = tree.begin_txn();
+                tree.put(&mut t, format!("C:{i:06}").as_bytes(), Bytes::from("c"))
+                    .unwrap();
+                tree.commit(&mut t).unwrap();
+            }
+            tree.flush().unwrap();
+        }
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        assert_eq!(
+            tree.get_at(tree.read_snapshot(), target).unwrap(),
+            Some(Bytes::from("v2")),
+            "straddling multi-version key read the STALE version"
+        );
+    }
+
     // An empty range yields high_water=None (the worker's terminal signal).
     #[test]
     fn scan_chunk_raw_empty_range_high_water_none() {
