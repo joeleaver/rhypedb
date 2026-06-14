@@ -782,14 +782,20 @@ impl SstReader {
         Ok(out)
     }
 
-    /// Find the sparse-index block whose first key is the latest one <= the
-    /// largest internal key for `user_key`, restricted to the suffix
-    /// `self.index[start..]`. Returns an absolute index into `self.index`.
+    /// Find the sparse-index block at or before `user_key`'s FIRST
+    /// (highest-version) entry, restricted to the suffix `self.index[start..]`.
+    /// Returns an absolute index into `self.index`.
+    ///
+    /// Seeds with the SMALLEST internal key for `user_key` (version=u64::MAX,
+    /// inverted bytes = 0x00). Seeding with the largest (version=0) is WRONG:
+    /// when a user key's versions straddle a sparse-index block boundary it
+    /// lands on the block holding only the OLDER version, and the forward scan
+    /// starts there — returning a stale read. Same bug class as `get_versioned`
+    /// (fixed); this is the `multi_get` / batched-lookup seek.
     fn locate_block_from(&self, user_key: &[u8], start: usize) -> usize {
-        // The largest InternalKey for user_key has version=0 (inverted bytes = 0xff).
         let mut search_key = Vec::with_capacity(user_key.len() + 8);
         search_key.extend_from_slice(user_key);
-        search_key.extend_from_slice(&[0xff; 8]);
+        search_key.extend_from_slice(&[0u8; 8]);
 
         let slice = &self.index[start..];
         let rel = match slice.binary_search_by(|e| e.key.as_ref().cmp(&search_key)) {

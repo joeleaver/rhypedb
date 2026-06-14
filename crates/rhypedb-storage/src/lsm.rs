@@ -1402,6 +1402,48 @@ mod tests {
         );
     }
 
+    // Same straddle as above, but through the BATCHED point-lookup path
+    // (`multi_get_at` -> SstReader::multi_get / locate_block_from). The seek
+    // there had the identical lowest-version seed bug; `get_many` /
+    // traversals must agree with `get`.
+    #[test]
+    fn multi_get_of_multi_version_key_straddling_block_boundary_reads_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let target: &[u8] = b"B:target";
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            for i in 0..15u64 {
+                let mut t = tree.begin_txn();
+                tree.put(&mut t, format!("A:{i:06}").as_bytes(), Bytes::from("a"))
+                    .unwrap();
+                tree.commit(&mut t).unwrap();
+            }
+            let mut t = tree.begin_txn();
+            tree.put(&mut t, target, Bytes::from("v1")).unwrap();
+            tree.commit(&mut t).unwrap();
+            let mut t = tree.begin_txn();
+            tree.put(&mut t, target, Bytes::from("v2")).unwrap();
+            tree.commit(&mut t).unwrap();
+            for i in 0..5u64 {
+                let mut t = tree.begin_txn();
+                tree.put(&mut t, format!("C:{i:06}").as_bytes(), Bytes::from("c"))
+                    .unwrap();
+                tree.commit(&mut t).unwrap();
+            }
+            tree.flush().unwrap();
+        }
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let snap = tree.read_snapshot();
+        let got = tree.multi_get_at(snap, &[target]).unwrap();
+        assert_eq!(
+            got,
+            vec![Some(Bytes::from("v2"))],
+            "batched multi_get returned the STALE version (must match get_at)"
+        );
+        // Differential: both paths agree.
+        assert_eq!(got[0], tree.get_at(snap, target).unwrap());
+    }
+
     // An empty range yields high_water=None (the worker's terminal signal).
     #[test]
     fn scan_chunk_raw_empty_range_high_water_none() {
