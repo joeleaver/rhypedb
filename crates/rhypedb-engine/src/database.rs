@@ -1801,19 +1801,228 @@ impl Database {
         Ok(created.plan_id)
     }
 
-    /// Run a plan's chunk loop to data-exhaustion (no `migration_lock` held),
-    /// then re-take the barrier to flip the catalog kind and release quiesce.
-    /// On a converter / data error the plan is left `Failed` (quiesce HELD)
-    /// and the error is propagated; quiesce is released only on a clean
-    /// `Completed`.
+    /// Drive a plan from its current phase to completion (shadow-field card 2).
+    ///
+    /// Phase `Converting`: backfill every `<field>__shadow` sibling WITHOUT
+    /// holding `migration_lock` so writers to OTHER types proceed during the
+    /// (potentially long) scan. Then transition to the cutover. Phase
+    /// `CuttingOver` (a resumed plan): the converter is NOT re-run — only the
+    /// rename pass resumes.
+    ///
+    /// The cutover (`run_cutover`) promotes the shadows to the source field,
+    /// reconciles every cover/index, flips the catalog kind, and releases
+    /// quiesce — holding `migration_lock.write()` for the whole pass. On a
+    /// converter / data / shadow error the plan is left `Failed` (quiesce HELD)
+    /// and the error propagates; quiesce is released only on a clean `Completed`.
     fn drive_migration_to_completion(
         &self,
         plan_id: u64,
         type_id: u64,
         converter: &crate::catalog::RegisteredConverter,
     ) -> EngineResult<()> {
-        crate::catalog::run_migration_chunks(&self.storage, plan_id, converter)?;
+        let phase = {
+            let txn = self.storage.begin_txn();
+            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?.phase
+        };
+        if phase == crate::catalog::MigrationPhase::Converting {
+            crate::catalog::run_migration_chunks(&self.storage, plan_id, converter)?;
+        }
+        self.run_cutover(plan_id, type_id)
+    }
+
+    /// Cutover pass (shadow-field card 2): promote every `<field>__shadow`
+    /// sibling to the source field, reconcile ALL covers/indexes via the shared
+    /// `rewrite_object_and_maintain_covers`, then flip the catalog kind and
+    /// release quiesce.
+    ///
+    /// Holds `migration_lock.write()` for the WHOLE pass. The write-lock spans
+    /// every commit, so once it is acquired no in-flight writer (card-2 inc 2d)
+    /// can add a shadow racing a rename, and a reader (which needs no lock) sees
+    /// each row transition source→target atomically (each row's rename is one
+    /// commit). Reads stay available throughout — only writes are drained.
+    ///
+    /// Per-chunk commit order mirrors the backfill worker: `[promoted o: blob,
+    /// i:/r:/g: cover maintenance, plan record (cutover_cursor) LAST]`, so a
+    /// torn tail drops only the cursor advance and resume re-does the chunk
+    /// idempotently (a row already promoted — source at target kind, no shadow —
+    /// is skipped). A `WriteConflict` (the background cover-refresh worker holds
+    /// no `migration_lock`) retries the chunk; the generation over-bump on a
+    /// retry is harmless (monotonic staleness counter).
+    fn run_cutover(&self, plan_id: u64, type_id: u64) -> EngineResult<()> {
+        const WRITE_CONFLICT_RETRIES: u32 = 8;
         let _guard = self.migration_lock.write();
+
+        let mut plan = {
+            let txn = self.storage.begin_txn();
+            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
+        };
+        let type_name = plan.type_name.clone();
+        let field_name = plan.field_name.clone();
+        let target_kind = plan.target_kind;
+        let converter_version = plan.converter_version;
+        let shadow_name = format!("{field_name}__shadow");
+        let shadow_cv_name = format!("{field_name}__shadow_cv");
+
+        // Durably mark CuttingOver BEFORE the first rename so a crash resumes the
+        // rename pass, not the converter. Idempotent (already CuttingOver → skip).
+        if plan.phase != crate::catalog::MigrationPhase::CuttingOver {
+            plan.phase = crate::catalog::MigrationPhase::CuttingOver;
+            let mut txn = self.storage.begin_txn();
+            let (k, v) = crate::catalog::migration_plan_record(&plan);
+            self.storage.put(&mut txn, &k, v)?;
+            self.storage.commit(&mut txn)?;
+        }
+
+        let chunk_size = if plan.chunk_size == 0 {
+            crate::catalog::DEFAULT_MIGRATION_CHUNK_SIZE
+        } else {
+            plan.chunk_size
+        } as usize;
+        let object_prefix = KeyBuilder::object_prefix(type_id);
+        let mut cursor = plan.cutover_cursor;
+
+        loop {
+            let start = if cursor == 0 {
+                object_prefix.clone()
+            } else {
+                match cursor.checked_add(1) {
+                    Some(next) => KeyBuilder::object(type_id, next),
+                    None => break,
+                }
+            };
+
+            let mut attempts = 0u32;
+            let committed: Option<(crate::catalog::MigrationPlan, bool)> = loop {
+                let mut txn = self.storage.begin_txn();
+                let snap = txn.snapshot();
+                let chunk = self.storage.scan_chunk_raw(snap, &object_prefix, &start, chunk_size)?;
+                let Some(high_water) = chunk.high_water.clone() else {
+                    self.storage.abort(&mut txn);
+                    break None;
+                };
+                let more = chunk.more;
+                let next_cursor =
+                    u64::from_be_bytes(high_water[high_water.len() - 8..].try_into().unwrap());
+
+                for (key, blob) in &chunk.live {
+                    let object_id =
+                        u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                    let mut fields = deserialize_fields(blob);
+                    match fields.get(&shadow_name).cloned() {
+                        None => {
+                            // No shadow. Skip rows that are already cut over
+                            // (source at target kind), absent, or Null (Null
+                            // carries no shadow); refuse a source-at-src-kind
+                            // row the converter never reached.
+                            match fields.get(&field_name) {
+                                None | Some(Value::Null) => continue,
+                                Some(v)
+                                    if crate::catalog::value_to_kind_byte_public(v)
+                                        == target_kind =>
+                                {
+                                    continue;
+                                }
+                                Some(_) => {
+                                    self.storage.abort(&mut txn);
+                                    crate::catalog::park_migration_failed(
+                                        &self.storage,
+                                        plan_id,
+                                    )?;
+                                    return Err(EngineError::MigrationCutoverShadowMissing {
+                                        plan_id,
+                                        object_id,
+                                    });
+                                }
+                            }
+                        }
+                        Some(shadow_val) => {
+                            // Refuse a shadow written by a stale converter.
+                            let found_cv = match fields.get(&shadow_cv_name) {
+                                Some(Value::U32(v)) => *v,
+                                _ => 0,
+                            };
+                            if found_cv != converter_version {
+                                self.storage.abort(&mut txn);
+                                crate::catalog::park_migration_failed(&self.storage, plan_id)?;
+                                return Err(EngineError::MigrationCutoverShadowStale {
+                                    plan_id,
+                                    object_id,
+                                    found_cv,
+                                    want_cv: converter_version,
+                                });
+                            }
+                            // Snapshot indexed-field values BEFORE the rename
+                            // (the migrating field is non-indexed, so siblings
+                            // are unchanged — this drives the covering re-put).
+                            let old_indexed_snapshot: Vec<Option<Value>> =
+                                if let Some(idx_fields) = self.indexed_fields.get(&type_name) {
+                                    idx_fields
+                                        .iter()
+                                        .map(|ifd| fields.get(&ifd.name).cloned())
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                            // Promote: source := shadow value, drop both shadow
+                            // siblings → shadow-free blob.
+                            fields.insert(field_name.clone(), shadow_val);
+                            fields.remove(&shadow_name);
+                            fields.remove(&shadow_cv_name);
+                            let serialized = serialize_fields(&fields);
+                            // Cover/index maintenance FIRST, the promoted o: blob
+                            // LAST: these are individual puts (not one atomic
+                            // put_batch), so the `o:` write — the one that flips
+                            // this row's "already cut?" decision — must be last.
+                            // A torn tail that drops `o:` leaves the shadow in
+                            // place, so resume re-promotes the row and redoes the
+                            // (idempotent) cover maintenance; a torn tail that
+                            // keeps `o:` necessarily kept every earlier write too.
+                            self.rewrite_object_and_maintain_covers(
+                                &mut txn,
+                                &type_name,
+                                type_id,
+                                object_id,
+                                &fields,
+                                &serialized,
+                                &old_indexed_snapshot,
+                                true,
+                            )?;
+                            self.storage.put(&mut txn, key, serialized.clone())?;
+                        }
+                    }
+                }
+
+                let mut plan_after = plan.clone();
+                plan_after.cutover_cursor = next_cursor;
+                // phase stays CuttingOver, status stays Running.
+                let (k, v) = crate::catalog::migration_plan_record(&plan_after);
+                self.storage.put(&mut txn, &k, v)?;
+                match self.storage.commit(&mut txn) {
+                    Ok(_) => break Some((plan_after, more)),
+                    Err(rhypedb_storage::Error::WriteConflict)
+                        if attempts < WRITE_CONFLICT_RETRIES =>
+                    {
+                        attempts += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(EngineError::Storage(e)),
+                }
+            };
+
+            match committed {
+                None => break,
+                Some((plan_after, more)) => {
+                    plan = plan_after;
+                    cursor = plan.cutover_cursor;
+                    if !more {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Flip the catalog kind + mark Completed (idempotent), then release
+        // quiesce + the double-write hook. Already holding migration_lock.write().
         crate::catalog::finalize_migration_cutover(&self.storage, plan_id)?;
         self.disarm_quiesce(type_id, plan_id);
         self.disarm_field_hook(type_id, plan_id);
@@ -1995,7 +2204,7 @@ impl Database {
         let mut txn = self.storage.begin_txn();
         let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
 
-        let scalar_fields = self.stage_create_writes(
+        let mut scalar_fields = self.stage_create_writes(
             &mut txn, type_name, type_def, type_id, object_id, &fields, &mut puts,
         )?;
 
@@ -2013,6 +2222,11 @@ impl Database {
                 other => EngineError::Storage(other),
             }
         })?;
+
+        // Card 2: drop any `<field>__shadow` siblings the double-write hook
+        // stamped into `scalar_fields` before they reach the change event or
+        // the returned Object — the durable `o:` blob keeps them.
+        self.strip_tombstoned_fields(type_name, &mut scalar_fields);
 
         self.subscriptions.publish(ChangeEvent {
             version,
@@ -2303,7 +2517,10 @@ impl Database {
         // Events report only the scalar fields (relation values went into
         // the edge index, not the object payload).
         let mut out = Vec::with_capacity(scalar_rows.len());
-        for (id, scalar_fields) in object_ids.into_iter().zip(scalar_rows) {
+        for (id, mut scalar_fields) in object_ids.into_iter().zip(scalar_rows) {
+            // Card 2: strip any `<field>__shadow` siblings the double-write hook
+            // stamped before they reach the change event / returned Object.
+            self.strip_tombstoned_fields(type_name, &mut scalar_fields);
             self.subscriptions.publish(ChangeEvent {
                 version,
                 kind: ChangeKind::Create,
@@ -2416,10 +2633,32 @@ impl Database {
         let snapshot = self.storage.read_snapshot();
         let values = self.storage.multi_get_at(snapshot, &key_refs)?;
 
+        // While a field-type migration is in flight, the `o:` blob carries
+        // `<field>__shadow` siblings the wire path must never ship. The lazy
+        // path ships `raw_fields` verbatim (protocol.rs `encode_object`), so it
+        // can't rely on the eager `strip_tombstoned_fields` chokepoint —
+        // deserialize + strip + fall back to an eager Object here. Paid only
+        // during a migration; the zero-copy fast path is untouched otherwise.
+        let migrating = self
+            .migrating_field_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0;
+
         let mut out = Vec::with_capacity(sorted.len());
         for (id, value) in sorted.into_iter().zip(values) {
             if let Some(data) = value {
-                out.push(Object::from_raw(type_name.into(), id, data));
+                if migrating {
+                    let mut fields = deserialize_fields(&data);
+                    self.strip_tombstoned_fields(type_name, &mut fields);
+                    out.push(Object {
+                        type_name: type_name.into(),
+                        id,
+                        fields,
+                        raw_fields: None,
+                    });
+                } else {
+                    out.push(Object::from_raw(type_name.into(), id, data));
+                }
             }
         }
         Ok(out)
@@ -3361,6 +3600,12 @@ impl Database {
                 other => EngineError::Storage(other),
             }
         })?;
+
+        // Card 2: the merged `fields` carry the `<field>__shadow` siblings the
+        // double-write hook stamped (now durable in the `o:` blob + covers). The
+        // change event and the returned Object face callers, so strip the
+        // siblings here — `serialized` (with the shadow) is already committed.
+        self.strip_tombstoned_fields(type_name, &mut fields);
 
         // Enqueue cover refresh for this target. Every other rev_edge that
         // embedded this object as `<name>__cover` (under a different source)
@@ -4577,6 +4822,41 @@ fn cover_refresh_worker(
 /// else in the slice that's `is_1to1_forward` becomes a covered peer.
 /// Returns `Bytes::new()` if there are no other 1:1 peers (matches the
 /// existing convention so the SST doesn't carry empty cover blobs).
+/// True when a field-type migration is in flight (the `<field>__shadow`
+/// double-write is active). Gates the shadow-strip in the cover builders so a
+/// non-migrating database pays one atomic load and no scan.
+fn migration_in_flight(db: &Database) -> bool {
+    db.migrating_field_count
+        .load(std::sync::atomic::Ordering::Relaxed)
+        > 0
+}
+
+/// Drop the card-2 `<field>__shadow`/`<field>__shadow_cv` siblings from a
+/// FieldMap that is about to be embedded in a cover blob. Covers must be
+/// SHADOW-FREE: cutover never re-derives cover keyspaces from the shadows, and
+/// a shadow baked into a cover would leak via the executor's fusion fast path
+/// and never reconcile. Gated by the caller on `migration_in_flight`.
+fn strip_shadow_from_cover(map: &mut FieldMap) {
+    map.retain(|k, _| !is_shadow_sibling_key(k));
+}
+
+/// Return a serialized blob guaranteed shadow-free: if a migration is in flight
+/// and `data` carries shadow siblings, deserialize + strip + re-serialize;
+/// otherwise hand back the original `Bytes` (refcount only, no copy).
+fn shadow_stripped_blob(db: &Database, data: Bytes) -> Bytes {
+    if !migration_in_flight(db) {
+        return data;
+    }
+    let mut fields = deserialize_fields(&data);
+    let before = fields.len();
+    strip_shadow_from_cover(&mut fields);
+    if fields.len() == before {
+        data
+    } else {
+        serialize_fields(&fields)
+    }
+}
+
 fn build_inflight_cover(
     db: &Database,
     txn: &rhypedb_storage::mvcc::Transaction,
@@ -4596,6 +4876,10 @@ fn build_inflight_cover(
     }
 
     let mut effective = scalar_fields.clone();
+    // Card 2: never bake the source's `<field>__shadow` siblings into a cover.
+    if migration_in_flight(db) {
+        strip_shadow_from_cover(&mut effective);
+    }
     effective.insert(this_field.to_string(), Value::U64(this_target));
     for link in &other_1to1 {
         effective.insert(link.0.clone(), Value::U64(link.1));
@@ -4670,6 +4954,10 @@ fn build_covering_rev_value(
         Some(bytes) => deserialize_fields(bytes),
         None => FieldMap::new(),
     };
+    // Card 2: never bake the source's `<field>__shadow` siblings into the cover.
+    if migration_in_flight(db) {
+        strip_shadow_from_cover(&mut effective);
+    }
     effective.insert(field_name.to_string(), Value::U64(target_id));
     for (name, tid) in &other_targets {
         effective.insert(name.clone(), Value::U64(*tid));
@@ -4739,20 +5027,25 @@ fn with_nested_forward_covers(
     target_id: u64,
 ) -> EngineResult<Bytes> {
     let Some(type_def) = db.schema.get_type(target_type) else {
-        return Ok(target_data);
+        // Card 2: even the verbatim-passthrough must not leak `<field>__shadow`.
+        return Ok(shadow_stripped_blob(db, target_data));
     };
 
     // Cheap pre-check: does this type even have any 1:1 forward outgoing
     // relations? If not, skip the deserialize+reserialize round trip and
-    // return the original bytes (refcount-only, no copy).
+    // return the original bytes (refcount-only, no copy — unless a migration
+    // means it carries shadow siblings to strip).
     let has_any_forward_1to1 = type_def.fields.iter().any(|f| {
         matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many) && f.inverse().is_none()
     });
     if !has_any_forward_1to1 {
-        return Ok(target_data);
+        return Ok(shadow_stripped_blob(db, target_data));
     }
 
     let mut effective = deserialize_fields(&target_data);
+    if migration_in_flight(db) {
+        strip_shadow_from_cover(&mut effective);
+    }
     let mut wrote_any = false;
 
     for field in &type_def.fields {
@@ -4782,7 +5075,11 @@ fn with_nested_forward_covers(
         };
         wrote_any = true;
         effective.insert(field.name.clone(), Value::U64(next_tid));
-        effective.insert(format!("{}__cover", field.name), Value::Bytes(next_data));
+        // Card 2: the next-hop blob is embedded verbatim — strip its shadows.
+        effective.insert(
+            format!("{}__cover", field.name),
+            Value::Bytes(shadow_stripped_blob(db, next_data)),
+        );
         let next_v = db.object_version(&rel.target_type, next_tid);
         effective.insert(format!("{}__cover_v", field.name), Value::U64(next_v));
     }
@@ -4790,8 +5087,9 @@ fn with_nested_forward_covers(
     if !wrote_any {
         // No outgoing 1:1 edges actually populated (type has the fields
         // but this instance hasn't been linked yet). Return original bytes
-        // unchanged so we don't pay reserialization cost for no benefit.
-        return Ok(target_data);
+        // unchanged so we don't pay reserialization cost for no benefit
+        // (still shadow-stripped if a migration is in flight).
+        return Ok(shadow_stripped_blob(db, target_data));
     }
     Ok(serialize_fields(&effective))
 }
@@ -6562,8 +6860,8 @@ mod tests {
         }
     }
 
-    /// Acceptance: chunks commit at chunk boundaries — `ceil(rows/chunk)`
-    /// chunk commits, NOT one big commit.
+    /// Acceptance: both passes commit at chunk boundaries — `ceil(rows/chunk)`
+    /// commits each for the shadow backfill AND the cutover, NOT one big commit.
     #[test]
     fn create_field_type_migration_chunks_commit_at_chunk_boundary() {
         use rhypedb_schema::{FieldType, ScalarType};
@@ -6599,19 +6897,27 @@ mod tests {
         let after = db.storage.txn_manager().current_version();
         let chunks = 10u64.div_ceil(4);
         assert!(chunks > 1, "test must exercise multiple chunks");
-        // 1 plan-create commit + `chunks` chunk commits + 1 finalize commit.
+        // Card-2 online flow, per-chunk commits throughout:
+        //   1 plan-create
+        // + `chunks` shadow-backfill commits (run_migration_chunks)
+        // + 1 phase-flip commit (Converting → CuttingOver)
+        // + `chunks` cutover commits (promote shadow + maintain covers)
+        // + 1 finalize commit (catalog kind flip + Completed)
         assert_eq!(
             after - before,
-            1 + chunks + 1,
-            "expected per-chunk commits, not a single batch"
+            1 + chunks + 1 + chunks + 1,
+            "expected per-chunk commits in both passes, not a single batch"
         );
     }
 
     /// Acceptance: crash mid-migration, then resume from the persisted
     /// cursor — every row ends converted exactly once. Drives the catalog
-    /// worker directly (the synchronous create path's seam) so we can
-    /// inject a converter that fails partway, leaving a `Running`→`Failed`
-    /// plan with a mid-range cursor, then re-drive with a good converter.
+    /// backfill worker + the cutover directly (the synchronous create path's
+    /// seam) so we can inject a converter that fails partway, leaving a
+    /// `Running`→`Failed` plan with a mid-range cursor, then re-drive with a
+    /// good converter. Under the card-2 shadow model the backfill writes
+    /// `<field>__shadow` siblings and LEAVES the source — reads return the
+    /// SOURCE until the cutover promotes the shadows.
     #[test]
     fn create_field_type_migration_resumes_from_cursor_after_simulated_crash() {
         use rhypedb_schema::{FieldType, ScalarType};
@@ -6669,15 +6975,28 @@ mod tests {
         let partial = mid[0].objects_converted;
         assert!(partial > 0 && partial < 12, "partial progress: {partial}");
 
-        // Resume with a good converter from the persisted cursor, then cut
-        // over. Already-converted rows are idempotently skipped (the good
-        // converter would error on an F64 input; it never sees one).
+        // Resume the backfill with a good converter from the persisted cursor.
+        // Already-shadowed rows are idempotently skipped (the good converter
+        // reads the SOURCE i64, never an f64 — the source is left intact).
         let good: crate::catalog::RegisteredConverter = Arc::new(|_oid: u64, v: &Value| match v {
             Value::I64(i) => Ok(Value::F64(*i as f64)),
-            _ => unreachable!("already-converted rows must be skipped before the converter"),
+            _ => unreachable!("the converter reads the source; it never sees an f64"),
         });
         crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &good).unwrap();
-        crate::catalog::finalize_migration_cutover(&db.storage, created.plan_id).unwrap();
+
+        // Mid-migration (Converting done, NOT yet cut over): reads still return
+        // the SOURCE value — the shadow is invisible and the kind is unchanged.
+        match db.get("User", ids[0]).unwrap().fields.get("score") {
+            Some(Value::I64(0)) => {}
+            other => panic!("pre-cutover read must return source I64(0), got {other:?}"),
+        }
+
+        // Cut over: promote every shadow to the source field + flip the kind.
+        db.run_cutover(created.plan_id, created.type_id).unwrap();
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
         drop(db);
 
         let db2 = Database::open(
@@ -6762,6 +7081,264 @@ mod tests {
             db2.get("User", null_id).unwrap().fields.get("score"),
             Some(Value::Null) | None
         ));
+    }
+
+    /// G1 REGRESSION (card 2): a covered query on a SIBLING `@indexed` field
+    /// must return the migrated field at its TARGET kind after cutover. The
+    /// secondary-index covering payload embeds a full copy of the object incl.
+    /// the (non-indexed) migrating field and carries NO `<field>__cover_v`
+    /// generation stamp — so the cutover generation-bump alone can't invalidate
+    /// it; cutover must REWRITE the covering payload. Without that fix this read
+    /// serves the stale SOURCE value/kind. (Also a latent card-1 / offline bug.)
+    #[test]
+    fn cutover_refreshes_index_cover_on_sibling_indexed_field() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type T { x: i64  y: i64 @indexed }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("T.x"));
+        for i in 0..6i64 {
+            let mut f = FieldMap::new();
+            f.insert("x".into(), Value::I64(i * 10));
+            f.insert("y".into(), Value::I64(i));
+            db.create("T", f).unwrap();
+        }
+        db.create_field_type_migration(MigrationPlanSpec {
+            type_name: "T".into(),
+            field_name: "x".into(),
+            target_field_type: FieldType::Scalar(ScalarType::F64),
+            converter_name: "widen".into(),
+            converter_version: 1,
+            chunk_size: 4,
+        })
+        .unwrap();
+        drop(db);
+        let db2 = Database::open(
+            parse_schema(r#"type T { x: f64  y: i64 @indexed }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        // Covered read through the @indexed sibling `y` (filter_scan_via_index
+        // materializes straight from the i: covering payload).
+        let results = db2.filter_scan("T", "y", CompareOp::Ge, 0, None).unwrap();
+        assert_eq!(results.len(), 6, "covered scan must see every row");
+        for obj in &results {
+            let y = match obj.fields.get("y") {
+                Some(Value::I64(v)) => *v,
+                other => panic!("y missing/wrong: {other:?}"),
+            };
+            match obj.fields.get("x") {
+                Some(Value::F64(f)) => assert_eq!(*f, (y * 10) as f64, "stale x value"),
+                other => panic!("covered read served stale/source x: {other:?}"),
+            }
+            assert!(
+                obj.fields.keys().all(|k| !is_shadow_sibling_key(k)),
+                "shadow leaked into covered read: {:?}",
+                obj.fields.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Cutover refuses (and parks `Failed`) an object whose source is still at
+    /// the source kind with NO shadow — the converter never reached it.
+    #[test]
+    fn cutover_refuses_missing_shadow() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        for i in 0..3i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            db.create("User", f).unwrap();
+        }
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+        )
+        .unwrap();
+        db.arm_quiesce(created.type_id, created.plan_id);
+        // Cut over WITHOUT backfilling any shadows → first row refuses.
+        let err = db.run_cutover(created.plan_id, created.type_id).unwrap_err();
+        assert!(
+            matches!(err, EngineError::MigrationCutoverShadowMissing { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Failed
+        );
+    }
+
+    /// Cutover refuses (and parks `Failed`) an object whose `<field>__shadow_cv`
+    /// stamp doesn't match the plan's pinned converter version.
+    #[test]
+    fn cutover_refuses_stale_shadow_cv() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let id = {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(7));
+            db.create("User", f).unwrap().id
+        };
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        // Plan pins converter_version = 2.
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 2, 16,
+        )
+        .unwrap();
+        db.arm_quiesce(created.type_id, created.plan_id);
+        // Craft a blob with a shadow stamped at the WRONG converter version (1).
+        let tid = db.resolve_type_id("User").unwrap();
+        let mut nf = FieldMap::new();
+        nf.insert("score".into(), Value::I64(7));
+        nf.insert("score__shadow".into(), Value::F64(7.0));
+        nf.insert("score__shadow_cv".into(), Value::U32(1));
+        let mut txn = db.storage.begin_txn();
+        db.storage
+            .put_batch(
+                &mut txn,
+                &[(
+                    rhypedb_storage::key::KeyBuilder::object(tid, id),
+                    crate::object::serialize_fields(&nf),
+                )],
+            )
+            .unwrap();
+        db.storage.commit(&mut txn).unwrap();
+        let err = db.run_cutover(created.plan_id, created.type_id).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::MigrationCutoverShadowStale {
+                    found_cv: 1,
+                    want_cv: 2,
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Failed
+        );
+    }
+
+    /// G3: while a migration is in flight the lazy/raw wire path
+    /// (`get_many_lazy`) must NOT leak the worker-written `<field>__shadow`
+    /// siblings — it ships `raw_fields` verbatim, bypassing the eager strip.
+    #[test]
+    fn lazy_path_strips_shadow_during_migration() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..4i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+        )
+        .unwrap();
+        db.arm_quiesce(created.type_id, created.plan_id);
+        // Arm the hook so migrating_field_count > 0 (drives the strip gate).
+        db.arm_field_hook(
+            created.type_id,
+            MigratingFieldHook {
+                field_name: "score".into(),
+                converter: None,
+                target_kind: target,
+                converter_version: 1,
+                plan_id: created.plan_id,
+            },
+        );
+        // Backfill shadows (Converting), leaving source intact.
+        let good = widen_i64_to_f64("User.score");
+        let conv: crate::catalog::RegisteredConverter = std::sync::Arc::new(good);
+        crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &conv).unwrap();
+
+        let lazy = db.get_many_lazy("User", &ids).unwrap();
+        assert_eq!(lazy.len(), ids.len());
+        for mut obj in lazy {
+            obj.ensure_fields_deserialized();
+            assert!(
+                obj.fields.keys().all(|k| !is_shadow_sibling_key(k)),
+                "lazy path leaked shadow: {:?}",
+                obj.fields.keys().collect::<Vec<_>>()
+            );
+            // Source still served (not yet cut over).
+            assert!(matches!(obj.fields.get("score"), Some(Value::I64(_))));
+        }
+    }
+
+    /// The backfill worker is idempotent across a resume: a second pass over
+    /// already-shadowed rows (shadow present, current converter version) must
+    /// skip them — it never re-invokes the converter.
+    #[test]
+    fn worker_shadow_backfill_idempotent_on_resume() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        for i in 0..5i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            db.create("User", f).unwrap();
+        }
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+        )
+        .unwrap();
+        db.arm_quiesce(created.type_id, created.plan_id);
+        let good: crate::catalog::RegisteredConverter =
+            Arc::new(widen_i64_to_f64("User.score"));
+        crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &good).unwrap();
+        // Second pass: every row is already shadowed at the current version, so
+        // this converter (which panics if called) must never run.
+        let poison: crate::catalog::RegisteredConverter = Arc::new(|_oid, _v: &Value| {
+            panic!("converter must not be re-invoked for an already-shadowed row")
+        });
+        crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &poison).unwrap();
+        // Cutover still completes correctly.
+        db.run_cutover(created.plan_id, created.type_id).unwrap();
+        drop(db);
+        let db2 = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let all = db2.scan_type("User").unwrap();
+        assert_eq!(all.len(), 5);
+        for obj in all {
+            assert!(matches!(obj.fields.get("score"), Some(Value::F64(_))));
+        }
     }
 
     /// An on-disk row whose migrating-field kind is neither source nor target

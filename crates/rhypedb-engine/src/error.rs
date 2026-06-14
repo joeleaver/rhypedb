@@ -153,6 +153,31 @@ pub enum EngineError {
         expected: &'static str,
         found: &'static str,
     },
+
+    /// Cutover (card 2) found an object whose source field is still at the
+    /// source kind but carries NO `<field>__shadow` sibling — the converter
+    /// never reached it (a torn backfill, or a write that landed before the
+    /// converter was registered). Cutover refuses to silently flip such a row;
+    /// the plan is parked `Failed`. Re-run the migration (resume) to backfill
+    /// the missing shadows, then cut over.
+    #[error(
+        "cutover of plan {plan_id} found object {object_id} with no shadow for the migrating field; re-run the migration to backfill it before cutover"
+    )]
+    MigrationCutoverShadowMissing { plan_id: u64, object_id: u64 },
+
+    /// Cutover (card 2) found an object whose `<field>__shadow_cv` stamp does
+    /// not match the plan's pinned converter version — the shadow was written
+    /// by a stale converter. Cutover refuses (the plan is parked `Failed`);
+    /// re-backfill with the pinned converter before cutting over.
+    #[error(
+        "cutover of plan {plan_id} found object {object_id} with a stale shadow (converter version {found_cv}, expected {want_cv}); re-backfill before cutover"
+    )]
+    MigrationCutoverShadowStale {
+        plan_id: u64,
+        object_id: u64,
+        found_cv: u32,
+        want_cv: u32,
+    },
 }
 
 /// Failures specific to the persisted schema catalog (see

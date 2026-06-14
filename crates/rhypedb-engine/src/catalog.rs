@@ -3937,24 +3937,80 @@ fn persist_migration_plan(storage: &LsmTree, plan: &MigrationPlan) -> EngineResu
     Ok(())
 }
 
+/// Point-load a single migration plan within `txn`. Public so the card-2
+/// cutover (a `Database` method — it must reach the index/rev-edge cover
+/// maintenance that lives on `Database`, not `LsmTree`) can read the plan
+/// it drives.
+pub(crate) fn load_migration_plan(
+    storage: &LsmTree,
+    txn: &rhypedb_storage::mvcc::Transaction,
+    plan_id: u64,
+) -> EngineResult<MigrationPlan> {
+    require_migration_plan(storage, txn, plan_id)
+}
+
+/// The `(key, encoded-bytes)` pair for a plan record, so the card-2 cutover
+/// loop can stage the plan-record advance (cutover cursor / phase) LAST in its
+/// own per-chunk batch — the same crash-safe ordering `run_migration_chunks`
+/// uses.
+pub(crate) fn migration_plan_record(plan: &MigrationPlan) -> (Bytes, Bytes) {
+    (
+        KeyBuilder::catalog_migration_plan(plan.plan_id),
+        encode_migration_plan(plan),
+    )
+}
+
+/// Park a plan `Failed` in its own txn (mirrors the worker's Failed-park).
+/// Used by the cutover when a row's shadow is missing or stale — the chunk's
+/// data txn is aborted, but the Failed status must persist so quiesce stays
+/// armed for inspection and the operator can re-backfill before retrying.
+pub(crate) fn park_migration_failed(storage: &LsmTree, plan_id: u64) -> EngineResult<()> {
+    let mut txn = storage.begin_txn();
+    let mut plan = match require_migration_plan(storage, &txn, plan_id) {
+        Ok(p) => p,
+        Err(e) => {
+            storage.abort(&mut txn);
+            return Err(e);
+        }
+    };
+    plan.status = MigrationStatus::Failed;
+    let (key, value) = migration_plan_record(&plan);
+    storage.put(&mut txn, &key, value)?;
+    storage.commit(&mut txn)?;
+    Ok(())
+}
+
 /// The trailing 8 bytes of an object key are its `object_id` (BE).
 fn object_id_from_key(key: &[u8]) -> u64 {
     u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap())
 }
 
-/// Drive a plan's chunk loop to data-exhaustion. Loads the plan, resolves
-/// the type id once, then converts the object keyspace in chunks. Each chunk
-/// commits as `[converted object blobs..., updated plan record LAST]`, so a
-/// torn WAL tail can only drop the cursor advance — never leave the cursor
-/// AHEAD of its durable blobs. Combined with per-row idempotency-on-target
-/// (a row already at the target kind is skipped), re-running from the last
-/// durable cursor after a crash is correct.
+/// Backfill the `<field>__shadow` siblings for a plan's `Converting` phase
+/// (shadow-field card 2). Loads the plan, resolves the type id once, then scans
+/// the object keyspace in chunks. For each row it converts the SOURCE value and
+/// writes a `<field>__shadow` + `<field>__shadow_cv` (= the converter version)
+/// sibling into the blob, **leaving the source field intact** — reads continue
+/// to serve the source until the separate cutover pass promotes the shadow.
 ///
-/// Does NOT flip the catalog kind — the caller invokes
-/// `finalize_migration_cutover` after this returns `Ok`. On a converter
-/// error, a converter that returns the wrong kind, or an on-disk row whose
-/// kind is neither source nor target, the plan is parked `Failed` (quiesce
-/// stays armed for inspection) and the error is returned.
+/// Each chunk commits as `[shadowed object blobs..., updated plan record LAST]`,
+/// so a torn WAL tail can only drop the cursor advance — never leave the cursor
+/// AHEAD of its durable blobs. Combined with per-row idempotency (a row whose
+/// `<field>__shadow` is already present AND stamped with the current converter
+/// version is skipped), re-running from the last durable cursor after a crash is
+/// correct. A `<field>__shadow` left by an OLD converter version is re-stamped.
+///
+/// The per-chunk commit is wrapped in a bounded `WriteConflict` retry that
+/// re-snapshots and re-scans the chunk (a concurrent live double-writer in card-2
+/// inc 2d may have advanced a row's shadow; the idempotency skip then drops it).
+/// During inc 2c quiesce is still armed, so no conflict can occur — the retry is
+/// dormant until 2d lifts the write barrier.
+///
+/// Does NOT bump the object generation (the source is unchanged, so covers stay
+/// correct during `Converting`) and does NOT flip the catalog kind — the caller
+/// invokes the cutover after this returns `Ok`. On a converter error, a
+/// converter that returns the wrong kind, or an on-disk row whose source kind is
+/// neither source nor target, the plan is parked `Failed` (quiesce stays armed
+/// for inspection) and the error is returned.
 pub(crate) fn run_migration_chunks(
     storage: &LsmTree,
     plan_id: u64,
@@ -3984,9 +4040,16 @@ pub(crate) fn run_migration_chunks(
         (plan, type_id)
     };
 
+    // Bound on per-chunk WriteConflict retries before giving up (a hot key
+    // under concurrent live writes in card-2 inc 2d). Dormant in inc 2c.
+    const WRITE_CONFLICT_RETRIES: u32 = 8;
+
     let field_name = plan.field_name.clone();
+    let shadow_name = format!("{field_name}__shadow");
+    let shadow_cv_name = format!("{field_name}__shadow_cv");
     let src_kind = plan.src_kind;
     let target_kind = plan.target_kind;
+    let converter_version = plan.converter_version;
     let chunk_size = if plan.chunk_size == 0 {
         DEFAULT_MIGRATION_CHUNK_SIZE
     } else {
@@ -3996,8 +4059,8 @@ pub(crate) fn run_migration_chunks(
     let mut cursor = plan.cursor;
 
     loop {
-        // Resume strictly AFTER the cursor (idempotency-on-target makes
-        // re-including it harmless, but skipping it is cheaper).
+        // Resume strictly AFTER the cursor (idempotency makes re-including it
+        // harmless, but skipping it is cheaper).
         let start = if cursor == 0 {
             object_prefix.clone()
         } else {
@@ -4008,107 +4071,148 @@ pub(crate) fn run_migration_chunks(
             }
         };
 
-        let mut txn = storage.begin_txn();
-        let snap = txn.snapshot();
-        let chunk = storage.scan_chunk_raw(snap, &object_prefix, &start, chunk_size)?;
-        let Some(high_water) = chunk.high_water.clone() else {
-            // No key — live or tombstoned — past the cursor: data done.
-            storage.abort(&mut txn);
-            break;
-        };
-
-        let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(chunk.live.len() + 1);
-        let mut converted_this_chunk: u64 = 0;
-        for (key, blob) in &chunk.live {
-            let object_id = object_id_from_key(key);
-            let mut fields = crate::object::deserialize_fields(blob);
-            let Some(old_value) = fields.get(&field_name).cloned() else {
-                continue; // field absent on this row — nothing to convert
-            };
-            let got_kind = value_to_kind_byte(&old_value);
-            if got_kind == target_kind {
-                continue; // already converted (idempotent re-scan after crash)
-            }
-            if got_kind == kind_byte::UNSET {
-                continue; // Null — skip exactly as an absent field is skipped
-            }
-            if got_kind != src_kind {
-                // On-disk data disagrees with the catalog. Park Failed
-                // (quiesce held) rather than guess. Abort this chunk's
-                // uncommitted blobs first; the cursor stays where the last
-                // committed chunk left it.
+        // Process one chunk, retrying its commit on a WriteConflict by
+        // re-snapshotting + re-scanning (the idempotency skip drops rows a
+        // racing writer already shadowed). `None` = data exhausted; `Some` =
+        // committed (carries the advanced plan + whether more chunks remain).
+        let mut attempts = 0u32;
+        let committed: Option<(MigrationPlan, bool)> = loop {
+            let mut txn = storage.begin_txn();
+            let snap = txn.snapshot();
+            let chunk = storage.scan_chunk_raw(snap, &object_prefix, &start, chunk_size)?;
+            let Some(high_water) = chunk.high_water.clone() else {
+                // No key — live or tombstoned — past the cursor: data done.
                 storage.abort(&mut txn);
-                plan.status = MigrationStatus::Failed;
-                persist_migration_plan(storage, &plan)?;
-                return Err(EngineError::Catalog(
-                    CatalogError::MigrationRowUnexpectedKind {
-                        plan_id,
-                        object_id,
-                        got_kind: kind_name(got_kind),
-                        expected_kind: kind_name(src_kind),
-                    },
-                ));
-            }
-            let new_value = match converter(object_id, &old_value) {
-                Ok(v) => v,
-                Err(e) => {
+                break None;
+            };
+            let more = chunk.more;
+            // Advance the cursor to the tombstone-inclusive high-water mark so
+            // a tombstone run longer than the chunk can't strand live keys.
+            let next_cursor = object_id_from_key(&high_water);
+
+            let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(chunk.live.len() + 1);
+            let mut converted_this_chunk: u64 = 0;
+            for (key, blob) in &chunk.live {
+                let object_id = object_id_from_key(key);
+                let mut fields = crate::object::deserialize_fields(blob);
+                let Some(old_value) = fields.get(&field_name).cloned() else {
+                    continue; // field absent on this row — nothing to convert
+                };
+                let src_got = value_to_kind_byte(&old_value);
+                if src_got == target_kind {
+                    // Source already holds a target-kind value (anomalous, or a
+                    // row that predates the source schema). No shadow needed —
+                    // cutover treats source==target+no-shadow as already-cut.
+                    continue;
+                }
+                if src_got == kind_byte::UNSET {
+                    continue; // Null — carries no shadow (mirrors the write hook)
+                }
+                if src_got != src_kind {
+                    // On-disk source disagrees with the catalog. Park Failed
+                    // (quiesce held) rather than guess. Abort this chunk's
+                    // uncommitted blobs first; the cursor stays where the last
+                    // committed chunk left it.
                     storage.abort(&mut txn);
                     plan.status = MigrationStatus::Failed;
                     persist_migration_plan(storage, &plan)?;
                     return Err(EngineError::Catalog(
-                        CatalogError::FieldTypeChangeConverterFailed {
-                            qualified: format!("{}.{}", plan.type_name, field_name),
+                        CatalogError::MigrationRowUnexpectedKind {
+                            plan_id,
                             object_id,
-                            reason: e.to_string(),
+                            got_kind: kind_name(src_got),
+                            expected_kind: kind_name(src_kind),
                         },
                     ));
                 }
-            };
-            let out_kind = value_to_kind_byte(&new_value);
-            if out_kind != target_kind {
-                storage.abort(&mut txn);
-                plan.status = MigrationStatus::Failed;
-                persist_migration_plan(storage, &plan)?;
-                return Err(EngineError::Catalog(
-                    CatalogError::FieldTypeChangeConverterReturnedWrongKind {
-                        qualified: format!("{}.{}", plan.type_name, field_name),
-                        object_id,
-                        got_kind: kind_name(out_kind),
-                        want_kind: kind_name(target_kind),
-                    },
-                ));
+                // Idempotency: a `<field>__shadow` present AND stamped with the
+                // CURRENT converter version is up to date — skip. A shadow from
+                // an OLD converter version (or with no `_cv` stamp) is stale and
+                // must be re-backfilled, so fall through and re-convert.
+                if fields.contains_key(&shadow_name)
+                    && matches!(
+                        fields.get(&shadow_cv_name),
+                        Some(crate::object::Value::U32(v)) if *v == converter_version
+                    )
+                {
+                    continue;
+                }
+                let new_value = match converter(object_id, &old_value) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        storage.abort(&mut txn);
+                        plan.status = MigrationStatus::Failed;
+                        persist_migration_plan(storage, &plan)?;
+                        return Err(EngineError::Catalog(
+                            CatalogError::FieldTypeChangeConverterFailed {
+                                qualified: format!("{}.{}", plan.type_name, field_name),
+                                object_id,
+                                reason: e.to_string(),
+                            },
+                        ));
+                    }
+                };
+                let out_kind = value_to_kind_byte(&new_value);
+                if out_kind != target_kind {
+                    storage.abort(&mut txn);
+                    plan.status = MigrationStatus::Failed;
+                    persist_migration_plan(storage, &plan)?;
+                    return Err(EngineError::Catalog(
+                        CatalogError::FieldTypeChangeConverterReturnedWrongKind {
+                            qualified: format!("{}.{}", plan.type_name, field_name),
+                            object_id,
+                            got_kind: kind_name(out_kind),
+                            want_kind: kind_name(target_kind),
+                        },
+                    ));
+                }
+                // Write the shadow sibling + its converter-version stamp, LEAVE
+                // the source field. No generation bump: the source is unchanged
+                // so every cover that embeds it stays correct during Converting.
+                fields.insert(shadow_name.clone(), new_value);
+                fields.insert(
+                    shadow_cv_name.clone(),
+                    crate::object::Value::U32(converter_version),
+                );
+                puts.push((key.clone(), crate::object::serialize_fields(&fields)));
+                converted_this_chunk += 1;
             }
-            // Bump the generation BEFORE the converted blob so a covered read
-            // re-probes the new value instead of serving a stale cover (see
-            // stage_generation_bump). A storage error here is infra, not a
-            // data/converter fault — abort and return without parking Failed.
-            if let Err(e) = stage_generation_bump(storage, &txn, type_id, object_id, &mut puts) {
-                storage.abort(&mut txn);
-                return Err(e);
+
+            let mut plan_after = plan.clone();
+            plan_after.cursor = next_cursor;
+            plan_after.objects_converted =
+                plan.objects_converted.saturating_add(converted_this_chunk);
+            plan_after.status = MigrationStatus::Running;
+            // Phase stays Converting throughout this loop.
+            // CRASH-SAFE ORDER: object blobs FIRST, plan record LAST.
+            puts.push((
+                KeyBuilder::catalog_migration_plan(plan_id),
+                encode_migration_plan(&plan_after),
+            ));
+            storage.put_batch(&mut txn, &puts)?;
+            match storage.commit(&mut txn) {
+                Ok(_) => break Some((plan_after, more)),
+                Err(rhypedb_storage::Error::WriteConflict)
+                    if attempts < WRITE_CONFLICT_RETRIES =>
+                {
+                    attempts += 1;
+                    continue; // re-snapshot + re-scan + re-skip already-shadowed
+                }
+                Err(e) => return Err(EngineError::Storage(e)),
             }
-            fields.insert(field_name.clone(), new_value);
-            puts.push((key.clone(), crate::object::serialize_fields(&fields)));
-            converted_this_chunk += 1;
-        }
+        };
 
-        // Advance the cursor to the tombstone-inclusive high-water mark so a
-        // tombstone run longer than the chunk can't strand live keys past it.
-        cursor = object_id_from_key(&high_water);
-        plan.cursor = cursor;
-        plan.objects_converted = plan.objects_converted.saturating_add(converted_this_chunk);
-        plan.status = MigrationStatus::Running;
-        // CRASH-SAFE ORDER: object blobs FIRST, plan record LAST.
-        puts.push((
-            KeyBuilder::catalog_migration_plan(plan_id),
-            encode_migration_plan(&plan),
-        ));
-        storage.put_batch(&mut txn, &puts)?;
-        storage.commit(&mut txn)?;
-
-        // `!more` is the ONLY sound exhaustion signal (live.len() < chunk
-        // cannot be — a tombstone run shrinks the live count below the cap).
-        if !chunk.more {
-            break;
+        match committed {
+            None => break, // data exhausted
+            Some((plan_after, more)) => {
+                plan = plan_after;
+                cursor = plan.cursor;
+                // `!more` is the ONLY sound exhaustion signal (live.len() <
+                // chunk cannot be — a tombstone run shrinks live below the cap).
+                if !more {
+                    break;
+                }
+            }
         }
     }
 
