@@ -952,7 +952,7 @@ pub(crate) fn apply_migration(
         // Refuse renaming a type or field that has an UNSETTLED chunked
         // field-type migration plan. A rename re-keys the catalog entry by
         // name (preserving the numeric id), but the plan and its name-keyed
-        // lookups (`finalize_migration_cutover`, `active_plan_for_field`)
+        // lookups (`finalize_migration_cutover`, `active_plan_for_type`)
         // still reference the OLD name — the cutover would silently never
         // land and a later reopen would hard-error `FieldKindChanged`.
         // Symmetric to the offline `change_field_type` interlock.
@@ -1691,20 +1691,19 @@ pub(crate) fn apply_field_type_change(
         let qual = format!("{}.{}", verb.type_name, verb.field_name);
 
         // Offline-surface interlock (shadow-field card 1): refuse a
-        // single-commit field-type change while a chunked migration plan is
-        // unsettled on the SAME field. Two independent flippers + a foreign
-        // converter would corrupt the field and double-write its
-        // type_change_history. This one site covers all three offline reach
-        // paths (Database::change_field_type, *_consuming, and
+        // single-commit field-type change while ANY chunked migration plan is
+        // unsettled on the same TYPE. The chunked worker rewrites the whole
+        // object blob with `migration_lock` dropped, so even a change on a
+        // DIFFERENT field of the type would clobber its `o:<type>:*` writes
+        // (and two flippers on one field double-write type_change_history).
+        // This one site covers all three offline reach paths
+        // (Database::change_field_type, *_consuming, and
         // MigrationContext::change_field_type via run_migrations) since they
         // all funnel here. Settled plans (Completed/Cancelled) don't block.
         let plans = scan_migration_plans(storage, snap)?;
-        if let Some(plan_id) = active_plan_for_field(&plans, &verb.type_name, &verb.field_name) {
+        if let Some((qualified, plan_id)) = active_plan_for_type(&plans, &verb.type_name) {
             return Err(EngineError::Catalog(
-                CatalogError::MigrationFieldHasActivePlan {
-                    qualified: qual,
-                    plan_id,
-                },
+                CatalogError::MigrationFieldHasActivePlan { qualified, plan_id },
             ));
         }
 
@@ -1833,8 +1832,8 @@ pub(crate) fn apply_field_type_change(
 /// Shared validation for a scalar field-type change, used by BOTH the
 /// offline single-commit path (`apply_field_type_change`) and the chunked
 /// migration create path. Runs every gate EXCEPT the active-plan interlock
-/// (each caller does its own `active_plan_for_field` check — offline refuses
-/// any unsettled plan, create refuses a pre-existing one). Returns the
+/// (each caller does its own `active_plan_for_type` check — both refuse while
+/// any unsettled plan covers the same type). Returns the
 /// validated source field entry (cloned) and its owning type id. The error
 /// order is preserved verbatim so the offline-path regression tests stay
 /// byte-identical.
@@ -2746,7 +2745,7 @@ fn reconcile_into_txn(
         };
         let want_kind = schema_kind_byte(&fd.field_type);
         if cat_kind != want_kind
-            && drivable_plan_for_kind_change(&migration_plans, t, f, cat_kind, want_kind).is_none()
+            && resumable_plan_for_kind_change(&migration_plans, t, f, cat_kind, want_kind).is_none()
         {
             return Err(EngineError::Catalog(CatalogError::FieldKindChanged {
                 qualified: qual.clone(),
@@ -3645,30 +3644,34 @@ fn next_migration_id(counter: u64, plans: &[MigrationPlan]) -> u64 {
     counter.max(max_plan).saturating_add(1)
 }
 
-/// The plan id of an *unsettled* (`status.quiesces()`) migration on
-/// `type_name.field_name`, if any. Used by the offline-surface interlock:
-/// a single-commit field-type change is refused while such a plan exists.
-/// Settled plans (Completed/Cancelled) don't block — the field is final.
-fn active_plan_for_field(
-    plans: &[MigrationPlan],
-    type_name: &str,
-    field_name: &str,
-) -> Option<u64> {
+/// `(qualified, plan_id)` of an *unsettled* (`status.quiesces()`) migration
+/// on `type_name` — ANY field. Used by the offline-surface interlock and the
+/// chunked-create interlock: a field-type change (offline OR chunked) and a
+/// rename are refused while any unsettled plan covers the same TYPE.
+///
+/// TYPE-scoped, not field-scoped: the migration worker rewrites the WHOLE
+/// object blob (deserialize all fields, convert one, re-serialize), so two
+/// migrations on different fields of one type — or an offline change on field
+/// B while a chunked plan drives field A with `migration_lock` dropped —
+/// clobber each other's `o:<type>:*` writes. Settled plans (Completed /
+/// Cancelled) don't block — the field is final.
+fn active_plan_for_type(plans: &[MigrationPlan], type_name: &str) -> Option<(String, u64)> {
     plans
         .iter()
-        .find(|p| p.status.quiesces() && p.type_name == type_name && p.field_name == field_name)
-        .map(|p| p.plan_id)
+        .find(|p| p.status.quiesces() && p.type_name == type_name)
+        .map(|p| (format!("{}.{}", p.type_name, p.field_name), p.plan_id))
 }
 
-/// The plan id of a *drivable* (`Pending`/`Running`) migration on
+/// The plan id of an *unsettled* (`status.quiesces()`) migration on
 /// `type_name.field_name` whose src/target kinds exactly match an observed
 /// catalog→schema kind delta, if any. Used by reconcile PASS 2 to recognise
-/// an in-flight field-type cutover and SKIP the `FieldKindChanged` hard
-/// error instead of refusing to open. Stricter than `active_plan_for_field`:
-/// it requires `is_drivable()` (a `Failed`/`AwaitingConverter` plan does NOT
-/// license the kind mismatch — that field is parked, not in motion) AND that
-/// the plan is migrating exactly `cat_kind → want_kind`.
-fn drivable_plan_for_kind_change(
+/// an in-flight field-type cutover and SKIP the `FieldKindChanged` hard error
+/// instead of refusing to open. Licenses the mismatch for ANY resumable plan
+/// (`Running`/`Pending`/`Failed`/`AwaitingConverter`) migrating exactly
+/// `cat_kind → want_kind`: a `Failed`/`AwaitingConverter` plan still needs the
+/// operator to reopen with the TARGET schema to resume it — refusing the open
+/// outright would brick the type (it can't be opened with either schema).
+fn resumable_plan_for_kind_change(
     plans: &[MigrationPlan],
     type_name: &str,
     field_name: &str,
@@ -3678,7 +3681,7 @@ fn drivable_plan_for_kind_change(
     plans
         .iter()
         .find(|p| {
-            p.status.is_drivable()
+            p.status.quiesces()
                 && p.type_name == type_name
                 && p.field_name == field_name
                 && p.src_kind == cat_kind
@@ -3736,14 +3739,13 @@ pub(crate) fn create_migration_plan(
         let format = decode_format_version("c:F:", &fv_raw)?;
         let cat = load_existing(storage, snap, format)?;
 
-        let qual = format!("{type_name}.{field_name}");
+        // Refuse a second migration on the same TYPE (any field) while one is
+        // unsettled — the worker rewrites the whole object blob, so concurrent
+        // plans on one type clobber each other (see active_plan_for_type).
         let plans = scan_migration_plans(storage, snap)?;
-        if let Some(plan_id) = active_plan_for_field(&plans, type_name, field_name) {
+        if let Some((qualified, plan_id)) = active_plan_for_type(&plans, type_name) {
             return Err(EngineError::Catalog(
-                CatalogError::MigrationFieldHasActivePlan {
-                    qualified: qual,
-                    plan_id,
-                },
+                CatalogError::MigrationFieldHasActivePlan { qualified, plan_id },
             ));
         }
 
@@ -4041,16 +4043,21 @@ pub(crate) fn finalize_migration_cutover(storage: &LsmTree, plan_id: u64) -> Eng
                 KeyBuilder::catalog_field(&plan.type_name, &plan.field_name),
                 encode_id_entry(&new_entry),
             ));
-            // Bump the catalog format FLOOR to V4 (never downgrade a V5+
-            // catalog — `max(current, V4)`).
-            if format_before < CATALOG_FORMAT_V4 {
-                puts.push((
-                    KeyBuilder::catalog_format(),
-                    encode_format_version(CATALOG_FORMAT_V4),
-                ));
-            }
             // Leave c:D: stale — the next open recomputes the digest (kind
             // contributes), reconcile finds no drift, refreshes it.
+        }
+
+        // Bump the catalog format FLOOR to V4 — a completed field-type change
+        // implies V4. INDEPENDENT of the flip guard above: if a torn prior
+        // finalize persisted the flip but dropped this bump (and the plan
+        // record), the idempotent re-run skips the flip yet must STILL restore
+        // the floor, or the version-gate at open is permanently lost. Never
+        // downgrades a V5+ catalog (`max(current, V4)`).
+        if format_before < CATALOG_FORMAT_V4 {
+            puts.push((
+                KeyBuilder::catalog_format(),
+                encode_format_version(CATALOG_FORMAT_V4),
+            ));
         }
 
         plan.status = MigrationStatus::Completed;
@@ -4687,40 +4694,96 @@ mod tests {
     }
 
     #[test]
-    fn active_plan_for_field_matches_unsettled_only() {
-        let plan = |id: u64, status: MigrationStatus| {
+    fn active_plan_for_type_matches_unsettled_any_field() {
+        let plan = |id: u64, field: &str, status: MigrationStatus| {
+            let mut p = sample_plan();
+            p.plan_id = id;
+            p.type_name = "User".into();
+            p.field_name = field.into();
+            p.status = status;
+            p
+        };
+        // Unsettled blocks the TYPE regardless of field (the worker rewrites
+        // the whole blob); settled (Completed / Cancelled) does not.
+        assert_eq!(
+            active_plan_for_type(&[plan(1, "age", MigrationStatus::Running)], "User"),
+            Some(("User.age".into(), 1))
+        );
+        // A different field of the same type still blocks.
+        assert_eq!(
+            active_plan_for_type(&[plan(2, "score", MigrationStatus::AwaitingConverter)], "User"),
+            Some(("User.score".into(), 2))
+        );
+        assert_eq!(
+            active_plan_for_type(&[plan(3, "age", MigrationStatus::Completed)], "User"),
+            None
+        );
+        assert_eq!(
+            active_plan_for_type(&[plan(4, "age", MigrationStatus::Cancelled)], "User"),
+            None
+        );
+        // Different type → no match.
+        assert_eq!(
+            active_plan_for_type(&[plan(5, "age", MigrationStatus::Running)], "Post"),
+            None
+        );
+    }
+
+    #[test]
+    fn resumable_plan_for_kind_change_licenses_unsettled_matching_direction() {
+        let plan = |id: u64, status: MigrationStatus, src: u8, target: u8| {
             let mut p = sample_plan();
             p.plan_id = id;
             p.type_name = "User".into();
             p.field_name = "age".into();
             p.status = status;
+            p.src_kind = src;
+            p.target_kind = target;
             p
         };
-        // Unsettled (Running / AwaitingConverter / Failed / Pending) blocks
-        // the offline path; settled (Completed / Cancelled) does not.
+        use kind_byte::{SCALAR_F64, SCALAR_I64};
+        // Any unsettled status (incl. Failed/AwaitingConverter) licenses the
+        // exact src->target mismatch — otherwise a Failed plan bricks the type
+        // (can't reopen with target schema).
+        for st in [
+            MigrationStatus::Running,
+            MigrationStatus::Pending,
+            MigrationStatus::Failed,
+            MigrationStatus::AwaitingConverter,
+        ] {
+            assert_eq!(
+                resumable_plan_for_kind_change(
+                    &[plan(1, st, SCALAR_I64, SCALAR_F64)],
+                    "User",
+                    "age",
+                    SCALAR_I64,
+                    SCALAR_F64
+                ),
+                Some(1),
+                "{st:?} should license its own kind change"
+            );
+        }
+        // Settled plan does not license.
         assert_eq!(
-            active_plan_for_field(&[plan(1, MigrationStatus::Running)], "User", "age"),
-            Some(1)
-        );
-        assert_eq!(
-            active_plan_for_field(&[plan(2, MigrationStatus::AwaitingConverter)], "User", "age"),
-            Some(2)
-        );
-        assert_eq!(
-            active_plan_for_field(&[plan(3, MigrationStatus::Completed)], "User", "age"),
+            resumable_plan_for_kind_change(
+                &[plan(2, MigrationStatus::Completed, SCALAR_I64, SCALAR_F64)],
+                "User",
+                "age",
+                SCALAR_I64,
+                SCALAR_F64
+            ),
             None
         );
+        // Direction mismatch does not license (guards against masking a real
+        // accidental kind change).
         assert_eq!(
-            active_plan_for_field(&[plan(4, MigrationStatus::Cancelled)], "User", "age"),
-            None
-        );
-        // Wrong field / type → no match.
-        assert_eq!(
-            active_plan_for_field(&[plan(5, MigrationStatus::Running)], "User", "name"),
-            None
-        );
-        assert_eq!(
-            active_plan_for_field(&[plan(6, MigrationStatus::Running)], "Post", "age"),
+            resumable_plan_for_kind_change(
+                &[plan(3, MigrationStatus::Running, SCALAR_I64, SCALAR_F64)],
+                "User",
+                "age",
+                SCALAR_I64,
+                kind_byte::SCALAR_U32
+            ),
             None
         );
     }
