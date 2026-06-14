@@ -108,6 +108,32 @@ pub struct LsmTree {
         parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// One bounded, tombstone-aware step of a resumable range scan
+/// (`LsmTree::scan_chunk_raw`). Built for chunked work that must walk an
+/// entire key range exactly once across crashes — e.g. shadow-field
+/// field-type migrations.
+#[derive(Debug, Clone)]
+pub struct ChunkScan {
+    /// Live (non-tombstone) entries in this chunk, ascending by key. Drawn
+    /// from the globally-smallest `max_distinct` RAW keys at/after the start
+    /// point; may be shorter than `max_distinct` (or empty) when the chunk
+    /// straddles a run of tombstones.
+    pub live: Vec<(Bytes, Bytes)>,
+    /// Highest RAW user key visited this chunk, INCLUDING tombstones. `None`
+    /// iff no key — live or tombstoned — exists at/after the start point
+    /// within `prefix` (the range is exhausted). A resumable caller advances
+    /// its cursor to this key so a tombstone run longer than `max_distinct`
+    /// cannot strand live keys beyond it (which a `scan_from_at_limited`
+    /// caller, seeing only live keys, would do).
+    pub high_water: Option<Bytes>,
+    /// `true` when more keys may exist strictly past `high_water`: either a
+    /// source saturated its `max_distinct` window, or the merged set held
+    /// more than `max_distinct` distinct keys. `false` PROVES the range ends
+    /// at `high_water`. NEVER infer end-of-range from `live.len() <
+    /// max_distinct`; only `!more` (or `high_water == None`) is sound.
+    pub more: bool,
+}
+
 impl LsmTree {
     /// Open or create an LSM-tree at the given directory.
     ///
@@ -610,6 +636,98 @@ impl LsmTree {
             .filter_map(|(k, v)| v.map(|val| (k, val)))
             .take(max_distinct)
             .collect())
+    }
+
+    /// Tombstone-aware bounded range scan for resumable chunked work.
+    ///
+    /// Unlike `scan_from_at_limited`, which drops tombstones BEFORE applying
+    /// the `max_distinct` cap (so neither its result count nor its max live
+    /// key can detect end-of-range across a tombstone run longer than the
+    /// cap), this returns the live entries PLUS a tombstone-inclusive
+    /// `high_water` and a sound `more` flag. A caller advances its cursor to
+    /// `high_water` each step and stops only when `!more` (or `high_water`
+    /// is `None`). See [`ChunkScan`].
+    ///
+    /// `start_user_key` is inclusive (same seek semantics as
+    /// `scan_from_at_limited`); pass the key strictly after the last cursor
+    /// to avoid re-visiting it.
+    pub fn scan_chunk_raw(
+        &self,
+        version: u64,
+        prefix: &[u8],
+        start_user_key: &[u8],
+        max_distinct: usize,
+    ) -> Result<ChunkScan> {
+        if max_distinct == 0 {
+            return Ok(ChunkScan {
+                live: Vec::new(),
+                high_water: None,
+                more: false,
+            });
+        }
+        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
+            std::collections::BTreeMap::new();
+        // A source is "saturated" when it returns a full `max_distinct`
+        // window — it may hold more keys past the window we can't see yet.
+        let mut source_saturated = false;
+
+        let ssts = self.sst_files.read();
+        for sst in ssts.iter() {
+            let rows = sst.scan_from_max(prefix, start_user_key, version, max_distinct);
+            source_saturated |= rows.len() == max_distinct;
+            for (key, value) in rows {
+                merged.insert(key, value);
+            }
+        }
+        drop(ssts);
+
+        let immutables = self.immutable_memtables.read().clone();
+        for mt in immutables.iter() {
+            let rows = mt.scan_from_max(prefix, start_user_key, version, max_distinct);
+            source_saturated |= rows.len() == max_distinct;
+            for (key, value) in rows {
+                merged.insert(key, value);
+            }
+        }
+
+        let active = self.active_memtable.read().clone();
+        let rows = active.scan_from_max(prefix, start_user_key, version, max_distinct);
+        source_saturated |= rows.len() == max_distinct;
+        for (key, value) in rows {
+            merged.insert(key, value);
+        }
+
+        // More keys may lie past `high_water` if either a source saturated
+        // its window OR the merged (deduped) set already holds more than we
+        // will take — the latter catches the case where several unsaturated
+        // sources together overflow `max_distinct` distinct keys (a pure
+        // any-source-saturated test would falsely report exhaustion here and
+        // strand the overflow).
+        let more = source_saturated || merged.len() > max_distinct;
+
+        // Take the globally-smallest `max_distinct` RAW keys (tombstones
+        // included). Each source contributed its own smallest `max_distinct`
+        // keys, so every key in the true global smallest-`max_distinct` is
+        // present: a key with < `max_distinct` keys below it across all
+        // sources has < `max_distinct` keys below it in whichever source
+        // holds it, so it sits inside that source's returned window.
+        let mut high_water: Option<Bytes> = None;
+        let mut live: Vec<(Bytes, Bytes)> = Vec::new();
+        for (k, v) in merged.into_iter().take(max_distinct) {
+            match v {
+                Some(val) => {
+                    high_water = Some(k.clone());
+                    live.push((k, val));
+                }
+                None => high_water = Some(k),
+            }
+        }
+
+        Ok(ChunkScan {
+            live,
+            high_water,
+            more,
+        })
     }
 
     /// Scan for all keys with the given prefix, visible at the given snapshot
@@ -1129,6 +1247,126 @@ mod tests {
             // tests below opt this back on to exercise the worker.
             background_compaction: false,
         }
+    }
+
+    // --- scan_chunk_raw (resumable chunked range scan) -------------------
+
+    // A test key under prefix `P:` whose 8-byte BE suffix == `id`, so
+    // lexicographic order matches numeric order (like real object keys).
+    fn ckey(id: u64) -> Bytes {
+        let mut k = b"P:".to_vec();
+        k.extend_from_slice(&id.to_be_bytes());
+        Bytes::from(k)
+    }
+
+    fn ckey_id(k: &[u8]) -> u64 {
+        u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap())
+    }
+
+    // Drive scan_chunk_raw to completion exactly as the migration worker
+    // does: advance the cursor to `high_water`, stop on `!more` or an empty
+    // range. Returns every live id seen, in scan order.
+    fn collect_via_chunks(tree: &LsmTree, chunk_size: usize) -> Vec<u64> {
+        let prefix = b"P:";
+        let mut out = Vec::new();
+        let mut cursor: Option<u64> = None;
+        loop {
+            let start = match cursor {
+                None => Bytes::from(prefix.to_vec()),
+                Some(c) => ckey(c + 1),
+            };
+            let snap = tree.txn_manager().current_version();
+            let chunk = tree.scan_chunk_raw(snap, prefix, &start, chunk_size).unwrap();
+            let Some(hw) = chunk.high_water.clone() else {
+                break;
+            };
+            for (k, _v) in &chunk.live {
+                out.push(ckey_id(k));
+            }
+            cursor = Some(ckey_id(&hw));
+            if !chunk.more {
+                break;
+            }
+        }
+        out
+    }
+
+    // The load-bearing correctness property: a run of tombstones LONGER than
+    // the chunk size must not strand the live keys beyond it. A
+    // `scan_from_at_limited` caller (which sees only live keys) would land
+    // its cursor inside the run, get an empty result, and wrongly conclude
+    // end-of-range. scan_chunk_raw's tombstone-inclusive high_water walks
+    // straight through.
+    #[test]
+    fn scan_chunk_raw_walks_through_long_tombstone_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        for id in 0..100u64 {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, &ckey(id), Bytes::from("v")).unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+        // Delete a contiguous run of 50 (ids 20..70) — far longer than the
+        // chunk size of 8.
+        for id in 20..70u64 {
+            let mut txn = tree.begin_txn();
+            tree.delete(&mut txn, &ckey(id)).unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+
+        let got = collect_via_chunks(&tree, 8);
+        let expected: Vec<u64> = (0..20).chain(70..100).collect();
+        assert_eq!(got, expected, "long tombstone run stranded live keys");
+    }
+
+    // Validates the `more` signal across MULTIPLE sources that each stay
+    // UNDER the cap but together overflow it. A naive `more = any source
+    // saturated` would report exhaustion after the first chunk and drop the
+    // overflow; the correct `more = saturated || merged_len > cap` continues.
+    #[test]
+    fn scan_chunk_raw_more_reflects_cross_source_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        // Even ids -> flushed to an SST.
+        for id in [0u64, 2, 4, 6, 8] {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, &ckey(id), Bytes::from("v")).unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+        tree.flush().unwrap();
+        // Odd ids -> live in the active memtable.
+        for id in [1u64, 3, 5, 7, 9] {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, &ckey(id), Bytes::from("v")).unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+
+        // cap 8: SST returns 5 (<8), memtable returns 5 (<8) — neither
+        // saturates — but merged is 10 distinct > 8, so the first chunk MUST
+        // set more=true.
+        let snap = tree.txn_manager().current_version();
+        let first = tree
+            .scan_chunk_raw(snap, b"P:", b"P:", 8)
+            .unwrap();
+        assert_eq!(first.live.len(), 8);
+        assert!(first.more, "cross-source overflow must report more=true");
+
+        let got = collect_via_chunks(&tree, 8);
+        assert_eq!(got, (0..10).collect::<Vec<_>>());
+    }
+
+    // An empty range yields high_water=None (the worker's terminal signal).
+    #[test]
+    fn scan_chunk_raw_empty_range_high_water_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let snap = tree.txn_manager().current_version();
+        let chunk = tree.scan_chunk_raw(snap, b"P:", b"P:", 8).unwrap();
+        assert!(chunk.live.is_empty());
+        assert!(chunk.high_water.is_none());
+        assert!(!chunk.more);
     }
 
     // Regression: background compaction must not drop committed data. With
