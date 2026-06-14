@@ -1749,6 +1749,10 @@ pub(crate) fn apply_field_type_change(
                         },
                     ));
                 }
+                // Bump the generation BEFORE the converted blob so a covered
+                // read re-probes the new value instead of serving the stale
+                // cover (see stage_generation_bump).
+                stage_generation_bump(storage, &txn, type_id, object_id, &mut puts)?;
                 fields.insert(verb.field_name.clone(), new_value);
                 let new_blob = crate::object::serialize_fields(&fields);
                 puts.push((key.clone(), new_blob));
@@ -1946,6 +1950,46 @@ fn validate_field_type_change(
         })
     })?;
     Ok((field_entry, type_id))
+}
+
+/// Stage a generation bump for a migrated object so rev-edge COVERS that
+/// embed its old field value are invalidated.
+///
+/// Rev-edge 1:1-forward covers cache a copy of the target's FieldMap plus a
+/// `<field>__cover_v` stamp = the target's generation at cover-write time. The
+/// fusion reader serves the cached cover iff `cover_v == object_version(target)`
+/// (executor.rs). A field-type change rewrites the object's `o:` blob WITHOUT
+/// going through the normal update path, so the generation never moves — and
+/// because of born-at-1 EVERY live object is generation >= 1, so `cover_v ==
+/// object_version` still holds and a covered read serves the STALE source
+/// value. Bumping the generation here (write the `g:` object_version key =
+/// current + 1; born-at-1 default of 1 when the key is absent) makes the
+/// staleness check re-probe the converted `o:` blob.
+///
+/// MUST be staged BEFORE the converted blob in the same batch: with per-entry
+/// WAL framing a torn tail drops a suffix, so "blob converted, generation not
+/// bumped" (which idempotent-on-target resume would then SKIP, stranding a
+/// stale cover forever) must be impossible. Over-bumping on a re-do is
+/// harmless — the generation is a monotonic staleness counter, not a count.
+/// The live handle's in-memory `version_counters` is left stale (the migrate
+/// handle is stale post-change → reopen rebuilds it from these `g:` keys).
+fn stage_generation_bump(
+    storage: &LsmTree,
+    txn: &rhypedb_storage::mvcc::Transaction,
+    type_id: u64,
+    object_id: u64,
+    puts: &mut Vec<(Bytes, Bytes)>,
+) -> EngineResult<()> {
+    let g_key = KeyBuilder::object_version(type_id, object_id);
+    let current = match storage.get(txn, &g_key)? {
+        Some(b) if b.len() == 8 => u64::from_be_bytes(b[..].try_into().unwrap()),
+        _ => 1, // born-at-1: a live object with no g: key is generation 1
+    };
+    puts.push((
+        g_key,
+        Bytes::copy_from_slice(&current.saturating_add(1).to_be_bytes()),
+    ));
+    Ok(())
 }
 
 fn is_scalar_kind(k: u8) -> bool {
@@ -3962,6 +4006,14 @@ pub(crate) fn run_migration_chunks(
                         want_kind: kind_name(target_kind),
                     },
                 ));
+            }
+            // Bump the generation BEFORE the converted blob so a covered read
+            // re-probes the new value instead of serving a stale cover (see
+            // stage_generation_bump). A storage error here is infra, not a
+            // data/converter fault — abort and return without parking Failed.
+            if let Err(e) = stage_generation_bump(storage, &txn, type_id, object_id, &mut puts) {
+                storage.abort(&mut txn);
+                return Err(e);
             }
             fields.insert(field_name.clone(), new_value);
             puts.push((key.clone(), crate::object::serialize_fields(&fields)));

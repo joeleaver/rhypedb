@@ -6154,6 +6154,87 @@ mod tests {
     // Chunked field-type migration (shadow-field card 1/5, increment 3)
     // -----------------------------------------------------------------
 
+    /// A field-type change must BUMP each converted object's generation so a
+    /// rev-edge cover embedding the old field value is invalidated (the fusion
+    /// reader serves a cover iff `cover_v == object_version`; born-at-1 makes
+    /// every live object generation >= 1, so without a bump `cover_v ==
+    /// object_version` keeps holding and a covered read serves the STALE source
+    /// value). Verified for BOTH the offline single-commit path and the
+    /// chunked migration path. Fails (object_version stays 1) without the
+    /// stage_generation_bump fix.
+    #[test]
+    fn field_type_change_bumps_generation_to_invalidate_covers() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        // --- offline single-commit path ---
+        let dir = tempfile::tempdir().unwrap();
+        let off_id = {
+            let db = Database::open(
+                parse_schema(r#"type User { score: i64 }"#).unwrap(),
+                dir.path(),
+            )
+            .unwrap();
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(5));
+            let id = db.create("User", f).unwrap().id;
+            assert_eq!(db.object_version("User", id), 1, "born-at-1");
+            db.change_field_type(
+                "User",
+                "score",
+                FieldType::Scalar(ScalarType::F64),
+                |_, v| match v {
+                    Value::I64(i) => Ok(Value::F64(*i as f64)),
+                    _ => Ok(Value::F64(0.0)),
+                },
+            )
+            .unwrap();
+            id
+        };
+        let db = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(
+            db.object_version("User", off_id) > 1,
+            "offline change_field_type must bump generation (covers would serve stale source); got {}",
+            db.object_version("User", off_id)
+        );
+
+        // --- chunked migration path ---
+        let dir2 = tempfile::tempdir().unwrap();
+        let chunk_id = {
+            let db = Database::open(
+                parse_schema(r#"type User { score: i64 }"#).unwrap(),
+                dir2.path(),
+            )
+            .unwrap();
+            db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(7));
+            let id = db.create("User", f).unwrap().id;
+            db.create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+            })
+            .unwrap();
+            id
+        };
+        let db2 = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir2.path(),
+        )
+        .unwrap();
+        assert!(
+            db2.object_version("User", chunk_id) > 1,
+            "chunked migration must bump generation; got {}",
+            db2.object_version("User", chunk_id)
+        );
+    }
+
     // A converter that widens I64 -> F64; anything else is a hard error
     // (so a double-conversion or wrong-kind row surfaces, not silently
     // coerces).
