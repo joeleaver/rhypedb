@@ -1713,6 +1713,19 @@ pub(crate) fn apply_field_type_change(
                 },
             ));
         }
+        // Refuse targets the engine has no writable `Value` for (DateTime /
+        // Json): a converter could never return a value whose kind byte
+        // matches, so the migration would fail every row. Also closes the
+        // latent offline-path bug where, with zero objects, this would
+        // vacuously flip the catalog to an unrepresentable kind.
+        if !is_representable_target_kind(verb.target_kind) {
+            return Err(EngineError::Catalog(
+                CatalogError::FieldTypeChangeUnrepresentableTarget {
+                    qualified: qual,
+                    kind: kind_name(verb.target_kind),
+                },
+            ));
+        }
         // Refuse @indexed / @unique / @vectorize. We consult the
         // schema's field definition for the source field: the field
         // exists in cat (just validated above), so it must exist in
@@ -1900,6 +1913,28 @@ fn is_scalar_kind(k: u8) -> bool {
             | SCALAR_DATETIME
             | SCALAR_BYTES
             | SCALAR_JSON
+    )
+}
+
+/// Target kinds a converter can actually PRODUCE — exactly the kinds
+/// `value_to_kind_byte` can emit. `SCALAR_DATETIME` and `SCALAR_JSON` are
+/// scalar (so `is_scalar_kind` admits them) but the `Value` enum has no
+/// variant for them, so no converter could ever return a value whose kind
+/// byte matches — a migration targeting them would fail every row. A
+/// field-type change MUST refuse them as a target up front.
+fn is_representable_target_kind(k: u8) -> bool {
+    use kind_byte::*;
+    matches!(
+        k,
+        SCALAR_STRING
+            | SCALAR_U32
+            | SCALAR_U64
+            | SCALAR_I32
+            | SCALAR_I64
+            | SCALAR_F32
+            | SCALAR_F64
+            | SCALAR_BOOL
+            | SCALAR_BYTES
     )
 }
 

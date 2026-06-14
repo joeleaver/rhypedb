@@ -6621,6 +6621,28 @@ mod tests {
     }
 
     #[test]
+    fn change_field_type_refuses_unrepresentable_target() {
+        // DateTime/Json have no writable Value variant, so no converter could
+        // ever produce a matching value — refuse the target up front (also
+        // covers the chunked create path, which shares this validation).
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema("type User { age: i64 }").unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let err = db
+            .change_field_type(
+                "User",
+                "age",
+                rhypedb_schema::FieldType::Scalar(rhypedb_schema::ScalarType::DateTime),
+                |_id, v| Ok(v.clone()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::FieldTypeChangeUnrepresentableTarget { .. })
+        ));
+    }
+
+    #[test]
     fn inverse_relationship_traversal() {
         let dir = tempfile::tempdir().unwrap();
         let schema = parse_schema(

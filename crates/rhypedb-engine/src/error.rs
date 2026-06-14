@@ -350,6 +350,15 @@ pub enum CatalogError {
     #[error("change_field_type {qualified:?}: source and target kind are the same; remove the verb")]
     FieldTypeChangeNoOp { qualified: String },
 
+    /// The target kind has no writable `Value` representation (DateTime /
+    /// Json), so a converter could never produce a matching value and the
+    /// migration would fail every row. Refused up front.
+    #[error("change_field_type {qualified:?}: target kind {kind} has no writable Value representation; pick a representable scalar")]
+    FieldTypeChangeUnrepresentableTarget {
+        qualified: String,
+        kind: &'static str,
+    },
+
     /// Card 4/5 phase 1 only supports migrating plain scalar fields.
     /// `@indexed`, `@unique`, `@vectorize` are deferred to a follow-on
     /// card because each requires additional on-disk rewriting
