@@ -949,6 +949,36 @@ pub(crate) fn apply_migration(
         // RenameSourceNotFound. Migration permanently stuck.
         check_field_rename_chain_directives(schema, verbs)?;
 
+        // Refuse renaming a type or field that has an UNSETTLED chunked
+        // field-type migration plan. A rename re-keys the catalog entry by
+        // name (preserving the numeric id), but the plan and its name-keyed
+        // lookups (`finalize_migration_cutover`, `active_plan_for_field`)
+        // still reference the OLD name — the cutover would silently never
+        // land and a later reopen would hard-error `FieldKindChanged`.
+        // Symmetric to the offline `change_field_type` interlock.
+        let plans = scan_migration_plans(storage, snap)?;
+        for verb in verbs {
+            let blocked = match verb {
+                RenameVerb::Type { old, .. } => plans
+                    .iter()
+                    .find(|p| p.status.quiesces() && &p.type_name == old)
+                    .map(|p| (old.clone(), p.plan_id)),
+                RenameVerb::Field {
+                    type_name, old, ..
+                } => plans
+                    .iter()
+                    .find(|p| {
+                        p.status.quiesces() && &p.type_name == type_name && &p.field_name == old
+                    })
+                    .map(|p| (format!("{type_name}.{old}"), p.plan_id)),
+            };
+            if let Some((qualified, plan_id)) = blocked {
+                return Err(EngineError::Catalog(
+                    CatalogError::MigrationFieldHasActivePlan { qualified, plan_id },
+                ));
+            }
+        }
+
         // Per-verb pre-flight + mutation. The whole plan succeeds or
         // fails as a unit before any storage write happens. Within a
         // single plan, each verb's effect is visible to the next.
@@ -2353,9 +2383,21 @@ fn recover_partial_into_txn(
     txn: &mut rhypedb_storage::mvcc::Transaction,
     snap: u64,
 ) -> EngineResult<Catalog> {
+    // Blanket-clear the catalog keyspace, THEN re-backfill from the live
+    // schema. EXEMPT the shadow-field migration keys (`c:P:` plans + the
+    // `c:N:M` id counter): they are not schema-derived, so backfill can't
+    // recreate them, and a torn-init reopen that hits this branch while a
+    // migration is in flight would otherwise silently wipe the plan + the
+    // counter — losing crash-resume and letting a freed id be reissued.
+    let plan_prefix = KeyBuilder::catalog_migration_plan_prefix();
+    let counter_key = KeyBuilder::catalog_next_migration();
     let stale = storage.scan_prefix_at(snap, &KeyBuilder::catalog_prefix_all())?;
-    if !stale.is_empty() {
-        let deletes: Vec<Bytes> = stale.into_iter().map(|(k, _)| k).collect();
+    let deletes: Vec<Bytes> = stale
+        .into_iter()
+        .map(|(k, _)| k)
+        .filter(|k| !k.starts_with(&plan_prefix) && k != &counter_key)
+        .collect();
+    if !deletes.is_empty() {
         storage.delete_batch(txn, &deletes)?;
     }
     backfill_into_txn(storage, schema, txn)
@@ -2682,6 +2724,18 @@ fn reconcile_into_txn(
     }
 
     // PASS 2 — detect kind changes.
+    //
+    // A kind mismatch is normally a fatal `FieldKindChanged` (the operator
+    // changed a field's type without a migration verb). BUT during an
+    // in-flight chunked field-type migration the catalog kind is still the
+    // SOURCE while the operator has reopened with the TARGET schema — the
+    // legitimate "resume me" state. Recognise a *drivable* plan migrating
+    // exactly `cat_kind -> want_kind` for this field and accept it; the
+    // open path's `auto_resume_migrations` arms quiesce and (once the
+    // converter is registered) drives the cutover that flips the catalog to
+    // match. Only a drivable plan licenses the mismatch — a `Failed` /
+    // `AwaitingConverter` plan does NOT (it's parked, not in motion).
+    let migration_plans = scan_migration_plans(storage, txn.snapshot())?;
     for (qual, &cat_kind) in &cat.field_kinds {
         let (t, f) = split_qualified(qual);
         let Some(td) = schema.types.get(t) else {
@@ -2691,7 +2745,9 @@ fn reconcile_into_txn(
             continue;
         };
         let want_kind = schema_kind_byte(&fd.field_type);
-        if cat_kind != want_kind {
+        if cat_kind != want_kind
+            && drivable_plan_for_kind_change(&migration_plans, t, f, cat_kind, want_kind).is_none()
+        {
             return Err(EngineError::Catalog(CatalogError::FieldKindChanged {
                 qualified: qual.clone(),
                 was: kind_name(cat_kind),
@@ -3612,7 +3668,6 @@ fn active_plan_for_field(
 /// it requires `is_drivable()` (a `Failed`/`AwaitingConverter` plan does NOT
 /// license the kind mismatch — that field is parked, not in motion) AND that
 /// the plan is migrating exactly `cat_kind → want_kind`.
-#[allow(dead_code)] // wired into load_or_initialize reconcile PASS 2 (increment 4)
 fn drivable_plan_for_kind_change(
     plans: &[MigrationPlan],
     type_name: &str,
@@ -4028,6 +4083,12 @@ pub(crate) fn finalize_migration_cutover(storage: &LsmTree, plan_id: u64) -> Eng
 /// caller's `FieldType` to the on-disk kind discriminant.
 pub(crate) fn schema_kind_byte_public(ft: &FieldType) -> u8 {
     schema_kind_byte(ft)
+}
+
+/// Public wrapper for the on-disk kind-byte → human name mapping, so
+/// `Database` can build typed migration errors without duplicating the table.
+pub(crate) fn kind_name_public(k: u8) -> &'static str {
+    kind_name(k)
 }
 
 fn schema_kind_byte(ft: &FieldType) -> u8 {

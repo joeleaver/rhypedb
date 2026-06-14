@@ -302,18 +302,22 @@ pub struct Database {
     /// * a future migrate verb can rebuild and atomically swap the table
     ///   without touching `LsmConfig` or rebuilding the closure (PR B).
     zone_field_id_lookup: Arc<arc_swap::ArcSwap<ZoneFieldIdLookup>>,
-    /// `type_id -> plan_id` for types under an active (quiescing) chunked
-    /// field-type migration (shadow-field card 1). While a type is in this
-    /// set every app write to its objects is REJECTED
+    /// `type_id -> {plan_id, ...}` for types under one or more active
+    /// (quiescing) chunked field-type migrations (shadow-field card 1). While
+    /// a type's set is non-empty every app write to its objects is REJECTED
     /// (`MigrationTypeQuiesced`) — the card-1 "quiesce the migrating type"
     /// contract; card 2 replaces the rejection with a cover-aware
-    /// double-write. The source of truth is the persisted `c:P:` plans;
-    /// this is a lock-free read cache rebuilt from them on open (increment
-    /// 4) and mutated ONLY under `migration_lock.write()` via
-    /// `arm_quiesce`/`disarm_quiesce`. Because every writer takes
-    /// `migration_lock.read()` before consulting it, a writer sees a
-    /// consistent set for the whole duration of its operation.
-    migrating: arc_swap::ArcSwap<std::collections::HashMap<u64, u64>>,
+    /// double-write. A SET (not a single id) because two fields of one type
+    /// can each carry an unsettled plan — disarming one must not un-quiesce
+    /// the type while the other is still in flight. The source of truth is
+    /// the persisted `c:P:` plans; this is a lock-free read cache rebuilt
+    /// from them on open (increment 4) and mutated ONLY under
+    /// `migration_lock.write()` via `arm_quiesce`/`disarm_quiesce`. Because
+    /// every writer takes `migration_lock.read()` before consulting it, a
+    /// writer sees a consistent set for the whole duration of its operation.
+    migrating: arc_swap::ArcSwap<
+        std::collections::HashMap<u64, std::collections::HashSet<u64>>,
+    >,
     /// Per-`Database` named converter registry for chunked field-type
     /// migrations (shadow-field card 1). `name -> (version, converter)`.
     /// Per-`Database` (NOT a process-global) so two DBs in one process —
@@ -839,8 +843,9 @@ impl Database {
                 None => Arc::new(parking_lot::RwLock::new(())),
             },
             zone_field_id_lookup,
-            // Empty until increment 4 rebuilds it from `c:P:` on open;
-            // create_field_type_migration arms it under migration_lock.write().
+            // Rebuilt from `c:P:` by `auto_resume_migrations` on the open path
+            // (below); create_field_type_migration arms it under
+            // migration_lock.write().
             migrating: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
             converters: match &carry {
                 Some(c) => Arc::clone(&c.converters),
@@ -864,6 +869,16 @@ impl Database {
                 .map_err(|e| EngineError::Storage(rhypedb_storage::Error::Io(e)))?;
             *db.cover_refresh_tx.lock() = Some(tx);
             *db.cover_refresh_handle.lock() = Some(handle);
+        }
+
+        // Auto-resume in-flight chunked field-type migrations (shadow-field
+        // card 1) — ONLY on the genuine open path (`carry.is_none()`). The
+        // `_consuming` rebuild path (`carry.is_some()`) is reached while the
+        // caller holds `migration_lock.write()`, and auto-resume re-takes it
+        // (via finalize) — gating on `carry` avoids that self-deadlock and is
+        // also correct: a `_consuming` verb is a schema op, not a fresh open.
+        if carry.is_none() {
+            db.auto_resume_migrations()?;
         }
 
         Ok(db)
@@ -1472,7 +1487,12 @@ impl Database {
     /// migrating-type set; callers already hold `migration_lock.read()` so
     /// the set cannot change under them (it mutates only under `.write()`).
     fn quiescing_plan(&self, type_id: u64) -> Option<u64> {
-        self.migrating.load().get(&type_id).copied()
+        // Any plan in the type's set quiesces it; report the smallest id for
+        // a deterministic error message when several are in flight.
+        self.migrating
+            .load()
+            .get(&type_id)
+            .and_then(|set| set.iter().min().copied())
     }
 
     /// Reject if `type_id` is quiesced by an in-flight field-type migration
@@ -1491,19 +1511,26 @@ impl Database {
     }
 
     /// Arm write-rejection (quiesce) for `type_id` under `plan_id`. MUST be
-    /// called while holding `migration_lock.write()` so no concurrent
-    /// writer observes a torn set; clone-on-write swap of the read cache.
+    /// called while holding `migration_lock.write()` so no concurrent writer
+    /// observes a torn set; clone-on-write swap of the read cache. Adding a
+    /// second plan id to a type already quiesced keeps it quiesced.
     pub(crate) fn arm_quiesce(&self, type_id: u64, plan_id: u64) {
         let mut m = (**self.migrating.load()).clone();
-        m.insert(type_id, plan_id);
+        m.entry(type_id).or_default().insert(plan_id);
         self.migrating.store(Arc::new(m));
     }
 
-    /// Release quiesce for `type_id` (migration completed/cancelled). Same
-    /// locking contract as `arm_quiesce`.
-    pub(crate) fn disarm_quiesce(&self, type_id: u64) {
+    /// Release quiesce for `plan_id` on `type_id` (its migration
+    /// completed/cancelled). The type stays quiesced while any OTHER plan on
+    /// it is still in flight. Same locking contract as `arm_quiesce`.
+    pub(crate) fn disarm_quiesce(&self, type_id: u64, plan_id: u64) {
         let mut m = (**self.migrating.load()).clone();
-        m.remove(&type_id);
+        if let Some(set) = m.get_mut(&type_id) {
+            set.remove(&plan_id);
+            if set.is_empty() {
+                m.remove(&type_id);
+            }
+        }
         self.migrating.store(Arc::new(m));
     }
 
@@ -1604,8 +1631,112 @@ impl Database {
         crate::catalog::run_migration_chunks(&self.storage, plan_id, converter)?;
         let _guard = self.migration_lock.write();
         crate::catalog::finalize_migration_cutover(&self.storage, plan_id)?;
-        self.disarm_quiesce(type_id);
+        self.disarm_quiesce(type_id, plan_id);
         Ok(())
+    }
+
+    /// Refuse to DRIVE a plan unless the open schema declares the field at the
+    /// plan's TARGET kind (shadow-field card 1, blocker F3). Driving flips the
+    /// catalog to the target; if this handle still validates writes against
+    /// the source kind (operator reopened with the OLD schema), finishing the
+    /// migration would silently corrupt. The operator must reopen with the
+    /// target schema first.
+    fn guard_resume_schema(&self, plan: &crate::catalog::MigrationPlan) -> EngineResult<()> {
+        let want = self
+            .schema
+            .get_type(&plan.type_name)
+            .and_then(|td| td.fields.iter().find(|f| f.name == plan.field_name))
+            .map(|fd| crate::catalog::schema_kind_byte_public(&fd.field_type));
+        if want != Some(plan.target_kind) {
+            return Err(EngineError::MigrationResumeSchemaMismatch {
+                plan_id: plan.plan_id,
+                expected: crate::catalog::kind_name_public(plan.target_kind),
+                found: want
+                    .map(crate::catalog::kind_name_public)
+                    .unwrap_or("<absent>"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Open-path hook (shadow-field card 1, inc 4): re-establish the quiesce
+    /// set from the persisted `c:P:` plans and resume any drivable migration
+    /// whose converter is already registered. Runs ONLY on a genuine open
+    /// (not the `_consuming` rebuild — see `rebuild_with_arc_storage`).
+    ///
+    /// At a fresh open the per-`Database` converter registry is empty (the
+    /// operator registers converters AFTER open), so drivable plans are armed
+    /// but NOT driven here — the operator calls `resume_field_type_migration`
+    /// after registering. Every quiescing plan (incl. `Failed` /
+    /// `AwaitingConverter`) still re-arms quiesce so writes stay rejected
+    /// across the restart.
+    fn auto_resume_migrations(&self) -> EngineResult<()> {
+        let plans = {
+            let txn = self.storage.begin_txn();
+            let snap = txn.snapshot();
+            crate::catalog::scan_migration_plans(&self.storage, snap)?
+        };
+        for plan in plans {
+            if !plan.status.quiesces() {
+                continue; // Completed / Cancelled — settled, no protection needed
+            }
+            let Some(&type_id) = self.type_ids.get(&plan.type_name) else {
+                continue; // type no longer exists — nothing to quiesce
+            };
+            {
+                let _guard = self.migration_lock.write();
+                self.arm_quiesce(type_id, plan.plan_id);
+            }
+            if plan.status.is_drivable()
+                && let Some(converter) =
+                    self.resolve_converter(&plan.converter_name, plan.converter_version)
+            {
+                // A registered converter at open time (e.g. carried across a
+                // _consuming rebuild) lets us finish the cutover immediately.
+                self.guard_resume_schema(&plan)?;
+                self.drive_migration_to_completion(plan.plan_id, type_id, &converter)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resume an in-flight chunked field-type migration after a restart (or
+    /// after it parked waiting for its converter). Resolves the plan's pinned
+    /// `(converter_name, converter_version)` from this `Database`'s registry —
+    /// register it first — then drives the plan to completion and cuts over.
+    /// No-op for an already-settled (`Completed`/`Cancelled`) plan.
+    ///
+    /// Like the other migrate verbs, on success this handle's in-memory schema
+    /// is stale (the catalog kind flipped underneath it): reopen with the
+    /// target schema before issuing further writes to the migrated type.
+    pub fn resume_field_type_migration(&self, plan_id: u64) -> EngineResult<()> {
+        self.check_not_migrated()?;
+        let plan = {
+            let txn = self.storage.begin_txn();
+            let snap = txn.snapshot();
+            crate::catalog::scan_migration_plans(&self.storage, snap)?
+                .into_iter()
+                .find(|p| p.plan_id == plan_id)
+                .ok_or(EngineError::MigrationPlanNotFound { plan_id })?
+        };
+        if !plan.status.quiesces() {
+            return Ok(()); // already settled
+        }
+        let type_id = *self.type_ids.get(&plan.type_name).ok_or_else(|| {
+            EngineError::TypeNotFound(plan.type_name.clone())
+        })?;
+        let converter = self
+            .resolve_converter(&plan.converter_name, plan.converter_version)
+            .ok_or_else(|| EngineError::ConverterNotRegistered {
+                name: plan.converter_name.clone(),
+                version: plan.converter_version,
+            })?;
+        self.guard_resume_schema(&plan)?;
+        {
+            let _guard = self.migration_lock.write();
+            self.arm_quiesce(type_id, plan_id); // idempotent if open already armed it
+        }
+        self.drive_migration_to_completion(plan_id, type_id, &converter)
     }
 
     /// Snapshot every persisted migration plan (`c:P:*`), newest semantics
@@ -6459,6 +6590,275 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Auto-resume on open (shadow-field card 1/5, increment 4)
+    // -----------------------------------------------------------------
+
+    // Persist a Running plan WITHOUT driving it — simulates a crash after
+    // create_migration_plan committed the plan but before the chunk loop
+    // finished. Returns the plan id.
+    fn persist_running_plan(db: &Database, type_name: &str, field: &str) -> u64 {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let target = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, type_name, field, target, "widen", 1, 4,
+        )
+        .unwrap()
+        .plan_id
+    }
+
+    /// Open scans `c:P:`, re-arms quiesce for a Running plan (writes rejected),
+    /// and — once the converter is registered — `resume_field_type_migration`
+    /// drives it to completion. Also exercises the plan-aware reconcile (open
+    /// with the TARGET schema while the catalog is still the source kind).
+    #[test]
+    fn database_open_auto_resumes_running_migrations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ids = Vec::new();
+        {
+            let db = Database::open(
+                parse_schema(r#"type User { score: i64 }"#).unwrap(),
+                dir.path(),
+            )
+            .unwrap();
+            for i in 0..6i64 {
+                let mut f = FieldMap::new();
+                f.insert("score".into(), Value::I64(i));
+                ids.push(db.create("User", f).unwrap().id);
+            }
+            // Crash after the plan is persisted Running, before any drive.
+            persist_running_plan(&db, "User", "score");
+        }
+
+        // Reopen with the TARGET schema: plan-aware reconcile accepts the
+        // still-source catalog kind because a drivable plan covers it.
+        let db = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        // Open re-armed quiesce — writes to the migrating type are rejected.
+        let mut f = FieldMap::new();
+        f.insert("score".into(), Value::F64(1.0));
+        assert!(matches!(
+            db.create("User", f),
+            Err(EngineError::MigrationTypeQuiesced { .. })
+        ));
+        let plan_id = db.list_migrations().unwrap()[0].plan_id;
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Running
+        );
+
+        // Register the converter and resume; the migration completes.
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        db.resume_field_type_migration(plan_id).unwrap();
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+        drop(db);
+
+        let db = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        for (id, i) in ids.iter().zip(0i64..) {
+            match db.get("User", *id).unwrap().fields.get("score") {
+                Some(Value::F64(v)) => assert_eq!(*v, i as f64),
+                other => panic!("id {id}: expected F64, got {other:?}"),
+            }
+        }
+        // Quiesce released — writes flow again.
+        let mut f = FieldMap::new();
+        f.insert("score".into(), Value::F64(9.0));
+        assert!(db.create("User", f).is_ok());
+    }
+
+    /// The converter is NOT persisted — only its `(name, version)` is, in the
+    /// plan. After a restart the operator re-registers the same name/version
+    /// and resume resolves it. A version skew leaves the plan unresumable.
+    #[test]
+    fn converter_registry_round_trip_through_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id;
+        {
+            let db = Database::open(
+                parse_schema(r#"type User { score: i64 }"#).unwrap(),
+                dir.path(),
+            )
+            .unwrap();
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(3));
+            db.create("User", f).unwrap();
+            plan_id = persist_running_plan(&db, "User", "score");
+        }
+        let db = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        // Wrong version registered -> resume can't resolve -> refused.
+        db.register_converter("widen", 2, widen_i64_to_f64("User.score"));
+        assert!(matches!(
+            db.resume_field_type_migration(plan_id),
+            Err(EngineError::ConverterNotRegistered { version: 1, .. })
+        ));
+        // Correct (name, version) -> resolves and completes.
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        db.resume_field_type_migration(plan_id).unwrap();
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+    }
+
+    /// Reopening with the SOURCE schema while a migration is in flight lets
+    /// open succeed (catalog == schema), but driving the migration is refused
+    /// — finishing it would flip the catalog to the target under a handle
+    /// still validating against the source kind (blocker F3).
+    #[test]
+    fn resume_refused_when_reopened_with_source_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id;
+        {
+            let db = Database::open(
+                parse_schema(r#"type User { score: i64 }"#).unwrap(),
+                dir.path(),
+            )
+            .unwrap();
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(3));
+            db.create("User", f).unwrap();
+            plan_id = persist_running_plan(&db, "User", "score");
+        }
+        // Reopen with the OLD (source) schema — open succeeds, quiesce armed.
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        assert!(matches!(
+            db.resume_field_type_migration(plan_id),
+            Err(EngineError::MigrationResumeSchemaMismatch { .. })
+        ));
+    }
+
+    /// A torn-init reopen (exactly one of c:F:/c:I: present) blanket-clears the
+    /// catalog keyspace and re-backfills — but the migration plan (`c:P:`) and
+    /// the id counter (`c:N:M`) must survive (they aren't schema-derived), or
+    /// crash-resume is lost and a freed id could be reissued (blocker G).
+    #[test]
+    fn recover_partial_preserves_migration_plan_and_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id;
+        {
+            let db = Database::open(
+                parse_schema(r#"type User { score: i64 }"#).unwrap(),
+                dir.path(),
+            )
+            .unwrap();
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(3));
+            db.create("User", f).unwrap();
+            plan_id = persist_running_plan(&db, "User", "score");
+            // Force the torn-init recovery branch on the next open by removing
+            // the `c:I:` initialized marker (c:F: stays).
+            let mut txn = db.storage.begin_txn();
+            db.storage
+                .delete_batch(
+                    &mut txn,
+                    &[rhypedb_storage::key::KeyBuilder::catalog_initialized()],
+                )
+                .unwrap();
+            db.storage.commit(&mut txn).unwrap();
+        }
+        // Reopen (source schema) -> recover_partial runs -> plan + counter
+        // must survive.
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let migs = db.list_migrations().unwrap();
+        assert_eq!(migs.len(), 1, "plan wiped by recover_partial");
+        assert_eq!(migs[0].plan_id, plan_id);
+        // Counter survived: a new plan on another field gets the NEXT id, not
+        // a reissued one.
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64  rank: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let next = persist_running_plan(&db, "User", "rank");
+        assert!(next > plan_id, "counter reissued a freed id: {next} <= {plan_id}");
+    }
+
+    /// Disarming one plan on a type must NOT un-quiesce the type while another
+    /// plan on a different field of the same type is still in flight.
+    #[test]
+    fn quiesce_survives_disarm_of_sibling_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { a: i64  b: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let tid = db.resolve_type_id("User").unwrap();
+        db.arm_quiesce(tid, 1);
+        db.arm_quiesce(tid, 2);
+        db.disarm_quiesce(tid, 1);
+        // Still quiesced by plan 2.
+        let mut f = FieldMap::new();
+        f.insert("a".into(), Value::I64(1));
+        f.insert("b".into(), Value::I64(2));
+        assert!(matches!(
+            db.create("User", f),
+            Err(EngineError::MigrationTypeQuiesced { plan_id: 2, .. })
+        ));
+        db.disarm_quiesce(tid, 2);
+        let mut f = FieldMap::new();
+        f.insert("a".into(), Value::I64(1));
+        f.insert("b".into(), Value::I64(2));
+        assert!(db.create("User", f).is_ok());
+    }
+
+    /// A rename verb (here a type rename) is refused while an unsettled plan
+    /// covers the type — the plan's name-keyed cutover would go stale
+    /// (blocker F2).
+    #[test]
+    fn rename_refused_while_migration_plan_unsettled() {
+        use crate::catalog::Migration;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let mut f = FieldMap::new();
+        f.insert("score".into(), Value::I64(3));
+        db.create("User", f).unwrap();
+        persist_running_plan(&db, "User", "score");
+        let err = db
+            .run_migrations(vec![Migration::new("rename_user", |m| {
+                m.rename_type("User", "Account")
+            })])
+            .unwrap_err();
+        // run_migrations wraps the verb failure; the underlying reason is the
+        // active-plan refusal.
+        match err {
+            EngineError::Catalog(crate::CatalogError::MigrationVerbFailed {
+                reason, ..
+            }) => assert!(
+                reason.contains("active migration plan"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("expected MigrationVerbFailed, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Migration log (card 5/5)
     // -----------------------------------------------------------------
 
@@ -7169,7 +7569,7 @@ mod tests {
         ));
 
         // Disarm → writes flow again.
-        db.disarm_quiesce(user_tid);
+        db.disarm_quiesce(user_tid, 7);
         assert!(db.create("User", named("Bob")).is_ok());
         assert!(db.update("User", alice.id, named("Alice2")).is_ok());
         assert!(db.delete("User", alice.id).is_ok());

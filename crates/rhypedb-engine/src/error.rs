@@ -121,6 +121,11 @@ pub enum EngineError {
     #[error("no converter registered as ({name}, v{version}); call register_converter before creating the migration")]
     ConverterNotRegistered { name: String, version: u32 },
 
+    /// `resume_field_type_migration` was given a plan id with no `c:P:`
+    /// record.
+    #[error("no migration plan with id {plan_id}")]
+    MigrationPlanNotFound { plan_id: u64 },
+
     /// On open, an in-flight migration plan was found but the schema passed
     /// to `open` still declares the field at its OLD (source) type. Driving
     /// the migration would flip the catalog to the target kind while this
