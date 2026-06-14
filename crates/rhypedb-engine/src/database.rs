@@ -314,6 +314,15 @@ pub struct Database {
     /// `migration_lock.read()` before consulting it, a writer sees a
     /// consistent set for the whole duration of its operation.
     migrating: arc_swap::ArcSwap<std::collections::HashMap<u64, u64>>,
+    /// Per-`Database` named converter registry for chunked field-type
+    /// migrations (shadow-field card 1). `name -> (version, converter)`.
+    /// Per-`Database` (NOT a process-global) so two DBs in one process —
+    /// the multi-tenant-in-VM deployment — can't collide on a converter
+    /// name and bind the wrong body at resume. `Arc` so it is shared with
+    /// the `_consuming` rebuilt handle. A migration pins `(name, version)`
+    /// in its plan and re-resolves here at create and at resume; a missing
+    /// or version-changed name parks the plan `AwaitingConverter`.
+    converters: Arc<parking_lot::RwLock<HashMap<String, (u32, crate::catalog::RegisteredConverter)>>>,
 }
 
 /// One @indexed scalar field on a type, with everything the write path needs
@@ -356,6 +365,9 @@ pub(crate) struct CarryState {
     pub version_counters: Arc<RwLock<HashMap<(u64, u64), u64>>>,
     pub version_counter_count: Arc<std::sync::atomic::AtomicUsize>,
     pub migration_lock: Arc<parking_lot::RwLock<()>>,
+    /// SAME registry Arc the OLD handle holds, so converters registered
+    /// before a `_consuming` verb stay resolvable on the new handle.
+    pub converters: Arc<parking_lot::RwLock<HashMap<String, (u32, crate::catalog::RegisteredConverter)>>>,
 }
 
 /// Operator-tunable knobs that don't depend on schema. Pass to
@@ -791,6 +803,10 @@ impl Database {
             // Empty until increment 4 rebuilds it from `c:P:` on open;
             // create_field_type_migration arms it under migration_lock.write().
             migrating: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+            converters: match &carry {
+                Some(c) => Arc::clone(&c.converters),
+                None => Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            },
             opts: options.clone(),
             migrated: std::sync::atomic::AtomicBool::new(false),
         });
@@ -1344,6 +1360,7 @@ impl Database {
             version_counters: Arc::clone(&self.version_counters),
             version_counter_count: Arc::clone(&self.version_counter_count),
             migration_lock: Arc::clone(&self.migration_lock),
+            converters: Arc::clone(&self.converters),
         };
         // Poison the OLD handle BEFORE rebuilding. If `rebuild_with_arc_storage`
         // succeeds, the OLD handle is already marked migrated so any
@@ -1451,6 +1468,33 @@ impl Database {
         let mut m = (**self.migrating.load()).clone();
         m.remove(&type_id);
         self.migrating.store(Arc::new(m));
+    }
+
+    /// Register a named row converter for chunked field-type migrations
+    /// (shadow-field card 1). A migration is created against a converter
+    /// `name`; the `(name, version)` pair is pinned in the persisted plan
+    /// and re-resolved here at create and after a restart. Bumping
+    /// `version` for a changed converter body makes an in-flight plan park
+    /// `AwaitingConverter` rather than silently run the new logic over rows
+    /// already converted by the old one. Per-`Database`, so converters in
+    /// one tenant's DB never resolve in another's.
+    pub fn register_converter<F>(&self, name: &str, version: u32, converter: F)
+    where
+        F: Fn(u64, &Value) -> EngineResult<Value> + Send + Sync + 'static,
+    {
+        self.converters
+            .write()
+            .insert(name.to_string(), (version, Arc::new(converter)));
+    }
+
+    /// Resolve a converter by `(name, version)`. `None` if absent or the
+    /// registered version differs (→ the caller parks `AwaitingConverter`).
+    #[allow(dead_code)] // wired into create_field_type_migration + resume (increment 3/4)
+    fn resolve_converter(&self, name: &str, version: u32) -> Option<crate::catalog::RegisteredConverter> {
+        self.converters
+            .read()
+            .get(name)
+            .and_then(|(v, c)| (*v == version).then(|| Arc::clone(c)))
     }
 
     pub fn create(&self, type_name: &str, fields: FieldMap) -> EngineResult<Object> {
@@ -6551,6 +6595,29 @@ mod tests {
         ));
         assert!(db.get("User", alice.id).is_ok());
         assert!(db.get("Post", post.id).is_ok());
+    }
+
+    #[test]
+    fn converter_registry_resolves_by_name_and_version() {
+        let (db, _dir) = quiesce_cascade_db();
+        db.register_converter("widen", 1, |_id, v| Ok(v.clone()));
+        assert!(db.resolve_converter("widen", 1).is_some()); // exact match
+        assert!(db.resolve_converter("widen", 2).is_none()); // version skew → park
+        assert!(db.resolve_converter("nope", 1).is_none()); // missing → park
+    }
+
+    #[test]
+    fn converter_registry_survives_consuming_rebuild() {
+        // Per-Database registry must ride the _consuming carry so a converter
+        // registered before a migrate verb is still resolvable on the new
+        // handle. clone_into_new_handle is the carry path every _consuming
+        // verb funnels through.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema("type User { name: String }").unwrap();
+        let db = Database::open(schema.clone(), dir.path()).unwrap();
+        db.register_converter("widen", 1, |_id, v| Ok(v.clone()));
+        let db2 = db.clone_into_new_handle(schema).unwrap();
+        assert!(db2.resolve_converter("widen", 1).is_some());
     }
 
     #[test]

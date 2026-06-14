@@ -738,6 +738,14 @@ pub(crate) struct FieldTypeChangeVerb {
 pub(crate) type RowConverter =
     Box<dyn Fn(u64, &crate::object::Value) -> EngineResult<crate::object::Value> + Send + Sync>;
 
+/// Shared, resumable converter held in the per-`Database` registry
+/// (shadow-field card 1). `Arc` (not `Box`) so the same converter resolves
+/// at create AND at resume after restart, and is carried across the
+/// `_consuming` rebuild. Resolved by `(name, version)` pinned in the plan.
+pub(crate) type RegisteredConverter = std::sync::Arc<
+    dyn Fn(u64, &crate::object::Value) -> EngineResult<crate::object::Value> + Send + Sync,
+>;
+
 /// One entry in the report a successful migrate returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenamePair {
