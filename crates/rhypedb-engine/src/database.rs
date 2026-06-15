@@ -267,6 +267,22 @@ pub struct Database {
     cover_refresh_tx: parking_lot::Mutex<Option<std::sync::mpsc::Sender<(u64, u64)>>>,
     /// Join handle for the cover-refresh worker thread. Taken on drop.
     cover_refresh_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// A `Weak` to this very `Database`, stashed right after `Arc::new` so a
+    /// `&self` method (`create_field_type_migration`) can hand a detached
+    /// migration driver thread a `Weak<Database>` WITHOUT changing the public
+    /// `&self` signature. The driver upgrades it transiently (only for the
+    /// cutover stage) so it never extends the database's lifetime — when external
+    /// `Arc`s drop, the upgrade returns `None` and the driver leaves the plan
+    /// resumable for the next open. Empty until set in `rebuild_with_arc_storage`.
+    self_weak: parking_lot::Mutex<std::sync::Weak<Database>>,
+    /// Per-plan registry of in-flight migration drivers (shadow-field card 3/5).
+    /// Keyed by `plan_id` (unique, monotonic — never reused). The single gate
+    /// enforcing "at most one driver per plan" (async create OR inline
+    /// resume/auto-resume register here before driving; a second registration
+    /// fails `MigrationAlreadyRunning`). `Drop` drains this, signals every
+    /// `control` to PAUSE, and joins each `Some(handle)` (mirrors the
+    /// `cover_refresh_*` teardown, with the same self-join-skip guard).
+    migration_drivers: parking_lot::Mutex<HashMap<u64, MigrationDriver>>,
     /// Write barrier excluding user-facing mutations during the catalog
     /// migration verbs. Read-locked by `create` / `create_batch` /
     /// `update` / `delete` / `link` / `unlink`; write-locked by
@@ -330,6 +346,79 @@ pub struct Database {
     /// `0` (the common case, no migration active). Kept in sync with
     /// `migrating_fields` under `migration_lock.write()`.
     migrating_field_count: std::sync::atomic::AtomicUsize,
+}
+
+/// Completion signal for a migration driver (shadow-field card 3/5). `finished`
+/// flips true when the driver stops (any disposition); `wait_take_error` blocks
+/// on the condvar until then and TAKES the terminal error (worker convert error
+/// / cutover refusal) the ASYNC create driver recorded — the inline resume path
+/// propagates its error through the normal return, so it leaves the error
+/// `None`. The `finished` atomic doubles as a lock-free check for the
+/// registration gate (reap a finished leftover without taking the inner mutex).
+/// Shared (`Arc`) between the registry entry and the driver, so the driver can
+/// signal completion even after `Database::drop` has drained the registry.
+struct MigrationSignal {
+    finished: std::sync::atomic::AtomicBool,
+    error: parking_lot::Mutex<Option<EngineError>>,
+    cv: parking_lot::Condvar,
+}
+
+impl MigrationSignal {
+    fn new() -> Self {
+        Self {
+            finished: std::sync::atomic::AtomicBool::new(false),
+            error: parking_lot::Mutex::new(None),
+            cv: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// Driver: record the terminal error (if any) + wake every waiter. Setting
+    /// `finished` UNDER the error mutex (the same one `wait_take_error` parks on)
+    /// is what rules out a lost wakeup.
+    fn mark_done(&self, error: Option<EngineError>) {
+        let mut g = self.error.lock();
+        *g = error;
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.cv.notify_all();
+    }
+
+    /// Lock-free "the driver has stopped" check for the registration gate.
+    fn is_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Waiter: block until the driver stops, then TAKE the terminal error (so a
+    /// second waiter sees `None` — the durable plan status is the multi-waiter
+    /// source of truth).
+    fn wait_take_error(&self) -> Option<EngineError> {
+        let mut g = self.error.lock();
+        while !self.finished.load(std::sync::atomic::Ordering::Acquire) {
+            self.cv.wait(&mut g);
+        }
+        g.take()
+    }
+}
+
+/// A registered in-flight migration driver (shadow-field card 3/5). One per
+/// `plan_id` (the registration is the double-driver gate). The ASYNC create
+/// driver does NOT remove its own entry on exit — it just `mark_done`s the
+/// signal and returns; the entry (with its still-joinable handle) is reaped by
+/// `wait_for_migration` (join + remove), by the registration gate (a finished
+/// leftover), or by `Database::drop` (drain + join). Keeping the handle until a
+/// JOIN is what makes a `wait; drop; reopen` sequence race-free.
+struct MigrationDriver {
+    /// Run/Pause/Cancel byte (`catalog::migration_control`), polled by every
+    /// partition worker BETWEEN chunks. `pause_migration`/`cancel_migration`
+    /// store into it; `Database::drop` stores PAUSE.
+    control: Arc<std::sync::atomic::AtomicU8>,
+    /// Completion signal — `wait_for_migration` blocks on it.
+    signal: Arc<MigrationSignal>,
+    /// `Some` for the async create driver (its detached thread, joined by
+    /// `wait_for_migration` / `Database::drop`); `None` for an inline resume /
+    /// auto-resume drive (which runs on the calling thread — no thread to join,
+    /// and its `InlineDriveGuard` removes the entry synchronously on exit).
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// A per-`(type, field)` double-write hook for an in-flight chunked field-type
@@ -870,6 +959,8 @@ impl Database {
             },
             cover_refresh_tx: parking_lot::Mutex::new(None),
             cover_refresh_handle: parking_lot::Mutex::new(None),
+            self_weak: parking_lot::Mutex::new(std::sync::Weak::new()),
+            migration_drivers: parking_lot::Mutex::new(HashMap::new()),
             migration_lock: match &carry {
                 Some(c) => Arc::clone(&c.migration_lock),
                 None => Arc::new(parking_lot::RwLock::new(())),
@@ -889,6 +980,11 @@ impl Database {
             opts: options.clone(),
             migrated: std::sync::atomic::AtomicBool::new(false),
         });
+
+        // Stash a `Weak` to ourselves so a `&self` verb can hand a detached
+        // migration driver a `Weak<Database>` (card 3/5) without an `Arc<Self>`
+        // signature. Set before any worker spawns / auto-resume runs.
+        *db.self_weak.lock() = Arc::downgrade(&db);
 
         // Spawn the cover-refresh worker now that `db` lives inside an Arc
         // we can downgrade. The worker holds a `Weak<Database>` so it
@@ -1673,6 +1769,19 @@ impl Database {
     /// schema is STALE (the catalog kind changed underneath it): drop it and
     /// reopen with the schema where the field has the target type before
     /// issuing further writes to the migrated type.
+    /// Create a chunked field-type migration and START it ASYNCHRONOUSLY,
+    /// returning the plan id IMMEDIATELY (shadow-field card 3/5). A detached
+    /// driver thread fans out `N` parallel partition workers over the
+    /// pre-existing object range `[1, U)`, then runs the single-threaded cutover.
+    ///
+    /// CONTRACT CHANGE vs card 2: the verb NO LONGER drives to completion before
+    /// returning. The plan + double-write hook are committed synchronously (so
+    /// every write after this returns carries the migration forward), but the
+    /// backfill + cutover run in the background. Use `wait_for_migration(plan_id)`
+    /// to block until the driver finishes, `pause_migration` / `resume_field_type_migration`
+    /// to control it. As with the other migrate verbs, on completion this handle's
+    /// in-memory schema is stale (the catalog kind flipped underneath it) — reopen
+    /// with the target schema before further writes to the migrated type.
     pub fn create_field_type_migration(&self, spec: MigrationPlanSpec) -> EngineResult<u64> {
         self.check_not_migrated()?;
         let target_kind = crate::catalog::schema_kind_byte_public(&spec.target_field_type);
@@ -1686,12 +1795,30 @@ impl Database {
                 version: spec.converter_version,
             })?;
 
+        // Resolve the parallel degree before the lock (cheap): one worker per CPU,
+        // capped at 8, clamped into `1..=64`.
+        let parallel_degree = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(crate::catalog::MAX_PARALLEL_DEGREE as usize) as u8;
+
         // Setup under the migration write-barrier: validate, allocate + persist
-        // the plan, and arm the double-write hook atomically so no writer slips
-        // a create/update into the migrating field between plan and hook (which
+        // the plan (with the parallel degree + the pre-existing id upper bound),
+        // and arm the double-write hook atomically so no writer slips a
+        // create/update into the migrating field between plan and hook (which
         // would land source-only with no shadow that cutover then refuses).
         let created = {
             let _guard = self.migration_lock.write();
+            // U = `next_object_id` snapshot. Writers (`create`/`create_batch`)
+            // take `migration_lock.read()` THEN `fetch_add`, so under this
+            // write-lock the counter is FROZEN — U is exact and stays exact until
+            // the lock releases. Every pre-existing object has id `< U` (a worker
+            // converts it); every object created after the lock releases gets id
+            // `>= U` and is born WITH the shadow via the now-armed hook (a worker
+            // never touches it). Persisting U atomically with the plan (below)
+            // closes any torn-U window.
+            let id_upper_bound = self.next_object_id.load(Ordering::SeqCst);
             let created = crate::catalog::create_migration_plan(
                 &self.storage,
                 &self.schema,
@@ -1701,10 +1828,8 @@ impl Database {
                 &spec.converter_name,
                 spec.converter_version,
                 spec.chunk_size,
-                // Card 3 (3b) wires parallel degree + id upper bound here; 3a keeps
-                // the legacy single-worker path (None) so behavior is unchanged.
-                None,
-                0,
+                Some(parallel_degree),
+                id_upper_bound,
             )?;
             // Install the double-write hook so live writes to the migrating
             // field carry it forward (card 2d — no quiesce; writes proceed).
@@ -1721,12 +1846,165 @@ impl Database {
             created
         };
 
-        // Drive WITHOUT holding `migration_lock` so live writes (to this type
-        // and others) proceed during the (potentially long) backfill; the
-        // double-write hook keeps every write's shadow current. The cutover
-        // re-takes `migration_lock.write()` to drain writers for its pass.
-        self.drive_migration_to_completion(created.plan_id, created.type_id, Some(&converter))?;
+        // Spawn the detached driver WITHOUT holding `migration_lock` so live
+        // writes (to this type and others) proceed during the (potentially long)
+        // backfill; the double-write hook keeps every write's shadow current. On
+        // a spawn failure, fall back to driving inline (synchronous) so the
+        // migration still completes (a fresh plan id, so the inline drive's
+        // registration can't collide).
+        if self
+            .spawn_migration_driver(created.plan_id, created.type_id, converter.clone())
+            .is_err()
+        {
+            self.drive_migration_to_completion(created.plan_id, created.type_id, Some(&converter))?;
+        }
         Ok(created.plan_id)
+    }
+
+    /// The double-driver gate (card 3/5): under the registry lock, refuse if an
+    /// ACTIVE driver already owns `plan_id`, else REAP a finished leftover (its
+    /// thread already `mark_done`d — drop its handle, detaching the spent thread)
+    /// and return a fresh `(control, signal)` plus a registry entry slot. The
+    /// caller fills the entry's handle (async) or leaves it `None` (inline). The
+    /// `is_finished` check is lock-free (the signal's atomic), so this never
+    /// nests the registry lock under the signal mutex.
+    fn gate_migration_driver(
+        &self,
+        plan_id: u64,
+    ) -> EngineResult<(Arc<std::sync::atomic::AtomicU8>, Arc<MigrationSignal>)> {
+        use std::sync::atomic::AtomicU8;
+        let mut reg = self.migration_drivers.lock();
+        if let Some(existing) = reg.get(&plan_id) {
+            if !existing.signal.is_finished() {
+                return Err(EngineError::MigrationAlreadyRunning { plan_id });
+            }
+            reg.remove(&plan_id); // finished leftover — reap (detach its spent thread)
+        }
+        let control = Arc::new(AtomicU8::new(crate::catalog::migration_control::RUN));
+        let signal = Arc::new(MigrationSignal::new());
+        reg.insert(
+            plan_id,
+            MigrationDriver {
+                control: Arc::clone(&control),
+                signal: Arc::clone(&signal),
+                handle: None,
+            },
+        );
+        Ok((control, signal))
+    }
+
+    /// Register + spawn the detached async migration driver for `plan_id` (card
+    /// 3/5). The driver does NOT remove its own entry on exit — it `mark_done`s
+    /// and returns, leaving the still-joinable handle for `wait_for_migration` /
+    /// `Database::drop` to join (this is what makes a `wait; drop; reopen`
+    /// race-free). Returns `MigrationAlreadyRunning` if an active driver already
+    /// owns the plan, or a spawn IO error.
+    fn spawn_migration_driver(
+        &self,
+        plan_id: u64,
+        type_id: u64,
+        converter: crate::catalog::RegisteredConverter,
+    ) -> EngineResult<()> {
+        let (control, signal) = self.gate_migration_driver(plan_id)?;
+        let weak = self.self_weak.lock().clone();
+        let storage = Arc::clone(&self.storage);
+        let handle = std::thread::Builder::new()
+            .name("rhypedb-migration-driver".into())
+            .spawn({
+                let control = Arc::clone(&control);
+                let signal = Arc::clone(&signal);
+                move || {
+                    migration_driver_main(
+                        weak, storage, converter, control, signal, plan_id, type_id,
+                    )
+                }
+            })
+            .map_err(|e| EngineError::Storage(rhypedb_storage::Error::Io(e)))?;
+        // Store the handle into the entry the gate inserted. The driver never
+        // touches the registry, so the entry is guaranteed still present here.
+        if let Some(entry) = self.migration_drivers.lock().get_mut(&plan_id) {
+            entry.handle = Some(handle);
+        }
+        Ok(())
+    }
+
+    /// Register an INLINE migration drive (resume / auto-resume) for `plan_id`
+    /// (card 3/5). Same gate as the async spawn, but `handle` stays `None` (the
+    /// drive runs on the calling thread). Returns the shared `(control, signal)`
+    /// so the caller can thread the control into the workers and an
+    /// `InlineDriveGuard` can signal/deregister on exit.
+    fn register_inline_driver(
+        &self,
+        plan_id: u64,
+    ) -> EngineResult<(Arc<std::sync::atomic::AtomicU8>, Arc<MigrationSignal>)> {
+        self.gate_migration_driver(plan_id)
+    }
+
+    /// Block until the migration driver for `plan_id` finishes — the async
+    /// create driver reaches a terminal disposition (Completed/Failed) or stops
+    /// (Paused), or an inline resume drive returns — then JOIN its thread so it
+    /// has fully exited (released its storage `Arc`) before returning, making a
+    /// following `drop(db)` + reopen race-free. Returns the async driver's
+    /// terminal error to the FIRST waiter (later waiters / the durable plan
+    /// status are the multi-waiter source of truth). Returns immediately if no
+    /// driver is registered (already reaped, or never started). Card 3/5: tests +
+    /// operators use this to bridge the now-ASYNC create contract.
+    pub fn wait_for_migration(&self, plan_id: u64) -> EngineResult<()> {
+        // Take the handle + signal under the registry lock. Taking the handle
+        // means only the first waiter joins; a later waiter still blocks on the
+        // signal but finds `handle == None`.
+        let (handle, signal) = {
+            let mut reg = self.migration_drivers.lock();
+            match reg.get_mut(&plan_id) {
+                Some(d) => (d.handle.take(), Arc::clone(&d.signal)),
+                None => return Ok(()), // no driver → already finished / never ran
+            }
+        };
+        let err = signal.wait_take_error();
+        if let Some(h) = handle
+            && h.thread().id() != std::thread::current().id()
+        {
+            let _ = h.join(); // the driver `mark_done`s then returns immediately
+        }
+        // Reap: a finished async entry is not self-removed, so drop it now that we
+        // have joined (idempotent if the gate / Drop got there first).
+        self.migration_drivers.lock().remove(&plan_id);
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Request a PAUSE of the in-flight driver for `plan_id` (card 3/5). Its
+    /// partition workers stop at the next chunk boundary (AC6: within one chunk),
+    /// leaving the plan resumable (Running/Converting). No-op success if no
+    /// driver is registered. Resume via `resume_field_type_migration`.
+    pub fn pause_migration(&self, plan_id: u64) -> EngineResult<()> {
+        if let Some(d) = self.migration_drivers.lock().get(&plan_id) {
+            d.control.store(
+                crate::catalog::migration_control::PAUSE,
+                Ordering::SeqCst,
+            );
+        }
+        Ok(())
+    }
+
+    /// Request a CANCEL of the in-flight driver for `plan_id` (card 3/5). For now
+    /// this behaves like `pause_migration` — the workers stop at a chunk boundary
+    /// and the plan is left RESUMABLE. The CANCEL control byte is plumbed
+    /// end-to-end, but TERMINAL cancellation (disarm the hook + roll back the
+    /// partial `<field>__shadow` siblings) is deferred to card 5: disarming while
+    /// rows still carry a shadow sibling would let a later `update()` bake the
+    /// shadow into a cover (the cover strip is gated on a live hook), and the
+    /// rollback needs its own coordinated pass. See the design-review decision.
+    pub fn cancel_migration(&self, plan_id: u64) -> EngineResult<()> {
+        if let Some(d) = self.migration_drivers.lock().get(&plan_id) {
+            d.control.store(
+                crate::catalog::migration_control::CANCEL,
+                Ordering::SeqCst,
+            );
+        }
+        Ok(())
     }
 
     /// Drive a plan from its current phase to completion (shadow-field card 2).
@@ -1762,7 +2040,50 @@ impl Database {
                 name: plan.converter_name.clone(),
                 version: plan.converter_version,
             })?;
-            crate::catalog::run_migration_chunks(&self.storage, plan_id, converter)?;
+            match plan.parallel_degree {
+                Some(n) => {
+                    // Card 3: parallel backfill INLINE (on this thread — resume /
+                    // auto-resume are synchronous). Register a control so a
+                    // concurrent pause/cancel/wait works during the drive AND to
+                    // gate a second driver on this plan. The `InlineDriveGuard`
+                    // signals done + deregisters on EVERY exit path (incl. `?` and
+                    // the cutover below). Boundaries recompute from the PINNED
+                    // `(n, id_upper_bound)` so they match the persisted `c:S:`
+                    // cursors exactly.
+                    let (control, signal) = self.register_inline_driver(plan_id)?;
+                    let _guard = InlineDriveGuard {
+                        db: self,
+                        plan_id,
+                        signal,
+                    };
+                    let disp = crate::catalog::run_parallel_backfill(
+                        &self.storage,
+                        plan_id,
+                        type_id,
+                        n.max(1),
+                        plan.id_upper_bound,
+                        &plan.type_name,
+                        &plan.field_name,
+                        plan.src_kind,
+                        plan.target_kind,
+                        plan.converter_version,
+                        plan.chunk_size,
+                        converter,
+                        &control,
+                    )?;
+                    if matches!(disp, crate::catalog::BackfillDisposition::Paused) {
+                        return Ok(()); // paused/cancelled — plan left resumable
+                    }
+                    // AllDone → single-threaded cutover (still under `_guard`, so a
+                    // waiter wakes only after cutover finishes/fails).
+                    return self.run_cutover(plan_id, type_id);
+                }
+                None => {
+                    // Legacy card-1/2 single-worker plan (no partitions): the
+                    // pre-3b/2 path, only reached by resuming an old plan.
+                    crate::catalog::run_migration_chunks(&self.storage, plan_id, converter)?;
+                }
+            }
         }
         self.run_cutover(plan_id, type_id)
     }
@@ -4792,7 +5113,148 @@ impl Drop for Database {
         {
             let _ = handle.join();
         }
+
+        // Stop in-flight migration drivers (card 3/5). Drain the registry under
+        // the lock, RELEASE it, then signal PAUSE + join — never hold the
+        // registry lock across a join (a driver self-deregisters under that same
+        // lock on its normal exit). PAUSE (not CANCEL) = "stop at a chunk
+        // boundary, leave the plan resumable"; the next open's auto-resume
+        // re-drives it. `Drop` runs only at refcount 0, so every `weak.upgrade`
+        // inside a driver returns `None` now — a driver cannot re-enter the
+        // database or take the registry lock, so there is no cycle. The same
+        // self-join-skip guard the cover-refresh worker uses covers the case
+        // where the LAST `Arc` was a driver's transient cutover upgrade, so this
+        // `Drop` is itself running on a driver thread.
+        let drivers: Vec<MigrationDriver> =
+            std::mem::take(&mut *self.migration_drivers.lock())
+                .into_values()
+                .collect();
+        for d in &drivers {
+            d.control.store(
+                crate::catalog::migration_control::PAUSE,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        for d in drivers {
+            if let Some(handle) = d.handle
+                && handle.thread().id() != std::thread::current().id()
+            {
+                let _ = handle.join();
+            }
+        }
     }
+}
+
+/// RAII cleanup for an INLINE migration drive (resume / auto-resume, card 3/5).
+/// On drop — EVERY exit path of `drive_migration_to_completion`'s parallel
+/// branch, including `?` propagation and a panic unwind — it wakes any
+/// `wait_for_migration` waiter and removes the registry entry. (The async create
+/// driver does this manually in `migration_driver_main`, since it holds only a
+/// `Weak<Database>`.) The inline drive runs under the operator's `Arc<Database>`,
+/// so `Database::drop` cannot run until the drive returns and the guard fires —
+/// no race against the registry drain.
+struct InlineDriveGuard<'a> {
+    db: &'a Database,
+    plan_id: u64,
+    signal: Arc<MigrationSignal>,
+}
+
+impl Drop for InlineDriveGuard<'_> {
+    fn drop(&mut self) {
+        // Inline drive surfaces its error through the normal return path, so the
+        // signal carries no error here — just mark finished + wake waiters, then
+        // remove the entry. Both run on the calling thread, so there is no
+        // separate thread to join.
+        self.signal.mark_done(None);
+        self.db.migration_drivers.lock().remove(&self.plan_id);
+    }
+}
+
+/// Detached ASYNC migration driver entrypoint (shadow-field card 3/5). Owns the
+/// `N` partition workers for one plan's Converting phase, then the
+/// single-threaded cutover. Holds a `Weak<Database>` (+ a storage `Arc`) — it
+/// upgrades to a strong `Arc<Database>` ONLY transiently for the cutover, so it
+/// never extends the database's lifetime: if external `Arc`s drop mid-backfill,
+/// `Database::drop` stores PAUSE + joins this thread, the cutover upgrade returns
+/// `None`, and the plan is left resumable for the next open's auto-resume.
+///
+/// Does NOT touch the registry (it never removes its own entry) — it just
+/// `mark_done`s the signal and returns, leaving the still-joinable handle for
+/// `wait_for_migration` / `Database::drop` to join. The whole drive runs under a
+/// `catch_unwind` so a worker/cutover panic can't skip the `mark_done`
+/// (parking_lot locks don't poison, so an unwound `run_cutover` releases
+/// `migration_lock` cleanly).
+fn migration_driver_main(
+    weak: std::sync::Weak<Database>,
+    storage: Arc<LsmTree>,
+    converter: crate::catalog::RegisteredConverter,
+    control: Arc<std::sync::atomic::AtomicU8>,
+    signal: Arc<MigrationSignal>,
+    plan_id: u64,
+    type_id: u64,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drive_async_migration(&weak, &storage, &converter, &control, plan_id, type_id)
+    }));
+    // `Ok(Err(e))` = a parked Failed terminal (surfaced to the first waiter);
+    // `Ok(Ok(()))` = completed or paused (both clean); `Err(_)` = a caught panic
+    // (the durable plan status is the source of truth — no EngineError to carry).
+    let error = match result {
+        Ok(Err(e)) => Some(e),
+        _ => None,
+    };
+    signal.mark_done(error);
+}
+
+/// The async driver's drive body: backfill (Converting) then cutover. Storage-
+/// only for the backfill (never needs the `Database`); upgrades the `Weak` just
+/// for the cutover. Returns the terminal error (which `run_parallel_backfill` /
+/// `run_cutover` have ALREADY parked the plan `Failed` for) so the driver can
+/// surface it to a `wait_for_migration` waiter; a clean completion, a pause, or
+/// a dropped-DB upgrade-`None` all return `Ok(())` (the plan is left for the next
+/// open in the drop case).
+fn drive_async_migration(
+    weak: &std::sync::Weak<Database>,
+    storage: &LsmTree,
+    converter: &crate::catalog::RegisteredConverter,
+    control: &std::sync::atomic::AtomicU8,
+    plan_id: u64,
+    type_id: u64,
+) -> EngineResult<()> {
+    let plan = {
+        let txn = storage.begin_txn();
+        match crate::catalog::load_migration_plan(storage, &txn, plan_id) {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // plan vanished — nothing to drive
+        }
+    };
+    if plan.phase == crate::catalog::MigrationPhase::Converting {
+        let n = plan.parallel_degree.unwrap_or(1).max(1);
+        match crate::catalog::run_parallel_backfill(
+            storage,
+            plan_id,
+            type_id,
+            n,
+            plan.id_upper_bound,
+            &plan.type_name,
+            &plan.field_name,
+            plan.src_kind,
+            plan.target_kind,
+            plan.converter_version,
+            plan.chunk_size,
+            converter,
+            control,
+        )? {
+            crate::catalog::BackfillDisposition::AllDone => {} // fall through to cutover
+            crate::catalog::BackfillDisposition::Paused => return Ok(()), // resumable
+        }
+    }
+    // Single-threaded cutover — skip if the DB is dropping (the next open's
+    // auto-resume finishes it).
+    if let Some(db) = weak.upgrade() {
+        db.run_cutover(plan_id, type_id)?;
+    }
+    Ok(())
 }
 
 /// Cover-refresh worker. Loops on the per-database channel, popping each
@@ -4843,8 +5305,12 @@ fn cover_refresh_worker(
 /// double-write is active). Gates the shadow-strip in the cover builders so a
 /// non-migrating database pays one atomic load and no scan.
 fn migration_in_flight(db: &Database) -> bool {
+    // Acquire pairs with the SeqCst store in `arm_field_hook`/`disarm_field_hook`
+    // so a cover builder running under `migration_lock.read()` (the background
+    // cover-refresh worker is NOT serialized against a disarm that happens
+    // outside the write-lock) can never observe a half-published count.
     db.migrating_field_count
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(std::sync::atomic::Ordering::Acquire)
         > 0
 }
 
@@ -6823,15 +7289,17 @@ mod tests {
             let mut f = FieldMap::new();
             f.insert("score".into(), Value::I64(7));
             let id = db.create("User", f).unwrap().id;
-            db.create_field_type_migration(MigrationPlanSpec {
-                type_name: "User".into(),
-                field_name: "score".into(),
-                target_field_type: FieldType::Scalar(ScalarType::F64),
-                converter_name: "widen".into(),
-                converter_version: 1,
-                chunk_size: 4,
-            })
-            .unwrap();
+            let plan_id = db
+                .create_field_type_migration(MigrationPlanSpec {
+                    type_name: "User".into(),
+                    field_name: "score".into(),
+                    target_field_type: FieldType::Scalar(ScalarType::F64),
+                    converter_name: "widen".into(),
+                    converter_version: 1,
+                    chunk_size: 4,
+                })
+                .unwrap();
+            db.wait_for_migration(plan_id).unwrap();
             id
         };
         let db2 = Database::open(
@@ -6892,6 +7360,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(plan_id, 1);
+        db.wait_for_migration(plan_id).unwrap();
         let summary = db.list_migrations().unwrap();
         assert_eq!(summary.len(), 1);
         assert_eq!(
@@ -6938,28 +7407,38 @@ mod tests {
             db.create("User", f).unwrap();
         }
         let before = db.storage.txn_manager().current_version();
-        db.create_field_type_migration(MigrationPlanSpec {
-            type_name: "User".into(),
-            field_name: "score".into(),
-            target_field_type: FieldType::Scalar(ScalarType::F64),
-            converter_name: "widen".into(),
-            converter_version: 1,
-            chunk_size: 4,
-        })
-        .unwrap();
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+            })
+            .unwrap();
+        // Must wait for the ASYNC driver to finish before counting commits.
+        db.wait_for_migration(plan_id).unwrap();
         let after = db.storage.txn_manager().current_version();
         let chunks = 10u64.div_ceil(4);
         assert!(chunks > 1, "test must exercise multiple chunks");
-        // Card-2 online flow, per-chunk commits throughout:
+        // Card-3 online flow with the ASYNC parallel driver, per-chunk commits
+        // throughout (NOT one big batch):
         //   1 plan-create
-        // + `chunks` shadow-backfill commits (run_migration_chunks)
+        // + the shadow backfill: each of the N partitions commits per chunk +
+        //   a `done` marker, so the backfill commit count is DEGREE-dependent
+        //   (splitting only adds partial-chunk commits) — at LEAST `chunks`
+        //   (the single-partition floor on a 1-CPU host).
         // + 1 phase-flip commit (Converting → CuttingOver)
-        // + `chunks` cutover commits (promote shadow + maintain covers)
+        // + `chunks` single-threaded cutover commits (deterministic)
         // + 1 finalize commit (catalog kind flip + Completed)
-        assert_eq!(
-            after - before,
-            1 + chunks + 1 + chunks + 1,
-            "expected per-chunk commits in both passes, not a single batch"
+        // Assert the incremental LOWER BOUND — proves chunked commits in both
+        // passes regardless of the resolved parallel degree.
+        let min_commits = 1 + chunks + 1 + chunks + 1;
+        assert!(
+            after - before >= min_commits,
+            "expected per-chunk commits in both passes (got {}, want >= {min_commits}), not a single batch",
+            after - before
         );
     }
 
@@ -7103,15 +7582,17 @@ mod tests {
             .unwrap();
         db.storage.commit(&mut txn).unwrap();
 
-        db.create_field_type_migration(MigrationPlanSpec {
-            type_name: "User".into(),
-            field_name: "score".into(),
-            target_field_type: FieldType::Scalar(ScalarType::F64),
-            converter_name: "widen".into(),
-            converter_version: 1,
-            chunk_size: 4,
-        })
-        .unwrap();
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+            })
+            .unwrap();
+        db.wait_for_migration(plan_id).unwrap();
         assert_eq!(
             db.list_migrations().unwrap()[0].status,
             crate::catalog::MigrationStatus::Completed
@@ -7159,15 +7640,17 @@ mod tests {
             f.insert("y".into(), Value::I64(i));
             db.create("T", f).unwrap();
         }
-        db.create_field_type_migration(MigrationPlanSpec {
-            type_name: "T".into(),
-            field_name: "x".into(),
-            target_field_type: FieldType::Scalar(ScalarType::F64),
-            converter_name: "widen".into(),
-            converter_version: 1,
-            chunk_size: 4,
-        })
-        .unwrap();
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "T".into(),
+                field_name: "x".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+            })
+            .unwrap();
+        db.wait_for_migration(plan_id).unwrap();
         drop(db);
         let db2 = Database::open(
             parse_schema(r#"type T { x: f64  y: i64 @indexed }"#).unwrap(),
@@ -7441,6 +7924,385 @@ mod tests {
             total2 += pc.objects_converted;
         }
         assert_eq!(total2, N as u64, "re-run must not double-count");
+    }
+
+    /// AC4: a `parallel_degree == 1` backfill produces the SAME converted object
+    /// content as the legacy single-worker `run_migration_chunks` — both go
+    /// through the one shared `convert_row_for_backfill`, and a single partition
+    /// covers the identical `[1, U)` range. (Compared as deserialized field maps,
+    /// since the on-disk byte order of a `FieldMap` is hash-nondeterministic and
+    /// not part of the contract.)
+    #[test]
+    fn parallel_degree_1_backfill_matches_single_worker_byte_for_byte() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc;
+        let i64k = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::I64));
+        let f64k = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let converter: crate::catalog::RegisteredConverter = Arc::new(|_o: u64, v: &Value| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => unreachable!(),
+        });
+        let seed = |db: &Database| -> Vec<u64> {
+            let mut ids = Vec::new();
+            for i in 0..20i64 {
+                let mut f = FieldMap::new();
+                f.insert("score".into(), Value::I64(i * 3 - 7));
+                ids.push(db.create("User", f).unwrap().id);
+            }
+            ids
+        };
+
+        // A: degree-1 parallel backfill.
+        let dir_a = tempfile::tempdir().unwrap();
+        let db_a =
+            Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir_a.path())
+                .unwrap();
+        let ids_a = seed(&db_a);
+        let u_a = db_a.next_object_id.load(Ordering::SeqCst);
+        let created_a = crate::catalog::create_migration_plan(
+            &db_a.storage,
+            &db_a.schema,
+            "User",
+            "score",
+            f64k,
+            "widen",
+            1,
+            4,
+            Some(1),
+            u_a,
+        )
+        .unwrap();
+        let ctrl = AtomicU8::new(crate::catalog::migration_control::RUN);
+        let disp = crate::catalog::run_parallel_backfill(
+            &db_a.storage,
+            created_a.plan_id,
+            created_a.type_id,
+            1,
+            u_a,
+            "User",
+            "score",
+            i64k,
+            f64k,
+            1,
+            4,
+            &converter,
+            &ctrl,
+        )
+        .unwrap();
+        assert_eq!(disp, crate::catalog::BackfillDisposition::AllDone);
+
+        // B: legacy single-worker backfill.
+        let dir_b = tempfile::tempdir().unwrap();
+        let db_b =
+            Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir_b.path())
+                .unwrap();
+        let ids_b = seed(&db_b);
+        let created_b = crate::catalog::create_migration_plan(
+            &db_b.storage,
+            &db_b.schema,
+            "User",
+            "score",
+            f64k,
+            "widen",
+            1,
+            4,
+            None,
+            0,
+        )
+        .unwrap();
+        crate::catalog::run_migration_chunks(&db_b.storage, created_b.plan_id, &converter).unwrap();
+
+        // Identical ids (fresh DBs, same create order) → compare converted content.
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(created_a.type_id, created_b.type_id);
+        let snap_a = db_a.storage.read_snapshot();
+        let snap_b = db_b.storage.read_snapshot();
+        for &id in &ids_a {
+            let key = rhypedb_storage::key::KeyBuilder::object(created_a.type_id, id);
+            let blob_a = db_a.storage.get_at(snap_a, &key).unwrap().unwrap();
+            let blob_b = db_b.storage.get_at(snap_b, &key).unwrap().unwrap();
+            let fields_a = crate::object::deserialize_fields(&blob_a);
+            let fields_b = crate::object::deserialize_fields(&blob_b);
+            assert_eq!(
+                fields_a, fields_b,
+                "object {id} converted content differs (degree-1 vs single-worker)"
+            );
+        }
+    }
+
+    /// Card 3 BLOCKER regression: a CUTOVER refusal on a parallel (N>1) plan must
+    /// reset the per-partition `c:S:` cursors (via `park_migration_failed_rewind`),
+    /// else the re-driven backfill fast-returns `Done` for every partition and
+    /// cutover re-refuses the same missing shadow FOREVER. Backfill, delete one
+    /// row's shadow to force `MigrationCutoverShadowMissing`, confirm the rewind
+    /// cleared the cursors, then re-backfill + cutover and assert it COMPLETES.
+    #[test]
+    fn parallel_cutover_refusal_resets_cursors_and_completes() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..30i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let i64k = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::I64));
+        let f64k = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let converter: crate::catalog::RegisteredConverter = Arc::new(|_o: u64, v: &Value| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => unreachable!(),
+        });
+        let degree = 4u8;
+        let u = db.next_object_id.load(Ordering::SeqCst);
+        let created = crate::catalog::create_migration_plan(
+            &db.storage,
+            &db.schema,
+            "User",
+            "score",
+            f64k,
+            "widen",
+            1,
+            4,
+            Some(degree),
+            u,
+        )
+        .unwrap();
+        let plan_id = created.plan_id;
+        let tid = created.type_id;
+        let ctrl = AtomicU8::new(crate::catalog::migration_control::RUN);
+        let backfill = || {
+            crate::catalog::run_parallel_backfill(
+                &db.storage, plan_id, tid, degree, u, "User", "score", i64k, f64k, 1, 4, &converter,
+                &ctrl,
+            )
+        };
+        assert_eq!(
+            backfill().unwrap(),
+            crate::catalog::BackfillDisposition::AllDone
+        );
+
+        // Corrupt: strip the shadow from one row so cutover refuses it.
+        let victim = ids[ids.len() / 2];
+        {
+            let key = rhypedb_storage::key::KeyBuilder::object(tid, victim);
+            let snap = db.storage.read_snapshot();
+            let blob = db.storage.get_at(snap, &key).unwrap().unwrap();
+            let mut fields = crate::object::deserialize_fields(&blob);
+            fields.remove("score__shadow");
+            fields.remove("score__shadow_cv");
+            let mut txn = db.storage.begin_txn();
+            db.storage
+                .put(&mut txn, &key, crate::object::serialize_fields(&fields))
+                .unwrap();
+            db.storage.commit(&mut txn).unwrap();
+        }
+
+        // Cutover refuses the missing shadow → park_migration_failed_rewind.
+        let err = db.run_cutover(plan_id, tid).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::MigrationCutoverShadowMissing { .. }
+        ));
+
+        // BLOCKER fix: the rewind deleted every c:S: cursor.
+        for idx in 0..degree {
+            let key = rhypedb_storage::key::KeyBuilder::catalog_partition_cursor(plan_id, idx);
+            let txn = db.storage.begin_txn();
+            assert!(
+                db.storage.get(&txn, &key).unwrap().is_none(),
+                "c:S cursor {idx} must be deleted by the rewind"
+            );
+        }
+
+        // Re-backfill (re-stamps the deleted shadow) then cutover — must COMPLETE
+        // (not loop). The full-range re-scan re-converts idempotently.
+        assert_eq!(
+            backfill().unwrap(),
+            crate::catalog::BackfillDisposition::AllDone
+        );
+        db.run_cutover(plan_id, tid).unwrap();
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+    }
+
+    /// AC6: a pause request stops the parallel backfill BEFORE completion (every
+    /// worker polls the control byte between chunks), leaving the plan resumable;
+    /// resume then completes it. A per-row sleep makes the backfill slow enough
+    /// that the pause (issued microseconds after create) lands mid-flight
+    /// deterministically.
+    #[test]
+    fn pause_migration_stops_before_completion_then_resumes() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("slow", 1, |_oid, v| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            match v {
+                Value::I64(i) => Ok(Value::F64(*i as f64)),
+                _ => unreachable!(),
+            }
+        });
+        let mut ids = Vec::new();
+        for i in 0..150i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "slow".into(),
+                converter_version: 1,
+                chunk_size: 4,
+            })
+            .unwrap();
+        // Pause immediately — workers honor it within one chunk (~4ms) << the
+        // ~150ms total backfill.
+        db.pause_migration(plan_id).unwrap();
+        db.wait_for_migration(plan_id).unwrap();
+
+        let st = db.list_migrations().unwrap()[0].status;
+        assert!(
+            st.quiesces() && st != crate::catalog::MigrationStatus::Completed,
+            "expected a paused/resumable plan, got {st:?}"
+        );
+        // Strictly fewer than all rows converted (proves it stopped early).
+        let tid = db.resolve_type_id("User").unwrap();
+        let snap = db.storage.read_snapshot();
+        let converted = ids
+            .iter()
+            .filter(|&&id| {
+                let blob = db
+                    .storage
+                    .get_at(snap, &rhypedb_storage::key::KeyBuilder::object(tid, id))
+                    .unwrap()
+                    .unwrap();
+                crate::object::deserialize_fields(&blob).contains_key("score__shadow")
+            })
+            .count();
+        assert!(
+            converted < ids.len(),
+            "pause must stop before converting all rows (converted {converted}/{})",
+            ids.len()
+        );
+        drop(db);
+
+        // Resume requires reopening with the TARGET schema (the F3 guard refuses
+        // to drive a plan whose handle still validates against the source kind).
+        let db2 = Database::open(parse_schema(r#"type User { score: f64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db2.register_converter("slow", 1, |_oid, v| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => unreachable!(),
+        });
+        db2.resume_field_type_migration(plan_id).unwrap();
+        assert_eq!(
+            db2.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+        for (id, i) in ids.iter().zip(0i64..) {
+            assert_eq!(
+                db2.get("User", *id).unwrap().fields.get("score"),
+                Some(&Value::F64(i as f64)),
+                "row {id} must be converted exactly once"
+            );
+        }
+    }
+
+    /// The double-driver gate (card 3/5): at most one ACTIVE driver per plan id
+    /// (a second registration is refused `MigrationAlreadyRunning`), but a
+    /// FINISHED leftover is reaped so a later resume can register cleanly.
+    #[test]
+    fn migration_driver_gate_rejects_second_and_reaps_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        let (_ctrl, sig) = db.gate_migration_driver(7).unwrap();
+        // A second registration while the first is active is refused.
+        assert!(matches!(
+            db.gate_migration_driver(7),
+            Err(EngineError::MigrationAlreadyRunning { plan_id: 7 })
+        ));
+        // Once the first signals finished, the gate reaps it and admits a new one.
+        sig.mark_done(None);
+        assert!(db.gate_migration_driver(7).is_ok());
+    }
+
+    /// AC2: a parallel plan paused mid-backfill resumes PER-PARTITION across a
+    /// REOPEN (simulated restart) — each partition continues from its persisted
+    /// `c:S:` cursor — and every row ends converted exactly once.
+    #[test]
+    fn parallel_migration_resumes_per_partition_across_reopen() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id;
+        let ids: Vec<u64>;
+        {
+            let db =
+                Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+                    .unwrap();
+            db.register_converter("slow", 1, |_oid, v| {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                match v {
+                    Value::I64(i) => Ok(Value::F64(*i as f64)),
+                    _ => unreachable!(),
+                }
+            });
+            let mut v = Vec::new();
+            for i in 0..150i64 {
+                let mut f = FieldMap::new();
+                f.insert("score".into(), Value::I64(i));
+                v.push(db.create("User", f).unwrap().id);
+            }
+            ids = v;
+            plan_id = db
+                .create_field_type_migration(MigrationPlanSpec {
+                    type_name: "User".into(),
+                    field_name: "score".into(),
+                    target_field_type: FieldType::Scalar(ScalarType::F64),
+                    converter_name: "slow".into(),
+                    converter_version: 1,
+                    chunk_size: 4,
+                })
+                .unwrap();
+            db.pause_migration(plan_id).unwrap();
+            db.wait_for_migration(plan_id).unwrap();
+            assert_ne!(
+                db.list_migrations().unwrap()[0].status,
+                crate::catalog::MigrationStatus::Completed
+            );
+            drop(db);
+        }
+        // Reopen with the TARGET schema (simulated restart); register the
+        // converter, then resume — each partition continues from its c:S: cursor.
+        let db = Database::open(parse_schema(r#"type User { score: f64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("slow", 1, |_oid, v| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => unreachable!(),
+        });
+        db.resume_field_type_migration(plan_id).unwrap();
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+        for (id, i) in ids.iter().zip(0i64..) {
+            assert_eq!(
+                db.get("User", *id).unwrap().fields.get("score"),
+                Some(&Value::F64(i as f64)),
+                "row {id} must be converted exactly once across the reopen"
+            );
+        }
     }
 
     /// G3: while a migration is in flight the lazy/raw wire path
@@ -7734,15 +8596,17 @@ mod tests {
             db.create("T", f).unwrap();
         }
 
-        db.create_field_type_migration(MigrationPlanSpec {
-            type_name: "T".into(),
-            field_name: "x".into(),
-            target_field_type: FieldType::Scalar(ScalarType::F64),
-            converter_name: "widen".into(),
-            converter_version: 1,
-            chunk_size: 8,
-        })
-        .unwrap();
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "T".into(),
+                field_name: "x".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 8,
+            })
+            .unwrap();
+        db.wait_for_migration(plan_id).unwrap();
         drop(db);
         let db2 = Database::open(
             parse_schema(r#"type T { x: f64  y: i64 @indexed }"#).unwrap(),
@@ -7800,7 +8664,9 @@ mod tests {
             .unwrap();
         db.storage.commit(&mut txn).unwrap();
 
-        let err = db
+        // Async create returns Ok immediately; the unexpected-kind error surfaces
+        // on the driver thread and is delivered to the first `wait_for_migration`.
+        let plan_id = db
             .create_field_type_migration(MigrationPlanSpec {
                 type_name: "User".into(),
                 field_name: "score".into(),
@@ -7809,7 +8675,8 @@ mod tests {
                 converter_version: 1,
                 chunk_size: 4,
             })
-            .unwrap_err();
+            .unwrap();
+        let err = db.wait_for_migration(plan_id).unwrap_err();
         assert!(matches!(
             err,
             EngineError::Catalog(crate::CatalogError::MigrationRowUnexpectedKind { .. })
@@ -7872,6 +8739,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(p1, 1);
+        db.wait_for_migration(p1).unwrap();
         drop(db);
         let db2 = Database::open(
             parse_schema(r#"type User { a: f64  b: i64 }"#).unwrap(),
@@ -7890,6 +8758,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(p2, 2, "plan id must not reset or reuse across restart");
+        db2.wait_for_migration(p2).unwrap();
     }
 
     /// A second migration on a field that already has an unsettled plan is
@@ -8199,15 +9068,17 @@ mod tests {
         // Push the originals to an SST so the migration scan + the converted
         // writes produce multi-version keys on disk after the cutover.
         db.storage.flush().unwrap();
-        db.create_field_type_migration(MigrationPlanSpec {
-            type_name: "User".into(),
-            field_name: "score".into(),
-            target_field_type: FieldType::Scalar(ScalarType::F64),
-            converter_name: "widen".into(),
-            converter_version: 1,
-            chunk_size: 4,
-        })
-        .unwrap();
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+            })
+            .unwrap();
+        db.wait_for_migration(plan_id).unwrap();
         drop(db);
         let db = Database::open(
             parse_schema(r#"type User { score: f64 }"#).unwrap(),
@@ -8278,7 +9149,9 @@ mod tests {
                     _ => unreachable!(),
                 }
             });
-            let err = db
+            // Async create returns Ok; the converter failure surfaces on the
+            // driver thread and is delivered to the first `wait_for_migration`.
+            plan_id = db
                 .create_field_type_migration(MigrationPlanSpec {
                     type_name: "User".into(),
                     field_name: "score".into(),
@@ -8287,12 +9160,12 @@ mod tests {
                     converter_version: 1,
                     chunk_size: 2,
                 })
-                .unwrap_err();
+                .unwrap();
+            let err = db.wait_for_migration(plan_id).unwrap_err();
             assert!(matches!(
                 err,
                 EngineError::Catalog(crate::CatalogError::FieldTypeChangeConverterFailed { .. })
             ));
-            plan_id = db.list_migrations().unwrap()[0].plan_id;
             assert_eq!(
                 db.list_migrations().unwrap()[0].status,
                 crate::catalog::MigrationStatus::Failed

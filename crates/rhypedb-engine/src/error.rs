@@ -166,6 +166,14 @@ pub enum EngineError {
         found_cv: u32,
         want_cv: u32,
     },
+
+    /// A migration driver (async create, or an inline resume / auto-resume) is
+    /// already driving this plan. Card 3: at most one driver per plan id — the
+    /// registration gate (`migration_drivers`) refuses a second concurrent
+    /// driver so two driver bodies can't fan out overlapping partition workers
+    /// (WriteConflict storm) or both reach cutover (double generation bump).
+    #[error("migration plan {plan_id} already has an active driver")]
+    MigrationAlreadyRunning { plan_id: u64 },
 }
 
 /// Failures specific to the persisted schema catalog (see
@@ -470,6 +478,21 @@ pub enum CatalogError {
         got_kind: &'static str,
         expected_kind: &'static str,
     },
+
+    /// Card 3/5: a parallel backfill partition worker PANICKED. Caught by the
+    /// driver's `catch_unwind` (so it can't unwind past the join + leave the
+    /// driver's done-signal un-run); the plan is parked `Failed` keeping the
+    /// per-partition cursors, so resume continues each partition idempotently.
+    #[error("a partition worker for migration plan {plan_id} panicked; the plan is parked Failed and is resumable")]
+    MigrationWorkerPanicked { plan_id: u64 },
+
+    /// Card 3/5: every partition worker reported `Done` but the persisted
+    /// `c:S:` `done` flags do not all agree — a worker-contract violation
+    /// (a worker returned Done without durably marking its partition done).
+    /// The plan is parked `Failed` rather than cut over a possibly-incomplete
+    /// range; resume re-checks.
+    #[error("migration plan {plan_id} cutover gate is inconsistent (a partition reported Done but its cursor is not marked done); parked Failed")]
+    MigrationPartitionGateInconsistent { plan_id: u64 },
 
     /// Card 3/5 phase 2 of rename_field refuses fields carrying
     /// `@indexed`, `@unique`, or `@vectorize`. Each requires follow-on

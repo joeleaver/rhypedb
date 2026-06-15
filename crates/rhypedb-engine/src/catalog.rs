@@ -116,7 +116,6 @@ const KIND_MIGRATION_PLAN: u8 = 0x04;
 /// Value kind for a per-partition migration cursor (`c:S:<plan><idx>`,
 /// card 3/5). A fixed-layout framed value (no TLV) — a torn write
 /// decode-FAILS cleanly rather than silently misparsing the cursor.
-#[allow(dead_code)] // card-3 worker; driver wires it in 3b-part-2
 const KIND_PARTITION_CURSOR: u8 = 0x05;
 
 // TLV tags inside id-entry bodies (phase 1).
@@ -3865,10 +3864,8 @@ pub(crate) struct PartitionCursor {
 /// Fixed framed layout: `[RECORD_FORMAT_V1][KIND_PARTITION_CURSOR][cursor u64 BE]
 /// [objects_converted u64 BE][done u8]`. A torn write decode-FAILS cleanly
 /// (wrong length / kind / done byte) rather than silently misparsing the cursor.
-#[allow(dead_code)]
 const PARTITION_CURSOR_LEN: usize = 2 + 8 + 8 + 1;
 
-#[allow(dead_code)]
 pub(crate) fn encode_partition_cursor(pc: &PartitionCursor) -> Bytes {
     let mut out = Vec::with_capacity(PARTITION_CURSOR_LEN);
     out.push(RECORD_FORMAT_V1);
@@ -3879,7 +3876,6 @@ pub(crate) fn encode_partition_cursor(pc: &PartitionCursor) -> Bytes {
     Bytes::from(out)
 }
 
-#[allow(dead_code)]
 pub(crate) fn decode_partition_cursor(
     key_debug: &str,
     bytes: &[u8],
@@ -3931,7 +3927,6 @@ pub(crate) fn decode_partition_cursor(
 /// forward range scan (no read amplification). The union over `idx in 0..n` is
 /// exactly `[1, id_upper_bound)` and the ranges are disjoint; a partition past
 /// the populated tail (under id skew) is empty (`lo == hi`).
-#[allow(dead_code)] // wired by the parallel driver in card-3 increment 3b
 pub(crate) fn partition_range(n: u8, id_upper_bound: u64, idx: u8) -> (u64, u64) {
     let n = n.max(1) as u64;
     let idx = idx as u64;
@@ -4153,20 +4148,6 @@ fn require_migration_plan(
     decode_migration_plan(plan_id, &debug_key(&key), &bytes)
 }
 
-/// Commit a plan record to `c:P:<id>` in its own txn (used for the
-/// status=Failed park, which must persist even though the failing chunk's
-/// data txn is aborted).
-fn persist_migration_plan(storage: &LsmTree, plan: &MigrationPlan) -> EngineResult<()> {
-    let mut txn = storage.begin_txn();
-    let puts = vec![(
-        KeyBuilder::catalog_migration_plan(plan.plan_id),
-        encode_migration_plan(plan),
-    )];
-    storage.put_batch(&mut txn, &puts)?;
-    storage.commit(&mut txn)?;
-    Ok(())
-}
-
 /// Point-load a single migration plan within `txn`. Public so the card-2
 /// cutover (a `Database` method — it must reach the index/rev-edge cover
 /// maintenance that lives on `Database`, not `LsmTree`) can read the plan
@@ -4202,6 +4183,7 @@ pub(crate) fn migration_plan_record(plan: &MigrationPlan) -> (Bytes, Bytes) {
 /// idempotently), and `cutover_cursor=0`.
 pub(crate) fn park_migration_failed_rewind(storage: &LsmTree, plan_id: u64) -> EngineResult<()> {
     let mut txn = storage.begin_txn();
+    let snap = txn.snapshot();
     let mut plan = match require_migration_plan(storage, &txn, plan_id) {
         Ok(p) => p,
         Err(e) => {
@@ -4213,6 +4195,55 @@ pub(crate) fn park_migration_failed_rewind(storage: &LsmTree, plan_id: u64) -> E
     plan.phase = MigrationPhase::Converting;
     plan.cursor = 0;
     plan.cutover_cursor = 0;
+    // Card 3 (load-bearing for parallel plans): the rewind sends resume BACK
+    // through the backfill, but an N>1 plan's backfill is gated by the
+    // per-partition `c:S:<plan><idx>` `done` flags — `run_migration_partition`
+    // fast-returns `Done` the instant `done==true`. If the cursors survived the
+    // rewind, the re-driven backfill would fast-return Done for every partition,
+    // `all_partitions_done` would report the range covered, and cutover would
+    // re-refuse the SAME missing/stale shadow forever. Deleting every `c:S:`
+    // cursor forces a full re-backfill (already-current shadows are
+    // idempotency-skipped). Done in the SAME txn as the plan rewrite, deletes
+    // FIRST so a torn tail can only drop the plan-status advance. Safe vs
+    // concurrent writers: the only caller is `run_cutover`, which holds
+    // `migration_lock.write()`, so no live writer/worker can add a `c:S:` key
+    // here. (The plain `park_migration_failed_keep_cursors` — used by a
+    // CONVERTING-phase worker error — does NOT reset the cursors so resume
+    // continues each partition from where it stopped.)
+    let cursor_keys: Vec<Bytes> = storage
+        .scan_prefix_at(snap, &KeyBuilder::catalog_partition_cursor_plan_prefix(plan_id))?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    if !cursor_keys.is_empty() {
+        storage.delete_batch(&mut txn, &cursor_keys)?;
+    }
+    let (key, value) = migration_plan_record(&plan);
+    storage.put(&mut txn, &key, value)?;
+    storage.commit(&mut txn)?;
+    Ok(())
+}
+
+/// Park a plan `Failed` WITHOUT resetting any cursor (card 3). Used by a
+/// CONVERTING-phase backfill error (single-worker `run_migration_chunks` or a
+/// parallel `run_migration_partition` worker): the failing chunk was aborted
+/// before commit, so every `c:S:<plan><idx>` (and the legacy `cursor`) stays at
+/// its last durable position — resume continues each partition from there and
+/// re-converts idempotently. Distinct from `park_migration_failed_rewind`, which
+/// a CUTOVER refusal uses to force a full re-backfill by deleting the cursors.
+pub(crate) fn park_migration_failed_keep_cursors(
+    storage: &LsmTree,
+    plan_id: u64,
+) -> EngineResult<()> {
+    let mut txn = storage.begin_txn();
+    let mut plan = match require_migration_plan(storage, &txn, plan_id) {
+        Ok(p) => p,
+        Err(e) => {
+            storage.abort(&mut txn);
+            return Err(e);
+        }
+    };
+    plan.status = MigrationStatus::Failed;
     let (key, value) = migration_plan_record(&plan);
     storage.put(&mut txn, &key, value)?;
     storage.commit(&mut txn)?;
@@ -4436,10 +4467,10 @@ pub(crate) fn run_migration_chunks(
                     Ok(None) => {}
                     Err(e) => {
                         // Abort this chunk's uncommitted blobs (the cursor stays
-                        // where the last committed chunk left it), park Failed.
+                        // where the last committed chunk left it), park Failed
+                        // keeping the cursor so resume continues converting.
                         storage.abort(&mut txn);
-                        plan.status = MigrationStatus::Failed;
-                        persist_migration_plan(storage, &plan)?;
+                        park_migration_failed_keep_cursors(storage, plan_id)?;
                         return Err(e);
                     }
                 }
@@ -4495,7 +4526,6 @@ pub(crate) fn run_migration_chunks(
 /// Control byte for an in-flight parallel migration, shared (`Arc<AtomicU8>`)
 /// across the driver + every partition worker; workers poll it BETWEEN chunks
 /// (card 3/5).
-#[allow(dead_code)] // card-3 worker control; driver wires it in 3b-part-2
 pub(crate) mod migration_control {
     pub const RUN: u8 = 0;
     pub const PAUSE: u8 = 1;
@@ -4504,7 +4534,6 @@ pub(crate) mod migration_control {
 
 /// Why a partition worker returned (card 3/5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum PartitionDriveOutcome {
     /// The partition's whole `[lo, hi)` range is converted (cursor `done`).
     Done,
@@ -4526,7 +4555,6 @@ pub(crate) enum PartitionDriveOutcome {
 /// the driver joins all partitions then parks `Failed` once. Per-chunk commit
 /// order `[o: blobs FIRST, c:S:<plan><idx> LAST]`; a torn tail drops only the
 /// cursor advance and resume re-converts idempotently.
-#[allow(dead_code)] // driver wires it in 3b-part-2
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_migration_partition(
     storage: &LsmTree,
@@ -4693,6 +4721,199 @@ pub(crate) fn run_migration_partition(
             }
         }
     }
+}
+
+/// Disposition of a parallel backfill pass (card 3b/2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackfillDisposition {
+    /// Every partition's `[lo,hi)` is converted (all `c:S:` `done` flags
+    /// satisfied) — the caller proceeds to the single-threaded cutover.
+    AllDone,
+    /// A worker stopped at a chunk boundary on a PAUSE/CANCEL signal (or because
+    /// `Database::drop` paused it). The plan stays Running/Converting, resumable.
+    Paused,
+}
+
+/// Card 3b/2 cutover gate: is every partition of `plan_id` backfilled, and if so
+/// how many objects did they convert in TOTAL? Returns `Some(total)` iff every
+/// partition is satisfied — a partition is satisfied iff its persisted
+/// `c:S:<plan><idx>` cursor has `done==true`, OR its `partition_range` is empty
+/// (`lo>=hi` — past the id domain, never written, immediately complete) — and
+/// `None` if any partition is not yet done. The `total` sums the per-partition
+/// `objects_converted` (the parallel workers track their counts in `c:S:`, not in
+/// the plan record). This re-read of the DURABLE flags — not the in-memory worker
+/// return values — is the authoritative "may we cut over" gate, so a fresh run
+/// and a resume that spawned a subset of workers reach the identical decision.
+pub(crate) fn all_partitions_done(
+    storage: &LsmTree,
+    plan_id: u64,
+    parallel_degree: u8,
+    id_upper_bound: u64,
+) -> EngineResult<Option<u64>> {
+    let n = parallel_degree.max(1);
+    let txn = storage.begin_txn();
+    let mut total: u64 = 0;
+    for idx in 0..n {
+        let (lo, hi) = partition_range(n, id_upper_bound, idx);
+        if lo >= hi {
+            continue; // empty partition — nothing to convert, treated as done
+        }
+        let key = KeyBuilder::catalog_partition_cursor(plan_id, idx);
+        match storage.get(&txn, &key)? {
+            Some(bytes) => {
+                let pc = decode_partition_cursor(&debug_key(&key), &bytes)?;
+                if !pc.done {
+                    return Ok(None);
+                }
+                total = total.saturating_add(pc.objects_converted);
+            }
+            None => return Ok(None), // never written → not done
+        }
+    }
+    Ok(Some(total))
+}
+
+/// Fan out `parallel_degree` partition workers over `[1, id_upper_bound)` for a
+/// plan's Converting phase and JOIN them all (card 3b/2). Worker idx 0 runs on
+/// THIS thread; idx `1..N` run on scoped threads — so this returns only after
+/// every partition has stopped (no detached worker survives into the caller's
+/// cutover; the join barrier is airtight via `std::thread::scope`). Each worker
+/// advances only its own `c:S:<plan><idx>` cursor + its `o:` blobs (disjoint
+/// keys → no inter-worker conflict). The caller must have already confirmed the
+/// plan is in the `Converting` phase and pass its fields.
+///
+/// Returns `AllDone` only when the AUTHORITATIVE gate (`all_partitions_done`,
+/// re-reading the persisted `done` flags) is satisfied. On any worker error or
+/// PANIC: parks the plan `Failed` KEEPING the `c:S:` cursors (the failing chunk
+/// aborted before commit, so resume continues each partition idempotently) and
+/// returns the error. On any PAUSE/CANCEL outcome: returns `Paused` (CANCEL is
+/// folded into Paused for card 3b/2 — terminal cancel + rollback is card 5).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_parallel_backfill(
+    storage: &LsmTree,
+    plan_id: u64,
+    type_id: u64,
+    parallel_degree: u8,
+    id_upper_bound: u64,
+    type_name: &str,
+    field_name: &str,
+    src_kind: u8,
+    target_kind: u8,
+    converter_version: u32,
+    chunk_size: u64,
+    converter: &RegisteredConverter,
+    control: &std::sync::atomic::AtomicU8,
+) -> EngineResult<BackfillDisposition> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let n = parallel_degree.max(1);
+
+    // catch_unwind each worker so a panic can't unwind past the scope join
+    // (which would skip the driver's done-signal + deregister → wait-forever +
+    // a wedged registry entry). The panicking worker's in-flight txn aborts
+    // cleanly on drop (buffered-not-applied since Step B).
+    type WorkerOut = Result<EngineResult<PartitionDriveOutcome>, ()>;
+    let run_one = |idx: u8| -> WorkerOut {
+        let (lo, hi) = partition_range(n, id_upper_bound, idx);
+        catch_unwind(AssertUnwindSafe(|| {
+            run_migration_partition(
+                storage,
+                plan_id,
+                type_id,
+                idx,
+                lo,
+                hi,
+                type_name,
+                field_name,
+                src_kind,
+                target_kind,
+                converter_version,
+                chunk_size,
+                converter,
+                control,
+            )
+        }))
+        .map_err(|_| ())
+    };
+
+    let outcomes: Vec<WorkerOut> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (1..n).map(|idx| scope.spawn(move || run_one(idx))).collect();
+        let mut out = Vec::with_capacity(n as usize);
+        out.push(run_one(0)); // worker 0 on this thread
+        for h in handles {
+            // The closure already catch_unwinds, so a scope join can itself only
+            // panic if `run_one`'s own frame did — fold that to `Err(())` too.
+            out.push(h.join().unwrap_or(Err(())));
+        }
+        out
+    });
+
+    let mut any_paused = false;
+    let mut first_err: Option<EngineError> = None;
+    for o in outcomes {
+        match o {
+            Err(()) => {
+                first_err.get_or_insert(EngineError::Catalog(
+                    CatalogError::MigrationWorkerPanicked { plan_id },
+                ));
+            }
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            Ok(Ok(PartitionDriveOutcome::Done)) => {}
+            Ok(Ok(PartitionDriveOutcome::Paused)) | Ok(Ok(PartitionDriveOutcome::Cancelled)) => {
+                any_paused = true;
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        park_migration_failed_keep_cursors(storage, plan_id)?;
+        return Err(e);
+    }
+    if any_paused {
+        return Ok(BackfillDisposition::Paused);
+    }
+    match all_partitions_done(storage, plan_id, n, id_upper_bound)? {
+        Some(total) => {
+            // Roll the per-partition converted counts up into the plan record's
+            // (observational) `objects_converted`, which `list_migrations` reads
+            // and `finalize` returns. The plan record is otherwise untouched in
+            // the Converting phase (no concurrent writer of `c:P:` here — all
+            // workers have joined and cutover hasn't started), so this can't
+            // conflict.
+            set_plan_objects_converted(storage, plan_id, total)?;
+            Ok(BackfillDisposition::AllDone)
+        }
+        None => {
+            // Defensive: all workers reported Done yet a `c:S:` flag is unset — a
+            // worker-contract violation. Park keeping cursors rather than cut over
+            // a possibly-incomplete range; resume re-checks.
+            park_migration_failed_keep_cursors(storage, plan_id)?;
+            Err(EngineError::Catalog(
+                CatalogError::MigrationPartitionGateInconsistent { plan_id },
+            ))
+        }
+    }
+}
+
+/// Set a plan's observational `objects_converted` (card 3b/2). Used by
+/// `run_parallel_backfill` to roll the per-partition `c:S:` counts up into the
+/// plan record once the backfill is complete.
+fn set_plan_objects_converted(storage: &LsmTree, plan_id: u64, total: u64) -> EngineResult<()> {
+    let mut txn = storage.begin_txn();
+    let mut plan = match require_migration_plan(storage, &txn, plan_id) {
+        Ok(p) => p,
+        Err(e) => {
+            storage.abort(&mut txn);
+            return Err(e);
+        }
+    };
+    plan.objects_converted = total;
+    let (key, value) = migration_plan_record(&plan);
+    storage.put(&mut txn, &key, value)?;
+    storage.commit(&mut txn)?;
+    Ok(())
 }
 
 /// Flip the catalog field kind to the plan's target and mark the plan
