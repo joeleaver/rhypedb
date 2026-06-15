@@ -5,8 +5,8 @@ pub mod object;
 pub mod vectorizer;
 
 pub use catalog::{
-    AppliedMigration, FieldTypeChangePair, Migration, MigrationContext, MigrationLogReport,
-    MigrationReport, RenamePair,
+    AppliedMigration, ErrorPolicy, FieldTypeChangePair, Migration, MigrationContext,
+    MigrationLogReport, MigrationReport, MigrationStatus, RenamePair,
 };
 pub use error::{CatalogError, EngineError, EngineResult};
 

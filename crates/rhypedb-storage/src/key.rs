@@ -784,6 +784,45 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.freeze()
     }
+
+    /// Quarantine sidecar row: `c:Q:<u64 BE plan_id><u64 BE object_id>`
+    /// (shadow-field card 4/5). Records a row whose converter failed under the
+    /// Quarantine policy so the operator can triage + retry. Like `c:P:`/`c:S:`,
+    /// NOT schema-derived → MUST be exempted from the torn-write recovery clear.
+    /// Third byte `Q` is distinct from every other `c:` subkey.
+    pub fn catalog_quarantine(plan_id: u64, object_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(4 + 8 + 8);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'Q');
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(plan_id);
+        buf.put_u64(object_id);
+        buf.freeze()
+    }
+
+    /// Scan prefix for all quarantine rows of ONE plan: `c:Q:<u64 BE plan_id>`.
+    /// Used by `list_quarantined` / the cutover gate / `clear_quarantine`.
+    pub fn catalog_quarantine_plan_prefix(plan_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(4 + 8);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'Q');
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(plan_id);
+        buf.freeze()
+    }
+
+    /// Broad scan prefix for EVERY quarantine row: `c:Q:`. Used only by the
+    /// torn-write recovery clear to exempt this keyspace.
+    pub fn catalog_quarantine_prefix() -> Bytes {
+        let mut buf = BytesMut::with_capacity(4);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'Q');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
 }
 
 #[cfg(test)]

@@ -117,6 +117,9 @@ const KIND_MIGRATION_PLAN: u8 = 0x04;
 /// card 3/5). A fixed-layout framed value (no TLV) — a torn write
 /// decode-FAILS cleanly rather than silently misparsing the cursor.
 const KIND_PARTITION_CURSOR: u8 = 0x05;
+/// Value kind for a quarantine sidecar record (`c:Q:<plan><object_id>`,
+/// card 4/5) — a row whose converter failed under the Quarantine policy.
+const KIND_QUARANTINE: u8 = 0x06;
 
 // TLV tags inside id-entry bodies (phase 1).
 const TLV_ID: u8 = 0x01;
@@ -232,6 +235,12 @@ const TLV_MP_CUTOVER_CURSOR: u8 = 0x21;
 // `id_upper_bound=0`. Unknown tags are preserved verbatim and round-tripped.
 const TLV_MP_PARALLEL_DEGREE: u8 = 0x22;
 const TLV_MP_ID_UPPER_BOUND: u8 = 0x23;
+// Card 4 (ErrorPolicy + quarantine + dry-run) — 0x24-0x2F band. Absent on a
+// card-1/2/3 row → decode as Stop / not-dry-run / 0 errors / default cap.
+const TLV_MP_ERROR_POLICY: u8 = 0x24;
+const TLV_MP_DRY_RUN: u8 = 0x25;
+const TLV_MP_ERROR_COUNT: u8 = 0x26;
+const TLV_MP_QUARANTINE_CAP: u8 = 0x27;
 
 // MigrationStatus payload bytes for TLV_MP_STATUS. The decoder refuses
 // any other value rather than guess.
@@ -241,10 +250,24 @@ const MP_STATUS_COMPLETED: u8 = 0x02;
 const MP_STATUS_CANCELLED: u8 = 0x03;
 const MP_STATUS_FAILED: u8 = 0x04;
 const MP_STATUS_AWAITING_CONVERTER: u8 = 0x05;
+// Card 4: a dry-run finished — settled + terminal, but the catalog kind was NOT
+// flipped (distinct from Completed so no reader mistakes a preflight for a real
+// migration). Non-quiescing (the hook was never armed for a dry-run).
+const MP_STATUS_DRY_RUN_COMPLETED: u8 = 0x06;
+
+// ErrorPolicy payload bytes for TLV_MP_ERROR_POLICY (card 4).
+const MP_ERROR_POLICY_STOP: u8 = 0x00;
+const MP_ERROR_POLICY_SKIP_AND_LOG: u8 = 0x01;
+const MP_ERROR_POLICY_QUARANTINE: u8 = 0x02;
 
 // MigrationPhase payload bytes for TLV_MP_PHASE.
 const MP_PHASE_CONVERTING: u8 = 0x00;
 const MP_PHASE_CUTTING_OVER: u8 = 0x01;
+
+/// Default per-migration quarantine cap (card 4). Exceeding it auto-STOPS the
+/// migration (parks `Failed`) — a tripwire against a runaway error field (e.g. a
+/// forgotten NULL case) flooding `c:Q:`. Overridable per migration (0 → this).
+pub(crate) const DEFAULT_QUARANTINE_CAP: u64 = 100_000;
 
 /// Default objects processed per chunk commit. Bounds each chunk's
 /// `put_batch` + fsync while amortizing the per-chunk lock/scan overhead;
@@ -811,6 +834,12 @@ pub enum MigrationStatus {
     /// Resume found the pinned converter missing or version-changed.
     /// Parked until re-registered or cancelled. Hook armed; resumable.
     AwaitingConverter,
+    /// Card 4: a `dry_run` migration finished. Settled + terminal, but the
+    /// catalog kind was NOT flipped and no `o:`/`c:Q:` writes happened — distinct
+    /// from `Completed` so no reader mistakes a preflight for a real migration.
+    /// Non-quiescing (the hook was never armed for a dry-run, so nothing to keep
+    /// armed); the record is kept only for observability of the estimate.
+    DryRunCompleted,
 }
 
 #[allow(dead_code)] // is_terminal wired into auto-resume (increment 4)
@@ -823,6 +852,7 @@ impl MigrationStatus {
             MigrationStatus::Cancelled => MP_STATUS_CANCELLED,
             MigrationStatus::Failed => MP_STATUS_FAILED,
             MigrationStatus::AwaitingConverter => MP_STATUS_AWAITING_CONVERTER,
+            MigrationStatus::DryRunCompleted => MP_STATUS_DRY_RUN_COMPLETED,
         }
     }
 
@@ -834,6 +864,7 @@ impl MigrationStatus {
             MP_STATUS_CANCELLED => MigrationStatus::Cancelled,
             MP_STATUS_FAILED => MigrationStatus::Failed,
             MP_STATUS_AWAITING_CONVERTER => MigrationStatus::AwaitingConverter,
+            MP_STATUS_DRY_RUN_COMPLETED => MigrationStatus::DryRunCompleted,
             _ => return None,
         })
     }
@@ -842,22 +873,68 @@ impl MigrationStatus {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            MigrationStatus::Completed | MigrationStatus::Cancelled | MigrationStatus::Failed
+            MigrationStatus::Completed
+                | MigrationStatus::Cancelled
+                | MigrationStatus::Failed
+                | MigrationStatus::DryRunCompleted
         )
     }
 
     /// True while the plan is unsettled — the double-write hook must stay armed.
-    /// Only `Completed` and `Cancelled` settle it; `Failed` stays unsettled so a
-    /// half-converted field keeps failing writes closed before inspection.
-    /// (Name kept for back-compat; card 2 replaced type-wide quiesce with the
-    /// field-scoped double-write hook.)
+    /// `Completed`/`Cancelled`/`DryRunCompleted` settle it; `Failed` stays
+    /// unsettled so a half-converted field keeps failing writes closed before
+    /// inspection. (Name kept for back-compat; card 2 replaced type-wide quiesce
+    /// with the field-scoped double-write hook.)
     pub fn quiesces(self) -> bool {
-        !matches!(self, MigrationStatus::Completed | MigrationStatus::Cancelled)
+        !matches!(
+            self,
+            MigrationStatus::Completed
+                | MigrationStatus::Cancelled
+                | MigrationStatus::DryRunCompleted
+        )
     }
 
     /// Eligible for the worker to (re)drive: `Pending` or `Running`.
     pub fn is_drivable(self) -> bool {
         matches!(self, MigrationStatus::Pending | MigrationStatus::Running)
+    }
+}
+
+/// Per-migration policy for per-row CONVERTER failures (card 4/5). Governs ONLY
+/// `FieldTypeChangeConverterFailed`; a structural `MigrationRowUnexpectedKind`
+/// (on-disk vs catalog kind disagreement) or `FieldTypeChangeConverterReturnedWrongKind`
+/// (converter-contract violation) ALWAYS halts regardless of policy. Immutable
+/// after create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorPolicy {
+    /// First converter failure halts all partitions; no cutover. (Default —
+    /// matches card-1/2/3 single-commit semantics.)
+    Stop,
+    /// Converter failure is counted, the row is left unchanged, the migration
+    /// continues. Cutover may proceed (errored rows stay source-shape).
+    SkipAndLog,
+    /// Converter failure is recorded to `c:Q:` (source preserved) and the
+    /// migration continues. Cutover refuses until every quarantine row is
+    /// resolved (retried) or cleared.
+    Quarantine,
+}
+
+impl ErrorPolicy {
+    fn to_byte(self) -> u8 {
+        match self {
+            ErrorPolicy::Stop => MP_ERROR_POLICY_STOP,
+            ErrorPolicy::SkipAndLog => MP_ERROR_POLICY_SKIP_AND_LOG,
+            ErrorPolicy::Quarantine => MP_ERROR_POLICY_QUARANTINE,
+        }
+    }
+
+    fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            MP_ERROR_POLICY_STOP => ErrorPolicy::Stop,
+            MP_ERROR_POLICY_SKIP_AND_LOG => ErrorPolicy::SkipAndLog,
+            MP_ERROR_POLICY_QUARANTINE => ErrorPolicy::Quarantine,
+            _ => return None,
+        })
     }
 }
 
@@ -915,6 +992,22 @@ pub(crate) struct MigrationPlan {
     /// born with the shadow via the double-write hook, so no worker touches them.
     /// `0` on a legacy plan (no partitions).
     pub id_upper_bound: u64,
+    /// Card 4: per-row converter-failure policy. PINNED at create (immutable —
+    /// the SkipAndLog cutover-skip soundness depends on it). Card-1/2/3 rows
+    /// decode as `Stop`.
+    pub error_policy: ErrorPolicy,
+    /// Card 4: a preflight that runs the converter over every row, counting
+    /// `objects_converted`/`error_count`, but writes NOTHING to `o:`/`c:Q:` and
+    /// never cuts over (no hook armed). Card-1/2/3 rows decode as `false`.
+    pub dry_run: bool,
+    /// Card 4: number of rows whose converter failed (summed from the durable
+    /// per-partition `c:S:` `errors` at finalize — re-scan-proof like
+    /// `objects_converted`, NOT a free-running counter). Observability + the
+    /// cutover gate's coarse signal. Card-1/2/3 rows decode as `0`.
+    pub error_count: u64,
+    /// Card 4: cap on quarantined/errored rows; exceeding it parks the migration
+    /// `Failed` (tripwire vs a runaway error field). `0` → `DEFAULT_QUARANTINE_CAP`.
+    pub quarantine_cap: u64,
     /// Forward-compat: TLV tags this binary doesn't recognise, preserved
     /// verbatim so a card-2/4 row round-trips through a card-1 binary.
     pub unknown_tlvs: Vec<(u8, Bytes)>,
@@ -2555,14 +2648,16 @@ fn recover_partial_into_txn(
 ) -> EngineResult<Catalog> {
     // Blanket-clear the catalog keyspace, THEN re-backfill from the live
     // schema. EXEMPT the shadow-field migration keys (`c:P:` plans, the
-    // `c:S:` per-partition cursors, and the `c:N:M` id counter): they are not
-    // schema-derived, so backfill can't recreate them, and a torn-init reopen
-    // that hits this branch while a migration is in flight would otherwise
+    // `c:S:` per-partition cursors, the `c:Q:` quarantine sidecars, and the
+    // `c:N:M` id counter): they are not schema-derived, so backfill can't
+    // recreate them, and a torn-init reopen that hits this branch while a
+    // migration is in flight would otherwise
     // silently wipe the plan + per-partition cursors + the counter — losing
     // crash-resume (re-converting every partition from scratch) and letting a
     // freed id be reissued.
     let plan_prefix = KeyBuilder::catalog_migration_plan_prefix();
     let partition_prefix = KeyBuilder::catalog_partition_cursor_prefix();
+    let quarantine_prefix = KeyBuilder::catalog_quarantine_prefix();
     let counter_key = KeyBuilder::catalog_next_migration();
     let stale = storage.scan_prefix_at(snap, &KeyBuilder::catalog_prefix_all())?;
     let deletes: Vec<Bytes> = stale
@@ -2571,6 +2666,7 @@ fn recover_partial_into_txn(
         .filter(|k| {
             !k.starts_with(&plan_prefix)
                 && !k.starts_with(&partition_prefix)
+                && !k.starts_with(&quarantine_prefix)
                 && k != &counter_key
         })
         .collect();
@@ -3603,7 +3699,17 @@ fn encode_migration_plan(plan: &MigrationPlan) -> Bytes {
             &plan.id_upper_bound.to_be_bytes(),
         );
     }
-    // Preserve forward-compat tags (card 4) verbatim.
+    // Card 4: error policy / dry-run / error count / quarantine cap (always
+    // written; absent on a card-1/2/3 row → decode to Stop/false/0/default).
+    write_tlv(&mut body, TLV_MP_ERROR_POLICY, &[plan.error_policy.to_byte()]);
+    write_tlv(&mut body, TLV_MP_DRY_RUN, &[plan.dry_run as u8]);
+    write_tlv(&mut body, TLV_MP_ERROR_COUNT, &plan.error_count.to_be_bytes());
+    write_tlv(
+        &mut body,
+        TLV_MP_QUARANTINE_CAP,
+        &plan.quarantine_cap.to_be_bytes(),
+    );
+    // Preserve forward-compat tags verbatim.
     for (tag, value) in &plan.unknown_tlvs {
         write_tlv(&mut body, *tag, value);
     }
@@ -3676,6 +3782,10 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
     let mut cutover_cursor: Option<u64> = None;
     let mut parallel_degree: Option<u8> = None;
     let mut id_upper_bound: Option<u64> = None;
+    let mut error_policy: Option<ErrorPolicy> = None;
+    let mut dry_run: Option<bool> = None;
+    let mut error_count: Option<u64> = None;
+    let mut quarantine_cap: Option<u64> = None;
     let mut unknown_tlvs: Vec<(u8, Bytes)> = Vec::new();
     let mut seen_tags: u128 = 0;
 
@@ -3796,6 +3906,18 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
                 parallel_degree = Some(n);
             }
             TLV_MP_ID_UPPER_BOUND => id_upper_bound = Some(read_u64(value)?),
+            TLV_MP_ERROR_POLICY => {
+                let b = read_u8(value)?;
+                error_policy = Some(ErrorPolicy::from_byte(b).ok_or_else(|| {
+                    EngineError::Catalog(CatalogError::MalformedMigrationPlan {
+                        row: key_debug.into(),
+                        reason: "unknown error policy byte",
+                    })
+                })?);
+            }
+            TLV_MP_DRY_RUN => dry_run = Some(read_u8(value)? != 0),
+            TLV_MP_ERROR_COUNT => error_count = Some(read_u64(value)?),
+            TLV_MP_QUARANTINE_CAP => quarantine_cap = Some(read_u64(value)?),
             other => unknown_tlvs.push((other, Bytes::copy_from_slice(value))),
         }
     }
@@ -3828,6 +3950,12 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
         // id_upper_bound 0). `parallel_degree` presence is the discriminator.
         parallel_degree,
         id_upper_bound: id_upper_bound.unwrap_or(0),
+        // Card 4: absent on a card-1/2/3 row → Stop / not-dry-run / 0 errors /
+        // default cap.
+        error_policy: error_policy.unwrap_or(ErrorPolicy::Stop),
+        dry_run: dry_run.unwrap_or(false),
+        error_count: error_count.unwrap_or(0),
+        quarantine_cap: quarantine_cap.unwrap_or(DEFAULT_QUARANTINE_CAP),
         unknown_tlvs,
     })
 }
@@ -3857,14 +3985,22 @@ pub(crate) struct PartitionCursor {
     pub cursor: u64,
     /// Objects this partition has converted (observability + skew surfacing).
     pub objects_converted: u64,
+    /// Card 4: rows in this partition whose converter FAILED under a non-Stop
+    /// policy (SkipAndLog/Quarantine). Committed atomically with the cursor
+    /// advance (same chunk batch), so a torn/conflicted chunk drops the count
+    /// alongside its converts — a re-scan recomputes it idempotently (the
+    /// re-scan-proof analogue of `objects_converted`, NOT a free-running counter).
+    pub errors: u64,
     /// True once this partition's whole `[lo, hi)` range is exhausted.
     pub done: bool,
 }
 
 /// Fixed framed layout: `[RECORD_FORMAT_V1][KIND_PARTITION_CURSOR][cursor u64 BE]
-/// [objects_converted u64 BE][done u8]`. A torn write decode-FAILS cleanly
-/// (wrong length / kind / done byte) rather than silently misparsing the cursor.
-const PARTITION_CURSOR_LEN: usize = 2 + 8 + 8 + 1;
+/// [objects_converted u64 BE][errors u64 BE][done u8]` (card-4 v2; the card-3
+/// 19-byte v1 is unshipped on this branch so there is no compat to keep). A torn
+/// write decode-FAILS cleanly (wrong length / kind / done byte) rather than
+/// silently misparsing the cursor.
+const PARTITION_CURSOR_LEN: usize = 2 + 8 + 8 + 8 + 1;
 
 pub(crate) fn encode_partition_cursor(pc: &PartitionCursor) -> Bytes {
     let mut out = Vec::with_capacity(PARTITION_CURSOR_LEN);
@@ -3872,6 +4008,7 @@ pub(crate) fn encode_partition_cursor(pc: &PartitionCursor) -> Bytes {
     out.push(KIND_PARTITION_CURSOR);
     out.extend_from_slice(&pc.cursor.to_be_bytes());
     out.extend_from_slice(&pc.objects_converted.to_be_bytes());
+    out.extend_from_slice(&pc.errors.to_be_bytes());
     out.push(pc.done as u8);
     Bytes::from(out)
 }
@@ -3903,7 +4040,8 @@ pub(crate) fn decode_partition_cursor(
     }
     let cursor = u64::from_be_bytes(bytes[2..10].try_into().unwrap());
     let objects_converted = u64::from_be_bytes(bytes[10..18].try_into().unwrap());
-    let done = match bytes[18] {
+    let errors = u64::from_be_bytes(bytes[18..26].try_into().unwrap());
+    let done = match bytes[26] {
         0 => false,
         1 => true,
         _ => {
@@ -3916,8 +4054,334 @@ pub(crate) fn decode_partition_cursor(
     Ok(PartitionCursor {
         cursor,
         objects_converted,
+        errors,
         done,
     })
+}
+
+// =====================================================================
+// Quarantine sidecar (`c:Q:<plan><object_id>`, card 4/5)
+// =====================================================================
+
+/// Cap on the stored converter error message (bytes). Keeps a runaway error
+/// string from bloating the sidecar; the operator gets the gist.
+const MAX_QUARANTINE_ERROR_MSG: usize = 1024;
+
+/// A decoded quarantine record. `source_value` is the serialized 1-field
+/// `FieldMap` `{field_name: <source value>}` (reuses the object codec) so a
+/// retry can recover the exact value the converter choked on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuarantineRecord {
+    pub source_value: Bytes,
+    pub errored_at_ms: u64,
+    pub error_msg: String,
+    pub attempted_converter_name: String,
+}
+
+/// Framed layout: `[fmt][KIND_QUARANTINE][errored_at_ms u64 BE]
+/// [source_value_len u32 BE][source_value][error_msg_len u16 BE][error_msg]
+/// [converter_name_len u16 BE][converter_name]`. The error message is truncated
+/// to `MAX_QUARANTINE_ERROR_MSG` bytes (on a char boundary).
+pub(crate) fn encode_quarantine_record(
+    source_value: &[u8],
+    errored_at_ms: u64,
+    error_msg: &str,
+    attempted_converter_name: &str,
+) -> Bytes {
+    let mut msg = error_msg;
+    if msg.len() > MAX_QUARANTINE_ERROR_MSG {
+        // Truncate on a UTF-8 char boundary at or below the cap.
+        let mut end = MAX_QUARANTINE_ERROR_MSG;
+        while end > 0 && !msg.is_char_boundary(end) {
+            end -= 1;
+        }
+        msg = &msg[..end];
+    }
+    let cname = attempted_converter_name.as_bytes();
+    let mut out =
+        Vec::with_capacity(2 + 8 + 4 + source_value.len() + 2 + msg.len() + 2 + cname.len());
+    out.push(RECORD_FORMAT_V1);
+    out.push(KIND_QUARANTINE);
+    out.extend_from_slice(&errored_at_ms.to_be_bytes());
+    out.extend_from_slice(&(source_value.len() as u32).to_be_bytes());
+    out.extend_from_slice(source_value);
+    out.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+    out.extend_from_slice(msg.as_bytes());
+    out.extend_from_slice(&(cname.len() as u16).to_be_bytes());
+    out.extend_from_slice(cname);
+    Bytes::from(out)
+}
+
+pub(crate) fn decode_quarantine_record(
+    key_debug: &str,
+    bytes: &[u8],
+) -> EngineResult<QuarantineRecord> {
+    let malformed = |reason: &'static str| {
+        EngineError::Catalog(CatalogError::MalformedMigrationPlan {
+            row: key_debug.into(),
+            reason,
+        })
+    };
+    if bytes.len() < 2 + 8 + 4 {
+        return Err(malformed("quarantine record too short"));
+    }
+    if bytes[0] != RECORD_FORMAT_V1 {
+        return Err(EngineError::Catalog(CatalogError::UnsupportedRecordFormat {
+            row: key_debug.into(),
+            got: bytes[0],
+            max_supported: RECORD_FORMAT_V1,
+        }));
+    }
+    if bytes[1] != KIND_QUARANTINE {
+        return Err(EngineError::Catalog(CatalogError::WrongValueKind {
+            key_debug: key_debug.into(),
+            expected: "QuarantineRecord",
+            got_tag: bytes[1],
+        }));
+    }
+    let errored_at_ms = u64::from_be_bytes(bytes[2..10].try_into().unwrap());
+    let mut cur = 10;
+    let mut read_lp = |width: usize| -> EngineResult<&[u8]> {
+        if bytes.len() - cur < width {
+            return Err(malformed("quarantine length-prefix truncated"));
+        }
+        let n = match width {
+            4 => u32::from_be_bytes(bytes[cur..cur + 4].try_into().unwrap()) as usize,
+            2 => u16::from_be_bytes(bytes[cur..cur + 2].try_into().unwrap()) as usize,
+            _ => unreachable!(),
+        };
+        cur += width;
+        if bytes.len() - cur < n {
+            return Err(malformed("quarantine field truncated"));
+        }
+        let s = &bytes[cur..cur + n];
+        cur += n;
+        Ok(s)
+    };
+    let source_value = Bytes::copy_from_slice(read_lp(4)?);
+    let error_msg = std::str::from_utf8(read_lp(2)?)
+        .map_err(|_| malformed("quarantine error_msg not utf-8"))?
+        .to_string();
+    let attempted_converter_name = std::str::from_utf8(read_lp(2)?)
+        .map_err(|_| malformed("quarantine converter_name not utf-8"))?
+        .to_string();
+    Ok(QuarantineRecord {
+        source_value,
+        errored_at_ms,
+        error_msg,
+        attempted_converter_name,
+    })
+}
+
+/// Serialize a single field's value as a 1-entry `FieldMap` blob (reusing the
+/// object codec) so the quarantine sidecar can store + later recover the exact
+/// source value the converter failed on. Returns `None` if the field is absent.
+fn single_field_value_blob(blob: &[u8], field_name: &str) -> Option<Bytes> {
+    let fields = crate::object::deserialize_fields(blob);
+    let value = fields.get(field_name)?.clone();
+    let mut one = crate::object::FieldMap::new();
+    one.insert(field_name.to_string(), value);
+    Some(crate::object::serialize_fields(&one))
+}
+
+/// True for the ONE per-row error class governed by `ErrorPolicy` — a converter
+/// that returned `Err` on an otherwise-valid row. A structural
+/// `MigrationRowUnexpectedKind` (on-disk vs catalog kind disagreement) or
+/// `FieldTypeChangeConverterReturnedWrongKind` (converter-contract violation)
+/// signals a setup/programming defect, not a bad row, and ALWAYS halts.
+fn is_policy_governed_error(e: &EngineError) -> bool {
+    matches!(
+        e,
+        EngineError::Catalog(CatalogError::FieldTypeChangeConverterFailed { .. })
+    )
+}
+
+/// Would the cutover still treat this object's migrating field as an UNCONVERTED
+/// source row (card 4)? True iff the source is present, at `src_kind`, AND has no
+/// current-version `<field>__shadow`. A row whose field became Null/target-kind,
+/// or which gained a current shadow (via the double-write hook self-healing it,
+/// or `retry_quarantined`), is RESOLVED. Mirrors `run_cutover`'s own per-row
+/// decision so the quarantine gate and the cutover agree.
+fn quarantine_unresolved(
+    blob: &[u8],
+    field_name: &str,
+    src_kind: u8,
+    target_kind: u8,
+    converter_version: u32,
+) -> bool {
+    let fields = crate::object::deserialize_fields(blob);
+    let Some(value) = fields.get(field_name) else {
+        return false; // field absent → cutover skips it
+    };
+    let got = value_to_kind_byte(value);
+    if got == target_kind || got == kind_byte::UNSET {
+        return false; // already target / Null → resolved
+    }
+    if got != src_kind {
+        return false; // some other kind — not a clean src row (cutover handles separately)
+    }
+    // Source still at src_kind: resolved IFF a current-version shadow exists.
+    let shadow_name = format!("{field_name}__shadow");
+    let shadow_cv_name = format!("{field_name}__shadow_cv");
+    let has_current_shadow = fields.contains_key(&shadow_name)
+        && matches!(
+            fields.get(&shadow_cv_name),
+            Some(crate::object::Value::U32(v)) if *v == converter_version
+        );
+    !has_current_shadow
+}
+
+/// The cutover error gate (card 4): how many of a plan's quarantine rows are
+/// still UNRESOLVED, after reaping the resolved ones? Returns `0` for any policy
+/// other than `Quarantine` (Stop never reaches cutover with errors; SkipAndLog's
+/// errored rows are accepted as source-shape). For `Quarantine` it scans
+/// `c:Q:<plan>`, and for each row checks the LIVE object blob: a row whose object
+/// gained a current shadow (the double-write hook self-healed it, or
+/// `retry_quarantined` ran) is RESOLVED — DELETE its now-stale sidecar — and one
+/// still source-at-src-no-shadow is UNRESOLVED. So the gate self-corrects against
+/// hook self-heals instead of trusting a free-running counter. Caller holds
+/// `migration_lock.write()` (no concurrent `c:Q:`/blob writer).
+pub(crate) fn cutover_quarantine_gate(
+    storage: &LsmTree,
+    plan: &MigrationPlan,
+    type_id: u64,
+) -> EngineResult<u64> {
+    if plan.error_policy != ErrorPolicy::Quarantine {
+        return Ok(0);
+    }
+    let prefix = KeyBuilder::catalog_quarantine_plan_prefix(plan.plan_id);
+    let mut txn = storage.begin_txn();
+    let snap = txn.snapshot();
+    let rows = storage.scan_prefix_at(snap, &prefix)?;
+    let mut unresolved = 0u64;
+    let mut resolved_keys: Vec<Bytes> = Vec::new();
+    for (qkey, _) in rows {
+        let object_id = object_id_from_key(&qkey);
+        let obj_key = KeyBuilder::object(type_id, object_id);
+        let is_unresolved = match storage.get_at(snap, &obj_key)? {
+            None => false, // object deleted → nothing to convert → resolved
+            Some(blob) => quarantine_unresolved(
+                &blob,
+                &plan.field_name,
+                plan.src_kind,
+                plan.target_kind,
+                plan.converter_version,
+            ),
+        };
+        if is_unresolved {
+            unresolved += 1;
+        } else {
+            resolved_keys.push(qkey);
+        }
+    }
+    if resolved_keys.is_empty() {
+        storage.abort(&mut txn);
+    } else {
+        storage.delete_batch(&mut txn, &resolved_keys)?;
+        storage.commit(&mut txn)?;
+    }
+    Ok(unresolved)
+}
+
+/// Re-run a (now-fixed) converter over the named quarantine rows (card 4).
+/// For each `object_id`: if there is no `c:Q:` row it is already resolved
+/// (skip, not counted); otherwise re-read the LIVE object blob and run
+/// `new_converter` via the shared `convert_row_for_backfill` — which is
+/// idempotent (a row the double-write hook already shadowed at the current
+/// version yields `Ok(None)`, so the hook's write wins) — writing the shadow on
+/// success and DELETING the `c:Q:` row. A row whose converter still fails keeps
+/// its `c:Q:` row (not counted). Returns the count of rows newly resolved.
+/// Caller holds `migration_lock.write()` so this serializes against the
+/// read-locked hook + `run_cutover` (no last-write-wins blob clobber). Does NOT
+/// change `plan.error_count` (a historical count; the cutover gate reads the live
+/// `c:Q:` state instead).
+pub(crate) fn retry_quarantined(
+    storage: &LsmTree,
+    plan: &MigrationPlan,
+    type_id: u64,
+    ids: &[u64],
+    new_converter: &RegisteredConverter,
+) -> EngineResult<u64> {
+    const WRITE_CONFLICT_RETRIES: u32 = 8;
+    let field_name = &plan.field_name;
+    let shadow_name = format!("{field_name}__shadow");
+    let shadow_cv_name = format!("{field_name}__shadow_cv");
+    let mut retried = 0u64;
+    for &object_id in ids {
+        let qkey = KeyBuilder::catalog_quarantine(plan.plan_id, object_id);
+        let obj_key = KeyBuilder::object(type_id, object_id);
+        let mut attempts = 0u32;
+        let resolved = loop {
+            let mut txn = storage.begin_txn();
+            if storage.get(&txn, &qkey)?.is_none() {
+                storage.abort(&mut txn); // no quarantine row → already resolved
+                break false;
+            }
+            // Decide the write from the LIVE blob (absent object → just drop the
+            // stale sidecar; else re-run the converter, idempotent vs a current shadow).
+            let new_blob = match storage.get(&txn, &obj_key)? {
+                None => None, // object deleted → nothing to convert; clear the sidecar
+                Some(blob) => match convert_row_for_backfill(
+                    object_id,
+                    &blob,
+                    &plan.type_name,
+                    field_name,
+                    &shadow_name,
+                    &shadow_cv_name,
+                    plan.src_kind,
+                    plan.target_kind,
+                    plan.converter_version,
+                    new_converter,
+                    plan.plan_id,
+                ) {
+                    Ok(Some(nb)) => Some(nb),  // converted → write shadow + clear sidecar
+                    Ok(None) => None,          // already current/Null/target → clear sidecar
+                    Err(_) => {
+                        storage.abort(&mut txn); // still failing → keep the sidecar
+                        break false;
+                    }
+                },
+            };
+            if let Some(nb) = new_blob {
+                storage.put(&mut txn, &obj_key, nb)?;
+            }
+            storage.delete(&mut txn, &qkey)?;
+            match storage.commit(&mut txn) {
+                Ok(_) => break true,
+                Err(rhypedb_storage::Error::WriteConflict) if attempts < WRITE_CONFLICT_RETRIES => {
+                    storage.abort(&mut txn);
+                    attempts += 1;
+                    continue;
+                }
+                Err(e) => return Err(EngineError::Storage(e)),
+            }
+        };
+        if resolved {
+            retried += 1;
+        }
+    }
+    Ok(retried)
+}
+
+/// Delete ALL of a plan's `c:Q:` rows (card 4) — the operator accepts that the
+/// remaining quarantined rows stay source-shape; cutover will then leave them.
+/// Returns the count deleted. Caller holds `migration_lock.write()`.
+pub(crate) fn clear_quarantine(storage: &LsmTree, plan_id: u64) -> EngineResult<u64> {
+    let mut txn = storage.begin_txn();
+    let snap = txn.snapshot();
+    let keys: Vec<Bytes> = storage
+        .scan_prefix_at(snap, &KeyBuilder::catalog_quarantine_plan_prefix(plan_id))?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    let n = keys.len() as u64;
+    if keys.is_empty() {
+        storage.abort(&mut txn);
+    } else {
+        storage.delete_batch(&mut txn, &keys)?;
+        storage.commit(&mut txn)?;
+    }
+    Ok(n)
 }
 
 /// Half-open object-id range `[lo, hi)` owned by partition `idx` when the domain
@@ -4059,6 +4523,11 @@ pub(crate) fn create_migration_plan(
     // (cursors in `c:S:`); `None` is a legacy single-worker plan (`cursor` field).
     parallel_degree: Option<u8>,
     id_upper_bound: u64,
+    // Card 4: per-row failure policy (immutable), dry-run preflight flag, and the
+    // quarantine cap (0 → DEFAULT_QUARANTINE_CAP).
+    error_policy: ErrorPolicy,
+    dry_run: bool,
+    quarantine_cap: u64,
 ) -> EngineResult<CreatedMigration> {
     let _guard = CATALOG_INIT_LOCK.lock();
     let mut txn = storage.begin_txn();
@@ -4108,6 +4577,14 @@ pub(crate) fn create_migration_plan(
             cutover_cursor: 0,
             parallel_degree,
             id_upper_bound,
+            error_policy,
+            dry_run,
+            error_count: 0,
+            quarantine_cap: if quarantine_cap == 0 {
+                DEFAULT_QUARANTINE_CAP
+            } else {
+                quarantine_cap
+            },
             unknown_tlvs: Vec::new(),
         };
         let puts = vec![
@@ -4393,6 +4870,16 @@ pub(crate) fn run_migration_chunks(
         (plan, type_id)
     };
 
+    // Card 4: the legacy single-worker path is STOP-only and resumes only
+    // pre-card-4 plans. A card-4 plan (non-Stop policy or dry-run) is always
+    // PARALLEL — refuse rather than silently downgrade its declared policy.
+    if plan.error_policy != ErrorPolicy::Stop || plan.dry_run {
+        return Err(EngineError::Catalog(CatalogError::MalformedMigrationPlan {
+            row: format!("c:P:{plan_id}"),
+            reason: "non-Stop / dry-run plan must run via the parallel backfill path, not run_migration_chunks",
+        }));
+    }
+
     // Bound on per-chunk WriteConflict retries before giving up (a hot key
     // under concurrent live writes in card-2 inc 2d). Dormant in inc 2c.
     const WRITE_CONFLICT_RETRIES: u32 = 8;
@@ -4541,6 +5028,10 @@ pub(crate) enum PartitionDriveOutcome {
     Paused,
     /// Stopped at a chunk boundary on a CANCEL signal — resumable from the cursor.
     Cancelled,
+    /// Card 4: the GLOBAL quarantine/error count crossed the cap — the worker
+    /// committed its in-flight chunk (so the `c:Q:` rows + counts are durable)
+    /// then stopped. The driver parks the plan `Failed` once.
+    CapExceeded,
 }
 
 /// Back-fill `<field>__shadow` for ONE partition's contiguous object-id range
@@ -4571,12 +5062,21 @@ pub(crate) fn run_migration_partition(
     chunk_size: u64,
     converter: &RegisteredConverter,
     control: &std::sync::atomic::AtomicU8,
+    // Card 4: per-row failure policy, dry-run (count-only), the GLOBAL error
+    // counter shared across all partitions (soft cap tripwire), the cap, and the
+    // converter name recorded in `c:Q:` rows.
+    error_policy: ErrorPolicy,
+    dry_run: bool,
+    error_counter: &std::sync::atomic::AtomicU64,
+    quarantine_cap: u64,
+    attempted_converter_name: &str,
 ) -> EngineResult<PartitionDriveOutcome> {
     use std::sync::atomic::Ordering;
     const WRITE_CONFLICT_RETRIES: u32 = 8;
     enum ChunkResult {
         Exhausted,
-        Committed(PartitionCursor),
+        // (advanced cursor, errors committed in THIS chunk).
+        Committed(PartitionCursor, u64),
     }
 
     let shadow_name = format!("{field_name}__shadow");
@@ -4598,6 +5098,7 @@ pub(crate) fn run_migration_partition(
             None => PartitionCursor {
                 cursor: 0,
                 objects_converted: 0,
+                errors: 0,
                 done: false,
             },
         }
@@ -4644,6 +5145,7 @@ pub(crate) fn run_migration_partition(
 
             let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(chunk.live.len() + 1);
             let mut converted_this_chunk: u64 = 0;
+            let mut errors_this_chunk: u64 = 0;
             for (key, blob) in &chunk.live {
                 let object_id = object_id_from_key(key);
                 if object_id >= hi {
@@ -4663,13 +5165,39 @@ pub(crate) fn run_migration_partition(
                     plan_id,
                 ) {
                     Ok(Some(new_blob)) => {
-                        puts.push((key.clone(), new_blob));
+                        // Dry-run counts the convert but writes NO `o:` blob.
+                        if !dry_run {
+                            puts.push((key.clone(), new_blob));
+                        }
                         converted_this_chunk += 1;
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        storage.abort(&mut txn);
-                        return Err(e);
+                        // A STRUCTURAL error (kind mismatch / converter-contract
+                        // violation) or the Stop policy halts regardless: abort the
+                        // chunk, propagate (the driver parks Failed keeping cursors).
+                        if error_policy == ErrorPolicy::Stop || !is_policy_governed_error(&e) {
+                            storage.abort(&mut txn);
+                            return Err(e);
+                        }
+                        // SkipAndLog / Quarantine: count + continue. The errored row
+                        // keeps its source value (NO shadow written) so cutover can
+                        // leave it source-shape (SkipAndLog) or the operator triages
+                        // it (Quarantine).
+                        errors_this_chunk += 1;
+                        if error_policy == ErrorPolicy::Quarantine && !dry_run {
+                            let source_value =
+                                single_field_value_blob(blob, field_name).unwrap_or_default();
+                            puts.push((
+                                KeyBuilder::catalog_quarantine(plan_id, object_id),
+                                encode_quarantine_record(
+                                    &source_value,
+                                    now_unix_millis(),
+                                    &e.to_string(),
+                                    attempted_converter_name,
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -4682,15 +5210,17 @@ pub(crate) fn run_migration_partition(
             let next_cursor = high_water_id.min(hi - 1);
             let pc_after = PartitionCursor {
                 cursor: next_cursor,
-                objects_converted: pc
-                    .objects_converted
-                    .saturating_add(converted_this_chunk),
+                objects_converted: pc.objects_converted.saturating_add(converted_this_chunk),
+                // errors are committed atomically with the cursor (and the
+                // `o:`/`c:Q:` puts) so a torn/conflicted chunk drops them too —
+                // re-scan recomputes idempotently.
+                errors: pc.errors.saturating_add(errors_this_chunk),
                 done,
             };
             puts.push((cursor_key.clone(), encode_partition_cursor(&pc_after)));
             storage.put_batch(&mut txn, &puts)?;
             match storage.commit(&mut txn) {
-                Ok(_) => break ChunkResult::Committed(pc_after),
+                Ok(_) => break ChunkResult::Committed(pc_after, errors_this_chunk),
                 Err(rhypedb_storage::Error::WriteConflict)
                     if attempts < WRITE_CONFLICT_RETRIES =>
                 {
@@ -4713,8 +5243,20 @@ pub(crate) fn run_migration_partition(
                 storage.commit(&mut txn)?;
                 return Ok(PartitionDriveOutcome::Done);
             }
-            ChunkResult::Committed(pc_after) => {
+            ChunkResult::Committed(pc_after, errs) => {
                 pc = pc_after;
+                // Roll this chunk's (now durable) errors into the GLOBAL counter
+                // AFTER the commit, so a WriteConflict re-scan never double-adds.
+                if errs > 0 {
+                    error_counter.fetch_add(errs, Ordering::SeqCst);
+                }
+                // Soft cap tripwire — stop (the in-flight chunk is already durable)
+                // once the GLOBAL error count crosses the cap; the driver parks Failed.
+                if error_policy != ErrorPolicy::Stop
+                    && error_counter.load(Ordering::SeqCst) > quarantine_cap
+                {
+                    return Ok(PartitionDriveOutcome::CapExceeded);
+                }
                 if pc.done {
                     return Ok(PartitionDriveOutcome::Done);
                 }
@@ -4734,25 +5276,25 @@ pub(crate) enum BackfillDisposition {
     Paused,
 }
 
-/// Card 3b/2 cutover gate: is every partition of `plan_id` backfilled, and if so
-/// how many objects did they convert in TOTAL? Returns `Some(total)` iff every
-/// partition is satisfied — a partition is satisfied iff its persisted
-/// `c:S:<plan><idx>` cursor has `done==true`, OR its `partition_range` is empty
-/// (`lo>=hi` — past the id domain, never written, immediately complete) — and
-/// `None` if any partition is not yet done. The `total` sums the per-partition
-/// `objects_converted` (the parallel workers track their counts in `c:S:`, not in
-/// the plan record). This re-read of the DURABLE flags — not the in-memory worker
-/// return values — is the authoritative "may we cut over" gate, so a fresh run
-/// and a resume that spawned a subset of workers reach the identical decision.
-pub(crate) fn all_partitions_done(
+/// Summed per-partition progress (card 3b/2 + card 4). Re-reads the DURABLE
+/// `c:S:<plan><idx>` cursors — the authoritative source (not in-memory worker
+/// outcomes), so a fresh run and a resume that spawned a subset of workers reach
+/// the identical decision. Returns `(objects_converted, errors, all_done)`:
+/// `all_done` is true iff every partition's cursor has `done==true` OR its
+/// `partition_range` is empty (`lo>=hi`, immediately complete). The counts sum
+/// over partitions regardless of `all_done` (so the cap-exceed/dry-run paths can
+/// roll them up, and a resume can seed the soft cap counter from them).
+pub(crate) fn sum_partition_counts(
     storage: &LsmTree,
     plan_id: u64,
     parallel_degree: u8,
     id_upper_bound: u64,
-) -> EngineResult<Option<u64>> {
+) -> EngineResult<(u64, u64, bool)> {
     let n = parallel_degree.max(1);
     let txn = storage.begin_txn();
-    let mut total: u64 = 0;
+    let mut converted: u64 = 0;
+    let mut errors: u64 = 0;
+    let mut all_done = true;
     for idx in 0..n {
         let (lo, hi) = partition_range(n, id_upper_bound, idx);
         if lo >= hi {
@@ -4762,15 +5304,16 @@ pub(crate) fn all_partitions_done(
         match storage.get(&txn, &key)? {
             Some(bytes) => {
                 let pc = decode_partition_cursor(&debug_key(&key), &bytes)?;
+                converted = converted.saturating_add(pc.objects_converted);
+                errors = errors.saturating_add(pc.errors);
                 if !pc.done {
-                    return Ok(None);
+                    all_done = false;
                 }
-                total = total.saturating_add(pc.objects_converted);
             }
-            None => return Ok(None), // never written → not done
+            None => all_done = false, // never written → not done
         }
     }
-    Ok(Some(total))
+    Ok((converted, errors, all_done))
 }
 
 /// Fan out `parallel_degree` partition workers over `[1, id_upper_bound)` for a
@@ -4803,9 +5346,24 @@ pub(crate) fn run_parallel_backfill(
     chunk_size: u64,
     converter: &RegisteredConverter,
     control: &std::sync::atomic::AtomicU8,
+    // Card 4: the immutable failure policy, dry-run flag, cap, and the converter
+    // name recorded into `c:Q:` rows.
+    error_policy: ErrorPolicy,
+    dry_run: bool,
+    quarantine_cap: u64,
+    converter_name: &str,
 ) -> EngineResult<BackfillDisposition> {
     use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::AtomicU64;
     let n = parallel_degree.max(1);
+
+    // Soft GLOBAL error counter shared across all partition workers — only a cap
+    // tripwire, NEVER the source of plan.error_count (that is summed from the
+    // durable c:S: errors). Seed it from the durable errors so a RESUMED run's
+    // cap check accounts for errors already committed in a prior run.
+    let (_seed_conv, seed_errors, _seed_done) =
+        sum_partition_counts(storage, plan_id, n, id_upper_bound)?;
+    let error_counter = AtomicU64::new(seed_errors);
 
     // catch_unwind each worker so a panic can't unwind past the scope join
     // (which would skip the driver's done-signal + deregister → wait-forever +
@@ -4830,6 +5388,11 @@ pub(crate) fn run_parallel_backfill(
                 chunk_size,
                 converter,
                 control,
+                error_policy,
+                dry_run,
+                &error_counter,
+                quarantine_cap,
+                converter_name,
             )
         }))
         .map_err(|_| ())
@@ -4848,6 +5411,7 @@ pub(crate) fn run_parallel_backfill(
     });
 
     let mut any_paused = false;
+    let mut any_cap_exceeded = false;
     let mut first_err: Option<EngineError> = None;
     for o in outcomes {
         match o {
@@ -4865,42 +5429,56 @@ pub(crate) fn run_parallel_backfill(
             Ok(Ok(PartitionDriveOutcome::Paused)) | Ok(Ok(PartitionDriveOutcome::Cancelled)) => {
                 any_paused = true;
             }
+            Ok(Ok(PartitionDriveOutcome::CapExceeded)) => {
+                any_cap_exceeded = true;
+            }
         }
     }
     if let Some(e) = first_err {
         park_migration_failed_keep_cursors(storage, plan_id)?;
         return Err(e);
     }
+    // Roll the DURABLE per-partition counts into the plan (authoritative
+    // error_count), regardless of disposition — observability + the cutover gate.
+    let (converted, errors, all_done) = sum_partition_counts(storage, plan_id, n, id_upper_bound)?;
+    set_plan_counts(storage, plan_id, converted, errors)?;
+
+    if any_cap_exceeded {
+        // The cap tripwire fired — park Failed (hook stays armed, resumable for
+        // triage). The cutover gate (unresolved c:Q: count) keeps it blocked until
+        // the operator retries/clears or fixes the converter and resumes.
+        park_migration_failed_keep_cursors(storage, plan_id)?;
+        return Err(EngineError::MigrationQuarantineCapExceeded {
+            plan_id,
+            cap: quarantine_cap,
+        });
+    }
     if any_paused {
         return Ok(BackfillDisposition::Paused);
     }
-    match all_partitions_done(storage, plan_id, n, id_upper_bound)? {
-        Some(total) => {
-            // Roll the per-partition converted counts up into the plan record's
-            // (observational) `objects_converted`, which `list_migrations` reads
-            // and `finalize` returns. The plan record is otherwise untouched in
-            // the Converting phase (no concurrent writer of `c:P:` here — all
-            // workers have joined and cutover hasn't started), so this can't
-            // conflict.
-            set_plan_objects_converted(storage, plan_id, total)?;
-            Ok(BackfillDisposition::AllDone)
-        }
-        None => {
-            // Defensive: all workers reported Done yet a `c:S:` flag is unset — a
-            // worker-contract violation. Park keeping cursors rather than cut over
-            // a possibly-incomplete range; resume re-checks.
-            park_migration_failed_keep_cursors(storage, plan_id)?;
-            Err(EngineError::Catalog(
-                CatalogError::MigrationPartitionGateInconsistent { plan_id },
-            ))
-        }
+    if all_done {
+        Ok(BackfillDisposition::AllDone)
+    } else {
+        // Defensive: all workers reported Done yet a `c:S:` flag is unset — a
+        // worker-contract violation. Park keeping cursors rather than cut over
+        // a possibly-incomplete range; resume re-checks.
+        park_migration_failed_keep_cursors(storage, plan_id)?;
+        Err(EngineError::Catalog(
+            CatalogError::MigrationPartitionGateInconsistent { plan_id },
+        ))
     }
 }
 
-/// Set a plan's observational `objects_converted` (card 3b/2). Used by
-/// `run_parallel_backfill` to roll the per-partition `c:S:` counts up into the
-/// plan record once the backfill is complete.
-fn set_plan_objects_converted(storage: &LsmTree, plan_id: u64, total: u64) -> EngineResult<()> {
+/// Roll the per-partition `c:S:` counts up into the plan record's observational
+/// `objects_converted` + `error_count` (card 3b/2 + 4). Called once the backfill
+/// stops; the plan record has no other concurrent `c:P:` writer at that point
+/// (all workers joined, cutover not started).
+fn set_plan_counts(
+    storage: &LsmTree,
+    plan_id: u64,
+    objects_converted: u64,
+    error_count: u64,
+) -> EngineResult<()> {
     let mut txn = storage.begin_txn();
     let mut plan = match require_migration_plan(storage, &txn, plan_id) {
         Ok(p) => p,
@@ -4909,7 +5487,40 @@ fn set_plan_objects_converted(storage: &LsmTree, plan_id: u64, total: u64) -> En
             return Err(e);
         }
     };
-    plan.objects_converted = total;
+    plan.objects_converted = objects_converted;
+    plan.error_count = error_count;
+    let (key, value) = migration_plan_record(&plan);
+    storage.put(&mut txn, &key, value)?;
+    storage.commit(&mut txn)?;
+    Ok(())
+}
+
+/// Finalize a DRY-RUN migration (card 4): delete the per-partition `c:S:`
+/// cursors and mark the plan `DryRunCompleted` (settled + terminal, catalog kind
+/// NOT flipped), in ONE commit. A dry-run never armed the double-write hook and
+/// wrote no `o:`/`c:Q:`, so there is nothing else to clean and no hook to disarm
+/// — this is storage-only (no `Database` needed). The plan record is KEPT so
+/// `list_migrations` reports the preflight's `objects_converted`/`error_count`.
+pub(crate) fn finalize_dry_run(storage: &LsmTree, plan_id: u64) -> EngineResult<()> {
+    let mut txn = storage.begin_txn();
+    let snap = txn.snapshot();
+    let mut plan = match require_migration_plan(storage, &txn, plan_id) {
+        Ok(p) => p,
+        Err(e) => {
+            storage.abort(&mut txn);
+            return Err(e);
+        }
+    };
+    // Delete every c:S:<plan> cursor (transient dry-run progress) in the same txn.
+    let cursor_keys: Vec<Bytes> = storage
+        .scan_prefix_at(snap, &KeyBuilder::catalog_partition_cursor_plan_prefix(plan_id))?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    if !cursor_keys.is_empty() {
+        storage.delete_batch(&mut txn, &cursor_keys)?;
+    }
+    plan.status = MigrationStatus::DryRunCompleted;
     let (key, value) = migration_plan_record(&plan);
     storage.put(&mut txn, &key, value)?;
     storage.commit(&mut txn)?;
@@ -5484,6 +6095,10 @@ mod tests {
             cutover_cursor: 0,
             parallel_degree: None,
             id_upper_bound: 0,
+            error_policy: ErrorPolicy::Stop,
+            dry_run: false,
+            error_count: 0,
+            quarantine_cap: DEFAULT_QUARANTINE_CAP,
             unknown_tlvs: Vec::new(),
         }
     }
@@ -5541,6 +6156,58 @@ mod tests {
     }
 
     #[test]
+    fn migration_plan_roundtrip_card4_fields() {
+        // Card 4: non-default error_policy / dry_run / error_count / cap round-trip.
+        let mut p = sample_plan();
+        p.error_policy = ErrorPolicy::Quarantine;
+        p.dry_run = true;
+        p.error_count = 1234;
+        p.quarantine_cap = 50_000;
+        p.status = MigrationStatus::DryRunCompleted;
+        let back = decode_migration_plan(p.plan_id, "c:P:7", &encode_migration_plan(&p)).unwrap();
+        assert_eq!(p, back);
+        assert_eq!(back.error_policy, ErrorPolicy::Quarantine);
+        assert!(back.dry_run);
+        assert_eq!(back.error_count, 1234);
+        assert_eq!(back.quarantine_cap, 50_000);
+        assert_eq!(back.status, MigrationStatus::DryRunCompleted);
+    }
+
+    #[test]
+    fn card1_plan_decodes_card4_defaults() {
+        // A pre-card-4 row (the hand-rolled encoder writes no 0x24-0x27 tags)
+        // decodes to Stop / not-dry-run / 0 errors / the default cap.
+        let raw = encode_plan_with_raw_status(MP_STATUS_RUNNING);
+        let back = decode_migration_plan(7, "c:P:7", &raw).unwrap();
+        assert_eq!(back.error_policy, ErrorPolicy::Stop);
+        assert!(!back.dry_run);
+        assert_eq!(back.error_count, 0);
+        assert_eq!(back.quarantine_cap, DEFAULT_QUARANTINE_CAP);
+    }
+
+    #[test]
+    fn quarantine_record_roundtrip_and_truncates_long_msg() {
+        let src = b"\x00\x01some-serialized-value";
+        let rec = decode_quarantine_record(
+            "c:Q:1#2",
+            &encode_quarantine_record(src, 1_700_000_000_000, "converter blew up", "widen"),
+        )
+        .unwrap();
+        assert_eq!(&rec.source_value[..], &src[..]);
+        assert_eq!(rec.errored_at_ms, 1_700_000_000_000);
+        assert_eq!(rec.error_msg, "converter blew up");
+        assert_eq!(rec.attempted_converter_name, "widen");
+        // A >1 KiB message is truncated (on a char boundary).
+        let long = "x".repeat(5000);
+        let rec2 = decode_quarantine_record(
+            "c:Q:1#2",
+            &encode_quarantine_record(b"v", 0, &long, "c"),
+        )
+        .unwrap();
+        assert_eq!(rec2.error_msg.len(), MAX_QUARANTINE_ERROR_MSG);
+    }
+
+    #[test]
     fn decode_migration_plan_rejects_out_of_range_parallel_degree() {
         // Hand-plant a parallel_degree TLV (0x22) with an illegal value 0.
         let mut p = sample_plan();
@@ -5572,6 +6239,7 @@ mod tests {
         let pc = PartitionCursor {
             cursor: 123456,
             objects_converted: 789,
+            errors: 12,
             done: true,
         };
         let bytes = encode_partition_cursor(&pc);

@@ -174,6 +174,20 @@ pub enum EngineError {
     /// (WriteConflict storm) or both reach cutover (double generation bump).
     #[error("migration plan {plan_id} already has an active driver")]
     MigrationAlreadyRunning { plan_id: u64 },
+
+    /// Card 4: cutover refused because the migration has unresolved per-row
+    /// errors and its policy is not `SkipAndLog`. Under `Quarantine` the operator
+    /// must `retry_quarantined` (re-run a fixed converter) or `clear_quarantine`
+    /// (accept the rows stay source-shape) until none remain, then resume.
+    #[error("cutover of plan {plan_id} refused: {error_count} unresolved error(s) under a non-skip policy; retry or clear the quarantine, then resume")]
+    MigrationCutoverHasErrors { plan_id: u64, error_count: u64 },
+
+    /// Card 4: the per-migration quarantine/error cap was exceeded — the
+    /// migration auto-STOPPED (parked `Failed`, hook still armed). A runaway
+    /// error field (e.g. a forgotten NULL case); fix the converter + resume, or
+    /// triage the quarantine.
+    #[error("migration plan {plan_id} exceeded its quarantine cap ({cap}); parked Failed")]
+    MigrationQuarantineCapExceeded { plan_id: u64, cap: u64 },
 }
 
 /// Failures specific to the persisted schema catalog (see

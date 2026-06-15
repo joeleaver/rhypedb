@@ -551,6 +551,36 @@ pub struct MigrationPlanSpec {
     /// (`DEFAULT_MIGRATION_CHUNK_SIZE`). Smaller = more frequent cursor
     /// commits (lower re-do on crash) at more fsyncs.
     pub chunk_size: u64,
+    /// Card 4: per-row converter-failure policy (default `Stop`).
+    pub error_policy: crate::catalog::ErrorPolicy,
+    /// Card 4: when `true`, run the converter over every row to estimate
+    /// `objects_converted`/`error_count` but write NOTHING and never cut over —
+    /// a preflight. Default `false`.
+    pub dry_run: bool,
+    /// Card 4: cap on quarantined/errored rows; exceeding it auto-stops the
+    /// migration (`Failed`). `0` → `DEFAULT_QUARANTINE_CAP` (100K).
+    pub quarantine_cap: u64,
+}
+
+impl Default for MigrationPlanSpec {
+    /// Defaults for the non-identifying knobs (card 4): `Stop` policy, not a
+    /// dry-run, engine-default chunk size + quarantine cap. The identifying
+    /// fields (type/field/target/converter) are placeholders the caller MUST
+    /// override — provided only so `..Default::default()` can supply the card-4
+    /// knobs without every call site spelling them out.
+    fn default() -> Self {
+        Self {
+            type_name: String::new(),
+            field_name: String::new(),
+            target_field_type: rhypedb_schema::FieldType::Scalar(rhypedb_schema::ScalarType::I64),
+            converter_name: String::new(),
+            converter_version: 0,
+            chunk_size: 0,
+            error_policy: crate::catalog::ErrorPolicy::Stop,
+            dry_run: false,
+            quarantine_cap: 0,
+        }
+    }
 }
 
 /// Operator-facing snapshot of a persisted migration plan
@@ -571,6 +601,23 @@ pub struct MigrationSummary {
     pub converter_name: String,
     pub converter_version: u32,
     pub created_at_ms: u64,
+    /// Card 4: rows whose converter failed during backfill (a historical count;
+    /// the live unresolved-quarantine count is `list_quarantined().len()`).
+    pub error_count: u64,
+    /// Card 4: per-row failure policy.
+    pub error_policy: crate::catalog::ErrorPolicy,
+    /// Card 4: a dry-run preflight (wrote nothing, never cut over).
+    pub dry_run: bool,
+}
+
+/// Operator-facing view of one quarantined row (card 4,
+/// [`Database::list_quarantined`]).
+#[derive(Debug, Clone)]
+pub struct QuarantineEntry {
+    pub object_id: u64,
+    pub error_msg: String,
+    pub errored_at_ms: u64,
+    pub attempted_converter_name: String,
 }
 
 impl Database {
@@ -1830,19 +1877,27 @@ impl Database {
                 spec.chunk_size,
                 Some(parallel_degree),
                 id_upper_bound,
+                spec.error_policy,
+                spec.dry_run,
+                spec.quarantine_cap,
             )?;
-            // Install the double-write hook so live writes to the migrating
-            // field carry it forward (card 2d — no quiesce; writes proceed).
-            self.arm_field_hook(
-                created.type_id,
-                MigratingFieldHook {
-                    field_name: spec.field_name.clone(),
-                    converter: Some(Arc::clone(&converter)),
-                    target_kind,
-                    converter_version: spec.converter_version,
-                    plan_id: created.plan_id,
-                },
-            );
+            // Install the double-write hook so live writes to the migrating field
+            // carry it forward (card 2d — no quiesce; writes proceed). Card 4: a
+            // DRY-RUN does NOT arm the hook — it's a preflight that writes nothing
+            // and never cuts over, so live writes proceed normally (no shadow,
+            // nothing to disarm or leak).
+            if !spec.dry_run {
+                self.arm_field_hook(
+                    created.type_id,
+                    MigratingFieldHook {
+                        field_name: spec.field_name.clone(),
+                        converter: Some(Arc::clone(&converter)),
+                        target_kind,
+                        converter_version: spec.converter_version,
+                        plan_id: created.plan_id,
+                    },
+                );
+            }
             created
         };
 
@@ -2084,12 +2139,20 @@ impl Database {
                         plan.chunk_size,
                         converter,
                         &control,
+                        plan.error_policy,
+                        plan.dry_run,
+                        plan.quarantine_cap,
+                        &plan.converter_name,
                     )?;
                     if matches!(disp, crate::catalog::BackfillDisposition::Paused) {
                         return Ok(()); // paused/cancelled — plan left resumable
                     }
-                    // AllDone → single-threaded cutover (still under `_guard`, so a
+                    // AllDone. A dry-run cleans up + marks DryRunCompleted (no
+                    // cutover); a real plan cuts over (still under `_guard`, so a
                     // waiter wakes only after cutover finishes/fails).
+                    if plan.dry_run {
+                        return crate::catalog::finalize_dry_run(&self.storage, plan_id);
+                    }
                     return self.run_cutover(plan_id, type_id);
                 }
                 None => {
@@ -2134,8 +2197,23 @@ impl Database {
         let field_name = plan.field_name.clone();
         let target_kind = plan.target_kind;
         let converter_version = plan.converter_version;
+        let error_policy = plan.error_policy;
         let shadow_name = format!("{field_name}__shadow");
         let shadow_cv_name = format!("{field_name}__shadow_cv");
+
+        // Card 4 cutover gate: a Quarantine plan with UNRESOLVED quarantine rows
+        // cannot cut over — the operator must `retry_quarantined` / `clear_quarantine`
+        // first (the gate self-corrects against hook self-heals + reaps resolved
+        // sidecars). Park `Failed` (hook armed, resumable) so the block is observable;
+        // resume re-checks. (SkipAndLog/Stop → gate returns 0 and proceeds.)
+        let unresolved = crate::catalog::cutover_quarantine_gate(&self.storage, &plan, type_id)?;
+        if unresolved > 0 {
+            crate::catalog::park_migration_failed_keep_cursors(&self.storage, plan_id)?;
+            return Err(EngineError::MigrationCutoverHasErrors {
+                plan_id,
+                error_count: unresolved,
+            });
+        }
 
         // Durably mark CuttingOver BEFORE the first rename so a crash resumes the
         // rename pass, not the converter. Idempotent (already CuttingOver → skip).
@@ -2200,6 +2278,18 @@ impl Database {
                                 Some(v)
                                     if crate::catalog::value_to_kind_byte_public(v)
                                         == target_kind =>
+                                {
+                                    continue;
+                                }
+                                // Card 4: under a non-Stop policy this is an
+                                // ACCEPTED error row (SkipAndLog left it, or a
+                                // Quarantine row the operator cleared) — the gate
+                                // already confirmed no UNRESOLVED quarantine rows
+                                // remain, so LEAVE it source-shape. Under Stop a
+                                // missing shadow is a genuine torn/unreached row →
+                                // refuse + rewind.
+                                Some(_)
+                                    if error_policy != crate::catalog::ErrorPolicy::Stop =>
                                 {
                                     continue;
                                 }
@@ -2499,8 +2589,78 @@ impl Database {
                 converter_name: p.converter_name,
                 converter_version: p.converter_version,
                 created_at_ms: p.created_at_ms,
+                error_count: p.error_count,
+                error_policy: p.error_policy,
+                dry_run: p.dry_run,
             })
             .collect())
+    }
+
+    /// List a migration plan's quarantined rows (card 4) — rows whose converter
+    /// failed under the `Quarantine` policy, for operator triage. NOTE: a row the
+    /// double-write hook has since self-healed (a live write converted it) still
+    /// appears until the cutover gate / `retry_quarantined` / `clear_quarantine`
+    /// reaps its sidecar.
+    pub fn list_quarantined(&self, plan_id: u64) -> EngineResult<Vec<QuarantineEntry>> {
+        let _guard = self.migration_lock.read();
+        let txn = self.storage.begin_txn();
+        let snap = txn.snapshot();
+        let prefix = rhypedb_storage::key::KeyBuilder::catalog_quarantine_plan_prefix(plan_id);
+        let mut out = Vec::new();
+        for (qkey, qval) in self.storage.scan_prefix_at(snap, &prefix)? {
+            let object_id = u64::from_be_bytes(qkey[qkey.len() - 8..].try_into().unwrap());
+            let rec = crate::catalog::decode_quarantine_record(
+                &format!("c:Q:{plan_id}:{object_id}"),
+                &qval,
+            )?;
+            out.push(QuarantineEntry {
+                object_id,
+                error_msg: rec.error_msg,
+                errored_at_ms: rec.errored_at_ms,
+                attempted_converter_name: rec.attempted_converter_name,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Re-run a (now-fixed) converter over the named quarantined rows (card 4),
+    /// writing the shadow + deleting the `c:Q:` sidecar on success. `new_converter_name`
+    /// must be registered at the plan's pinned converter version. Returns the count
+    /// newly resolved. Does NOT auto-unblock cutover (resume re-checks the gate);
+    /// does NOT change the historical `error_count`. Takes `migration_lock.write()`
+    /// to serialize against the read-locked double-write hook + `run_cutover`.
+    pub fn retry_quarantined(
+        &self,
+        plan_id: u64,
+        ids: &[u64],
+        new_converter_name: &str,
+    ) -> EngineResult<u64> {
+        self.check_not_migrated()?;
+        let plan = {
+            let txn = self.storage.begin_txn();
+            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
+        };
+        let converter = self
+            .resolve_converter(new_converter_name, plan.converter_version)
+            .ok_or_else(|| EngineError::ConverterNotRegistered {
+                name: new_converter_name.to_string(),
+                version: plan.converter_version,
+            })?;
+        let type_id = *self.type_ids.get(&plan.type_name).ok_or_else(|| {
+            EngineError::TypeNotFound(plan.type_name.clone())
+        })?;
+        let _guard = self.migration_lock.write();
+        crate::catalog::retry_quarantined(&self.storage, &plan, type_id, ids, &converter)
+    }
+
+    /// Delete ALL of a plan's quarantine rows (card 4): the operator accepts the
+    /// remaining quarantined rows stay source-shape, unblocking cutover (resume
+    /// then leaves them source-shape). Returns the count cleared. Takes
+    /// `migration_lock.write()`.
+    pub fn clear_quarantine(&self, plan_id: u64) -> EngineResult<u64> {
+        self.check_not_migrated()?;
+        let _guard = self.migration_lock.write();
+        crate::catalog::clear_quarantine(&self.storage, plan_id)
     }
 
     /// Create a new object of the given type.
@@ -5258,9 +5418,18 @@ fn drive_async_migration(
             plan.chunk_size,
             converter,
             control,
+            plan.error_policy,
+            plan.dry_run,
+            plan.quarantine_cap,
+            &plan.converter_name,
         )? {
-            crate::catalog::BackfillDisposition::AllDone => {} // fall through to cutover
+            crate::catalog::BackfillDisposition::AllDone => {} // fall through to cutover / dry-run finish
             crate::catalog::BackfillDisposition::Paused => return Ok(()), // resumable
+        }
+        // A dry-run preflight cleans up + marks DryRunCompleted (storage-only —
+        // no hook was armed, no cutover); it never reaches the cutover below.
+        if plan.dry_run {
+            return crate::catalog::finalize_dry_run(storage, plan_id);
         }
     }
     // Single-threaded cutover — skip if the DB is dropping (the next open's
@@ -7310,7 +7479,7 @@ mod tests {
                     target_field_type: FieldType::Scalar(ScalarType::F64),
                     converter_name: "widen".into(),
                     converter_version: 1,
-                    chunk_size: 4,
+                    chunk_size: 4, ..Default::default()
                 })
                 .unwrap();
             db.wait_for_migration(plan_id).unwrap();
@@ -7370,7 +7539,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 2,
+                chunk_size: 2, ..Default::default()
             })
             .unwrap();
         assert_eq!(plan_id, 1);
@@ -7428,7 +7597,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 4,
+                chunk_size: 4, ..Default::default()
             })
             .unwrap();
         // Must wait for the ASYNC driver to finish before counting commits.
@@ -7483,7 +7652,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
 
@@ -7603,7 +7772,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 4,
+                chunk_size: 4, ..Default::default()
             })
             .unwrap();
         db.wait_for_migration(plan_id).unwrap();
@@ -7661,7 +7830,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 4,
+                chunk_size: 4, ..Default::default()
             })
             .unwrap();
         db.wait_for_migration(plan_id).unwrap();
@@ -7762,7 +7931,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         // Cut over WITHOUT backfilling any shadows → first row refuses.
@@ -7797,7 +7966,7 @@ mod tests {
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         // Plan pins converter_version = 2.
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 2, 16, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 2, 16, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         // Craft a blob with a shadow stamped at the WRONG converter version (1).
@@ -7860,7 +8029,7 @@ mod tests {
         let u = db.next_object_id.load(Ordering::SeqCst); // exclusive id upper bound
         let degree = 4u8;
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, Some(degree), u,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, Some(degree), u, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         let converter: crate::catalog::RegisteredConverter =
@@ -7875,6 +8044,7 @@ mod tests {
                 )),
             });
         let control = AtomicU8::new(crate::catalog::migration_control::RUN);
+        let errs = std::sync::atomic::AtomicU64::new(0);
 
         let run_all = || {
             for idx in 0..degree {
@@ -7882,6 +8052,7 @@ mod tests {
                 let outcome = crate::catalog::run_migration_partition(
                     &db.storage, created.plan_id, created.type_id, idx, lo, hi,
                     "User", "score", i64_kind, target, 1, 16, &converter, &control,
+                    crate::catalog::ErrorPolicy::Stop, false, &errs, 0, "widen",
                 )
                 .unwrap();
                 assert_eq!(outcome, crate::catalog::PartitionDriveOutcome::Done);
@@ -7984,7 +8155,7 @@ mod tests {
             1,
             4,
             Some(1),
-            u_a,
+            u_a, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         let ctrl = AtomicU8::new(crate::catalog::migration_control::RUN);
@@ -8002,6 +8173,10 @@ mod tests {
             4,
             &converter,
             &ctrl,
+            crate::catalog::ErrorPolicy::Stop,
+            false,
+            0,
+            "widen",
         )
         .unwrap();
         assert_eq!(disp, crate::catalog::BackfillDisposition::AllDone);
@@ -8022,7 +8197,7 @@ mod tests {
             1,
             4,
             None,
-            0,
+            0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         crate::catalog::run_migration_chunks(&db_b.storage, created_b.plan_id, &converter).unwrap();
@@ -8083,7 +8258,7 @@ mod tests {
             1,
             4,
             Some(degree),
-            u,
+            u, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         let plan_id = created.plan_id;
@@ -8092,7 +8267,7 @@ mod tests {
         let backfill = || {
             crate::catalog::run_parallel_backfill(
                 &db.storage, plan_id, tid, degree, u, "User", "score", i64k, f64k, 1, 4, &converter,
-                &ctrl,
+                &ctrl, crate::catalog::ErrorPolicy::Stop, false, 0, "widen",
             )
         };
         assert_eq!(
@@ -8210,7 +8385,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 4,
+                chunk_size: 4, ..Default::default()
             })
             .unwrap();
         // A worker has reached the (blocked) converter → backfill is mid-flight,
@@ -8318,7 +8493,7 @@ mod tests {
                     target_field_type: FieldType::Scalar(ScalarType::F64),
                     converter_name: "widen".into(),
                     converter_version: 1,
-                    chunk_size: 4,
+                    chunk_size: 4, ..Default::default()
                 })
                 .unwrap();
             started.recv().unwrap();
@@ -8353,6 +8528,368 @@ mod tests {
         }
     }
 
+    // =====================================================================
+    // Card 4/5: ErrorPolicy + quarantine sidecar + dry-run
+    // =====================================================================
+
+    /// A widen converter that ERRORS on a sentinel value (`poison`) and widens
+    /// every other `I64` to `F64`. Models a row the operator's converter can't
+    /// handle (e.g. a forgotten edge case).
+    fn widen_or_fail_on(poison: i64) -> impl Fn(u64, &Value) -> EngineResult<Value> + Send + Sync {
+        move |oid, v| match v {
+            Value::I64(i) if *i == poison => Err(EngineError::Catalog(
+                crate::CatalogError::FieldTypeChangeConverterFailed {
+                    qualified: "User.score".into(),
+                    object_id: oid,
+                    reason: format!("poison value {poison}"),
+                },
+            )),
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            other => Err(EngineError::Catalog(
+                crate::CatalogError::FieldTypeChangeConverterFailed {
+                    qualified: "User.score".into(),
+                    object_id: oid,
+                    reason: format!("unexpected {}", other.type_name()),
+                },
+            )),
+        }
+    }
+
+    /// Seed `n` User rows with `score = i`, planting `score = -1` (the poison
+    /// value) at `poison_ids` positions. Returns the created object ids.
+    fn seed_scores(db: &Database, n: i64, poison_idxs: &[i64]) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let mut f = FieldMap::new();
+            let v = if poison_idxs.contains(&i) { -1 } else { i };
+            f.insert("score".into(), Value::I64(v));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        ids
+    }
+
+    fn card4_spec(error_policy: crate::catalog::ErrorPolicy, dry_run: bool) -> MigrationPlanSpec {
+        use rhypedb_schema::{FieldType, ScalarType};
+        MigrationPlanSpec {
+            type_name: "User".into(),
+            field_name: "score".into(),
+            target_field_type: FieldType::Scalar(ScalarType::F64),
+            converter_name: "widen".into(),
+            converter_version: 1,
+            chunk_size: 4,
+            error_policy,
+            dry_run,
+            ..Default::default()
+        }
+    }
+
+    /// AC: `Stop` (the default) halts the whole migration on the first converter
+    /// failure — parked `Failed`, no cutover.
+    #[test]
+    fn error_policy_stop_halts_all_partitions_on_first_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("widen", 1, widen_or_fail_on(-1));
+        seed_scores(&db, 30, &[15]); // one poison row
+        let plan_id = db
+            .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::Stop, false))
+            .unwrap();
+        let err = db.wait_for_migration(plan_id).unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::FieldTypeChangeConverterFailed { .. })
+        ));
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Failed
+        );
+    }
+
+    /// AC: `SkipAndLog` counts the failure, leaves the row source-shape, and the
+    /// migration continues + cuts over (the errored rows stay source-shape).
+    #[test]
+    fn error_policy_skip_and_log_continues_and_increments_error_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("widen", 1, widen_or_fail_on(-1));
+        let ids = seed_scores(&db, 30, &[5, 15, 25]); // 3 poison rows
+        let plan_id = db
+            .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::SkipAndLog, false))
+            .unwrap();
+        db.wait_for_migration(plan_id).unwrap();
+        let summary = &db.list_migrations().unwrap()[0];
+        assert_eq!(summary.status, crate::catalog::MigrationStatus::Completed);
+        assert_eq!(summary.error_count, 3);
+        assert_eq!(summary.objects_converted, 27);
+        // A non-poison row is converted (f64); a poison row stays source-shape.
+        drop(db);
+        let db2 = Database::open(parse_schema(r#"type User { score: f64 }"#).unwrap(), dir.path())
+            .unwrap();
+        assert_eq!(
+            db2.get("User", ids[0]).unwrap().fields.get("score"),
+            Some(&Value::F64(0.0))
+        );
+        // The poison row (id at index 5) was LEFT source-shape (still I64(-1)).
+        assert_eq!(
+            db2.get("User", ids[5]).unwrap().fields.get("score"),
+            Some(&Value::I64(-1))
+        );
+    }
+
+    /// AC: `Quarantine` writes a `c:Q:` sidecar per failed row + continues the
+    /// backfill (the good rows are converted).
+    #[test]
+    fn error_policy_quarantine_writes_sidecar_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("widen", 1, widen_or_fail_on(-1));
+        let ids = seed_scores(&db, 30, &[5, 15, 25]);
+        let plan_id = db
+            .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::Quarantine, false))
+            .unwrap();
+        // The backfill continues + quarantines; the driver then refuses cutover
+        // (unresolved quarantine) — but the SIDECARS prove the backfill continued.
+        let _ = db.wait_for_migration(plan_id);
+        let q = db.list_quarantined(plan_id).unwrap();
+        assert_eq!(q.len(), 3, "one sidecar per failed row");
+        assert!(q.iter().all(|e| e.error_msg.contains("poison")));
+        assert_eq!(db.list_migrations().unwrap()[0].error_count, 3);
+        // A good row was converted (shadow present) despite the errors.
+        let tid = db.resolve_type_id("User").unwrap();
+        let snap = db.storage.read_snapshot();
+        let blob = db
+            .storage
+            .get_at(snap, &rhypedb_storage::key::KeyBuilder::object(tid, ids[0]))
+            .unwrap()
+            .unwrap();
+        assert!(crate::object::deserialize_fields(&blob).contains_key("score__shadow"));
+    }
+
+    /// AC: cutover refuses a `Quarantine` plan with unresolved quarantine rows
+    /// (`MigrationCutoverHasErrors`), parking `Failed`.
+    #[test]
+    fn cutover_refuses_with_non_skip_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("widen", 1, widen_or_fail_on(-1));
+        seed_scores(&db, 30, &[5, 15, 25]);
+        let plan_id = db
+            .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::Quarantine, false))
+            .unwrap();
+        let err = db.wait_for_migration(plan_id).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::MigrationCutoverHasErrors { error_count: 3, .. }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Failed
+        );
+    }
+
+    /// AC: a `dry_run` invokes the converter on every row but writes NO `o:` /
+    /// `c:Q:` / lingering `c:S:` rows, and never flips the catalog kind.
+    #[test]
+    fn dry_run_invokes_converter_without_storage_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        let ids = seed_scores(&db, 20, &[]);
+        let plan_id = db
+            .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::Stop, true))
+            .unwrap();
+        db.wait_for_migration(plan_id).unwrap();
+        let summary = &db.list_migrations().unwrap()[0];
+        assert_eq!(summary.status, crate::catalog::MigrationStatus::DryRunCompleted);
+        assert!(summary.dry_run);
+        assert_eq!(summary.objects_converted, 20, "counted, not written");
+        // NO shadow on any object.
+        let tid = db.resolve_type_id("User").unwrap();
+        let snap = db.storage.read_snapshot();
+        for id in &ids {
+            let blob = db
+                .storage
+                .get_at(snap, &rhypedb_storage::key::KeyBuilder::object(tid, *id))
+                .unwrap()
+                .unwrap();
+            let f = crate::object::deserialize_fields(&blob);
+            assert!(!f.contains_key("score__shadow"), "dry-run wrote a shadow");
+            assert!(matches!(f.get("score"), Some(Value::I64(_))), "source untouched");
+        }
+        // c:S: cursors were cleaned up.
+        let cs = db
+            .storage
+            .scan_prefix_at(
+                snap,
+                &rhypedb_storage::key::KeyBuilder::catalog_partition_cursor_plan_prefix(plan_id),
+            )
+            .unwrap();
+        assert!(cs.is_empty(), "dry-run left c:S: cursors");
+        // Catalog kind NOT flipped — reopening with the SOURCE schema still works.
+        drop(db);
+        let db2 = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        assert_eq!(
+            db2.get("User", ids[0]).unwrap().fields.get("score"),
+            Some(&Value::I64(0))
+        );
+    }
+
+    /// AC: a dry-run's `error_count` matches a real run over the same data.
+    #[test]
+    fn dry_run_error_count_matches_actual_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("widen", 1, widen_or_fail_on(-1));
+        seed_scores(&db, 30, &[5, 15, 25]); // 3 poison rows
+        // Dry run (preflight) — SkipAndLog so the converter failures are counted.
+        let dry = db
+            .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::SkipAndLog, true))
+            .unwrap();
+        db.wait_for_migration(dry).unwrap();
+        let dry_errors = db.list_migrations().unwrap()[0].error_count;
+        assert_eq!(dry_errors, 3);
+        // A real run over the SAME data (the settled dry-run plan doesn't block it).
+        let real = db
+            .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::SkipAndLog, false))
+            .unwrap();
+        db.wait_for_migration(real).unwrap();
+        let real_errors = db
+            .list_migrations()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.plan_id == real)
+            .unwrap()
+            .error_count;
+        assert_eq!(real_errors, dry_errors, "preflight estimate must be accurate");
+    }
+
+    /// AC: exceeding the quarantine cap auto-STOPS the migration (parks `Failed`).
+    #[test]
+    fn quarantine_cap_auto_stops_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        // A converter that fails on EVERY row → a runaway error field.
+        db.register_converter("widen", 1, |oid, _v| -> EngineResult<Value> {
+            Err(EngineError::Catalog(
+                crate::CatalogError::FieldTypeChangeConverterFailed {
+                    qualified: "User.score".into(),
+                    object_id: oid,
+                    reason: "always fails".into(),
+                },
+            ))
+        });
+        seed_scores(&db, 200, &[]);
+        let mut spec = card4_spec(crate::catalog::ErrorPolicy::Quarantine, false);
+        spec.quarantine_cap = 10; // tiny cap
+        let plan_id = db.create_field_type_migration(spec).unwrap();
+        let err = db.wait_for_migration(plan_id).unwrap_err();
+        assert!(
+            matches!(err, EngineError::MigrationQuarantineCapExceeded { cap: 10, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Failed
+        );
+    }
+
+    /// AC: `retry_quarantined` with a fixed converter clears the `c:Q:` keys +
+    /// writes the shadow; the plan then cuts over cleanly.
+    #[test]
+    fn retry_quarantined_rerunning_with_fixed_converter_clears_q_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("widen", 1, widen_or_fail_on(-1));
+        let ids = seed_scores(&db, 30, &[5, 15, 25]);
+        let plan_id = db
+            .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::Quarantine, false))
+            .unwrap();
+        let _ = db.wait_for_migration(plan_id); // cutover refused; 3 quarantined
+        let poison_ids: Vec<u64> = vec![ids[5], ids[15], ids[25]];
+        assert_eq!(db.list_quarantined(plan_id).unwrap().len(), 3);
+        // Register a GOOD converter at the plan's pinned name+version and retry.
+        db.register_converter("good", 1, |_oid, v| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => unreachable!(),
+        });
+        let n = db.retry_quarantined(plan_id, &poison_ids, "good").unwrap();
+        assert_eq!(n, 3);
+        assert!(
+            db.list_quarantined(plan_id).unwrap().is_empty(),
+            "retry must clear the c:Q: keys"
+        );
+        // Resume (reopen with target schema; the pinned converter name is "widen",
+        // re-register it with a good body) → cutover now passes → Completed.
+        drop(db);
+        let db2 = Database::open(parse_schema(r#"type User { score: f64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db2.register_converter("widen", 1, |_oid, v| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => unreachable!(),
+        });
+        db2.resume_field_type_migration(plan_id).unwrap();
+        assert_eq!(
+            db2.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+    }
+
+    /// A STRUCTURAL error (on-disk kind mismatch) ALWAYS halts, regardless of
+    /// policy — it is never quarantined/skipped.
+    #[test]
+    fn structural_kind_mismatch_always_stops_under_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        let ids = seed_scores(&db, 12, &[]);
+        // Overwrite one row's score with a String (kind SCALAR_STRING) — neither
+        // src (i64) nor target (f64).
+        let tid = db.resolve_type_id("User").unwrap();
+        let mut sf = FieldMap::new();
+        sf.insert("score".into(), Value::String("oops".into()));
+        let mut txn = db.storage.begin_txn();
+        db.storage
+            .put_batch(
+                &mut txn,
+                &[(
+                    rhypedb_storage::key::KeyBuilder::object(tid, ids[6]),
+                    crate::object::serialize_fields(&sf),
+                )],
+            )
+            .unwrap();
+        db.storage.commit(&mut txn).unwrap();
+        let plan_id = db
+            .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::Quarantine, false))
+            .unwrap();
+        let err = db.wait_for_migration(plan_id).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Catalog(crate::CatalogError::MigrationRowUnexpectedKind { .. })
+            ),
+            "structural mismatch must halt, not quarantine; got {err:?}"
+        );
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Failed
+        );
+        // It was NOT quarantined.
+        assert!(db.list_quarantined(plan_id).unwrap().is_empty());
+    }
+
     /// G3: while a migration is in flight the lazy/raw wire path
     /// (`get_many_lazy`) must NOT leak the worker-written `<field>__shadow`
     /// siblings — it ships `raw_fields` verbatim, bypassing the eager strip.
@@ -8374,7 +8911,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         // Arm the hook so migrating_field_count > 0 (drives the strip gate).
@@ -8428,7 +8965,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         let good: crate::catalog::RegisteredConverter =
@@ -8478,7 +9015,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         let conv: crate::catalog::RegisteredConverter = Arc::new(widen_i64_to_f64("User.score"));
@@ -8556,7 +9093,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 2, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 2, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         let conv: crate::catalog::RegisteredConverter = Arc::new(widen_i64_to_f64("User.score"));
@@ -8651,7 +9188,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 8,
+                chunk_size: 8, ..Default::default()
             })
             .unwrap();
         db.wait_for_migration(plan_id).unwrap();
@@ -8721,7 +9258,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 4,
+                chunk_size: 4, ..Default::default()
             })
             .unwrap();
         let err = db.wait_for_migration(plan_id).unwrap_err();
@@ -8753,7 +9290,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "missing".into(),
                 converter_version: 1,
-                chunk_size: 0,
+                chunk_size: 0, ..Default::default()
             })
             .unwrap_err();
         assert!(matches!(err, EngineError::ConverterNotRegistered { .. }));
@@ -8783,7 +9320,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 0,
+                chunk_size: 0, ..Default::default()
             })
             .unwrap();
         assert_eq!(p1, 1);
@@ -8802,7 +9339,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 0,
+                chunk_size: 0, ..Default::default()
             })
             .unwrap();
         assert_eq!(p2, 2, "plan id must not reset or reuse across restart");
@@ -8828,7 +9365,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let _created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         // A create against the same field now refuses.
@@ -8839,7 +9376,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 4,
+                chunk_size: 4, ..Default::default()
             })
             .unwrap_err();
         assert!(matches!(
@@ -8859,7 +9396,7 @@ mod tests {
         use rhypedb_schema::{FieldType, ScalarType};
         let target = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, type_name, field, target, "widen", 1, 4, None, 0,
+            &db.storage, &db.schema, type_name, field, target, "widen", 1, 4, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap()
         .plan_id
@@ -9123,7 +9660,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 4,
+                chunk_size: 4, ..Default::default()
             })
             .unwrap();
         db.wait_for_migration(plan_id).unwrap();
@@ -9206,7 +9743,7 @@ mod tests {
                     target_field_type: FieldType::Scalar(ScalarType::F64),
                     converter_name: "widen".into(),
                     converter_version: 1,
-                    chunk_size: 2,
+                    chunk_size: 2, ..Default::default()
                 })
                 .unwrap();
             let err = db.wait_for_migration(plan_id).unwrap_err();
@@ -9293,7 +9830,7 @@ mod tests {
                 target_field_type: FieldType::Scalar(ScalarType::F64),
                 converter_name: "widen".into(),
                 converter_version: 1,
-                chunk_size: 4,
+                chunk_size: 4, ..Default::default()
             })
             .unwrap_err();
         assert!(matches!(
@@ -10176,7 +10713,7 @@ mod tests {
         let converter: crate::catalog::RegisteredConverter =
             Arc::new(widen_i64_to_f64("User.score"));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         db.arm_field_hook(
@@ -10251,7 +10788,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0, crate::catalog::ErrorPolicy::Stop, false, 0,
         )
         .unwrap();
         db.arm_field_hook(
