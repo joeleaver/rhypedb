@@ -2476,6 +2476,20 @@ impl Database {
             let Some(&type_id) = self.type_ids.get(&plan.type_name) else {
                 continue; // type no longer exists — nothing to re-arm
             };
+            // Card 4: a dry-run preflight NEVER arms the double-write hook (it
+            // writes no shadows and never flips the catalog kind), so arming it on
+            // reopen would brick live writes to the field with no recovery. Re-drive
+            // the preflight to completion when its converter is available (settles it
+            // `DryRunCompleted`); otherwise leave it Running for an explicit
+            // `resume_field_type_migration` — it still does NOT brick writes (no hook).
+            if plan.dry_run {
+                let converter =
+                    self.resolve_converter(&plan.converter_name, plan.converter_version);
+                if plan.status.is_drivable() && converter.is_some() {
+                    self.drive_migration_to_completion(plan.plan_id, type_id, converter.as_ref())?;
+                }
+                continue;
+            }
             // Converter is empty at a fresh open (operator registers AFTER
             // open) → the hook arms in a REJECTING (converter: None) state, so a
             // live write to the migrating field fails closed until it resolves.
@@ -2549,6 +2563,13 @@ impl Database {
                 name: plan.converter_name.clone(),
                 version: plan.converter_version,
             });
+        }
+        // Card 4: a dry-run preflight runs against (and stays on) the SOURCE
+        // schema and never flips the catalog kind, so the F3 target-schema guard
+        // doesn't apply; and it arms no hook. Just drive the preflight to
+        // completion (→ DryRunCompleted) on this source-schema handle.
+        if plan.dry_run {
+            return self.drive_migration_to_completion(plan_id, type_id, converter.as_ref());
         }
         self.guard_resume_schema(&plan)?;
         {
@@ -8771,6 +8792,61 @@ mod tests {
             .unwrap()
             .error_count;
         assert_eq!(real_errors, dry_errors, "preflight estimate must be accurate");
+    }
+
+    /// A dry-run paused/crashed mid-flight must NOT brick writes to the field on
+    /// reopen — it never arms the double-write hook, and it remains resumable on
+    /// the SOURCE-schema handle (no F3 target-schema guard). (impl-review BLOCKER)
+    #[test]
+    fn paused_dry_run_does_not_brick_writes_and_resumes() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let plan_id;
+        {
+            let db =
+                Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+                    .unwrap();
+            let (started, release) = register_gated_widen(&db);
+            seed_scores(&db, 120, &[]);
+            plan_id = db
+                .create_field_type_migration(card4_spec(crate::catalog::ErrorPolicy::Stop, true))
+                .unwrap();
+            // A dry-run never arms the hook — even mid-flight.
+            assert_eq!(db.migrating_field_count.load(Ordering::SeqCst), 0);
+            started.recv().unwrap();
+            db.pause_migration(plan_id).unwrap();
+            release();
+            db.wait_for_migration(plan_id).unwrap();
+            assert_ne!(
+                db.list_migrations().unwrap()[0].status,
+                crate::catalog::MigrationStatus::DryRunCompleted
+            );
+            drop(db);
+        }
+        // Reopen on the SOURCE schema (a dry-run never flipped the kind).
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        // auto_resume must NOT have armed the hook for the dry-run.
+        assert_eq!(db.migrating_field_count.load(Ordering::SeqCst), 0);
+        // A write to the migrating field SUCCEEDS (not failed-closed).
+        let mut f = FieldMap::new();
+        f.insert("score".into(), Value::I64(999));
+        db.create("User", f).unwrap();
+        // Resume completes the preflight on the source-schema handle (no F3 guard).
+        db.register_converter("widen", 1, |_oid, v| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => unreachable!(),
+        });
+        db.resume_field_type_migration(plan_id).unwrap();
+        assert_eq!(
+            db.list_migrations()
+                .unwrap()
+                .into_iter()
+                .find(|m| m.plan_id == plan_id)
+                .unwrap()
+                .status,
+            crate::catalog::MigrationStatus::DryRunCompleted
+        );
     }
 
     /// AC: exceeding the quarantine cap auto-STOPS the migration (parks `Failed`).
