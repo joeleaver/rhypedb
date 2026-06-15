@@ -5280,6 +5280,57 @@ pub(crate) enum BackfillDisposition {
 /// `c:S:<plan><idx>` cursors — the authoritative source (not in-memory worker
 /// outcomes), so a fresh run and a resume that spawned a subset of workers reach
 /// the identical decision. Returns `(objects_converted, errors, all_done)`:
+/// One partition's live progress, for `Database::query_migration_progress`
+/// (card 5). `lo`/`hi` are the `[lo, hi)` id range the worker owns; the cursor
+/// fields come from the durable `c:S:<plan><idx>` record (defaulted to zero /
+/// `done = lo>=hi` when the worker has not yet committed a cursor).
+pub(crate) struct PartitionProgressRow {
+    pub idx: u8,
+    pub lo: u64,
+    pub hi: u64,
+    pub cursor: u64,
+    pub objects_converted: u64,
+    pub errors: u64,
+    pub done: bool,
+}
+
+/// Read every partition's `c:S:<plan><idx>` cursor into a per-partition
+/// progress row (card 5 observability). Mirrors `sum_partition_counts`'s scan
+/// but keeps the per-partition detail. An empty range (`lo>=hi`) or an
+/// unwritten cursor is reported as zero-progress; `done` reflects the durable
+/// flag OR an immediately-complete empty range.
+pub(crate) fn read_partition_progress(
+    storage: &LsmTree,
+    plan_id: u64,
+    parallel_degree: u8,
+    id_upper_bound: u64,
+) -> EngineResult<Vec<PartitionProgressRow>> {
+    let n = parallel_degree.max(1);
+    let txn = storage.begin_txn();
+    let mut rows = Vec::with_capacity(n as usize);
+    for idx in 0..n {
+        let (lo, hi) = partition_range(n, id_upper_bound, idx);
+        let key = KeyBuilder::catalog_partition_cursor(plan_id, idx);
+        let (cursor, objects_converted, errors, done) = match storage.get(&txn, &key)? {
+            Some(bytes) => {
+                let pc = decode_partition_cursor(&debug_key(&key), &bytes)?;
+                (pc.cursor, pc.objects_converted, pc.errors, pc.done || lo >= hi)
+            }
+            None => (0, 0, 0, lo >= hi),
+        };
+        rows.push(PartitionProgressRow {
+            idx,
+            lo,
+            hi,
+            cursor,
+            objects_converted,
+            errors,
+            done,
+        });
+    }
+    Ok(rows)
+}
+
 /// `all_done` is true iff every partition's cursor has `done==true` OR its
 /// `partition_range` is empty (`lo>=hi`, immediately complete). The counts sum
 /// over partitions regardless of `all_done` (so the cap-exceed/dry-run paths can
@@ -5864,7 +5915,7 @@ fn decode_type_change_chain(
     Ok(chain)
 }
 
-fn now_unix_millis() -> u64 {
+pub(crate) fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

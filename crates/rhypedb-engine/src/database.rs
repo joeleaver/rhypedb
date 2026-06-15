@@ -620,6 +620,70 @@ pub struct QuarantineEntry {
     pub attempted_converter_name: String,
 }
 
+/// One partition's live progress within a parallel migration (card 5,
+/// [`Database::query_migration_progress`]). A legacy single-worker plan is
+/// reported as one synthetic partition over `[1, id_upper_bound)`.
+#[derive(Debug, Clone)]
+pub struct PartitionProgress {
+    pub idx: u8,
+    /// Inclusive low / exclusive high object-id bound the worker owns.
+    pub lo: u64,
+    pub hi: u64,
+    /// Highest object id whose shadow is durably committed in this partition.
+    pub cursor: u64,
+    pub objects_converted: u64,
+    pub errors: u64,
+    pub done: bool,
+}
+
+/// Live progress snapshot of one migration plan (card 5,
+/// [`Database::query_migration_progress`]). Aggregates the per-partition
+/// `c:S:` cursors and derives an ETA from the durable `created_at_ms` and the
+/// converted count.
+#[derive(Debug, Clone)]
+pub struct MigrationProgress {
+    pub plan_id: u64,
+    pub type_name: String,
+    pub field_name: String,
+    pub status: crate::catalog::MigrationStatus,
+    pub phase: crate::catalog::MigrationPhase,
+    pub dry_run: bool,
+    pub parallel_degree: Option<u8>,
+    /// `id_upper_bound - 1` — the count of object ids in `[1, U)` at plan
+    /// creation. The progress denominator. Overcounts if rows in the range
+    /// were deleted (converted may never reach this), which is acceptable for a
+    /// "wait or come back" ETA.
+    pub total_objects: u64,
+    pub objects_converted: u64,
+    pub errors: u64,
+    pub created_at_ms: u64,
+    pub now_ms: u64,
+    /// Conversion rate over the whole run (`converted / elapsed`). `None`
+    /// unless the plan is `Running` with at least one converted row.
+    pub objects_per_sec: Option<f64>,
+    /// Projected completion wall-clock (unix ms): `now + remaining/rate`.
+    /// `None` unless the plan is `Running` with a positive rate.
+    pub eta_unix_ms: Option<u64>,
+    pub partitions: Vec<PartitionProgress>,
+}
+
+/// Filter for [`Database::list_migrations_filtered`] (card 5). A `None` field
+/// matches everything; set fields are ANDed.
+#[derive(Debug, Clone, Default)]
+pub struct MigrationFilter {
+    pub status: Option<crate::catalog::MigrationStatus>,
+    pub type_name: Option<String>,
+}
+
+/// Handle returned by [`Database::start_field_type_migration_async`] (card 5).
+/// The operator-facing surface is keyed by `plan_id`; `created_at_ms` is
+/// captured once at creation (immutable thereafter) for client-side ETA math.
+#[derive(Debug, Clone, Copy)]
+pub struct MigrationHandle {
+    pub plan_id: u64,
+    pub created_at_ms: u64,
+}
+
 impl Database {
     /// Open a database with the given schema and data directory.
     ///
@@ -2615,6 +2679,139 @@ impl Database {
                 dry_run: p.dry_run,
             })
             .collect())
+    }
+
+    /// Like [`list_migrations`](Self::list_migrations) but filtered (card 5).
+    /// `filter.status` / `filter.type_name` are ANDed; a `None` field matches
+    /// everything. Cheap — filters the in-memory snapshot.
+    pub fn list_migrations_filtered(
+        &self,
+        filter: &MigrationFilter,
+    ) -> EngineResult<Vec<MigrationSummary>> {
+        let all = self.list_migrations()?;
+        Ok(all
+            .into_iter()
+            .filter(|s| {
+                filter.status.is_none_or(|st| s.status == st)
+                    && filter
+                        .type_name
+                        .as_ref()
+                        .is_none_or(|t| &s.type_name == t)
+            })
+            .collect())
+    }
+
+    /// Live progress + ETA for one migration plan (card 5). Aggregates the
+    /// durable per-partition `c:S:` cursors (parallel plans) or the plan's own
+    /// cursor (legacy single-worker), and derives a rate-based ETA from
+    /// `created_at_ms`. The ETA is `None` unless the plan is `Running` with at
+    /// least one converted row (a settled / not-yet-started plan has no
+    /// meaningful projection).
+    pub fn query_migration_progress(&self, plan_id: u64) -> EngineResult<MigrationProgress> {
+        let _guard = self.migration_lock.read();
+        let plan = {
+            let txn = self.storage.begin_txn();
+            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
+        };
+        let total_objects = plan.id_upper_bound.saturating_sub(1);
+        let (objects_converted, errors, partitions) = match plan.parallel_degree {
+            Some(n) => {
+                let rows = crate::catalog::read_partition_progress(
+                    &self.storage,
+                    plan_id,
+                    n,
+                    plan.id_upper_bound,
+                )?;
+                let mut converted = 0u64;
+                let mut errs = 0u64;
+                let parts: Vec<PartitionProgress> = rows
+                    .into_iter()
+                    .map(|r| {
+                        converted = converted.saturating_add(r.objects_converted);
+                        errs = errs.saturating_add(r.errors);
+                        PartitionProgress {
+                            idx: r.idx,
+                            lo: r.lo,
+                            hi: r.hi,
+                            cursor: r.cursor,
+                            objects_converted: r.objects_converted,
+                            errors: r.errors,
+                            done: r.done,
+                        }
+                    })
+                    .collect();
+                (converted, errs, parts)
+            }
+            None => {
+                // Legacy card-1/2 single-worker plan: synthesize one partition
+                // over the whole range from the plan's own cursor/counters.
+                let done = !plan.status.quiesces();
+                let part = PartitionProgress {
+                    idx: 0,
+                    lo: 1,
+                    hi: plan.id_upper_bound.max(1),
+                    cursor: plan.cursor,
+                    objects_converted: plan.objects_converted,
+                    errors: plan.error_count,
+                    done,
+                };
+                (plan.objects_converted, plan.error_count, vec![part])
+            }
+        };
+        let now_ms = crate::catalog::now_unix_millis();
+        let elapsed_ms = now_ms.saturating_sub(plan.created_at_ms);
+        let running = plan.status == crate::catalog::MigrationStatus::Running;
+        let (objects_per_sec, eta_unix_ms) = if running && objects_converted > 0 && elapsed_ms > 0 {
+            let rate = (objects_converted as f64) * 1000.0 / (elapsed_ms as f64);
+            // eta = now + remaining/rate = now + remaining*elapsed/converted.
+            // Saturating throughout: `remaining*elapsed` can be enormous.
+            let remaining = total_objects.saturating_sub(objects_converted);
+            let eta = now_ms
+                .saturating_add(remaining.saturating_mul(elapsed_ms) / objects_converted);
+            (Some(rate), Some(eta))
+        } else {
+            (None, None)
+        };
+        Ok(MigrationProgress {
+            plan_id,
+            type_name: plan.type_name,
+            field_name: plan.field_name,
+            status: plan.status,
+            phase: plan.phase,
+            dry_run: plan.dry_run,
+            parallel_degree: plan.parallel_degree,
+            total_objects,
+            objects_converted,
+            errors,
+            created_at_ms: plan.created_at_ms,
+            now_ms,
+            objects_per_sec,
+            eta_unix_ms,
+            partitions,
+        })
+    }
+
+    /// Async operator entry point (card 5): start a field-type migration and
+    /// return a [`MigrationHandle`] (the plan id + its immutable
+    /// `created_at_ms`) immediately. Thin wrapper over
+    /// [`create_field_type_migration`](Self::create_field_type_migration) (which
+    /// already arms the hook + spawns the detached driver) — kept separate so
+    /// the existing synchronous-completion callers (cards 1-4 tests) are
+    /// untouched. The post-create load is race-free: `created_at_ms` never
+    /// changes after the plan record is first written.
+    pub fn start_field_type_migration_async(
+        &self,
+        spec: MigrationPlanSpec,
+    ) -> EngineResult<MigrationHandle> {
+        let plan_id = self.create_field_type_migration(spec)?;
+        let created_at_ms = {
+            let txn = self.storage.begin_txn();
+            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?.created_at_ms
+        };
+        Ok(MigrationHandle {
+            plan_id,
+            created_at_ms,
+        })
     }
 
     /// List a migration plan's quarantined rows (card 4) — rows whose converter
@@ -7584,6 +7781,80 @@ mod tests {
                 other => panic!("expected F64, got {other:?}"),
             }
         }
+    }
+
+    /// Card 5 (5a): `start_field_type_migration_async` returns a handle;
+    /// `query_migration_progress` aggregates the per-partition cursors and
+    /// reports a settled plan with no ETA; `list_migrations_filtered` ANDs the
+    /// status + type filters.
+    #[test]
+    fn card5_query_progress_and_filter() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        for s in [1i64, 2, 3, 4, 5] {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(s));
+            db.create("User", f).unwrap();
+        }
+        let handle = db
+            .start_field_type_migration_async(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(handle.created_at_ms > 0, "handle carries created_at_ms");
+        db.wait_for_migration(handle.plan_id).unwrap();
+
+        let p = db.query_migration_progress(handle.plan_id).unwrap();
+        assert_eq!(p.status, crate::catalog::MigrationStatus::Completed);
+        assert_eq!(p.objects_converted, 5);
+        assert_eq!(p.total_objects, 5, "U-1 over [1,U) with 5 objects");
+        assert!(p.eta_unix_ms.is_none(), "settled plan has no ETA");
+        assert!(p.objects_per_sec.is_none());
+        assert!(!p.partitions.is_empty());
+        assert!(p.partitions.iter().all(|pp| pp.done));
+        assert_eq!(
+            p.partitions.iter().map(|pp| pp.objects_converted).sum::<u64>(),
+            5
+        );
+
+        // Filters.
+        assert!(
+            db.list_migrations_filtered(&MigrationFilter {
+                status: Some(crate::catalog::MigrationStatus::Running),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            db.list_migrations_filtered(&MigrationFilter {
+                status: Some(crate::catalog::MigrationStatus::Completed),
+                type_name: Some("User".into()),
+            })
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(
+            db.list_migrations_filtered(&MigrationFilter {
+                type_name: Some("Other".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+        );
     }
 
     /// Acceptance: both passes commit at chunk boundaries — `ceil(rows/chunk)`
