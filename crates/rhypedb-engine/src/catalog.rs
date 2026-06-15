@@ -113,6 +113,12 @@ const KIND_MARKER: u8 = 0x03;
 /// card 1/5). Its own decoder; `decode_id_entry`/`decode_counter` reject
 /// it via the WrongValueKind arm so a stray plan row can't be misread.
 const KIND_MIGRATION_PLAN: u8 = 0x04;
+/// Value kind for a per-partition migration cursor (`c:S:<plan><idx>`,
+/// card 3/5). A fixed-layout framed value (no TLV) — a torn write
+/// decode-FAILS cleanly rather than silently misparsing the cursor.
+// Wired by the parallel worker + async driver in card-3 increment 3b.
+#[allow(dead_code)]
+const KIND_PARTITION_CURSOR: u8 = 0x05;
 
 // TLV tags inside id-entry bodies (phase 1).
 const TLV_ID: u8 = 0x01;
@@ -219,8 +225,15 @@ const TLV_MP_OBJECTS_CONVERTED: u8 = 0x0C;
 // card-1 defaults (phase=Converting, cutover_cursor=0).
 const TLV_MP_PHASE: u8 = 0x20;
 const TLV_MP_CUTOVER_CURSOR: u8 = 0x21;
-// 0x22-0x3F reserved for cards 2/4 (error_policy, quarantine cursor). Unknown
-// tags are preserved verbatim and round-tripped.
+// Card 3 (parallel workers) — coordinated band split so card 4 doesn't collide:
+//   0x22-0x23 = card 3 (parallel_degree, id_upper_bound)
+//   0x24-0x2F = reserved for card 4 (error_policy, quarantine cursor)
+// `parallel_degree` PRESENCE is the discriminator between a parallel (card-3)
+// plan and a legacy single-cursor (card-1/2) plan — NOT a U==0 sentinel. A
+// card-1/2 row has neither tag and decodes as `parallel_degree=None`,
+// `id_upper_bound=0`. Unknown tags are preserved verbatim and round-tripped.
+const TLV_MP_PARALLEL_DEGREE: u8 = 0x22;
+const TLV_MP_ID_UPPER_BOUND: u8 = 0x23;
 
 // MigrationStatus payload bytes for TLV_MP_STATUS. The decoder refuses
 // any other value rather than guess.
@@ -239,6 +252,12 @@ const MP_PHASE_CUTTING_OVER: u8 = 0x01;
 /// `put_batch` + fsync while amortizing the per-chunk lock/scan overhead;
 /// cancel latency is `<= chunk_size` rows. Overridable per migration.
 pub(crate) const DEFAULT_MIGRATION_CHUNK_SIZE: u64 = 1024;
+
+/// Upper clamp on a migration's parallel backfill degree (card 3/5). One worker
+/// thread per partition; the object-id range `[1, id_upper_bound)` is split into
+/// this many contiguous spans. Bounded so a hostile/garbage value can't spawn an
+/// unreasonable thread count or overflow the `u8` partition index.
+pub(crate) const MAX_PARALLEL_DEGREE: u8 = 64;
 
 /// Discriminants stored in TLV 0x04 of every field/relation id-entry.
 /// Catches scalar-type swaps (Int → String) and scalar↔relation flips
@@ -884,6 +903,20 @@ pub(crate) struct MigrationPlan {
     /// a cursor dedicated to the cutover pass, distinct from `cursor` (the
     /// conversion scan). `0` = cutover not started. Card-1 rows decode as `0`.
     pub cutover_cursor: u64,
+    /// Card 3: number of parallel backfill partitions (`1..=64`). `Some(n)` marks
+    /// a parallel plan whose Converting-phase cursors live in `c:S:<plan><idx>`
+    /// keys (the legacy `cursor` field is unused, left 0). `None` = a legacy
+    /// card-1/2 single-worker plan whose cursor is the `cursor` field. PINNED at
+    /// create; resume recomputes identical partition boundaries from it, so the
+    /// operator can't change it mid-migration.
+    pub parallel_degree: Option<u8>,
+    /// Card 3: exclusive upper bound on pre-existing object ids — the snapshot of
+    /// `next_object_id` taken (under `migration_lock.write()`, after the hook is
+    /// armed) at create. The backfill partitions cover `[1, id_upper_bound)`;
+    /// objects created during the migration get ids `>= id_upper_bound` and are
+    /// born with the shadow via the double-write hook, so no worker touches them.
+    /// `0` on a legacy plan (no partitions).
+    pub id_upper_bound: u64,
     /// Forward-compat: TLV tags this binary doesn't recognise, preserved
     /// verbatim so a card-2/4 row round-trips through a card-1 binary.
     pub unknown_tlvs: Vec<(u8, Bytes)>,
@@ -2523,18 +2556,25 @@ fn recover_partial_into_txn(
     snap: u64,
 ) -> EngineResult<Catalog> {
     // Blanket-clear the catalog keyspace, THEN re-backfill from the live
-    // schema. EXEMPT the shadow-field migration keys (`c:P:` plans + the
-    // `c:N:M` id counter): they are not schema-derived, so backfill can't
-    // recreate them, and a torn-init reopen that hits this branch while a
-    // migration is in flight would otherwise silently wipe the plan + the
-    // counter — losing crash-resume and letting a freed id be reissued.
+    // schema. EXEMPT the shadow-field migration keys (`c:P:` plans, the
+    // `c:S:` per-partition cursors, and the `c:N:M` id counter): they are not
+    // schema-derived, so backfill can't recreate them, and a torn-init reopen
+    // that hits this branch while a migration is in flight would otherwise
+    // silently wipe the plan + per-partition cursors + the counter — losing
+    // crash-resume (re-converting every partition from scratch) and letting a
+    // freed id be reissued.
     let plan_prefix = KeyBuilder::catalog_migration_plan_prefix();
+    let partition_prefix = KeyBuilder::catalog_partition_cursor_prefix();
     let counter_key = KeyBuilder::catalog_next_migration();
     let stale = storage.scan_prefix_at(snap, &KeyBuilder::catalog_prefix_all())?;
     let deletes: Vec<Bytes> = stale
         .into_iter()
         .map(|(k, _)| k)
-        .filter(|k| !k.starts_with(&plan_prefix) && k != &counter_key)
+        .filter(|k| {
+            !k.starts_with(&plan_prefix)
+                && !k.starts_with(&partition_prefix)
+                && k != &counter_key
+        })
         .collect();
     if !deletes.is_empty() {
         storage.delete_batch(txn, &deletes)?;
@@ -3556,6 +3596,15 @@ fn encode_migration_plan(plan: &MigrationPlan) -> Bytes {
         TLV_MP_CUTOVER_CURSOR,
         &plan.cutover_cursor.to_be_bytes(),
     );
+    // Card 3: parallel degree (only when parallel) + id upper bound.
+    if let Some(n) = plan.parallel_degree {
+        write_tlv(&mut body, TLV_MP_PARALLEL_DEGREE, &[n]);
+        write_tlv(
+            &mut body,
+            TLV_MP_ID_UPPER_BOUND,
+            &plan.id_upper_bound.to_be_bytes(),
+        );
+    }
     // Preserve forward-compat tags (card 4) verbatim.
     for (tag, value) in &plan.unknown_tlvs {
         write_tlv(&mut body, *tag, value);
@@ -3627,6 +3676,8 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
     let mut objects_converted: Option<u64> = None;
     let mut phase: Option<MigrationPhase> = None;
     let mut cutover_cursor: Option<u64> = None;
+    let mut parallel_degree: Option<u8> = None;
+    let mut id_upper_bound: Option<u64> = None;
     let mut unknown_tlvs: Vec<(u8, Bytes)> = Vec::new();
     let mut seen_tags: u128 = 0;
 
@@ -3734,6 +3785,19 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
                 })?);
             }
             TLV_MP_CUTOVER_CURSOR => cutover_cursor = Some(read_u64(value)?),
+            TLV_MP_PARALLEL_DEGREE => {
+                let n = read_u8(value)?;
+                // Reject out-of-range degrees rather than decode a plan whose
+                // partition math can't be reconstructed (fail closed).
+                if n == 0 || n > MAX_PARALLEL_DEGREE {
+                    return Err(EngineError::Catalog(CatalogError::MalformedMigrationPlan {
+                        row: key_debug.into(),
+                        reason: "parallel_degree out of range (1..=64)",
+                    }));
+                }
+                parallel_degree = Some(n);
+            }
+            TLV_MP_ID_UPPER_BOUND => id_upper_bound = Some(read_u64(value)?),
             other => unknown_tlvs.push((other, Bytes::copy_from_slice(value))),
         }
     }
@@ -3762,6 +3826,10 @@ fn decode_migration_plan(plan_id: u64, key_debug: &str, bytes: &[u8]) -> EngineR
         // semantics (Converting, cutover not started).
         phase: phase.unwrap_or(MigrationPhase::Converting),
         cutover_cursor: cutover_cursor.unwrap_or(0),
+        // Card 3: absent → legacy single-worker plan (parallel_degree None,
+        // id_upper_bound 0). `parallel_degree` presence is the discriminator.
+        parallel_degree,
+        id_upper_bound: id_upper_bound.unwrap_or(0),
         unknown_tlvs,
     })
 }
@@ -3775,6 +3843,112 @@ fn read_migration_counter(
         Some(bytes) => decode_counter("c:N:M", &bytes),
         None => Ok(0),
     }
+}
+
+// =====================================================================
+// Per-partition migration cursor (`c:S:<plan><idx>`, card 3/5)
+// =====================================================================
+
+/// One parallel backfill partition's durable progress. A worker advances ONLY
+/// its own partition's cursor (disjoint `c:S:` key → no inter-worker conflict);
+/// the plan-level aggregate is summed over partitions at finalize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PartitionCursor {
+    /// Highest `object_id` in this partition whose shadow is durably committed.
+    /// `0` = not started; the worker resumes from `max(cursor + 1, lo)`.
+    pub cursor: u64,
+    /// Objects this partition has converted (observability + skew surfacing).
+    pub objects_converted: u64,
+    /// True once this partition's whole `[lo, hi)` range is exhausted.
+    pub done: bool,
+}
+
+/// Fixed framed layout: `[RECORD_FORMAT_V1][KIND_PARTITION_CURSOR][cursor u64 BE]
+/// [objects_converted u64 BE][done u8]`. A torn write decode-FAILS cleanly
+/// (wrong length / kind / done byte) rather than silently misparsing the cursor.
+#[allow(dead_code)] // wired by the parallel worker/driver in card-3 increment 3b
+const PARTITION_CURSOR_LEN: usize = 2 + 8 + 8 + 1;
+
+#[allow(dead_code)] // wired by the parallel worker/driver in card-3 increment 3b
+pub(crate) fn encode_partition_cursor(pc: &PartitionCursor) -> Bytes {
+    let mut out = Vec::with_capacity(PARTITION_CURSOR_LEN);
+    out.push(RECORD_FORMAT_V1);
+    out.push(KIND_PARTITION_CURSOR);
+    out.extend_from_slice(&pc.cursor.to_be_bytes());
+    out.extend_from_slice(&pc.objects_converted.to_be_bytes());
+    out.push(pc.done as u8);
+    Bytes::from(out)
+}
+
+#[allow(dead_code)] // wired by the parallel worker/driver in card-3 increment 3b
+pub(crate) fn decode_partition_cursor(
+    key_debug: &str,
+    bytes: &[u8],
+) -> EngineResult<PartitionCursor> {
+    if bytes.len() != PARTITION_CURSOR_LEN {
+        return Err(EngineError::Catalog(CatalogError::Truncated {
+            key_debug: key_debug.into(),
+            len: bytes.len(),
+            min: PARTITION_CURSOR_LEN,
+        }));
+    }
+    if bytes[0] != RECORD_FORMAT_V1 {
+        return Err(EngineError::Catalog(CatalogError::UnsupportedRecordFormat {
+            row: key_debug.into(),
+            got: bytes[0],
+            max_supported: RECORD_FORMAT_V1,
+        }));
+    }
+    if bytes[1] != KIND_PARTITION_CURSOR {
+        return Err(EngineError::Catalog(CatalogError::WrongValueKind {
+            key_debug: key_debug.into(),
+            expected: "PartitionCursor",
+            got_tag: bytes[1],
+        }));
+    }
+    let cursor = u64::from_be_bytes(bytes[2..10].try_into().unwrap());
+    let objects_converted = u64::from_be_bytes(bytes[10..18].try_into().unwrap());
+    let done = match bytes[18] {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(EngineError::Catalog(CatalogError::MalformedMigrationPlan {
+                row: key_debug.into(),
+                reason: "partition cursor done byte not in {0,1}",
+            }));
+        }
+    };
+    Ok(PartitionCursor {
+        cursor,
+        objects_converted,
+        done,
+    })
+}
+
+/// Half-open object-id range `[lo, hi)` owned by partition `idx` when the domain
+/// `[1, id_upper_bound)` is split into `n` contiguous spans (card 3/5).
+/// Deterministic in `(n, id_upper_bound, idx)` so resume recomputes identical
+/// boundaries (cursors stay sound). Contiguous so each worker does a pure
+/// forward range scan (no read amplification). The union over `idx in 0..n` is
+/// exactly `[1, id_upper_bound)` and the ranges are disjoint; a partition past
+/// the populated tail (under id skew) is empty (`lo == hi`).
+#[allow(dead_code)] // wired by the parallel driver in card-3 increment 3b
+pub(crate) fn partition_range(n: u8, id_upper_bound: u64, idx: u8) -> (u64, u64) {
+    let n = n.max(1) as u64;
+    let idx = idx as u64;
+    let width = id_upper_bound.saturating_sub(1); // count of ids in [1, U)
+    if width == 0 {
+        let end = id_upper_bound.max(1);
+        return (end, end); // empty domain → every partition empty
+    }
+    let span = width.div_ceil(n).max(1);
+    let lo = idx.saturating_mul(span).saturating_add(1).min(id_upper_bound);
+    let hi = idx
+        .saturating_add(1)
+        .saturating_mul(span)
+        .saturating_add(1)
+        .min(id_upper_bound);
+    (lo, hi)
 }
 
 /// Decode every `c:P:<id>` plan record visible at `snap`, ascending by id.
@@ -3887,6 +4061,10 @@ pub(crate) fn create_migration_plan(
     converter_name: &str,
     converter_version: u32,
     chunk_size: u64,
+    // Card 3: `Some(n)` makes this a parallel plan over `[1, id_upper_bound)`
+    // (cursors in `c:S:`); `None` is a legacy single-worker plan (`cursor` field).
+    parallel_degree: Option<u8>,
+    id_upper_bound: u64,
 ) -> EngineResult<CreatedMigration> {
     let _guard = CATALOG_INIT_LOCK.lock();
     let mut txn = storage.begin_txn();
@@ -3934,6 +4112,8 @@ pub(crate) fn create_migration_plan(
             objects_converted: 0,
             phase: MigrationPhase::Converting,
             cutover_cursor: 0,
+            parallel_degree,
+            id_upper_bound,
             unknown_tlvs: Vec::new(),
         };
         let puts = vec![
@@ -4851,6 +5031,8 @@ mod tests {
             objects_converted: 999,
             phase: MigrationPhase::Converting,
             cutover_cursor: 0,
+            parallel_degree: None,
+            id_upper_bound: 0,
             unknown_tlvs: Vec::new(),
         }
     }
@@ -4883,6 +5065,99 @@ mod tests {
         let bytes = encode_migration_plan(&p);
         let back = decode_migration_plan(p.plan_id, "c:P:7", &bytes).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn migration_plan_roundtrip_parallel() {
+        // Card 3: a parallel plan carries parallel_degree + id_upper_bound.
+        let mut p = sample_plan();
+        p.parallel_degree = Some(8);
+        p.id_upper_bound = 1_000_000;
+        p.cursor = 0; // parallel plans leave the legacy cursor at 0
+        let bytes = encode_migration_plan(&p);
+        let back = decode_migration_plan(p.plan_id, "c:P:7", &bytes).unwrap();
+        assert_eq!(p, back);
+        assert_eq!(back.parallel_degree, Some(8));
+        assert_eq!(back.id_upper_bound, 1_000_000);
+    }
+
+    #[test]
+    fn legacy_plan_decodes_as_non_parallel() {
+        // A card-1/2 row (sample_plan has no parallel tags) decodes to None/0.
+        let back = decode_migration_plan(7, "c:P:7", &encode_migration_plan(&sample_plan())).unwrap();
+        assert_eq!(back.parallel_degree, None);
+        assert_eq!(back.id_upper_bound, 0);
+    }
+
+    #[test]
+    fn decode_migration_plan_rejects_out_of_range_parallel_degree() {
+        // Hand-plant a parallel_degree TLV (0x22) with an illegal value 0.
+        let mut p = sample_plan();
+        p.parallel_degree = Some(8);
+        p.id_upper_bound = 10;
+        let mut bytes = encode_migration_plan(&p).to_vec();
+        // Find the 0x22 TLV in the body (after the 4-byte record header) and
+        // overwrite its 1-byte payload with 0. Body starts at offset 4; each TLV
+        // is [tag u8][len u16 BE][payload].
+        let body = &mut bytes[4..];
+        let mut i = 0;
+        let mut patched = false;
+        while i + 3 <= body.len() {
+            let tag = body[i];
+            let len = u16::from_be_bytes([body[i + 1], body[i + 2]]) as usize;
+            if tag == TLV_MP_PARALLEL_DEGREE {
+                body[i + 3] = 0; // illegal degree
+                patched = true;
+                break;
+            }
+            i += 3 + len;
+        }
+        assert!(patched, "parallel_degree TLV not found");
+        assert!(decode_migration_plan(7, "c:P:7", &bytes).is_err());
+    }
+
+    #[test]
+    fn partition_cursor_roundtrip_and_rejects_corruption() {
+        let pc = PartitionCursor {
+            cursor: 123456,
+            objects_converted: 789,
+            done: true,
+        };
+        let bytes = encode_partition_cursor(&pc);
+        assert_eq!(bytes.len(), PARTITION_CURSOR_LEN);
+        assert_eq!(decode_partition_cursor("c:S:1#0", &bytes).unwrap(), pc);
+
+        // Wrong length, wrong kind, bad done byte all fail cleanly.
+        assert!(decode_partition_cursor("x", &bytes[..bytes.len() - 1]).is_err());
+        let mut bad_kind = bytes.to_vec();
+        bad_kind[1] = 0xFF;
+        assert!(decode_partition_cursor("x", &bad_kind).is_err());
+        let mut bad_done = bytes.to_vec();
+        bad_done[PARTITION_CURSOR_LEN - 1] = 2;
+        assert!(decode_partition_cursor("x", &bad_done).is_err());
+    }
+
+    #[test]
+    fn partition_range_covers_domain_exactly_once() {
+        // For several (n, U), every id in [1, U) lands in exactly one partition.
+        for &u in &[1u64, 2, 7, 100, 1000, 1001, 4096] {
+            for &n in &[1u8, 2, 3, 4, 8, 16, 64] {
+                let ranges: Vec<(u64, u64)> =
+                    (0..n).map(|i| partition_range(n, u, i)).collect();
+                // Disjoint + ascending, and within the domain.
+                for w in ranges.windows(2) {
+                    assert!(w[0].1 <= w[1].0, "overlap at n={n} u={u}: {ranges:?}");
+                }
+                for &(lo, hi) in &ranges {
+                    assert!(lo <= hi && hi <= u.max(1), "bad range n={n} u={u}: ({lo},{hi})");
+                }
+                // Every id in [1, U) covered exactly once.
+                for id in 1..u {
+                    let hits = ranges.iter().filter(|&&(lo, hi)| id >= lo && id < hi).count();
+                    assert_eq!(hits, 1, "id {id} hit {hits}× at n={n} u={u}: {ranges:?}");
+                }
+            }
+        }
     }
 
     #[test]

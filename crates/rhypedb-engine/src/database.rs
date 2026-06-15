@@ -1701,6 +1701,10 @@ impl Database {
                 &spec.converter_name,
                 spec.converter_version,
                 spec.chunk_size,
+                // Card 3 (3b) wires parallel degree + id upper bound here; 3a keeps
+                // the legacy single-worker path (None) so behavior is unchanged.
+                None,
+                0,
             )?;
             // Install the double-write hook so live writes to the migrating
             // field carry it forward (card 2d — no quiesce; writes proceed).
@@ -6986,7 +6990,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4, None, 0,
         )
         .unwrap();
 
@@ -7261,7 +7265,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
         )
         .unwrap();
         // Cut over WITHOUT backfilling any shadows → first row refuses.
@@ -7296,7 +7300,7 @@ mod tests {
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         // Plan pins converter_version = 2.
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 2, 16,
+            &db.storage, &db.schema, "User", "score", target, "widen", 2, 16, None, 0,
         )
         .unwrap();
         // Craft a blob with a shadow stamped at the WRONG converter version (1).
@@ -7355,7 +7359,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
         )
         .unwrap();
         // Arm the hook so migrating_field_count > 0 (drives the strip gate).
@@ -7409,7 +7413,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
         )
         .unwrap();
         let good: crate::catalog::RegisteredConverter =
@@ -7459,7 +7463,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
         )
         .unwrap();
         let conv: crate::catalog::RegisteredConverter = Arc::new(widen_i64_to_f64("User.score"));
@@ -7537,7 +7541,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 2,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 2, None, 0,
         )
         .unwrap();
         let conv: crate::catalog::RegisteredConverter = Arc::new(widen_i64_to_f64("User.score"));
@@ -7802,7 +7806,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let _created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 4, None, 0,
         )
         .unwrap();
         // A create against the same field now refuses.
@@ -7833,7 +7837,7 @@ mod tests {
         use rhypedb_schema::{FieldType, ScalarType};
         let target = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, type_name, field, target, "widen", 1, 4,
+            &db.storage, &db.schema, type_name, field, target, "widen", 1, 4, None, 0,
         )
         .unwrap()
         .plan_id
@@ -9146,7 +9150,7 @@ mod tests {
         let converter: crate::catalog::RegisteredConverter =
             Arc::new(widen_i64_to_f64("User.score"));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
         )
         .unwrap();
         db.arm_field_hook(
@@ -9221,7 +9225,7 @@ mod tests {
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         let created = crate::catalog::create_migration_plan(
-            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, None, 0,
         )
         .unwrap();
         db.arm_field_hook(

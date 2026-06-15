@@ -741,6 +741,49 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.freeze()
     }
+
+    /// Per-partition migration cursor: `c:S:<u64 BE plan_id><u8 partition_idx>`
+    /// (shadow-field card 3/5). Each parallel backfill worker advances ONLY its
+    /// own partition's cursor, so workers never write the shared `c:P:` plan
+    /// record on the hot path (which would WriteConflict every chunk). Like
+    /// `c:P:`, these rows are NOT schema-derived and MUST be exempted from the
+    /// torn-write recovery clear. Third byte `S` is distinct from every other
+    /// `c:` subkey (P/T/E/R/F/I/M/D/N).
+    pub fn catalog_partition_cursor(plan_id: u64, partition_idx: u8) -> Bytes {
+        let mut buf = BytesMut::with_capacity(4 + 8 + 1);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'S');
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(plan_id);
+        buf.put_u8(partition_idx);
+        buf.freeze()
+    }
+
+    /// Scan prefix for all partition cursors of ONE plan:
+    /// `c:S:<u64 BE plan_id>`. Used to load a plan's partition state on resume
+    /// and to delete them on a terminal cutover/cancel.
+    pub fn catalog_partition_cursor_plan_prefix(plan_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(4 + 8);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'S');
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(plan_id);
+        buf.freeze()
+    }
+
+    /// Broad scan prefix for EVERY partition cursor: `c:S:`. Used only by the
+    /// torn-write recovery clear to exempt this keyspace (see
+    /// `catalog_migration_plan_prefix`).
+    pub fn catalog_partition_cursor_prefix() -> Bytes {
+        let mut buf = BytesMut::with_capacity(4);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'S');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
 }
 
 #[cfg(test)]
