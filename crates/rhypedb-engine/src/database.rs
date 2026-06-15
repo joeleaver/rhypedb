@@ -302,22 +302,6 @@ pub struct Database {
     /// * a future migrate verb can rebuild and atomically swap the table
     ///   without touching `LsmConfig` or rebuilding the closure (PR B).
     zone_field_id_lookup: Arc<arc_swap::ArcSwap<ZoneFieldIdLookup>>,
-    /// `type_id -> {plan_id, ...}` for types under one or more active
-    /// (quiescing) chunked field-type migrations (shadow-field card 1). While
-    /// a type's set is non-empty every app write to its objects is REJECTED
-    /// (`MigrationTypeQuiesced`) — the card-1 "quiesce the migrating type"
-    /// contract; card 2 replaces the rejection with a cover-aware
-    /// double-write. A SET (not a single id) because two fields of one type
-    /// can each carry an unsettled plan — disarming one must not un-quiesce
-    /// the type while the other is still in flight. The source of truth is
-    /// the persisted `c:P:` plans; this is a lock-free read cache rebuilt
-    /// from them on open (increment 4) and mutated ONLY under
-    /// `migration_lock.write()` via `arm_quiesce`/`disarm_quiesce`. Because
-    /// every writer takes `migration_lock.read()` before consulting it, a
-    /// writer sees a consistent set for the whole duration of its operation.
-    migrating: arc_swap::ArcSwap<
-        std::collections::HashMap<u64, std::collections::HashSet<u64>>,
-    >,
     /// Per-`Database` named converter registry for chunked field-type
     /// migrations (shadow-field card 1). `name -> (version, converter)`.
     /// Per-`Database` (NOT a process-global) so two DBs in one process —
@@ -890,14 +874,11 @@ impl Database {
                 None => Arc::new(parking_lot::RwLock::new(())),
             },
             zone_field_id_lookup,
-            // Rebuilt from `c:P:` by `auto_resume_migrations` on the open path
-            // (below); create_field_type_migration arms it under
-            // migration_lock.write().
-            migrating: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
-            // Card 2: double-write hooks. Same lifecycle as `migrating` —
-            // start empty, rebuilt by `auto_resume_migrations` / armed by
-            // create. (Not carried via CarryState: a `_consuming` rebuild is
-            // refused while a plan is unsettled, so carry is always migration-free.)
+            // Card 2: double-write hooks — start empty, rebuilt from `c:P:` by
+            // `auto_resume_migrations` on the open path (below) / armed by
+            // create_field_type_migration under migration_lock.write(). (Not
+            // carried via CarryState: a `_consuming` rebuild is refused while a
+            // plan is unsettled, so carry is always migration-free.)
             migrating_fields: arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
             migrating_field_count: std::sync::atomic::AtomicUsize::new(0),
             converters: match &carry {
@@ -1540,65 +1521,6 @@ impl Database {
         })
     }
 
-    /// Create a new object of the given type.
-    ///
-    /// `fields` may include forward (non-inverse) relation fields whose
-    /// value is an integer target id — the engine then writes the forward
-    /// edge AND rev_edge as part of the same txn, with symmetric covers
-    /// built from the in-memory FieldMap (no per-link `scan_prefix` for
-    /// other targets, no extra commits). This collapses the historical
-    /// `Type.create + link + link` 3-txn dance into one batched txn.
-    /// The plan id quiescing `type_id`, if any. Lock-free read of the
-    /// migrating-type set; callers already hold `migration_lock.read()` so
-    /// the set cannot change under them (it mutates only under `.write()`).
-    fn quiescing_plan(&self, type_id: u64) -> Option<u64> {
-        // Any plan in the type's set quiesces it; report the smallest id for
-        // a deterministic error message when several are in flight.
-        self.migrating
-            .load()
-            .get(&type_id)
-            .and_then(|set| set.iter().min().copied())
-    }
-
-    /// Reject if `type_id` is quiesced by an in-flight field-type migration
-    /// (shadow-field card 1). The single guard every `o:`-writing path
-    /// funnels through — direct writers call it after `resolve_type_id`;
-    /// `delete_inner` calls it per cascaded type so a delete on type A that
-    /// cascades into migrating type B is rejected as a whole.
-    fn guard_not_quiesced(&self, type_id: u64, type_name: &str) -> EngineResult<()> {
-        if let Some(plan_id) = self.quiescing_plan(type_id) {
-            return Err(EngineError::MigrationTypeQuiesced {
-                type_name: type_name.into(),
-                plan_id,
-            });
-        }
-        Ok(())
-    }
-
-    /// Arm write-rejection (quiesce) for `type_id` under `plan_id`. MUST be
-    /// called while holding `migration_lock.write()` so no concurrent writer
-    /// observes a torn set; clone-on-write swap of the read cache. Adding a
-    /// second plan id to a type already quiesced keeps it quiesced.
-    pub(crate) fn arm_quiesce(&self, type_id: u64, plan_id: u64) {
-        let mut m = (**self.migrating.load()).clone();
-        m.entry(type_id).or_default().insert(plan_id);
-        self.migrating.store(Arc::new(m));
-    }
-
-    /// Release quiesce for `plan_id` on `type_id` (its migration
-    /// completed/cancelled). The type stays quiesced while any OTHER plan on
-    /// it is still in flight. Same locking contract as `arm_quiesce`.
-    pub(crate) fn disarm_quiesce(&self, type_id: u64, plan_id: u64) {
-        let mut m = (**self.migrating.load()).clone();
-        if let Some(set) = m.get_mut(&type_id) {
-            set.remove(&plan_id);
-            if set.is_empty() {
-                m.remove(&type_id);
-            }
-        }
-        self.migrating.store(Arc::new(m));
-    }
-
     /// Install (or replace) the card-2 double-write hook for `type_id`'s
     /// `hook.field_name`. MUST hold `migration_lock.write()`. Clone-on-write
     /// swap of the ArcSwap; keeps `migrating_field_count` in sync. Replacing an
@@ -1732,12 +1654,13 @@ impl Database {
     }
 
     /// Create and run a chunked, crash-resumable field-type migration
-    /// (shadow-field card 1/5). Synchronous: converts the whole object
-    /// keyspace in per-chunk commits, then flips the catalog field kind,
-    /// and returns the durable plan id. While it runs, the migrating type is
-    /// QUIESCED — concurrent writes to it are rejected with
-    /// `MigrationTypeQuiesced` (card 2 lifts this with live double-writes);
-    /// writes to other types proceed.
+    /// (shadow-field card 2/5). Synchronous: backfills a converted
+    /// `<field>__shadow` sibling for every object in per-chunk commits, then
+    /// cuts over (promote shadow → source + reconcile covers + flip the catalog
+    /// kind), returning the durable plan id. ONLINE: concurrent writes proceed
+    /// throughout via the double-write hook — a write to the migrating field
+    /// whose converter is unresolved is the only one rejected
+    /// (`MigrationFieldConverterUnresolved`, fail-closed).
     ///
     /// Unlike the single-commit [`Database::change_field_type`], this never
     /// holds `CATALOG_INIT_LOCK` across the scan-and-rewrite, commits at
@@ -1777,10 +1700,8 @@ impl Database {
                 spec.converter_version,
                 spec.chunk_size,
             )?;
-            self.arm_quiesce(created.type_id, created.plan_id);
-            // Card 2a: also install the double-write hook (converter resolved
-            // above). Not consumed by writers until card 2b; quiesce still
-            // rejects writes for now.
+            // Install the double-write hook so live writes to the migrating
+            // field carry it forward (card 2d — no quiesce; writes proceed).
             self.arm_field_hook(
                 created.type_id,
                 MigratingFieldHook {
@@ -1794,9 +1715,10 @@ impl Database {
             created
         };
 
-        // Drive WITHOUT holding `migration_lock` so writers to OTHER types
-        // proceed during the (potentially long) chunk loop; the migrating
-        // type stays quiesced via the armed set.
+        // Drive WITHOUT holding `migration_lock` so live writes (to this type
+        // and others) proceed during the (potentially long) backfill; the
+        // double-write hook keeps every write's shadow current. The cutover
+        // re-takes `migration_lock.write()` to drain writers for its pass.
         self.drive_migration_to_completion(created.plan_id, created.type_id, Some(&converter))?;
         Ok(created.plan_id)
     }
@@ -2063,10 +1985,9 @@ impl Database {
             }
         }
 
-        // Flip the catalog kind + mark Completed (idempotent), then release
-        // quiesce + the double-write hook. Already holding migration_lock.write().
+        // Flip the catalog kind + mark Completed (idempotent), then disarm the
+        // double-write hook. Already holding migration_lock.write().
         crate::catalog::finalize_migration_cutover(&self.storage, plan_id)?;
-        self.disarm_quiesce(type_id, plan_id);
         self.disarm_field_hook(type_id, plan_id);
         Ok(())
     }
@@ -2114,18 +2035,18 @@ impl Database {
         };
         for plan in plans {
             if !plan.status.quiesces() {
-                continue; // Completed / Cancelled — settled, no protection needed
+                continue; // Completed / Cancelled — settled, no hook needed
             }
             let Some(&type_id) = self.type_ids.get(&plan.type_name) else {
-                continue; // type no longer exists — nothing to quiesce
+                continue; // type no longer exists — nothing to re-arm
             };
             // Converter is empty at a fresh open (operator registers AFTER
-            // open) → the hook arms in a REJECTING (converter: None) state.
+            // open) → the hook arms in a REJECTING (converter: None) state, so a
+            // live write to the migrating field fails closed until it resolves.
             let converter = self.resolve_converter(&plan.converter_name, plan.converter_version);
             {
                 let _guard = self.migration_lock.write();
-                self.arm_quiesce(type_id, plan.plan_id);
-                // Card 2a: rebuild the double-write hook from the plan.
+                // Rebuild the double-write hook from the plan.
                 self.arm_field_hook(
                     type_id,
                     MigratingFieldHook {
@@ -2196,7 +2117,6 @@ impl Database {
         self.guard_resume_schema(&plan)?;
         {
             let _guard = self.migration_lock.write();
-            self.arm_quiesce(type_id, plan_id); // idempotent if open already armed it
             // Re-arm the hook with the now-resolved converter (open may have
             // armed it REJECTING when the converter wasn't registered yet).
             self.arm_field_hook(
@@ -2237,6 +2157,14 @@ impl Database {
             .collect())
     }
 
+    /// Create a new object of the given type.
+    ///
+    /// `fields` may include forward (non-inverse) relation fields whose
+    /// value is an integer target id — the engine then writes the forward
+    /// edge AND rev_edge as part of the same txn, with symmetric covers
+    /// built from the in-memory FieldMap (no per-link `scan_prefix` for
+    /// other targets, no extra commits). This collapses the historical
+    /// `Type.create + link + link` 3-txn dance into one batched txn.
     pub fn create(&self, type_name: &str, fields: FieldMap) -> EngineResult<Object> {
         // Block under the migration write-barrier: if a rename / change
         // / run_migrations is in flight, wait until it commits so this
@@ -2249,7 +2177,10 @@ impl Database {
         // entities. Surfacing `TypeRetired` instead tells the operator
         // "you removed this, not typoed it."
         let type_id = self.resolve_type_id(type_name)?;
-        self.guard_not_quiesced(type_id, type_name)?;
+        // Card 2d: writes to a migrating type are NO LONGER quiesced — the
+        // double-write hook (apply_migrating_field_hook) stamps the converted
+        // shadow inline, so the write carries the migration forward. A migrating
+        // field whose converter is unresolved still FAILS CLOSED inside the hook.
         let type_def = self
             .schema
             .get_type(type_name)
@@ -2259,7 +2190,7 @@ impl Database {
         let mut txn = self.storage.begin_txn();
         let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
 
-        let mut scalar_fields = self.stage_create_writes(
+        let scalar_fields = self.stage_create_writes(
             &mut txn, type_name, type_def, type_id, object_id, &fields, &mut puts,
         )?;
 
@@ -2277,11 +2208,6 @@ impl Database {
                 other => EngineError::Storage(other),
             }
         })?;
-
-        // Card 2: drop any `<field>__shadow` siblings the double-write hook
-        // stamped into `scalar_fields` before they reach the change event or
-        // the returned Object — the durable `o:` blob keeps them.
-        self.strip_tombstoned_fields(type_name, &mut scalar_fields);
 
         self.subscriptions.publish(ChangeEvent {
             version,
@@ -2417,12 +2343,23 @@ impl Database {
             }
         }
 
-        // Card 2: double-write the shadow for any field mid-migration BEFORE
-        // serialize, so the shadow lands in the single `serialized` blob shared
-        // by the object entry AND every covering-index entry below.
-        self.apply_migrating_field_hook(type_id, type_name, object_id, &mut scalar_fields)?;
-
-        let serialized = serialize_fields(&scalar_fields);
+        // Card 2: double-write the shadow for any field mid-migration into the
+        // SERIALIZED blob (shared by the object entry AND every covering-index
+        // entry below). Apply it to a clone so `scalar_fields` itself stays
+        // shadow-free — the unique-index loop, the in-memory covers, the change
+        // event, and the returned Object all iterate `scalar_fields` and must
+        // see only real fields. Cloned only while a migration is in flight.
+        let serialized = if self
+            .migrating_field_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            let mut with_shadow = scalar_fields.clone();
+            self.apply_migrating_field_hook(type_id, type_name, object_id, &mut with_shadow)?;
+            serialize_fields(&with_shadow)
+        } else {
+            serialize_fields(&scalar_fields)
+        };
 
         // Unique-index writes for scalar fields (inline — required for
         // cross-row uniqueness detection inside a single `create_batch`).
@@ -2508,7 +2445,8 @@ impl Database {
         }
         let _migration_guard = self.migration_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
-        self.guard_not_quiesced(type_id, type_name)?;
+        // Card 2d: no quiesce — the per-row double-write hook in
+        // stage_create_writes carries each migrating field forward.
         let type_def = self
             .schema
             .get_type(type_name)
@@ -2572,10 +2510,7 @@ impl Database {
         // Events report only the scalar fields (relation values went into
         // the edge index, not the object payload).
         let mut out = Vec::with_capacity(scalar_rows.len());
-        for (id, mut scalar_fields) in object_ids.into_iter().zip(scalar_rows) {
-            // Card 2: strip any `<field>__shadow` siblings the double-write hook
-            // stamped before they reach the change event / returned Object.
-            self.strip_tombstoned_fields(type_name, &mut scalar_fields);
+        for (id, scalar_fields) in object_ids.into_iter().zip(scalar_rows) {
             self.subscriptions.publish(ChangeEvent {
                 version,
                 kind: ChangeKind::Create,
@@ -3554,7 +3489,8 @@ impl Database {
     ) -> EngineResult<Object> {
         let _migration_guard = self.migration_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
-        self.guard_not_quiesced(type_id, type_name)?;
+        // Card 2d: no quiesce — the double-write hook re-stamps the migrating
+        // field's shadow over the merged blob (apply_migrating_field_hook).
         let type_def = self
             .schema
             .get_type(type_name)
@@ -3622,12 +3558,21 @@ impl Database {
             fields.insert(k, v);
         }
 
-        // Card 2: double-write the shadow over the MERGED field set (so an
-        // update that doesn't touch the migrating field still re-stamps a
-        // consistent shadow) BEFORE serialize.
-        self.apply_migrating_field_hook(type_id, type_name, object_id, &mut fields)?;
-
-        let serialized = serialize_fields(&fields);
+        // Card 2: double-write the shadow over the MERGED field set into the
+        // SERIALIZED blob. Apply to a clone so `fields` stays shadow-free — the
+        // cover maintenance, change event, and returned Object all use `fields`
+        // and must see only real fields. Cloned only while a migration runs.
+        let serialized = if self
+            .migrating_field_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            let mut with_shadow = fields.clone();
+            self.apply_migrating_field_hook(type_id, type_name, object_id, &mut with_shadow)?;
+            serialize_fields(&with_shadow)
+        } else {
+            serialize_fields(&fields)
+        };
 
         // Maintain secondary-index covering payloads, refresh outbound rev-edge
         // covers, and bump this object's generation — shared with the card-2
@@ -3655,12 +3600,6 @@ impl Database {
                 other => EngineError::Storage(other),
             }
         })?;
-
-        // Card 2: the merged `fields` carry the `<field>__shadow` siblings the
-        // double-write hook stamped (now durable in the `o:` blob + covers). The
-        // change event and the returned Object face callers, so strip the
-        // siblings here — `serialized` (with the shadow) is already committed.
-        self.strip_tombstoned_fields(type_name, &mut fields);
 
         // Enqueue cover refresh for this target. Every other rev_edge that
         // embedded this object as `<name>__cover` (under a different source)
@@ -3914,13 +3853,10 @@ impl Database {
             )
         })?;
 
-        // Quiesce guard (shadow-field card 1). Placed AFTER the meta lookup
-        // (which stages nothing) and BEFORE any tombstone is staged, so a
-        // cascade that reaches a migrating type aborts the WHOLE delete (it
-        // is one txn — the caller never commits on Err) with nothing
-        // written. Covers the top-level delete AND a cascade into the
-        // migrating type from a delete issued against a different type.
-        self.guard_not_quiesced(type_id, &meta.type_name)?;
+        // Card 2d: deletes (incl. cascades) into a migrating type are now
+        // ALLOWED — the object and its `<field>__shadow` siblings are dropped
+        // together with the rest of the object blob, so the migration stays
+        // consistent (a deleted row simply never reaches cutover).
 
         // Unique-index + secondary-index cleanup. Skipped entirely when the
         // type has neither — for edge-only types (Rating in the bench) the
@@ -7031,7 +6967,6 @@ mod tests {
             &db.storage, &db.schema, "User", "score", target, "widen", 1, 4,
         )
         .unwrap();
-        db.arm_quiesce(created.type_id, created.plan_id);
 
         // "Crash": a converter that errors once it reaches the back half.
         let cutoff = ids[ids.len() / 2];
@@ -7307,7 +7242,6 @@ mod tests {
             &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
         )
         .unwrap();
-        db.arm_quiesce(created.type_id, created.plan_id);
         // Cut over WITHOUT backfilling any shadows → first row refuses.
         let err = db.run_cutover(created.plan_id, created.type_id).unwrap_err();
         assert!(
@@ -7343,7 +7277,6 @@ mod tests {
             &db.storage, &db.schema, "User", "score", target, "widen", 2, 16,
         )
         .unwrap();
-        db.arm_quiesce(created.type_id, created.plan_id);
         // Craft a blob with a shadow stamped at the WRONG converter version (1).
         let tid = db.resolve_type_id("User").unwrap();
         let mut nf = FieldMap::new();
@@ -7403,7 +7336,6 @@ mod tests {
             &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
         )
         .unwrap();
-        db.arm_quiesce(created.type_id, created.plan_id);
         // Arm the hook so migrating_field_count > 0 (drives the strip gate).
         db.arm_field_hook(
             created.type_id,
@@ -7458,7 +7390,6 @@ mod tests {
             &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
         )
         .unwrap();
-        db.arm_quiesce(created.type_id, created.plan_id);
         let good: crate::catalog::RegisteredConverter =
             Arc::new(widen_i64_to_f64("User.score"));
         crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &good).unwrap();
@@ -7509,7 +7440,6 @@ mod tests {
             &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
         )
         .unwrap();
-        db.arm_quiesce(created.type_id, created.plan_id);
         let conv: crate::catalog::RegisteredConverter = Arc::new(widen_i64_to_f64("User.score"));
         crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &conv).unwrap();
         // Corrupt one row back to source-only (drop its shadow) so cutover hits
@@ -7588,7 +7518,6 @@ mod tests {
             &db.storage, &db.schema, "User", "score", target, "widen", 1, 2,
         )
         .unwrap();
-        db.arm_quiesce(created.type_id, created.plan_id);
         let conv: crate::catalog::RegisteredConverter = Arc::new(widen_i64_to_f64("User.score"));
         crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &conv).unwrap();
 
@@ -7850,11 +7779,10 @@ mod tests {
         // Persist a Running plan directly (don't drive it to completion).
         let target =
             crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
-        let created = crate::catalog::create_migration_plan(
+        let _created = crate::catalog::create_migration_plan(
             &db.storage, &db.schema, "User", "score", target, "widen", 1, 4,
         )
         .unwrap();
-        db.arm_quiesce(created.type_id, created.plan_id);
         // A create against the same field now refuses.
         let err = db
             .create_field_type_migration(MigrationPlanSpec {
@@ -7889,8 +7817,9 @@ mod tests {
         .plan_id
     }
 
-    /// Open scans `c:P:`, re-arms quiesce for a Running plan (writes rejected),
-    /// and — once the converter is registered — `resume_field_type_migration`
+    /// Open scans `c:P:`, re-arms the double-write hook for a Running plan
+    /// (writes to the migrating field fail closed until the converter is
+    /// registered), and — once registered — `resume_field_type_migration`
     /// drives it to completion. Also exercises the plan-aware reconcile (open
     /// with the TARGET schema while the catalog is still the source kind).
     #[test]
@@ -7919,12 +7848,14 @@ mod tests {
             dir.path(),
         )
         .unwrap();
-        // Open re-armed quiesce — writes to the migrating type are rejected.
+        // Card 2d: open re-armed the double-write hook in a REJECTING state
+        // (converter not registered yet) — a write to the MIGRATING field fails
+        // closed, while other writes proceed.
         let mut f = FieldMap::new();
         f.insert("score".into(), Value::F64(1.0));
         assert!(matches!(
             db.create("User", f),
-            Err(EngineError::MigrationTypeQuiesced { .. })
+            Err(EngineError::MigrationFieldConverterUnresolved { .. })
         ));
         let plan_id = db.list_migrations().unwrap()[0].plan_id;
         assert_eq!(
@@ -8077,35 +8008,6 @@ mod tests {
         .unwrap();
         let next = persist_running_plan(&db, "Post", "score");
         assert!(next > plan_id, "counter reissued a freed id: {next} <= {plan_id}");
-    }
-
-    /// Disarming one plan on a type must NOT un-quiesce the type while another
-    /// plan on a different field of the same type is still in flight.
-    #[test]
-    fn quiesce_survives_disarm_of_sibling_plan() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(
-            parse_schema(r#"type User { a: i64  b: i64 }"#).unwrap(),
-            dir.path(),
-        )
-        .unwrap();
-        let tid = db.resolve_type_id("User").unwrap();
-        db.arm_quiesce(tid, 1);
-        db.arm_quiesce(tid, 2);
-        db.disarm_quiesce(tid, 1);
-        // Still quiesced by plan 2.
-        let mut f = FieldMap::new();
-        f.insert("a".into(), Value::I64(1));
-        f.insert("b".into(), Value::I64(2));
-        assert!(matches!(
-            db.create("User", f),
-            Err(EngineError::MigrationTypeQuiesced { plan_id: 2, .. })
-        ));
-        db.disarm_quiesce(tid, 2);
-        let mut f = FieldMap::new();
-        f.insert("a".into(), Value::I64(1));
-        f.insert("b".into(), Value::I64(2));
-        assert!(db.create("User", f).is_ok());
     }
 
     /// A rename verb (here a type rename) is refused while an unsettled plan
@@ -9168,7 +9070,7 @@ mod tests {
         ));
     }
 
-    // --- Shadow-field card 1: quiesce keyspace-coverage guards (increment 2) ---
+    // --- Shadow-field card 2d: live writes during migration (no quiesce) ---
 
     fn quiesce_cascade_db() -> (Arc<Database>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -9194,49 +9096,137 @@ mod tests {
         f
     }
 
+    /// Card 2d: live writes to a migrating type PROCEED (no quiesce). The
+    /// double-write hook stamps a converted shadow on each create/update, the
+    /// backfill worker skips those already-shadowed rows, and the cutover
+    /// promotes everything — so a row written DURING the migration ends at the
+    /// target with its latest value.
     #[test]
-    fn quiesced_type_rejects_every_write_path() {
-        let (db, _dir) = quiesce_cascade_db();
-        let alice = db.create("User", named("Alice")).unwrap();
+    fn writes_proceed_and_double_write_during_migration() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        let mut ids = Vec::new();
+        for i in 0..4i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        // Begin a migration (plan + hook armed) but do NOT cut over yet.
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let converter: crate::catalog::RegisteredConverter =
+            Arc::new(widen_i64_to_f64("User.score"));
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+        )
+        .unwrap();
+        db.arm_field_hook(
+            created.type_id,
+            MigratingFieldHook {
+                field_name: "score".into(),
+                converter: Some(Arc::clone(&converter)),
+                target_kind: target,
+                converter_version: 1,
+                plan_id: created.plan_id,
+            },
+        );
 
-        let user_tid = db.resolve_type_id("User").unwrap();
-        db.arm_quiesce(user_tid, 7);
+        // Live writes mid-migration PROCEED + double-write a shadow; the
+        // returned Object is shadow-free.
+        let live_created = {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(100));
+            let obj = db.create("User", f).unwrap();
+            assert!(obj.fields.keys().all(|k| !is_shadow_sibling_key(k)));
+            obj.id
+        };
+        {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(999));
+            let obj = db.update("User", ids[0], f).unwrap();
+            assert!(obj.fields.keys().all(|k| !is_shadow_sibling_key(k)));
+        }
 
-        assert!(matches!(
-            db.create("User", named("Bob")),
-            Err(EngineError::MigrationTypeQuiesced { plan_id: 7, .. })
-        ));
-        assert!(matches!(
-            db.create_batch("User", vec![named("Carol")]),
-            Err(EngineError::MigrationTypeQuiesced { plan_id: 7, .. })
-        ));
-        assert!(matches!(
-            db.update("User", alice.id, named("Alice2")),
-            Err(EngineError::MigrationTypeQuiesced { plan_id: 7, .. })
-        ));
-        assert!(matches!(
-            db.delete("User", alice.id),
-            Err(EngineError::MigrationTypeQuiesced { plan_id: 7, .. })
-        ));
+        // Backfill the remaining rows + cut over.
+        crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &converter).unwrap();
+        db.run_cutover(created.plan_id, created.type_id).unwrap();
+        drop(db);
 
-        // Disarm → writes flow again.
-        db.disarm_quiesce(user_tid, 7);
-        assert!(db.create("User", named("Bob")).is_ok());
-        assert!(db.update("User", alice.id, named("Alice2")).is_ok());
-        assert!(db.delete("User", alice.id).is_ok());
+        let db2 = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        // Live-updated row reflects the NEW value, converted.
+        assert!(matches!(
+            db2.get("User", ids[0]).unwrap().fields.get("score"),
+            Some(Value::F64(f)) if *f == 999.0
+        ));
+        // Live-created row converted.
+        assert!(matches!(
+            db2.get("User", live_created).unwrap().fields.get("score"),
+            Some(Value::F64(f)) if *f == 100.0
+        ));
+        // Untouched originals converted.
+        for (id, i) in ids[1..].iter().zip(1i64..) {
+            assert!(matches!(
+                db2.get("User", *id).unwrap().fields.get("score"),
+                Some(Value::F64(f)) if *f == i as f64
+            ));
+        }
     }
 
+    /// Card 2d open-to-register window: a write that TOUCHES a migrating field
+    /// whose converter is unresolved FAILS CLOSED — never lands a source-only
+    /// value the cutover would later refuse. A write that doesn't touch the
+    /// migrating field proceeds.
     #[test]
-    fn quiesce_is_scoped_to_the_migrating_type() {
-        // Arming Post must NOT block writes to the un-migrating User type.
-        let (db, _dir) = quiesce_cascade_db();
-        let post_tid = db.resolve_type_id("Post").unwrap();
-        db.arm_quiesce(post_tid, 3);
-        assert!(db.create("User", named("Alice")).is_ok());
+    fn write_to_migrating_field_with_unresolved_converter_fails_closed() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64  tag: String }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+        )
+        .unwrap();
+        db.arm_field_hook(
+            created.type_id,
+            MigratingFieldHook {
+                field_name: "score".into(),
+                converter: None,
+                target_kind: target,
+                converter_version: 1,
+                plan_id: created.plan_id,
+            },
+        );
+        let mut f = FieldMap::new();
+        f.insert("score".into(), Value::I64(5));
+        assert!(matches!(
+            db.create("User", f),
+            Err(EngineError::MigrationFieldConverterUnresolved { .. })
+        ));
+        let mut f = FieldMap::new();
+        f.insert("tag".into(), Value::String("ok".into()));
+        assert!(db.create("User", f).is_ok());
     }
 
+    /// Card 2d: a delete (incl. a cascade) into a migrating type is now ALLOWED
+    /// — the object and any `<field>__shadow` siblings drop together.
     #[test]
-    fn cascade_delete_into_quiesced_type_is_rejected_atomically() {
+    fn delete_cascade_into_migrating_type_proceeds() {
         let (db, _dir) = quiesce_cascade_db();
         let alice = db.create("User", named("Alice")).unwrap();
         let mut pf = FieldMap::new();
@@ -9244,18 +9234,32 @@ mod tests {
         let post = db.create("Post", pf).unwrap();
         db.link("Post", post.id, "author", alice.id, None).unwrap();
 
-        // Quiesce the CHILD (Post). Deleting the PARENT (User) cascades into
-        // Post — the guard inside delete_inner must reject the whole delete,
-        // and because it is one txn, BOTH objects survive untouched. This is
-        // the case a create/update-only guard would have missed.
+        // Arm a migration hook on the CHILD (Post). Deleting the PARENT (User)
+        // cascades into Post — under card 1 this was rejected; under 2d it
+        // proceeds and removes BOTH objects. (delete drops the whole blob, so
+        // it never invokes the hook's converter.)
         let post_tid = db.resolve_type_id("Post").unwrap();
-        db.arm_quiesce(post_tid, 9);
+        db.arm_field_hook(
+            post_tid,
+            MigratingFieldHook {
+                field_name: "title".into(),
+                converter: None,
+                target_kind: crate::catalog::schema_kind_byte_public(
+                    &rhypedb_schema::FieldType::Scalar(rhypedb_schema::ScalarType::Bytes),
+                ),
+                converter_version: 1,
+                plan_id: 9,
+            },
+        );
+        db.delete("User", alice.id).unwrap();
         assert!(matches!(
-            db.delete("User", alice.id),
-            Err(EngineError::MigrationTypeQuiesced { plan_id: 9, .. })
+            db.get("User", alice.id),
+            Err(EngineError::ObjectNotFound { .. })
         ));
-        assert!(db.get("User", alice.id).is_ok());
-        assert!(db.get("Post", post.id).is_ok());
+        assert!(matches!(
+            db.get("Post", post.id),
+            Err(EngineError::ObjectNotFound { .. })
+        ));
     }
 
     #[test]

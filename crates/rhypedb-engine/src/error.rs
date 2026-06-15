@@ -100,18 +100,6 @@ pub enum EngineError {
     #[error("database handle has been migrated away — switch to the Arc returned by the migrate verb")]
     DatabaseMigratedAway,
 
-    /// A write was rejected because its target type is under an active
-    /// chunked field-type migration (shadow-field card 1). Card 1 quiesces
-    /// the migrating type — no concurrent writes to its objects — until the
-    /// migration completes or is cancelled. Card 2 lifts this by carrying
-    /// live writes through a double-write hook. Fires for create / update /
-    /// delete, and for a cascade-delete that reaches the migrating type
-    /// from a delete issued against another type.
-    #[error(
-        "type {type_name} is quiesced by in-flight migration plan {plan_id}; writes are rejected until it completes or is cancelled"
-    )]
-    MigrationTypeQuiesced { type_name: String, plan_id: u64 },
-
     /// `create_field_type_migration` was asked for a converter `(name,
     /// version)` that is not in this `Database`'s converter registry. Fail
     /// fast at create rather than persist a plan that can never run; the
