@@ -7338,6 +7338,111 @@ mod tests {
         );
     }
 
+    /// Card 3 worker: N partitions over `[1, U)` back-fill the shadow for every
+    /// object exactly once, each advancing its own `c:S:` cursor; re-running is
+    /// idempotent (done partitions return immediately, convert nothing more).
+    #[test]
+    fn parallel_partition_backfill_covers_range_idempotently() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+
+        const N: i64 = 250;
+        for i in 0..N {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            db.create("User", f).unwrap();
+        }
+        let i64_kind = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::I64));
+        let target = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let u = db.next_object_id.load(Ordering::SeqCst); // exclusive id upper bound
+        let degree = 4u8;
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16, Some(degree), u,
+        )
+        .unwrap();
+        let converter: crate::catalog::RegisteredConverter =
+            std::sync::Arc::new(|_oid: u64, v: &Value| match v {
+                Value::I64(i) => Ok(Value::F64(*i as f64)),
+                other => Err(EngineError::Catalog(
+                    crate::CatalogError::FieldTypeChangeConverterFailed {
+                        qualified: "User.score".into(),
+                        object_id: 0,
+                        reason: format!("unexpected {other:?}"),
+                    },
+                )),
+            });
+        let control = AtomicU8::new(crate::catalog::migration_control::RUN);
+
+        let run_all = || {
+            for idx in 0..degree {
+                let (lo, hi) = crate::catalog::partition_range(degree, u, idx);
+                let outcome = crate::catalog::run_migration_partition(
+                    &db.storage, created.plan_id, created.type_id, idx, lo, hi,
+                    "User", "score", i64_kind, target, 1, 16, &converter, &control,
+                )
+                .unwrap();
+                assert_eq!(outcome, crate::catalog::PartitionDriveOutcome::Done);
+            }
+        };
+
+        run_all();
+
+        // Every object carries a converted shadow (score i64 → shadow f64, cv 1).
+        let tid = created.type_id;
+        let snap = db.storage.read_snapshot();
+        let mut shadows = 0usize;
+        for id in 1..u {
+            let key = rhypedb_storage::key::KeyBuilder::object(tid, id);
+            let blob = db.storage.get_at(snap, &key).unwrap().expect("object missing");
+            let fields = crate::object::deserialize_fields(&blob);
+            match (
+                fields.get("score"),
+                fields.get("score__shadow"),
+                fields.get("score__shadow_cv"),
+            ) {
+                (Some(Value::I64(s)), Some(Value::F64(sh)), Some(Value::U32(1))) => {
+                    assert_eq!(*sh, *s as f64);
+                    shadows += 1;
+                }
+                other => panic!("object {id} missing/bad shadow: {other:?}"),
+            }
+        }
+        assert_eq!(shadows, N as usize, "every object backfilled exactly once");
+
+        // Sum of per-partition converted counts == N (counted once), all done.
+        let mut total = 0u64;
+        for idx in 0..degree {
+            let key = rhypedb_storage::key::KeyBuilder::catalog_partition_cursor(created.plan_id, idx);
+            let txn = db.storage.begin_txn();
+            let bytes = db.storage.get(&txn, &key).unwrap().expect("partition cursor missing");
+            let pc = crate::catalog::decode_partition_cursor("c:S", &bytes).unwrap();
+            assert!(pc.done, "partition {idx} not done");
+            total += pc.objects_converted;
+        }
+        assert_eq!(total, N as u64, "objects_converted summed over partitions");
+
+        // Idempotent re-run: done partitions return Done, convert nothing more.
+        run_all();
+        let mut total2 = 0u64;
+        for idx in 0..degree {
+            let key = rhypedb_storage::key::KeyBuilder::catalog_partition_cursor(created.plan_id, idx);
+            let txn = db.storage.begin_txn();
+            let pc = crate::catalog::decode_partition_cursor(
+                "c:S",
+                &db.storage.get(&txn, &key).unwrap().unwrap(),
+            )
+            .unwrap();
+            total2 += pc.objects_converted;
+        }
+        assert_eq!(total2, N as u64, "re-run must not double-count");
+    }
+
     /// G3: while a migration is in flight the lazy/raw wire path
     /// (`get_many_lazy`) must NOT leak the worker-written `<field>__shadow`
     /// siblings — it ships `raw_fields` verbatim, bypassing the eager strip.

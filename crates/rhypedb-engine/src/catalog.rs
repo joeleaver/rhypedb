@@ -116,8 +116,7 @@ const KIND_MIGRATION_PLAN: u8 = 0x04;
 /// Value kind for a per-partition migration cursor (`c:S:<plan><idx>`,
 /// card 3/5). A fixed-layout framed value (no TLV) — a torn write
 /// decode-FAILS cleanly rather than silently misparsing the cursor.
-// Wired by the parallel worker + async driver in card-3 increment 3b.
-#[allow(dead_code)]
+#[allow(dead_code)] // card-3 worker; driver wires it in 3b-part-2
 const KIND_PARTITION_CURSOR: u8 = 0x05;
 
 // TLV tags inside id-entry bodies (phase 1).
@@ -3866,10 +3865,10 @@ pub(crate) struct PartitionCursor {
 /// Fixed framed layout: `[RECORD_FORMAT_V1][KIND_PARTITION_CURSOR][cursor u64 BE]
 /// [objects_converted u64 BE][done u8]`. A torn write decode-FAILS cleanly
 /// (wrong length / kind / done byte) rather than silently misparsing the cursor.
-#[allow(dead_code)] // wired by the parallel worker/driver in card-3 increment 3b
+#[allow(dead_code)]
 const PARTITION_CURSOR_LEN: usize = 2 + 8 + 8 + 1;
 
-#[allow(dead_code)] // wired by the parallel worker/driver in card-3 increment 3b
+#[allow(dead_code)]
 pub(crate) fn encode_partition_cursor(pc: &PartitionCursor) -> Bytes {
     let mut out = Vec::with_capacity(PARTITION_CURSOR_LEN);
     out.push(RECORD_FORMAT_V1);
@@ -3880,7 +3879,7 @@ pub(crate) fn encode_partition_cursor(pc: &PartitionCursor) -> Bytes {
     Bytes::from(out)
 }
 
-#[allow(dead_code)] // wired by the parallel worker/driver in card-3 increment 3b
+#[allow(dead_code)]
 pub(crate) fn decode_partition_cursor(
     key_debug: &str,
     bytes: &[u8],
@@ -4251,6 +4250,89 @@ fn object_id_from_key(key: &[u8]) -> u64 {
 /// converter that returns the wrong kind, or an on-disk row whose source kind is
 /// neither source nor target, the plan is parked `Failed` (the double-write hook
 /// stays armed so writes to the field keep failing closed) and the error is returned.
+/// Convert one object's blob for a field-type migration backfill. Returns the
+/// rewritten blob (source kept + `<field>__shadow`/`__shadow_cv` added) when the
+/// row needs conversion, or `None` to skip (field absent / Null / source already
+/// at target kind / shadow already current). A terminal `Err` (on-disk source
+/// kind != catalog `src_kind`, converter failure, converter returned the wrong
+/// kind) means the caller must abort the in-flight chunk and park the plan
+/// `Failed`. Shared by the single-worker (`run_migration_chunks`) and
+/// per-partition (`run_migration_partition`) backfills so the conversion
+/// semantics — and thus the produced blobs (AC4 byte-for-byte) — are identical.
+#[allow(clippy::too_many_arguments)]
+fn convert_row_for_backfill(
+    object_id: u64,
+    blob: &[u8],
+    type_name: &str,
+    field_name: &str,
+    shadow_name: &str,
+    shadow_cv_name: &str,
+    src_kind: u8,
+    target_kind: u8,
+    converter_version: u32,
+    converter: &RegisteredConverter,
+    plan_id: u64,
+) -> EngineResult<Option<Bytes>> {
+    let mut fields = crate::object::deserialize_fields(blob);
+    let Some(old_value) = fields.get(field_name).cloned() else {
+        return Ok(None); // field absent on this row — nothing to convert
+    };
+    let src_got = value_to_kind_byte(&old_value);
+    // Source already holds a target-kind value (anomalous / predates the source
+    // schema) → cutover treats source==target+no-shadow as already-cut; or Null
+    // → carries no shadow (mirrors the write hook). Either way: skip.
+    if src_got == target_kind || src_got == kind_byte::UNSET {
+        return Ok(None);
+    }
+    if src_got != src_kind {
+        // On-disk source disagrees with the catalog — park Failed rather than guess.
+        return Err(EngineError::Catalog(CatalogError::MigrationRowUnexpectedKind {
+            plan_id,
+            object_id,
+            got_kind: kind_name(src_got),
+            expected_kind: kind_name(src_kind),
+        }));
+    }
+    // Idempotency: a `<field>__shadow` present AND stamped with the CURRENT
+    // converter version is up to date — skip. A shadow from an OLD version (or
+    // with no `_cv` stamp) is stale → fall through and re-convert.
+    if fields.contains_key(shadow_name)
+        && matches!(
+            fields.get(shadow_cv_name),
+            Some(crate::object::Value::U32(v)) if *v == converter_version
+        )
+    {
+        return Ok(None);
+    }
+    let new_value = converter(object_id, &old_value).map_err(|e| {
+        EngineError::Catalog(CatalogError::FieldTypeChangeConverterFailed {
+            qualified: format!("{type_name}.{field_name}"),
+            object_id,
+            reason: e.to_string(),
+        })
+    })?;
+    let out_kind = value_to_kind_byte(&new_value);
+    if out_kind != target_kind {
+        return Err(EngineError::Catalog(
+            CatalogError::FieldTypeChangeConverterReturnedWrongKind {
+                qualified: format!("{type_name}.{field_name}"),
+                object_id,
+                got_kind: kind_name(out_kind),
+                want_kind: kind_name(target_kind),
+            },
+        ));
+    }
+    // Write the shadow sibling + its converter-version stamp, LEAVE the source.
+    // No generation bump: the source is unchanged so every cover that embeds it
+    // stays correct during Converting.
+    fields.insert(shadow_name.to_string(), new_value);
+    fields.insert(
+        shadow_cv_name.to_string(),
+        crate::object::Value::U32(converter_version),
+    );
+    Ok(Some(crate::object::serialize_fields(&fields)))
+}
+
 pub(crate) fn run_migration_chunks(
     storage: &LsmTree,
     plan_id: u64,
@@ -4334,88 +4416,33 @@ pub(crate) fn run_migration_chunks(
             let mut converted_this_chunk: u64 = 0;
             for (key, blob) in &chunk.live {
                 let object_id = object_id_from_key(key);
-                let mut fields = crate::object::deserialize_fields(blob);
-                let Some(old_value) = fields.get(&field_name).cloned() else {
-                    continue; // field absent on this row — nothing to convert
-                };
-                let src_got = value_to_kind_byte(&old_value);
-                if src_got == target_kind {
-                    // Source already holds a target-kind value (anomalous, or a
-                    // row that predates the source schema). No shadow needed —
-                    // cutover treats source==target+no-shadow as already-cut.
-                    continue;
-                }
-                if src_got == kind_byte::UNSET {
-                    continue; // Null — carries no shadow (mirrors the write hook)
-                }
-                if src_got != src_kind {
-                    // On-disk source disagrees with the catalog. Park Failed
-                    // (quiesce held) rather than guess. Abort this chunk's
-                    // uncommitted blobs first; the cursor stays where the last
-                    // committed chunk left it.
-                    storage.abort(&mut txn);
-                    plan.status = MigrationStatus::Failed;
-                    persist_migration_plan(storage, &plan)?;
-                    return Err(EngineError::Catalog(
-                        CatalogError::MigrationRowUnexpectedKind {
-                            plan_id,
-                            object_id,
-                            got_kind: kind_name(src_got),
-                            expected_kind: kind_name(src_kind),
-                        },
-                    ));
-                }
-                // Idempotency: a `<field>__shadow` present AND stamped with the
-                // CURRENT converter version is up to date — skip. A shadow from
-                // an OLD converter version (or with no `_cv` stamp) is stale and
-                // must be re-backfilled, so fall through and re-convert.
-                if fields.contains_key(&shadow_name)
-                    && matches!(
-                        fields.get(&shadow_cv_name),
-                        Some(crate::object::Value::U32(v)) if *v == converter_version
-                    )
-                {
-                    continue;
-                }
-                let new_value = match converter(object_id, &old_value) {
-                    Ok(v) => v,
+                match convert_row_for_backfill(
+                    object_id,
+                    blob,
+                    &plan.type_name,
+                    &field_name,
+                    &shadow_name,
+                    &shadow_cv_name,
+                    src_kind,
+                    target_kind,
+                    converter_version,
+                    converter,
+                    plan_id,
+                ) {
+                    Ok(Some(new_blob)) => {
+                        puts.push((key.clone(), new_blob));
+                        converted_this_chunk += 1;
+                    }
+                    Ok(None) => {}
                     Err(e) => {
+                        // Abort this chunk's uncommitted blobs (the cursor stays
+                        // where the last committed chunk left it), park Failed.
                         storage.abort(&mut txn);
                         plan.status = MigrationStatus::Failed;
                         persist_migration_plan(storage, &plan)?;
-                        return Err(EngineError::Catalog(
-                            CatalogError::FieldTypeChangeConverterFailed {
-                                qualified: format!("{}.{}", plan.type_name, field_name),
-                                object_id,
-                                reason: e.to_string(),
-                            },
-                        ));
+                        return Err(e);
                     }
-                };
-                let out_kind = value_to_kind_byte(&new_value);
-                if out_kind != target_kind {
-                    storage.abort(&mut txn);
-                    plan.status = MigrationStatus::Failed;
-                    persist_migration_plan(storage, &plan)?;
-                    return Err(EngineError::Catalog(
-                        CatalogError::FieldTypeChangeConverterReturnedWrongKind {
-                            qualified: format!("{}.{}", plan.type_name, field_name),
-                            object_id,
-                            got_kind: kind_name(out_kind),
-                            want_kind: kind_name(target_kind),
-                        },
-                    ));
                 }
-                // Write the shadow sibling + its converter-version stamp, LEAVE
-                // the source field. No generation bump: the source is unchanged
-                // so every cover that embeds it stays correct during Converting.
-                fields.insert(shadow_name.clone(), new_value);
-                fields.insert(
-                    shadow_cv_name.clone(),
-                    crate::object::Value::U32(converter_version),
-                );
-                puts.push((key.clone(), crate::object::serialize_fields(&fields)));
-                converted_this_chunk += 1;
             }
 
             let mut plan_after = plan.clone();
@@ -4463,6 +4490,209 @@ pub(crate) fn run_migration_chunks(
     }
 
     Ok(())
+}
+
+/// Control byte for an in-flight parallel migration, shared (`Arc<AtomicU8>`)
+/// across the driver + every partition worker; workers poll it BETWEEN chunks
+/// (card 3/5).
+#[allow(dead_code)] // card-3 worker control; driver wires it in 3b-part-2
+pub(crate) mod migration_control {
+    pub const RUN: u8 = 0;
+    pub const PAUSE: u8 = 1;
+    pub const CANCEL: u8 = 2;
+}
+
+/// Why a partition worker returned (card 3/5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PartitionDriveOutcome {
+    /// The partition's whole `[lo, hi)` range is converted (cursor `done`).
+    Done,
+    /// Stopped at a chunk boundary on a PAUSE signal — resumable from the cursor.
+    Paused,
+    /// Stopped at a chunk boundary on a CANCEL signal — resumable from the cursor.
+    Cancelled,
+}
+
+/// Back-fill `<field>__shadow` for ONE partition's contiguous object-id range
+/// `[lo, hi)` (card 3/5). Mirrors `run_migration_chunks` but scans only its
+/// range and advances its OWN `c:S:<plan><idx>` cursor — disjoint from every
+/// other partition's keys AND from the `c:P:` plan record, so N workers never
+/// WriteConflict with each other on the hot path (only with a live foreground
+/// writer touching a row in this range). Resumes from the persisted partition
+/// cursor; polls `control` between chunks (pause/cancel stop at a chunk
+/// boundary, leaving the partition resumable). On a conversion/data error it
+/// aborts the in-flight chunk and returns the error WITHOUT parking the plan —
+/// the driver joins all partitions then parks `Failed` once. Per-chunk commit
+/// order `[o: blobs FIRST, c:S:<plan><idx> LAST]`; a torn tail drops only the
+/// cursor advance and resume re-converts idempotently.
+#[allow(dead_code)] // driver wires it in 3b-part-2
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_migration_partition(
+    storage: &LsmTree,
+    plan_id: u64,
+    type_id: u64,
+    partition_idx: u8,
+    lo: u64,
+    hi: u64,
+    type_name: &str,
+    field_name: &str,
+    src_kind: u8,
+    target_kind: u8,
+    converter_version: u32,
+    chunk_size: u64,
+    converter: &RegisteredConverter,
+    control: &std::sync::atomic::AtomicU8,
+) -> EngineResult<PartitionDriveOutcome> {
+    use std::sync::atomic::Ordering;
+    const WRITE_CONFLICT_RETRIES: u32 = 8;
+    enum ChunkResult {
+        Exhausted,
+        Committed(PartitionCursor),
+    }
+
+    let shadow_name = format!("{field_name}__shadow");
+    let shadow_cv_name = format!("{field_name}__shadow_cv");
+    let chunk_size = if chunk_size == 0 {
+        DEFAULT_MIGRATION_CHUNK_SIZE
+    } else {
+        chunk_size
+    } as usize;
+    let object_prefix = KeyBuilder::object_prefix(type_id);
+    let cursor_key = KeyBuilder::catalog_partition_cursor(plan_id, partition_idx);
+    let cursor_dbg = debug_key(&cursor_key);
+
+    // Load this partition's persisted cursor (absent → start at `lo`).
+    let mut pc = {
+        let txn = storage.begin_txn();
+        match storage.get(&txn, &cursor_key)? {
+            Some(bytes) => decode_partition_cursor(&cursor_dbg, &bytes)?,
+            None => PartitionCursor {
+                cursor: 0,
+                objects_converted: 0,
+                done: false,
+            },
+        }
+    };
+    if pc.done {
+        return Ok(PartitionDriveOutcome::Done);
+    }
+
+    loop {
+        match control.load(Ordering::Relaxed) {
+            migration_control::PAUSE => return Ok(PartitionDriveOutcome::Paused),
+            migration_control::CANCEL => return Ok(PartitionDriveOutcome::Cancelled),
+            _ => {}
+        }
+
+        // Resume strictly after the cursor, but never before `lo` (a fresh
+        // cursor of 0 starts the scan at `lo`).
+        let start_id = pc.cursor.max(lo.saturating_sub(1)).saturating_add(1);
+        if start_id >= hi {
+            // The whole [lo, hi) range is covered (incl. an empty partition where
+            // lo >= hi) — mark done idempotently.
+            if !pc.done {
+                pc.done = true;
+                let mut txn = storage.begin_txn();
+                storage.put(&mut txn, &cursor_key, encode_partition_cursor(&pc))?;
+                storage.commit(&mut txn)?;
+            }
+            return Ok(PartitionDriveOutcome::Done);
+        }
+        let start = KeyBuilder::object(type_id, start_id);
+
+        let mut attempts = 0u32;
+        let result = loop {
+            let mut txn = storage.begin_txn();
+            let snap = txn.snapshot();
+            let chunk = storage.scan_chunk_raw(snap, &object_prefix, &start, chunk_size)?;
+            let Some(high_water) = chunk.high_water.clone() else {
+                // No key past `start` in the WHOLE type prefix → range exhausted.
+                storage.abort(&mut txn);
+                break ChunkResult::Exhausted;
+            };
+            let more = chunk.more;
+            let high_water_id = object_id_from_key(&high_water);
+
+            let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(chunk.live.len() + 1);
+            let mut converted_this_chunk: u64 = 0;
+            for (key, blob) in &chunk.live {
+                let object_id = object_id_from_key(key);
+                if object_id >= hi {
+                    continue; // belongs to the next partition — never write it here
+                }
+                match convert_row_for_backfill(
+                    object_id,
+                    blob,
+                    type_name,
+                    field_name,
+                    &shadow_name,
+                    &shadow_cv_name,
+                    src_kind,
+                    target_kind,
+                    converter_version,
+                    converter,
+                    plan_id,
+                ) {
+                    Ok(Some(new_blob)) => {
+                        puts.push((key.clone(), new_blob));
+                        converted_this_chunk += 1;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        storage.abort(&mut txn);
+                        return Err(e);
+                    }
+                }
+            }
+
+            // Termination is decided AFTER the commit, not as a pre-loop guard:
+            // done once the type is exhausted OR the scan reached/passed `hi`.
+            // The cursor never advances past `hi - 1` (the next partition owns
+            // ids >= hi), so resume can't re-scan into the neighbour's range.
+            let done = !more || high_water_id >= hi;
+            let next_cursor = high_water_id.min(hi - 1);
+            let pc_after = PartitionCursor {
+                cursor: next_cursor,
+                objects_converted: pc
+                    .objects_converted
+                    .saturating_add(converted_this_chunk),
+                done,
+            };
+            puts.push((cursor_key.clone(), encode_partition_cursor(&pc_after)));
+            storage.put_batch(&mut txn, &puts)?;
+            match storage.commit(&mut txn) {
+                Ok(_) => break ChunkResult::Committed(pc_after),
+                Err(rhypedb_storage::Error::WriteConflict)
+                    if attempts < WRITE_CONFLICT_RETRIES =>
+                {
+                    storage.abort(&mut txn);
+                    attempts += 1;
+                    continue;
+                }
+                Err(e) => {
+                    storage.abort(&mut txn);
+                    return Err(EngineError::Storage(e));
+                }
+            }
+        };
+
+        match result {
+            ChunkResult::Exhausted => {
+                pc.done = true;
+                let mut txn = storage.begin_txn();
+                storage.put(&mut txn, &cursor_key, encode_partition_cursor(&pc))?;
+                storage.commit(&mut txn)?;
+                return Ok(PartitionDriveOutcome::Done);
+            }
+            ChunkResult::Committed(pc_after) => {
+                pc = pc_after;
+                if pc.done {
+                    return Ok(PartitionDriveOutcome::Done);
+                }
+            }
+        }
+    }
 }
 
 /// Flip the catalog field kind to the plan's target and mark the plan
