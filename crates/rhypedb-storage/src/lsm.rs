@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use crate::memtable::MemTable;
 use crate::mvcc::{Transaction, TransactionManager};
 use crate::sst::{SstReader, SstWriter};
-use crate::wal::{RecordType, Wal, WalRecord};
+use crate::wal::{RecordType, Wal};
 use crate::Result;
 
 const DEFAULT_MEMTABLE_FLUSH_SIZE: usize = 4 * 1024 * 1024; // 4MB
@@ -212,6 +212,11 @@ impl LsmTree {
 
         // Replay WAL into a memtable, tracking max version.
         let wal_path = config.data_dir.join("wal.log");
+        // A pre-framing (legacy, un-magic'd) WAL is replayed with old per-record
+        // semantics, then converted to framed below so no framed appends are ever
+        // mixed into an un-magic'd file (which replay can't disambiguate from a
+        // torn framed batch).
+        let wal_was_legacy = Wal::file_is_legacy(&wal_path)?;
         let memtable = Arc::new(MemTable::new());
         let records = Wal::replay(&wal_path)?;
         for record in &records {
@@ -223,6 +228,9 @@ impl LsmTree {
                 RecordType::Delete => {
                     memtable.delete(&record.key, record.version);
                 }
+                // `replay` resolves commit framing internally and never yields a
+                // `Commit` footer — only the data records of completed txns.
+                RecordType::Commit => {}
             }
         }
 
@@ -250,6 +258,14 @@ impl LsmTree {
             )),
             compaction_handle: parking_lot::Mutex::new(None),
         });
+
+        // One-time upgrade: persist the legacy-WAL records to an SST and
+        // re-create the WAL with the framing magic (flush() calls create_fresh).
+        // The recovered records are non-empty (a non-empty legacy WAL always
+        // rebuilds a non-empty memtable), so the flush converts the file.
+        if wal_was_legacy {
+            tree.flush()?;
+        }
 
         if background_compaction {
             let weak = Arc::downgrade(&tree);
@@ -787,54 +803,17 @@ impl LsmTree {
 
     /// Write a key-value pair within a transaction.
     pub fn put(&self, txn: &mut Transaction, user_key: &[u8], value: Bytes) -> Result<()> {
-        {
-            // Hold `flush_lock.read()` across the WAL append + memtable write so
-            // a concurrent `flush()` (`.write()`) cannot rotate the memtable +
-            // truncate the WAL between them. Released BEFORE `maybe_flush` so
-            // this thread never deadlocks against its own `flush()` (`.write()`).
-            let _fg = self.flush_lock.read();
-            let version = self.txn_manager.current_version() + 1; // provisional
-
-            txn.record_write(Bytes::copy_from_slice(user_key));
-
-            // Write to WAL first for durability.
-            self.wal.lock().append(&WalRecord {
-                record_type: RecordType::Put,
-                key: Bytes::copy_from_slice(user_key),
-                value: value.clone(),
-                version,
-            })?;
-
-            // Write to memtable.
-            self.active_memtable.read().put(user_key, version, value);
-        }
-
-        self.maybe_flush()?;
-
+        // Buffer into the transaction. The write is applied to the WAL + memtable
+        // atomically at commit (see `commit`); it is NOT durable or visible (even
+        // to this txn) until then.
+        txn.record_put(Bytes::copy_from_slice(user_key), value);
         Ok(())
     }
 
     /// Delete a key within a transaction.
     pub fn delete(&self, txn: &mut Transaction, user_key: &[u8]) -> Result<()> {
-        {
-            // See `put` — flush-vs-write atomicity for the WAL+memtable pair.
-            let _fg = self.flush_lock.read();
-            let version = self.txn_manager.current_version() + 1;
-
-            txn.record_write(Bytes::copy_from_slice(user_key));
-
-            self.wal.lock().append(&WalRecord {
-                record_type: RecordType::Delete,
-                key: Bytes::copy_from_slice(user_key),
-                value: Bytes::new(),
-                version,
-            })?;
-
-            self.active_memtable.read().delete(user_key, version);
-        }
-
-        self.maybe_flush()?;
-
+        // Buffer a tombstone; applied at commit (see `put` / `commit`).
+        txn.record_delete(Bytes::copy_from_slice(user_key));
         Ok(())
     }
 
@@ -852,32 +831,11 @@ impl LsmTree {
         if entries.is_empty() {
             return Ok(());
         }
-        {
-            // See `put` — flush-vs-write atomicity. Holding `flush_lock.read()`
-            // across the whole batch also guarantees the entire `put_batch`
-            // lands in ONE flush generation (all-or-nothing across a flush),
-            // which a chunked migration relies on to make a torn/lost chunk
-            // re-doable idempotently from its cursor.
-            let _fg = self.flush_lock.read();
-            let version = self.txn_manager.current_version() + 1;
-
-            for (key, _) in entries {
-                txn.record_write(key.clone());
-            }
-
-            // `append_batch_inline` encodes straight from `entries` — no
-            // intermediate `Vec<WalRecord>` clone-fest.
-            self.wal
-                .lock()
-                .append_batch_inline(RecordType::Put, entries, version)?;
-
-            let mt = self.active_memtable.read();
-            for (k, v) in entries {
-                mt.put(k, version, v.clone());
-            }
+        // Buffer the batch; applied as one framed WAL txn + memtable apply at
+        // commit (see `commit`).
+        for (key, value) in entries {
+            txn.record_put(key.clone(), value.clone());
         }
-
-        self.maybe_flush()?;
         Ok(())
     }
 
@@ -895,26 +853,10 @@ impl LsmTree {
         if keys.is_empty() {
             return Ok(());
         }
-        {
-            // See `put_batch` — flush-vs-write atomicity for the whole batch.
-            let _fg = self.flush_lock.read();
-            let version = self.txn_manager.current_version() + 1;
-
-            for key in keys {
-                txn.record_write(key.clone());
-            }
-
-            self.wal
-                .lock()
-                .append_batch_keys(RecordType::Delete, keys, version)?;
-
-            let mt = self.active_memtable.read();
-            for key in keys {
-                mt.delete(key, version);
-            }
+        // Buffer the tombstone batch; applied at commit (see `commit`).
+        for key in keys {
+            txn.record_delete(key.clone());
         }
-
-        self.maybe_flush()?;
         Ok(())
     }
 
@@ -925,10 +867,39 @@ impl LsmTree {
     /// `write_all` (so a clean crash is recoverable) but no fsync syscall
     /// runs; matches Postgres's `fsync=off` mode.
     pub fn commit(&self, txn: &mut Transaction) -> Result<u64> {
-        let version = self.txn_manager.commit(txn)?;
-        if self.config.sync_on_commit {
-            self.wal.lock().sync()?;
-        }
+        // Apply the transaction's buffered writes durably, then publish.
+        //
+        // Lock order: `flush_lock.read()` (coordinate with flush's WAL truncate,
+        // Step A) is acquired OUTSIDE the serialized commit critical section. The
+        // apply closure runs INSIDE the txn_manager's `commit_mu`, AFTER the
+        // conflict check + version reservation and BEFORE the version is
+        // published — so a conflict loser's buffer is never applied, and the
+        // reader-visible version never names a not-yet-applied version. Holding
+        // `flush_lock.read()` across the WAL append + memtable apply means a
+        // concurrent `flush()` (`flush_lock.write()`) cannot rotate the memtable +
+        // truncate the WAL between them. `maybe_flush()` runs only AFTER both
+        // locks are released (it needs `flush_lock.write()`).
+        let version = {
+            let _fg = self.flush_lock.read();
+            self.txn_manager.commit(txn, |commit_version, writes| {
+                {
+                    let mut wal = self.wal.lock();
+                    wal.append_txn(writes, commit_version)?;
+                    if self.config.sync_on_commit {
+                        wal.sync()?;
+                    }
+                }
+                let mt = self.active_memtable.read();
+                for (key, value) in writes {
+                    match value {
+                        Some(v) => mt.put(key, commit_version, v.clone()),
+                        None => mt.delete(key, commit_version),
+                    }
+                }
+                Ok(())
+            })?
+        };
+        self.maybe_flush()?;
         Ok(version)
     }
 
@@ -1799,13 +1770,8 @@ mod tests {
         }
     }
 
-    // Diagnostic: does an ABORTED txn's data leak into reads? `abort` only
-    // releases the snapshot; the puts already hit the shared memtable at a
-    // provisional version. This probes whether aborted rows are visible (and
-    // whether a concurrent flush makes them durable across reopen). Documents
-    // the abort contract that card 3's WriteConflict-abort-then-retry relies
-    // on (its retry re-writes the identical deterministic shadow, so a leaked
-    // aborted row equals the committed one — but the raw contract matters).
+    // An ABORTED txn's writes never reach storage: they are buffered in the
+    // Transaction and dropped on abort (Step B), so they are invisible to reads.
     #[test]
     fn aborted_txn_data_visibility_probe() {
         let dir = tempfile::tempdir().unwrap();
@@ -1837,35 +1803,23 @@ mod tests {
             .filter(|&k| tree.get_at(snap, &key(k)).unwrap().is_some())
             .count();
 
-        // Aborted data is INVISIBLE at the current snapshot: puts land at
-        // version `current_version()+1`, one above any snapshot taken before a
-        // later commit. (It is NOT removed from the memtable — it is merely
-        // shadowed by the version gate.)
+        // Buffered + dropped on abort → never visible.
         assert_eq!(
             visible, 0,
             "ABORTED txn rows visible at the current snapshot ({visible}/200)"
         );
     }
 
-    // Diagnostic (the subtle one): aborted rows are written at the provisional
-    // version `current_version()+1`. A LATER committing txn (writing DIFFERENT
-    // keys) advances current_version to exactly that provisional value — at
-    // which point the earlier aborted rows, sharing that version, become
-    // VISIBLE. This is a KNOWN substrate defect (fixed by storage Step B), not
-    // intended behavior; this test PINS it so a future change is noticed.
-    // It is tolerable ONLY for the migration's deterministic `<field>__shadow`
-    // / `__shadow_cv` siblings: a WriteConflict abort there is followed by a
-    // retry that re-writes the whole chunk at a higher version (overwriting the
-    // ghost), the shadow is a pure function of the source (a resurrected ghost
-    // == the retry's value), and cutover re-validates `__shadow_cv`. It is NOT
-    // safe for arbitrary `o:` blob content — e.g. a foreground UPDATE to the
-    // source field racing the worker carries no staleness stamp (see Step B).
+    // Regression (Step B fixed the old "resurrection" defect): an aborted txn's
+    // write is buffered and dropped, never applied to the memtable, so a LATER
+    // commit of a DIFFERENT key cannot resurrect it. (Pre-Step-B, both shared a
+    // provisional version and the ghost reappeared once current_version advanced.)
     #[test]
-    fn aborted_txn_data_resurrects_after_later_commit_at_same_version() {
+    fn aborted_txn_data_does_not_resurrect_after_later_commit() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = LsmConfig {
             data_dir: dir.path().to_path_buf(),
-            memtable_flush_size: 1 << 20, // no flush — isolate the version logic
+            memtable_flush_size: 1 << 20,
             compact_trigger_ssts: usize::MAX,
             zone_extractor: None,
             sync_on_commit: false,
@@ -1876,46 +1830,34 @@ mod tests {
         let ghost = b"g:ghost";
         let other = b"g:other";
 
-        // Txn A writes the ghost key, then aborts.
+        // Txn A writes the ghost key, then aborts (buffer dropped).
         let mut a = tree.begin_txn();
         tree.put(&mut a, ghost, Bytes::from_static(b"GHOST")).unwrap();
         tree.abort(&mut a);
 
-        // Invisible right now.
         let snap0 = tree.read_snapshot();
         assert!(tree.get_at(snap0, ghost).unwrap().is_none(), "ghost visible pre-commit");
 
-        // Txn B writes a DIFFERENT key and commits — advancing current_version
-        // to the provisional version the ghost was stamped with.
+        // Txn B writes a DIFFERENT key and commits.
         let mut b = tree.begin_txn();
         tree.put(&mut b, other, Bytes::from_static(b"OTHER")).unwrap();
         tree.commit(&mut b).unwrap();
 
-        // The ghost has resurrected at the new snapshot.
+        // The ghost stays gone — no resurrection.
         let snap1 = tree.read_snapshot();
-        let resurrected = tree.get_at(snap1, ghost).unwrap();
-        assert_eq!(
-            resurrected.as_deref(),
-            Some(&b"GHOST"[..]),
-            "expected the documented resurrection: aborted ghost visible after a \
-             later commit at the same provisional version"
+        assert!(
+            tree.get_at(snap1, ghost).unwrap().is_none(),
+            "aborted ghost resurrected after a later commit (Step-B regression)"
         );
     }
 
-    // KNOWN DEFECT (fixed by storage Step B — buffer-in-txn): on SAME-key
-    // concurrent writes, the WriteConflict LOSER's value can durably replace
-    // the committed WINNER's. Both txns `put` BEFORE either commits, so both
-    // stamp the identical provisional version `current_version()+1` and target
-    // the SAME memtable slot `(user_key, inverted_version)`; the loser's `put`
-    // physically overwrites the winner's value in the slot, and the
-    // commit-time conflict check rejects the loser WITHOUT removing its already
-    // written row. Result: the committed value is lost, replaced by an aborted
-    // one — surviving reopen. The `flush_lock` fix does NOT address this (it is
-    // a version-stamping issue, orthogonal to the flush/WAL durability race);
-    // Step B (apply writes at commit under the real commit_version) fixes it.
-    // `#[ignore]`d so it documents the bug without failing CI until Step B.
+    // Regression (Step B): on SAME-key concurrent writes, the WriteConflict
+    // LOSER must NOT overwrite the committed WINNER. Pre-Step-B, both txns wrote
+    // the shared memtable at the same provisional version before the conflict
+    // check, so the loser's row physically replaced the winner's. With
+    // buffer-in-txn the loser's buffer is discarded on conflict and never
+    // applied, so the winner survives (incl. across reopen).
     #[test]
-    #[ignore = "exposes same-key provisional-version overwrite; fixed by storage Step B (buffer-in-txn)"]
     fn same_key_conflict_loser_must_not_overwrite_committed_winner() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = LsmConfig {
@@ -1950,6 +1892,181 @@ mod tests {
             Some(&b"WINNER"[..]),
             "committed winner's value was overwritten by the aborted loser"
         );
+    }
+
+    // Last-write-wins within a single txn must hold across the WAL too: the
+    // buffer coalesces put/delete/put on one key to its final value, and the WAL
+    // append + memtable apply are driven from that same deduped sequence, so a
+    // reopen (WAL replay) reconstructs the same final value.
+    #[test]
+    fn same_key_multiple_writes_in_one_txn_last_wins_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 1 << 20, // keep it in the WAL (force replay on reopen)
+            compact_trigger_ssts: usize::MAX,
+            zone_extractor: None,
+            sync_on_commit: true,
+            background_compaction: false,
+        };
+        let tree = LsmTree::open(cfg).unwrap();
+        let k: &[u8] = b"k:multi";
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, k, Bytes::from_static(b"v1")).unwrap();
+        tree.delete(&mut txn, k).unwrap();
+        tree.put(&mut txn, k, Bytes::from_static(b"v2")).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        let snap = tree.read_snapshot();
+        assert_eq!(tree.get_at(snap, k).unwrap().as_deref(), Some(&b"v2"[..]));
+
+        // Reopen → replay the WAL → same final value.
+        drop(tree);
+        let reopened = LsmTree::open(LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 1 << 20,
+            compact_trigger_ssts: usize::MAX,
+            zone_extractor: None,
+            sync_on_commit: true,
+            background_compaction: false,
+        })
+        .unwrap();
+        let snap = reopened.read_snapshot();
+        assert_eq!(
+            reopened.get_at(snap, k).unwrap().as_deref(),
+            Some(&b"v2"[..]),
+            "last-write-wins not preserved across WAL replay"
+        );
+    }
+
+    // A multi-record transaction is atomic across reopen even when a flush races
+    // its commit: every committed multi-key txn is either wholly present or
+    // (if torn) wholly absent — never a partial set of its keys.
+    #[test]
+    fn multi_record_txn_atomic_across_reopen_with_concurrent_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 4 * 1024, // force flushes mid-stream
+            compact_trigger_ssts: 4,
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: true,
+        };
+        let tree = LsmTree::open(cfg).unwrap();
+
+        // Each txn writes a primary + two "index" keys sharing a txn id; the
+        // invariant: a txn's three keys are all-present or all-absent.
+        const TXNS: u64 = 4000;
+        let pk = |t: u64| Bytes::from(format!("p:{t:08}"));
+        let i1 = |t: u64| Bytes::from(format!("i1:{t:08}"));
+        let i2 = |t: u64| Bytes::from(format!("i2:{t:08}"));
+        for t in 0..TXNS {
+            let mut txn = tree.begin_txn();
+            tree.put_batch(
+                &mut txn,
+                &[
+                    (pk(t), Bytes::from_static(b"x")),
+                    (i1(t), Bytes::from_static(b"x")),
+                    (i2(t), Bytes::from_static(b"x")),
+                ],
+            )
+            .unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+        tree.wait_for_compaction();
+        drop(tree);
+
+        let reopened = LsmTree::open(LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 4 * 1024,
+            compact_trigger_ssts: 4,
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: false,
+        })
+        .unwrap();
+        let snap = reopened.read_snapshot();
+        for t in 0..TXNS {
+            let p = reopened.get_at(snap, &pk(t)).unwrap().is_some();
+            let a = reopened.get_at(snap, &i1(t)).unwrap().is_some();
+            let b = reopened.get_at(snap, &i2(t)).unwrap().is_some();
+            assert!(
+                p == a && a == b,
+                "txn {t} torn across reopen: p={p} i1={a} i2={b}"
+            );
+        }
+        // All txns committed cleanly (no crash injected), so all must be present.
+        assert!(
+            reopened.get_at(snap, &pk(TXNS - 1)).unwrap().is_some(),
+            "committed txns lost across reopen"
+        );
+    }
+
+    // Upgrade path: a pre-framing (legacy, un-magic'd) WAL is recovered with old
+    // per-record semantics AND converted to a framed (magic'd) WAL on open, so
+    // subsequent framed appends are never mixed into an un-magic'd file.
+    #[test]
+    fn legacy_wal_converted_to_framed_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sst")).unwrap();
+        let wal_path = dir.path().join("wal.log");
+
+        // Hand-build a legacy WAL: raw un-framed records, NO magic header.
+        let mut raw = Vec::new();
+        for i in 0..3u64 {
+            crate::wal::WalRecord {
+                record_type: RecordType::Put,
+                key: Bytes::from(format!("lk{i}")),
+                value: Bytes::from_static(b"v"),
+                version: i + 1,
+            }
+            .encode_into(&mut raw);
+        }
+        std::fs::write(&wal_path, &raw).unwrap();
+        assert!(crate::wal::Wal::file_is_legacy(&wal_path).unwrap());
+
+        let cfg = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 1 << 20,
+            compact_trigger_ssts: usize::MAX,
+            zone_extractor: None,
+            sync_on_commit: true,
+            background_compaction: false,
+        };
+        let tree = LsmTree::open(cfg).unwrap();
+        // Legacy records recovered.
+        let snap = tree.read_snapshot();
+        for i in 0..3u64 {
+            assert!(
+                tree.get_at(snap, format!("lk{i}").as_bytes()).unwrap().is_some(),
+                "legacy record lk{i} lost on upgrade open"
+            );
+        }
+        // WAL converted to framed (magic now present, no longer legacy).
+        assert!(
+            !crate::wal::Wal::file_is_legacy(&wal_path).unwrap(),
+            "legacy WAL was not converted to framed on open"
+        );
+
+        // A subsequent committed write + reopen still works on the framed WAL.
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"lk_new", Bytes::from_static(b"v")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        drop(tree);
+        let reopened = LsmTree::open(LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 1 << 20,
+            compact_trigger_ssts: usize::MAX,
+            zone_extractor: None,
+            sync_on_commit: true,
+            background_compaction: false,
+        })
+        .unwrap();
+        let snap = reopened.read_snapshot();
+        assert!(reopened.get_at(snap, b"lk0").unwrap().is_some());
+        assert!(reopened.get_at(snap, b"lk_new").unwrap().is_some());
     }
 
     // Recovery must order SSTs by the versions they hold, NOT by file id. A
