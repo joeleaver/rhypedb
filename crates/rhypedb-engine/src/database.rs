@@ -1263,7 +1263,7 @@ impl Database {
         &self,
         migrations: Vec<crate::catalog::Migration>,
     ) -> EngineResult<crate::catalog::MigrationLogReport> {
-        crate::catalog::run_migrations(&self.storage, &self.schema, migrations)
+        crate::catalog::run_migrations(&self.storage, &self.schema, migrations, Some(self))
     }
 
     /// Change a scalar field's type. The closure converts each
@@ -1322,7 +1322,7 @@ impl Database {
             target_kind,
             converter: Box::new(converter),
         };
-        crate::catalog::apply_field_type_change(&self.storage, &self.schema, verb)
+        crate::catalog::apply_field_type_change(&self.storage, &self.schema, verb, Some(self))
     }
 
     // -----------------------------------------------------------------
@@ -5506,6 +5506,42 @@ fn compare_bool(a: bool, op: rhypedb_storage::zone::CompareOp, b: bool) -> bool 
     compare_ord(&u8::from(a), op, &u8::from(b))
 }
 
+impl crate::catalog::FieldCoverMaintainer for Database {
+    /// Offline field-type change (`change_field_type` / `run_migrations`) cover
+    /// maintenance: overwrite every SIBLING `@indexed` field's covering payload
+    /// with the converted blob, so a covered `filter_scan` on that sibling stops
+    /// returning the migrated field's stale source value. The indexed values are
+    /// unchanged by the migration (the migrating field is never @indexed), so
+    /// each existing index key is reproduced exactly and `put` overwrites the
+    /// stale value in place. Mirrors the `any_update` re-put branch the online
+    /// cutover hits via `rewrite_object_and_maintain_covers`.
+    fn sibling_index_cover_puts(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        fields: &FieldMap,
+        serialized: &Bytes,
+    ) -> Vec<(Bytes, Bytes)> {
+        let mut out = Vec::new();
+        let Some(idx_fields) = self.indexed_fields.get(type_name) else {
+            return out;
+        };
+        let Some(&type_id) = self.type_ids.get(type_name) else {
+            return out;
+        };
+        for ifd in idx_fields {
+            if let Some(value) = fields.get(&ifd.name)
+                && !matches!(value, Value::Null)
+                && let Some(key) =
+                    build_field_index_key(type_id, ifd.field_id, ifd.kind, value, object_id)
+            {
+                out.push((key, serialized.clone()));
+            }
+        }
+        out
+    }
+}
+
 /// Build the secondary-index key for one `(type_id, field_id, value, object_id)`
 /// tuple, picking the encoder + key layout that matches the indexed field's
 /// `kind`. Returns `None` when the value isn't representable in the chosen
@@ -7195,6 +7231,57 @@ mod tests {
                 "shadow leaked into covered read: {:?}",
                 obj.fields.keys().collect::<Vec<_>>()
             );
+        }
+    }
+
+    /// G2 REGRESSION (offline): the single-commit `change_field_type` must also
+    /// refresh sibling `@indexed` covering payloads, or a covered query on the
+    /// sibling returns the migrated field's stale source value/kind (latent
+    /// since card 1). Mirrors `cutover_refreshes_index_cover_on_sibling_indexed_field`
+    /// for the offline path.
+    #[test]
+    fn offline_field_type_change_refreshes_index_cover() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type T { x: i64  y: i64 @indexed }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        for i in 0..5i64 {
+            let mut f = FieldMap::new();
+            f.insert("x".into(), Value::I64(i * 10));
+            f.insert("y".into(), Value::I64(i));
+            db.create("T", f).unwrap();
+        }
+        db.change_field_type(
+            "T",
+            "x",
+            FieldType::Scalar(ScalarType::F64),
+            |_oid, v| match v {
+                Value::I64(i) => Ok(Value::F64(*i as f64)),
+                _ => unreachable!(),
+            },
+        )
+        .unwrap();
+        drop(db);
+        let db2 = Database::open(
+            parse_schema(r#"type T { x: f64  y: i64 @indexed }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let results = db2.filter_scan("T", "y", CompareOp::Ge, 0, None).unwrap();
+        assert_eq!(results.len(), 5);
+        for obj in &results {
+            let y = match obj.fields.get("y") {
+                Some(Value::I64(v)) => *v,
+                other => panic!("y: {other:?}"),
+            };
+            match obj.fields.get("x") {
+                Some(Value::F64(f)) => assert_eq!(*f, (y * 10) as f64, "stale x via offline change"),
+                other => panic!("offline covered read served stale/source x: {other:?}"),
+            }
         }
     }
 

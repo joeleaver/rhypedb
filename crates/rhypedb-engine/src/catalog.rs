@@ -1707,10 +1707,36 @@ fn apply_field_rename_verb(
 // card so we can ship this verb today.
 // =====================================================================
 
+/// Supplies the per-object secondary-index covering-payload re-puts an offline
+/// field-type change must stage so a covered query on a SIBLING `@indexed`
+/// field stops serving the migrated field's stale source value. The covering
+/// payload is a full copy of the object blob with NO generation stamp, so the
+/// `stage_generation_bump` this verb already does can't invalidate it — it must
+/// be REWRITTEN. The catalog can't reach the engine's `@indexed` metadata +
+/// index-key encoding (they live on `Database`), so it asks an implementor (the
+/// `Database`) for the extra puts — inverting the dependency so catalog stays
+/// the lower layer. Mirrors what the online cutover does via
+/// `rewrite_object_and_maintain_covers`.
+pub(crate) trait FieldCoverMaintainer {
+    /// For a converted object — now serialized (`serialized`) with its migrated
+    /// field at the target kind — return the `(key, value)` puts that overwrite
+    /// each sibling `@indexed` field's covering payload with the fresh blob.
+    /// `fields` is the object's full FieldMap (the indexed values are unchanged
+    /// by the migration, so they reproduce the existing index keys).
+    fn sibling_index_cover_puts(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        fields: &crate::object::FieldMap,
+        serialized: &Bytes,
+    ) -> Vec<(Bytes, Bytes)>;
+}
+
 pub(crate) fn apply_field_type_change(
     storage: &LsmTree,
     schema: &Schema,
     verb: FieldTypeChangeVerb,
+    cover: Option<&dyn FieldCoverMaintainer>,
 ) -> EngineResult<MigrationReport> {
     let _guard = CATALOG_INIT_LOCK.lock();
 
@@ -1801,6 +1827,18 @@ pub(crate) fn apply_field_type_change(
                 stage_generation_bump(storage, &txn, type_id, object_id, &mut puts)?;
                 fields.insert(verb.field_name.clone(), new_value);
                 let new_blob = crate::object::serialize_fields(&fields);
+                // Refresh sibling @indexed covering payloads with the new blob
+                // (they carry no generation stamp, so the bump above can't fix
+                // them). Same atomic batch as the o: blob. No-op when there are
+                // no @indexed siblings.
+                if let Some(cover) = cover {
+                    puts.extend(cover.sibling_index_cover_puts(
+                        &verb.type_name,
+                        object_id,
+                        &fields,
+                        &new_blob,
+                    ));
+                }
                 puts.push((key.clone(), new_blob));
                 objects_converted += 1;
             }
@@ -2154,6 +2192,10 @@ impl Migration {
 pub struct MigrationContext<'a> {
     storage: &'a LsmTree,
     schema: &'a Schema,
+    /// Cover maintainer threaded from `Database::run_migrations_inner` so a
+    /// field-type change verb inside a migration list refreshes sibling
+    /// `@indexed` covering payloads (see [`FieldCoverMaintainer`]).
+    cover: Option<&'a dyn FieldCoverMaintainer>,
 }
 
 impl MigrationContext<'_> {
@@ -2201,7 +2243,7 @@ impl MigrationContext<'_> {
             target_kind,
             converter: Box::new(converter),
         };
-        apply_field_type_change(self.storage, self.schema, verb)?;
+        apply_field_type_change(self.storage, self.schema, verb, self.cover)?;
         Ok(())
     }
 }
@@ -2228,6 +2270,7 @@ pub(crate) fn run_migrations(
     storage: &LsmTree,
     schema: &Schema,
     migrations: Vec<Migration>,
+    cover: Option<&dyn FieldCoverMaintainer>,
 ) -> EngineResult<MigrationLogReport> {
     // NOTE: we do NOT hold `CATALOG_INIT_LOCK` here. Each verb the
     // migration closure calls (rename_type, change_field_type) acquires
@@ -2286,7 +2329,11 @@ pub(crate) fn run_migrations(
         ..MigrationLogReport::default()
     };
     let mut version_cursor = current_version;
-    let ctx = MigrationContext { storage, schema };
+    let ctx = MigrationContext {
+        storage,
+        schema,
+        cover,
+    };
     for (i, mig) in migrations.into_iter().enumerate() {
         let ord = i as u64;
         if ord < current_version {
