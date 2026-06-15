@@ -92,6 +92,19 @@ pub struct LsmTree {
     sst_files: Arc<RwLock<Vec<SstReader>>>,
     wal: Arc<parking_lot::Mutex<Wal>>,
     txn_manager: Arc<TransactionManager>,
+    /// Coordinates concurrent writers against `flush()`. Every writer holds
+    /// `.read()` across its `[WAL append + memtable write]` pair; `flush()`
+    /// holds `.write()` across its `[rotate memtable + write SST + truncate
+    /// WAL]` pass. This makes a write's WAL record and memtable entry land in
+    /// ONE flush generation: without it, a flush rotating the memtable between
+    /// a concurrent writer's WAL append and its memtable write strands that
+    /// write's row in the new (not-yet-flushed) memtable while its WAL record
+    /// is truncated — silently losing committed data across a reopen. Writers
+    /// still run concurrently with each other (shared read lock); only `flush`
+    /// excludes them, for its duration. (Perf note: `flush` holds the write
+    /// lock across its SST write I/O, a brief periodic write-stall; a future
+    /// segmented-WAL change could move that I/O out of the lock.)
+    flush_lock: parking_lot::RwLock<()>,
     next_sst_id: std::sync::atomic::AtomicU64,
     /// Serializes simultaneous compaction attempts. The background worker
     /// AND any caller of public `compact()` both acquire this — guarantees
@@ -228,6 +241,7 @@ impl LsmTree {
             sst_files: Arc::new(RwLock::new(sst_readers)),
             wal: Arc::new(parking_lot::Mutex::new(wal)),
             txn_manager,
+            flush_lock: parking_lot::RwLock::new(()),
             next_sst_id: std::sync::atomic::AtomicU64::new(max_sst_id + 1),
             compaction_mutex: parking_lot::Mutex::new(()),
             compaction_state: Arc::new((
@@ -773,20 +787,27 @@ impl LsmTree {
 
     /// Write a key-value pair within a transaction.
     pub fn put(&self, txn: &mut Transaction, user_key: &[u8], value: Bytes) -> Result<()> {
-        let version = self.txn_manager.current_version() + 1; // provisional
+        {
+            // Hold `flush_lock.read()` across the WAL append + memtable write so
+            // a concurrent `flush()` (`.write()`) cannot rotate the memtable +
+            // truncate the WAL between them. Released BEFORE `maybe_flush` so
+            // this thread never deadlocks against its own `flush()` (`.write()`).
+            let _fg = self.flush_lock.read();
+            let version = self.txn_manager.current_version() + 1; // provisional
 
-        txn.record_write(Bytes::copy_from_slice(user_key));
+            txn.record_write(Bytes::copy_from_slice(user_key));
 
-        // Write to WAL first for durability.
-        self.wal.lock().append(&WalRecord {
-            record_type: RecordType::Put,
-            key: Bytes::copy_from_slice(user_key),
-            value: value.clone(),
-            version,
-        })?;
+            // Write to WAL first for durability.
+            self.wal.lock().append(&WalRecord {
+                record_type: RecordType::Put,
+                key: Bytes::copy_from_slice(user_key),
+                value: value.clone(),
+                version,
+            })?;
 
-        // Write to memtable.
-        self.active_memtable.read().put(user_key, version, value);
+            // Write to memtable.
+            self.active_memtable.read().put(user_key, version, value);
+        }
 
         self.maybe_flush()?;
 
@@ -795,18 +816,22 @@ impl LsmTree {
 
     /// Delete a key within a transaction.
     pub fn delete(&self, txn: &mut Transaction, user_key: &[u8]) -> Result<()> {
-        let version = self.txn_manager.current_version() + 1;
+        {
+            // See `put` — flush-vs-write atomicity for the WAL+memtable pair.
+            let _fg = self.flush_lock.read();
+            let version = self.txn_manager.current_version() + 1;
 
-        txn.record_write(Bytes::copy_from_slice(user_key));
+            txn.record_write(Bytes::copy_from_slice(user_key));
 
-        self.wal.lock().append(&WalRecord {
-            record_type: RecordType::Delete,
-            key: Bytes::copy_from_slice(user_key),
-            value: Bytes::new(),
-            version,
-        })?;
+            self.wal.lock().append(&WalRecord {
+                record_type: RecordType::Delete,
+                key: Bytes::copy_from_slice(user_key),
+                value: Bytes::new(),
+                version,
+            })?;
 
-        self.active_memtable.read().delete(user_key, version);
+            self.active_memtable.read().delete(user_key, version);
+        }
 
         self.maybe_flush()?;
 
@@ -827,23 +852,30 @@ impl LsmTree {
         if entries.is_empty() {
             return Ok(());
         }
-        let version = self.txn_manager.current_version() + 1;
+        {
+            // See `put` — flush-vs-write atomicity. Holding `flush_lock.read()`
+            // across the whole batch also guarantees the entire `put_batch`
+            // lands in ONE flush generation (all-or-nothing across a flush),
+            // which a chunked migration relies on to make a torn/lost chunk
+            // re-doable idempotently from its cursor.
+            let _fg = self.flush_lock.read();
+            let version = self.txn_manager.current_version() + 1;
 
-        for (key, _) in entries {
-            txn.record_write(key.clone());
+            for (key, _) in entries {
+                txn.record_write(key.clone());
+            }
+
+            // `append_batch_inline` encodes straight from `entries` — no
+            // intermediate `Vec<WalRecord>` clone-fest.
+            self.wal
+                .lock()
+                .append_batch_inline(RecordType::Put, entries, version)?;
+
+            let mt = self.active_memtable.read();
+            for (k, v) in entries {
+                mt.put(k, version, v.clone());
+            }
         }
-
-        // `append_batch_inline` encodes straight from `entries` — no
-        // intermediate `Vec<WalRecord>` clone-fest.
-        self.wal
-            .lock()
-            .append_batch_inline(RecordType::Put, entries, version)?;
-
-        let mt = self.active_memtable.read();
-        for (k, v) in entries {
-            mt.put(k, version, v.clone());
-        }
-        drop(mt);
 
         self.maybe_flush()?;
         Ok(())
@@ -863,21 +895,24 @@ impl LsmTree {
         if keys.is_empty() {
             return Ok(());
         }
-        let version = self.txn_manager.current_version() + 1;
+        {
+            // See `put_batch` — flush-vs-write atomicity for the whole batch.
+            let _fg = self.flush_lock.read();
+            let version = self.txn_manager.current_version() + 1;
 
-        for key in keys {
-            txn.record_write(key.clone());
+            for key in keys {
+                txn.record_write(key.clone());
+            }
+
+            self.wal
+                .lock()
+                .append_batch_keys(RecordType::Delete, keys, version)?;
+
+            let mt = self.active_memtable.read();
+            for key in keys {
+                mt.delete(key, version);
+            }
         }
-
-        self.wal
-            .lock()
-            .append_batch_keys(RecordType::Delete, keys, version)?;
-
-        let mt = self.active_memtable.read();
-        for key in keys {
-            mt.delete(key, version);
-        }
-        drop(mt);
 
         self.maybe_flush()?;
         Ok(())
@@ -948,6 +983,13 @@ impl LsmTree {
 
     /// Flush the active memtable to a new SST file.
     pub fn flush(&self) -> Result<()> {
+        // Exclude all writers for the whole pass: the memtable rotate and the
+        // WAL truncate must be atomic w.r.t. any concurrent writer's
+        // `[WAL append + memtable write]` (which holds `flush_lock.read()`),
+        // else a writer can land its row in the new memtable while its WAL
+        // record is truncated → committed data lost across reopen.
+        let _fg = self.flush_lock.write();
+
         // Rotate memtable: current becomes immutable, new empty one becomes active.
         let old_memtable = {
             let mut active = self.active_memtable.write();
@@ -1540,6 +1582,373 @@ mod tests {
         assert_eq!(
             reopened_scanned, n as usize,
             "keys lost across reopen after background compaction"
+        );
+    }
+
+    // === Concurrent-writer contract (gating card 3 / parallel migration) ===
+    //
+    // Card 3 (parallel migration workers) spawns N threads, each converting a
+    // DISJOINT object-id sub-range with its own write txn, all committing
+    // concurrently while flushes fire mid-flight. The engine was built for
+    // effectively-serialized writers (`put` stamps the SHARED active memtable
+    // at a provisional version `current_version()+1` BEFORE the commit-time
+    // conflict check), and no test ever exercised multiple concurrent writer
+    // THREADS. These tests establish — empirically — whether the disjoint
+    // concurrent-writer model loses or corrupts COMMITTED data. They are the
+    // gate: if the gate passes, parallel backfill is safe to build on this
+    // substrate; if it fails, the write path must be hardened first.
+
+    // GATE: N threads writing disjoint key ranges, committing in small batches
+    // with a tiny flush size + background compaction so flushes/compactions
+    // fire CONSTANTLY while other threads have in-flight (put-but-not-yet-
+    // committed) txns. Every committed key must survive: point read, scan, AND
+    // a reopen from disk. A single lost/torn key fails the gate.
+    #[test]
+    fn concurrent_disjoint_writers_no_committed_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 4 * 1024, // tiny -> flush mid-flight, constantly
+            compact_trigger_ssts: 4,       // + background compaction races writers
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: true,
+        };
+        let tree = LsmTree::open(cfg).unwrap();
+
+        const THREADS: u64 = 12;
+        const PER_THREAD: u64 = 2_000;
+        const BATCH: u64 = 20; // small -> many commits -> wide in-flight overlap
+
+        // Globally-disjoint key: `o:<thread BE><local BE>`; value encodes the
+        // global id so a torn/wrong value (not just a miss) is also caught.
+        let key = |t: u64, local: u64| -> Bytes {
+            let mut k = b"o:".to_vec();
+            k.extend_from_slice(&t.to_be_bytes());
+            k.extend_from_slice(&local.to_be_bytes());
+            Bytes::from(k)
+        };
+        let val = |t: u64, local: u64| -> Bytes {
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&t.to_be_bytes());
+            v.extend_from_slice(&local.to_be_bytes());
+            Bytes::from(v)
+        };
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS as usize));
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let tree = std::sync::Arc::clone(&tree);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait(); // release all writers at once -> maximal overlap
+                let mut local = 0u64;
+                while local < PER_THREAD {
+                    let end = (local + BATCH).min(PER_THREAD);
+                    let entries: Vec<(Bytes, Bytes)> =
+                        (local..end).map(|l| (key(t, l), val(t, l))).collect();
+                    // Retry on WriteConflict (disjoint ranges shouldn't conflict
+                    // with each other, but the engine is optimistic — be honest).
+                    loop {
+                        let mut txn = tree.begin_txn();
+                        tree.put_batch(&mut txn, &entries).unwrap();
+                        match tree.commit(&mut txn) {
+                            Ok(_) => break,
+                            Err(Error::WriteConflict) => {
+                                tree.abort(&mut txn);
+                                continue;
+                            }
+                            Err(e) => panic!("unexpected commit error: {e:?}"),
+                        }
+                    }
+                    local = end;
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let total = (THREADS * PER_THREAD) as usize;
+
+        // Every committed key present + correct via point read.
+        let check_all_present = |tree: &LsmTree| {
+            let snap = tree.read_snapshot();
+            let mut misses = 0u64;
+            let mut wrong = 0u64;
+            for t in 0..THREADS {
+                for l in 0..PER_THREAD {
+                    match tree.get_at(snap, &key(t, l)).unwrap() {
+                        None => misses += 1,
+                        Some(v) if v != val(t, l) => wrong += 1,
+                        Some(_) => {}
+                    }
+                }
+            }
+            (misses, wrong)
+        };
+
+        let (misses, wrong) = check_all_present(&tree);
+        assert_eq!(
+            (misses, wrong),
+            (0, 0),
+            "concurrent disjoint writers lost/corrupted committed keys (point read)"
+        );
+        // Quiesce compaction, then scan must also see every key.
+        tree.wait_for_compaction();
+        let snap = tree.read_snapshot();
+        let scanned = tree.scan_prefix_at(snap, b"o:").unwrap().len();
+        assert_eq!(scanned, total, "scan lost committed keys");
+
+        // Durability across reopen.
+        drop(tree);
+        let reopened = LsmTree::open(LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 4 * 1024,
+            compact_trigger_ssts: 4,
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: false,
+        })
+        .unwrap();
+        let (misses, wrong) = check_all_present(&reopened);
+        assert_eq!(
+            (misses, wrong),
+            (0, 0),
+            "concurrent disjoint writers lost/corrupted committed keys across reopen"
+        );
+        let snap = reopened.read_snapshot();
+        let scanned = reopened.scan_prefix_at(snap, b"o:").unwrap().len();
+        assert_eq!(scanned, total, "scan lost committed keys across reopen");
+    }
+
+    // Concurrent writers contending for the SAME keys: every key must end
+    // present with a WELL-FORMED value written by a real thread (no missing
+    // key, no byte-torn/partial value), and the conflict detector must reject
+    // overlapping commits. This checks structural integrity under same-key
+    // contention; it deliberately does NOT assert committed-only survivorship —
+    // that property is a KNOWN defect (a conflict loser's value can overwrite
+    // the committed winner's) pinned by the `#[ignore]`d deterministic test
+    // `same_key_conflict_loser_must_not_overwrite_committed_winner` and fixed
+    // by storage Step B. (Asserting survivorship here would fail today.)
+    #[test]
+    fn concurrent_conflicting_writers_no_torn_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 4 * 1024,
+            compact_trigger_ssts: 4,
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: true,
+        };
+        let tree = LsmTree::open(cfg).unwrap();
+
+        const THREADS: u64 = 8;
+        const KEYS: u64 = 400;
+        const ROUNDS: u64 = 30;
+
+        let key = |k: u64| -> Bytes {
+            let mut b = b"k:".to_vec();
+            b.extend_from_slice(&k.to_be_bytes());
+            Bytes::from(b)
+        };
+        // value = [thread u8 | round u8-ish] — first byte is the writing thread.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS as usize));
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let tree = std::sync::Arc::clone(&tree);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for r in 0..ROUNDS {
+                    for k in 0..KEYS {
+                        let v = Bytes::from(vec![t as u8, (r & 0xff) as u8, 0xAB]);
+                        loop {
+                            let mut txn = tree.begin_txn();
+                            tree.put(&mut txn, &key(k), v.clone()).unwrap();
+                            match tree.commit(&mut txn) {
+                                Ok(_) => break,
+                                Err(Error::WriteConflict) => {
+                                    tree.abort(&mut txn);
+                                    continue;
+                                }
+                                Err(e) => panic!("unexpected: {e:?}"),
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every key must be present with a well-formed value written by a real
+        // thread (no missing key, no torn/partial value).
+        tree.wait_for_compaction();
+        let snap = tree.read_snapshot();
+        for k in 0..KEYS {
+            let v = tree
+                .get_at(snap, &key(k))
+                .unwrap()
+                .unwrap_or_else(|| panic!("key {k} missing after concurrent contention"));
+            assert_eq!(v.len(), 3, "key {k} has a torn value: {v:?}");
+            assert!((v[0] as u64) < THREADS, "key {k} value from no real thread: {v:?}");
+            assert_eq!(v[2], 0xAB, "key {k} value sentinel corrupted: {v:?}");
+        }
+    }
+
+    // Diagnostic: does an ABORTED txn's data leak into reads? `abort` only
+    // releases the snapshot; the puts already hit the shared memtable at a
+    // provisional version. This probes whether aborted rows are visible (and
+    // whether a concurrent flush makes them durable across reopen). Documents
+    // the abort contract that card 3's WriteConflict-abort-then-retry relies
+    // on (its retry re-writes the identical deterministic shadow, so a leaked
+    // aborted row equals the committed one — but the raw contract matters).
+    #[test]
+    fn aborted_txn_data_visibility_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 1024,
+            compact_trigger_ssts: usize::MAX,
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: false,
+        };
+        let tree = LsmTree::open(cfg).unwrap();
+
+        let key = |k: u64| -> Bytes {
+            let mut b = b"a:".to_vec();
+            b.extend_from_slice(&k.to_be_bytes());
+            Bytes::from(b)
+        };
+
+        // Write 200 keys in a txn, then ABORT (never commit).
+        let mut txn = tree.begin_txn();
+        for k in 0..200u64 {
+            tree.put(&mut txn, &key(k), Bytes::from(vec![9u8; 32])).unwrap();
+        }
+        tree.abort(&mut txn);
+
+        let snap = tree.read_snapshot();
+        let visible = (0..200u64)
+            .filter(|&k| tree.get_at(snap, &key(k)).unwrap().is_some())
+            .count();
+
+        // Aborted data is INVISIBLE at the current snapshot: puts land at
+        // version `current_version()+1`, one above any snapshot taken before a
+        // later commit. (It is NOT removed from the memtable — it is merely
+        // shadowed by the version gate.)
+        assert_eq!(
+            visible, 0,
+            "ABORTED txn rows visible at the current snapshot ({visible}/200)"
+        );
+    }
+
+    // Diagnostic (the subtle one): aborted rows are written at the provisional
+    // version `current_version()+1`. A LATER committing txn (writing DIFFERENT
+    // keys) advances current_version to exactly that provisional value — at
+    // which point the earlier aborted rows, sharing that version, become
+    // VISIBLE. This is a KNOWN substrate defect (fixed by storage Step B), not
+    // intended behavior; this test PINS it so a future change is noticed.
+    // It is tolerable ONLY for the migration's deterministic `<field>__shadow`
+    // / `__shadow_cv` siblings: a WriteConflict abort there is followed by a
+    // retry that re-writes the whole chunk at a higher version (overwriting the
+    // ghost), the shadow is a pure function of the source (a resurrected ghost
+    // == the retry's value), and cutover re-validates `__shadow_cv`. It is NOT
+    // safe for arbitrary `o:` blob content — e.g. a foreground UPDATE to the
+    // source field racing the worker carries no staleness stamp (see Step B).
+    #[test]
+    fn aborted_txn_data_resurrects_after_later_commit_at_same_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 1 << 20, // no flush — isolate the version logic
+            compact_trigger_ssts: usize::MAX,
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: false,
+        };
+        let tree = LsmTree::open(cfg).unwrap();
+
+        let ghost = b"g:ghost";
+        let other = b"g:other";
+
+        // Txn A writes the ghost key, then aborts.
+        let mut a = tree.begin_txn();
+        tree.put(&mut a, ghost, Bytes::from_static(b"GHOST")).unwrap();
+        tree.abort(&mut a);
+
+        // Invisible right now.
+        let snap0 = tree.read_snapshot();
+        assert!(tree.get_at(snap0, ghost).unwrap().is_none(), "ghost visible pre-commit");
+
+        // Txn B writes a DIFFERENT key and commits — advancing current_version
+        // to the provisional version the ghost was stamped with.
+        let mut b = tree.begin_txn();
+        tree.put(&mut b, other, Bytes::from_static(b"OTHER")).unwrap();
+        tree.commit(&mut b).unwrap();
+
+        // The ghost has resurrected at the new snapshot.
+        let snap1 = tree.read_snapshot();
+        let resurrected = tree.get_at(snap1, ghost).unwrap();
+        assert_eq!(
+            resurrected.as_deref(),
+            Some(&b"GHOST"[..]),
+            "expected the documented resurrection: aborted ghost visible after a \
+             later commit at the same provisional version"
+        );
+    }
+
+    // KNOWN DEFECT (fixed by storage Step B — buffer-in-txn): on SAME-key
+    // concurrent writes, the WriteConflict LOSER's value can durably replace
+    // the committed WINNER's. Both txns `put` BEFORE either commits, so both
+    // stamp the identical provisional version `current_version()+1` and target
+    // the SAME memtable slot `(user_key, inverted_version)`; the loser's `put`
+    // physically overwrites the winner's value in the slot, and the
+    // commit-time conflict check rejects the loser WITHOUT removing its already
+    // written row. Result: the committed value is lost, replaced by an aborted
+    // one — surviving reopen. The `flush_lock` fix does NOT address this (it is
+    // a version-stamping issue, orthogonal to the flush/WAL durability race);
+    // Step B (apply writes at commit under the real commit_version) fixes it.
+    // `#[ignore]`d so it documents the bug without failing CI until Step B.
+    #[test]
+    #[ignore = "exposes same-key provisional-version overwrite; fixed by storage Step B (buffer-in-txn)"]
+    fn same_key_conflict_loser_must_not_overwrite_committed_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = LsmConfig {
+            data_dir: dir.path().to_path_buf(),
+            memtable_flush_size: 1 << 20,
+            compact_trigger_ssts: usize::MAX,
+            zone_extractor: None,
+            sync_on_commit: false,
+            background_compaction: false,
+        };
+        let tree = LsmTree::open(cfg).unwrap();
+        let k: &[u8] = b"k:dup";
+
+        // A and B both write the SAME key; both `put` before either commits.
+        let mut a = tree.begin_txn();
+        let mut b = tree.begin_txn();
+        tree.put(&mut a, k, Bytes::from_static(b"WINNER")).unwrap();
+        tree.put(&mut b, k, Bytes::from_static(b"LOSER")).unwrap();
+
+        // A commits (no prior conflict); B then conflicts with A and aborts.
+        tree.commit(&mut a).unwrap();
+        assert!(
+            matches!(tree.commit(&mut b), Err(Error::WriteConflict)),
+            "B must conflict with A on the shared key"
+        );
+        tree.abort(&mut b);
+
+        // The committed winner's value must survive — not the aborted loser's.
+        let snap = tree.read_snapshot();
+        assert_eq!(
+            tree.get_at(snap, k).unwrap().as_deref(),
+            Some(&b"WINNER"[..]),
+            "committed winner's value was overwritten by the aborted loser"
         );
     }
 
