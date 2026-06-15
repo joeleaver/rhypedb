@@ -1797,7 +1797,7 @@ impl Database {
         // Drive WITHOUT holding `migration_lock` so writers to OTHER types
         // proceed during the (potentially long) chunk loop; the migrating
         // type stays quiesced via the armed set.
-        self.drive_migration_to_completion(created.plan_id, created.type_id, &converter)?;
+        self.drive_migration_to_completion(created.plan_id, created.type_id, Some(&converter))?;
         Ok(created.plan_id)
     }
 
@@ -1818,13 +1818,21 @@ impl Database {
         &self,
         plan_id: u64,
         type_id: u64,
-        converter: &crate::catalog::RegisteredConverter,
+        converter: Option<&crate::catalog::RegisteredConverter>,
     ) -> EngineResult<()> {
-        let phase = {
+        let plan = {
             let txn = self.storage.begin_txn();
-            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?.phase
+            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
         };
-        if phase == crate::catalog::MigrationPhase::Converting {
+        // The converter is needed ONLY to backfill shadows in the Converting
+        // phase. A plan resumed in the CuttingOver phase (a crash mid-cutover)
+        // is a pure rename pass — don't demand a converter the operator has no
+        // reason to re-register.
+        if plan.phase == crate::catalog::MigrationPhase::Converting {
+            let converter = converter.ok_or_else(|| EngineError::ConverterNotRegistered {
+                name: plan.converter_name.clone(),
+                version: plan.converter_version,
+            })?;
             crate::catalog::run_migration_chunks(&self.storage, plan_id, converter)?;
         }
         self.run_cutover(plan_id, type_id)
@@ -1904,6 +1912,13 @@ impl Database {
                 let next_cursor =
                     u64::from_be_bytes(high_water[high_water.len() - 8..].try_into().unwrap());
 
+                // Objects whose in-memory generation this attempt bumped (via
+                // rewrite_object_and_maintain_covers). On any path that does NOT
+                // commit — a refusal park, a WriteConflict retry, or a terminal
+                // storage error — these must be rolled back, mirroring update()'s
+                // commit-failure handling, so the live handle's generation
+                // counters don't drift ahead of the durable `g:` keys.
+                let mut bumped: Vec<u64> = Vec::new();
                 for (key, blob) in &chunk.live {
                     let object_id =
                         u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
@@ -1924,7 +1939,12 @@ impl Database {
                                 }
                                 Some(_) => {
                                     self.storage.abort(&mut txn);
-                                    crate::catalog::park_migration_failed(
+                                    for oid in &bumped {
+                                        self.rollback_version(type_id, *oid);
+                                    }
+                                    // Rewind to Converting so resume re-backfills
+                                    // the missing shadow rather than re-refusing.
+                                    crate::catalog::park_migration_failed_rewind(
                                         &self.storage,
                                         plan_id,
                                     )?;
@@ -1943,7 +1963,13 @@ impl Database {
                             };
                             if found_cv != converter_version {
                                 self.storage.abort(&mut txn);
-                                crate::catalog::park_migration_failed(&self.storage, plan_id)?;
+                                for oid in &bumped {
+                                    self.rollback_version(type_id, *oid);
+                                }
+                                crate::catalog::park_migration_failed_rewind(
+                                    &self.storage,
+                                    plan_id,
+                                )?;
                                 return Err(EngineError::MigrationCutoverShadowStale {
                                     plan_id,
                                     object_id,
@@ -1987,6 +2013,7 @@ impl Database {
                                 &old_indexed_snapshot,
                                 true,
                             )?;
+                            bumped.push(object_id);
                             self.storage.put(&mut txn, key, serialized.clone())?;
                         }
                     }
@@ -2002,10 +2029,25 @@ impl Database {
                     Err(rhypedb_storage::Error::WriteConflict)
                         if attempts < WRITE_CONFLICT_RETRIES =>
                     {
+                        // Release the conflicted txn's snapshot + undo this
+                        // attempt's generation bumps before re-scanning.
+                        self.storage.abort(&mut txn);
+                        for oid in &bumped {
+                            self.rollback_version(type_id, *oid);
+                        }
                         attempts += 1;
                         continue;
                     }
-                    Err(e) => return Err(EngineError::Storage(e)),
+                    Err(e) => {
+                        self.storage.abort(&mut txn);
+                        for oid in &bumped {
+                            self.rollback_version(type_id, *oid);
+                        }
+                        return Err(match e {
+                            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                            other => EngineError::Storage(other),
+                        });
+                    }
                 }
             };
 
@@ -2095,13 +2137,20 @@ impl Database {
                     },
                 );
             }
-            if plan.status.is_drivable()
-                && let Some(converter) = converter
-            {
-                // A registered converter at open time (e.g. carried across a
-                // _consuming rebuild) lets us finish the cutover immediately.
+            // Drive a drivable plan when we can: a Converting plan needs its
+            // converter registered (carried across a _consuming rebuild, or a
+            // re-open where the operator registered before open); a CuttingOver
+            // plan (crashed mid-cutover) is a pure rename pass and resumes with
+            // NO converter — so a reopen finishes the cutover even though the
+            // per-`Database` converter registry is empty after restart.
+            let is_cutting = plan.phase == crate::catalog::MigrationPhase::CuttingOver;
+            if plan.status.is_drivable() && (converter.is_some() || is_cutting) {
                 self.guard_resume_schema(&plan)?;
-                self.drive_migration_to_completion(plan.plan_id, type_id, &converter)?;
+                self.drive_migration_to_completion(
+                    plan.plan_id,
+                    type_id,
+                    converter.as_ref(),
+                )?;
             }
         }
         Ok(())
@@ -2132,12 +2181,18 @@ impl Database {
         let type_id = *self.type_ids.get(&plan.type_name).ok_or_else(|| {
             EngineError::TypeNotFound(plan.type_name.clone())
         })?;
-        let converter = self
-            .resolve_converter(&plan.converter_name, plan.converter_version)
-            .ok_or_else(|| EngineError::ConverterNotRegistered {
+        // The converter is required ONLY to backfill in the Converting phase. A
+        // plan that crashed mid-cutover (CuttingOver) resumes as a pure rename
+        // pass and needs no converter — don't force the operator to re-register
+        // one. (drive_migration_to_completion re-checks this for the Converting
+        // branch, but failing here avoids arming for a plan we can't drive.)
+        let converter = self.resolve_converter(&plan.converter_name, plan.converter_version);
+        if plan.phase == crate::catalog::MigrationPhase::Converting && converter.is_none() {
+            return Err(EngineError::ConverterNotRegistered {
                 name: plan.converter_name.clone(),
                 version: plan.converter_version,
-            })?;
+            });
+        }
         self.guard_resume_schema(&plan)?;
         {
             let _guard = self.migration_lock.write();
@@ -2148,14 +2203,14 @@ impl Database {
                 type_id,
                 MigratingFieldHook {
                     field_name: plan.field_name.clone(),
-                    converter: Some(Arc::clone(&converter)),
+                    converter: converter.clone(),
                     target_kind: plan.target_kind,
                     converter_version: plan.converter_version,
                     plan_id,
                 },
             );
         }
-        self.drive_migration_to_completion(plan_id, type_id, &converter)
+        self.drive_migration_to_completion(plan_id, type_id, converter.as_ref())
     }
 
     /// Snapshot every persisted migration plan (`c:P:*`), newest semantics
@@ -7338,6 +7393,229 @@ mod tests {
         assert_eq!(all.len(), 5);
         for obj in all {
             assert!(matches!(obj.fields.get("score"), Some(Value::F64(_))));
+        }
+    }
+
+    /// A2 (review): a cutover that refuses a missing shadow must REWIND the
+    /// plan to Converting (not leave it stuck at CuttingOver) so a resume
+    /// re-backfills the missing shadow and completes — rather than re-refusing
+    /// forever with quiesce held.
+    #[test]
+    fn cutover_missing_shadow_rewinds_and_recovers_via_resume() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..4i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 16,
+        )
+        .unwrap();
+        db.arm_quiesce(created.type_id, created.plan_id);
+        let conv: crate::catalog::RegisteredConverter = Arc::new(widen_i64_to_f64("User.score"));
+        crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &conv).unwrap();
+        // Corrupt one row back to source-only (drop its shadow) so cutover hits
+        // the missing-shadow refusal.
+        let tid = db.resolve_type_id("User").unwrap();
+        let mut src_only = FieldMap::new();
+        src_only.insert("score".into(), Value::I64(1));
+        let mut txn = db.storage.begin_txn();
+        db.storage
+            .put_batch(
+                &mut txn,
+                &[(
+                    rhypedb_storage::key::KeyBuilder::object(tid, ids[1]),
+                    crate::object::serialize_fields(&src_only),
+                )],
+            )
+            .unwrap();
+        db.storage.commit(&mut txn).unwrap();
+
+        let err = db.run_cutover(created.plan_id, created.type_id).unwrap_err();
+        assert!(matches!(err, EngineError::MigrationCutoverShadowMissing { .. }));
+        // REWOUND to a clean Converting start (status Failed, cursors reset).
+        let plans = crate::catalog::scan_migration_plans(&db.storage, db.storage.begin_txn().snapshot())
+            .unwrap();
+        let p = plans.iter().find(|p| p.plan_id == created.plan_id).unwrap();
+        assert_eq!(p.status, crate::catalog::MigrationStatus::Failed);
+        assert_eq!(p.phase, crate::catalog::MigrationPhase::Converting);
+        assert_eq!(p.cursor, 0);
+        assert_eq!(p.cutover_cursor, 0);
+        drop(db);
+
+        // Recover: reopen at the target schema (licensed mid-migration), register
+        // the converter, resume → re-backfills the missing shadow + cuts over.
+        let db2 = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db2.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        db2.resume_field_type_migration(created.plan_id).unwrap();
+        assert_eq!(
+            db2.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+        for (id, i) in ids.iter().zip(0i64..) {
+            match db2.get("User", *id).unwrap().fields.get("score") {
+                Some(Value::F64(f)) => assert_eq!(*f, i as f64),
+                other => panic!("id {id}: expected F64, got {other:?}"),
+            }
+        }
+    }
+
+    /// A3 (review): crash mid-cutover, then reopen — auto-resume must finish the
+    /// CuttingOver pass from the persisted `cutover_cursor` WITHOUT a converter
+    /// (a rename-only pass), re-scanning already-promoted rows idempotently (the
+    /// `source already target, no shadow → skip` arm).
+    #[test]
+    fn cutover_resumes_from_partial_via_reopen() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..6i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let target =
+            crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
+        let created = crate::catalog::create_migration_plan(
+            &db.storage, &db.schema, "User", "score", target, "widen", 1, 2,
+        )
+        .unwrap();
+        db.arm_quiesce(created.type_id, created.plan_id);
+        let conv: crate::catalog::RegisteredConverter = Arc::new(widen_i64_to_f64("User.score"));
+        crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &conv).unwrap();
+
+        // Simulate a crash PART WAY through the cutover: promote rows 0 and 1 by
+        // hand (source := f64, drop the shadow) and mark the plan CuttingOver,
+        // BUT leave cutover_cursor = 0 so resume re-scans from the start and must
+        // skip the already-promoted rows.
+        let tid = db.resolve_type_id("User").unwrap();
+        let mut txn = db.storage.begin_txn();
+        for &promoted in &ids[..2] {
+            let mut f = FieldMap::new();
+            let orig = ids.iter().position(|x| *x == promoted).unwrap() as f64;
+            f.insert("score".into(), Value::F64(orig));
+            db.storage
+                .put_batch(
+                    &mut txn,
+                    &[(
+                        rhypedb_storage::key::KeyBuilder::object(tid, promoted),
+                        crate::object::serialize_fields(&f),
+                    )],
+                )
+                .unwrap();
+        }
+        let mut plan = crate::catalog::load_migration_plan(&db.storage, &txn, created.plan_id)
+            .unwrap();
+        plan.phase = crate::catalog::MigrationPhase::CuttingOver;
+        plan.cutover_cursor = 0;
+        let (k, v) = crate::catalog::migration_plan_record(&plan);
+        db.storage.put(&mut txn, &k, v).unwrap();
+        db.storage.commit(&mut txn).unwrap();
+        drop(db);
+
+        // Reopen at the target schema; the converter registry is EMPTY after
+        // restart. auto-resume must still finish the CuttingOver rename pass.
+        let db2 = Database::open(
+            parse_schema(r#"type User { score: f64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            db2.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Completed
+        );
+        for (id, i) in ids.iter().zip(0i64..) {
+            match db2.get("User", *id).unwrap().fields.get("score") {
+                Some(Value::F64(f)) => assert_eq!(*f, i as f64),
+                other => panic!("id {id}: expected F64, got {other:?}"),
+            }
+        }
+    }
+
+    /// A7 (review): a Null-source (and an already-target) row reads back
+    /// correctly through a COVERED scan on a sibling @indexed field after
+    /// cutover — the cutover's `None => continue` arm leaves the create-time
+    /// covering payload, which is already cutover-correct for those rows.
+    #[test]
+    fn cutover_covered_read_of_null_and_target_rows() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type T { x: i64  y: i64 @indexed }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("T.x"));
+        // Normal rows.
+        for i in 0..3i64 {
+            let mut f = FieldMap::new();
+            f.insert("x".into(), Value::I64(i * 10));
+            f.insert("y".into(), Value::I64(i));
+            db.create("T", f).unwrap();
+        }
+        // A row with a Null migrating field. Created through the normal path so
+        // its o: blob AND its sibling-y covering payload are written
+        // consistently (both Null) — the worker + cutover both skip it, leaving
+        // those create-time entries, which must already read back as Null.
+        let null_y = 99i64;
+        {
+            let mut f = FieldMap::new();
+            f.insert("x".into(), Value::Null);
+            f.insert("y".into(), Value::I64(null_y));
+            db.create("T", f).unwrap();
+        }
+
+        db.create_field_type_migration(MigrationPlanSpec {
+            type_name: "T".into(),
+            field_name: "x".into(),
+            target_field_type: FieldType::Scalar(ScalarType::F64),
+            converter_name: "widen".into(),
+            converter_version: 1,
+            chunk_size: 8,
+        })
+        .unwrap();
+        drop(db);
+        let db2 = Database::open(
+            parse_schema(r#"type T { x: f64  y: i64 @indexed }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let results = db2.filter_scan("T", "y", CompareOp::Ge, 0, None).unwrap();
+        assert_eq!(results.len(), 4);
+        for obj in &results {
+            assert!(obj.fields.keys().all(|k| !is_shadow_sibling_key(k)));
+            let y = match obj.fields.get("y") {
+                Some(Value::I64(v)) => *v,
+                other => panic!("y: {other:?}"),
+            };
+            match obj.fields.get("x") {
+                // The Null row stays Null; the rest are the converted f64.
+                Some(Value::Null) | None if y == null_y => {}
+                Some(Value::F64(f)) if y != null_y => assert_eq!(*f, (y * 10) as f64),
+                other => panic!("covered read y={y} served wrong x: {other:?}"),
+            }
         }
     }
 

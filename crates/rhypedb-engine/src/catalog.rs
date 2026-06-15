@@ -3960,11 +3960,17 @@ pub(crate) fn migration_plan_record(plan: &MigrationPlan) -> (Bytes, Bytes) {
     )
 }
 
-/// Park a plan `Failed` in its own txn (mirrors the worker's Failed-park).
-/// Used by the cutover when a row's shadow is missing or stale — the chunk's
-/// data txn is aborted, but the Failed status must persist so quiesce stays
-/// armed for inspection and the operator can re-backfill before retrying.
-pub(crate) fn park_migration_failed(storage: &LsmTree, plan_id: u64) -> EngineResult<()> {
+/// Park a plan `Failed` AND rewind it to a clean `Converting` start, in its own
+/// txn. Used by the CUTOVER refusal arms (missing / stale shadow): unlike the
+/// backfill's plain `park_migration_failed` (which leaves `phase=Converting` +
+/// a mid-range backfill cursor so resume continues the converter), a cutover
+/// refusal must send resume BACK through the backfill so the missing/stale
+/// shadow is re-stamped — otherwise `drive_migration_to_completion` (which only
+/// runs the converter while `phase==Converting`) would skip straight back to the
+/// cutover and re-refuse forever, holding quiesce. Resets `phase=Converting`,
+/// `cursor=0` (re-scan the whole keyspace; already-current shadows are skipped
+/// idempotently), and `cutover_cursor=0`.
+pub(crate) fn park_migration_failed_rewind(storage: &LsmTree, plan_id: u64) -> EngineResult<()> {
     let mut txn = storage.begin_txn();
     let mut plan = match require_migration_plan(storage, &txn, plan_id) {
         Ok(p) => p,
@@ -3974,6 +3980,9 @@ pub(crate) fn park_migration_failed(storage: &LsmTree, plan_id: u64) -> EngineRe
         }
     };
     plan.status = MigrationStatus::Failed;
+    plan.phase = MigrationPhase::Converting;
+    plan.cursor = 0;
+    plan.cutover_cursor = 0;
     let (key, value) = migration_plan_record(&plan);
     storage.put(&mut txn, &key, value)?;
     storage.commit(&mut txn)?;
@@ -4195,10 +4204,16 @@ pub(crate) fn run_migration_chunks(
                 Err(rhypedb_storage::Error::WriteConflict)
                     if attempts < WRITE_CONFLICT_RETRIES =>
                 {
+                    // Release the conflicted txn's snapshot before re-scanning,
+                    // else each retry orphans a snapshot that pins the GC floor.
+                    storage.abort(&mut txn);
                     attempts += 1;
                     continue; // re-snapshot + re-scan + re-skip already-shadowed
                 }
-                Err(e) => return Err(EngineError::Storage(e)),
+                Err(e) => {
+                    storage.abort(&mut txn);
+                    return Err(EngineError::Storage(e));
+                }
             }
         };
 
