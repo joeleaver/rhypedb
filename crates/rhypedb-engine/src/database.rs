@@ -314,13 +314,14 @@ pub struct Database {
     /// Per-`(type_id, field_name)` double-write hooks for in-flight chunked
     /// field-type migrations (shadow-field card 2). While a field is migrating,
     /// every write to it ALSO stamps a converted `<field>__shadow` sibling so
-    /// writes proceed during the migration instead of being quiesced. Nested
+    /// writes proceed during the migration (card 2d — no type-wide quiesce). A
+    /// hook with an unresolved converter is REJECTING: a write to its field
+    /// fails closed (`MigrationFieldConverterUnresolved`). Nested
     /// `type_id -> {field_name -> hook}` so the hot-path probe for a
     /// non-migrating type is a single Copy-`u64` miss. Lock-free read cache
     /// (ArcSwap), mutated ONLY under `migration_lock.write()` via
     /// `arm_field_hook`/`disarm_field_hook`, rebuilt from the `c:P:` plans on
-    /// open/create alongside `migrating`. **Card 2a plumbs it; writers don't
-    /// consume it until card 2b** (quiesce still rejects in 2a).
+    /// open/create. A non-zero `migrating_field_count` is the fast-path gate.
     migrating_fields: arc_swap::ArcSwap<
         std::collections::HashMap<u64, std::collections::HashMap<String, Arc<MigratingFieldHook>>>,
     >,
@@ -1085,17 +1086,17 @@ impl Database {
             fields.retain(|name, _| !retired.contains(name));
         }
         // Card 2: never expose the migration shadow siblings (`<field>__shadow`,
-        // `<field>__shadow_cv`) to callers. Gated on an active migration so a
-        // non-migrating database pays one atomic load and no scan. This is the
-        // single eager-read chokepoint (get/get_many/scan/filter_scan all call
-        // it); the lazy/raw wire path is handled separately in card 2c.
-        if self
-            .migrating_field_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-        {
-            fields.retain(|name, _| !is_shadow_sibling_key(name));
-        }
+        // `<field>__shadow_cv`) to callers. UNCONDITIONAL (not gated on an
+        // active migration): a reader on a pre-cutover MVCC snapshot can
+        // deserialize a shadow-bearing blob and then race a `disarm_field_hook`
+        // that flips the count to 0 before the gate is checked — gating here
+        // would leak the siblings on that read. `__`-suffixed siblings are a
+        // reserved namespace that must never reach a caller regardless, and the
+        // retain is cheap next to the deserialize this always follows. (The
+        // lazy/raw wire path stays count-gated — its zero-copy fast path can't
+        // afford an always-on deserialize, and it only ships verbatim bytes a
+        // migration could have written.)
+        fields.retain(|name, _| !is_shadow_sibling_key(name));
     }
 
     // -----------------------------------------------------------------
@@ -1685,9 +1686,10 @@ impl Database {
                 version: spec.converter_version,
             })?;
 
-        // Setup under the migration write-barrier: validate, allocate +
-        // persist the plan, and arm quiesce atomically so no writer slips a
-        // create/update into the migrating type between plan and quiesce.
+        // Setup under the migration write-barrier: validate, allocate + persist
+        // the plan, and arm the double-write hook atomically so no writer slips
+        // a create/update into the migrating field between plan and hook (which
+        // would land source-only with no shadow that cutover then refuses).
         let created = {
             let _guard = self.migration_lock.write();
             let created = crate::catalog::create_migration_plan(
@@ -1732,10 +1734,11 @@ impl Database {
     /// rename pass resumes.
     ///
     /// The cutover (`run_cutover`) promotes the shadows to the source field,
-    /// reconciles every cover/index, flips the catalog kind, and releases
-    /// quiesce — holding `migration_lock.write()` for the whole pass. On a
-    /// converter / data / shadow error the plan is left `Failed` (quiesce HELD)
-    /// and the error propagates; quiesce is released only on a clean `Completed`.
+    /// reconciles every cover/index, flips the catalog kind, and disarms the
+    /// double-write hook — holding `migration_lock.write()` for the whole pass.
+    /// On a converter / data / shadow error the plan is left `Failed` (the hook
+    /// stays armed, so writes to the migrating field keep failing closed until
+    /// it is resolved + resumed); the hook is disarmed only on a clean `Completed`.
     fn drive_migration_to_completion(
         &self,
         plan_id: u64,
@@ -1763,21 +1766,23 @@ impl Database {
     /// Cutover pass (shadow-field card 2): promote every `<field>__shadow`
     /// sibling to the source field, reconcile ALL covers/indexes via the shared
     /// `rewrite_object_and_maintain_covers`, then flip the catalog kind and
-    /// release quiesce.
+    /// disarm the double-write hook.
     ///
     /// Holds `migration_lock.write()` for the WHOLE pass. The write-lock spans
     /// every commit, so once it is acquired no in-flight writer (card-2 inc 2d)
-    /// can add a shadow racing a rename, and a reader (which needs no lock) sees
-    /// each row transition source→target atomically (each row's rename is one
-    /// commit). Reads stay available throughout — only writes are drained.
+    /// AND no background cover-refresh pass (which also takes
+    /// `migration_lock.read()`) can add a shadow or stamp a stale `cover_v`
+    /// racing a rename, and a reader (which needs no lock) sees each row
+    /// transition source→target atomically (each row's rename is one commit).
+    /// Reads stay available throughout — only writes are drained.
     ///
     /// Per-chunk commit order mirrors the backfill worker: `[promoted o: blob,
     /// i:/r:/g: cover maintenance, plan record (cutover_cursor) LAST]`, so a
     /// torn tail drops only the cursor advance and resume re-does the chunk
     /// idempotently (a row already promoted — source at target kind, no shadow —
-    /// is skipped). A `WriteConflict` (the background cover-refresh worker holds
-    /// no `migration_lock`) retries the chunk; the generation over-bump on a
-    /// retry is harmless (monotonic staleness counter).
+    /// is skipped). The bounded `WriteConflict` retry is belt-and-suspenders for
+    /// any same-keyspace racer; the generation over-bump on a retry is harmless
+    /// (monotonic staleness counter).
     fn run_cutover(&self, plan_id: u64, type_id: u64) -> EngineResult<()> {
         const WRITE_CONFLICT_RETRIES: u32 = 8;
         let _guard = self.migration_lock.write();
@@ -2016,17 +2021,19 @@ impl Database {
         Ok(())
     }
 
-    /// Open-path hook (shadow-field card 1, inc 4): re-establish the quiesce
-    /// set from the persisted `c:P:` plans and resume any drivable migration
-    /// whose converter is already registered. Runs ONLY on a genuine open
+    /// Open-path hook (shadow-field card 2): re-establish the double-write hook
+    /// from the persisted `c:P:` plans and resume any drivable migration that
+    /// can proceed (a Converting plan whose converter is already registered, or
+    /// any CuttingOver plan — a rename-only pass). Runs ONLY on a genuine open
     /// (not the `_consuming` rebuild — see `rebuild_with_arc_storage`).
     ///
     /// At a fresh open the per-`Database` converter registry is empty (the
-    /// operator registers converters AFTER open), so drivable plans are armed
+    /// operator registers converters AFTER open), so a Converting plan is armed
     /// but NOT driven here — the operator calls `resume_field_type_migration`
-    /// after registering. Every quiescing plan (incl. `Failed` /
-    /// `AwaitingConverter`) still re-arms quiesce so writes stay rejected
-    /// across the restart.
+    /// after registering. Every unsettled plan re-arms the field hook: writes to
+    /// the migrating field whose converter is unresolved FAIL CLOSED
+    /// (`MigrationFieldConverterUnresolved`) across the restart, while all other
+    /// writes proceed (card 2d — no type-wide quiesce).
     fn auto_resume_migrations(&self) -> EngineResult<()> {
         let plans = {
             let txn = self.storage.begin_txn();
@@ -4693,7 +4700,22 @@ impl Database {
     /// All rewrites happen in one txn so partial work can't make the index
     /// temporarily inconsistent. A commit failure (write conflict) is
     /// surfaced; the next bump re-enqueues the target so retry is cheap.
+    ///
+    /// Card 2: takes `migration_lock.read()` for the whole pass. This worker
+    /// runs on a background thread and writes rev-edge cover blobs that embed
+    /// other objects' fields + a `<name>__cover_v` stamp from the LIVE
+    /// generation counter — neither of which the MVCC write-set conflict check
+    /// would order against an in-flight cutover (different keyspaces). Without
+    /// the lock, a refresh racing `run_cutover` (which holds
+    /// `migration_lock.write()`) could (a) bake a `<field>__shadow` into a cover
+    /// if the migration disarms between the blob read and the strip decision, or
+    /// (b) stamp `cover_v` = the post-bump generation onto a stale (pre-cutover)
+    /// blob, defeating the cutover's generation-bump invalidation. The read
+    /// guard makes the cutover's write pass mutually exclude this worker. Safe:
+    /// only the worker calls this (the enqueue at `update()` is async), so the
+    /// guard is never re-entrant.
     fn refresh_covers_for_target(&self, target_type_id: u64, target_id: u64) -> EngineResult<()> {
+        let _migration_guard = self.migration_lock.read();
         let Some(incoming) = self.incoming_relations.get(&target_type_id) else {
             return Ok(());
         };
@@ -7946,7 +7968,7 @@ mod tests {
             db.create("User", f).unwrap();
             plan_id = persist_running_plan(&db, "User", "score");
         }
-        // Reopen with the OLD (source) schema — open succeeds, quiesce armed.
+        // Reopen with the OLD (source) schema — open succeeds, hook re-armed.
         let db = Database::open(
             parse_schema(r#"type User { score: i64 }"#).unwrap(),
             dir.path(),
@@ -8251,9 +8273,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Card 2b: double-write producer hook + reader strip (isolation tests —
-    // quiesce still blocks the live create/update path in 2b, so the hook is
-    // exercised directly and the strip via a hand-written shadow blob)
+    // Double-write producer hook + reader strip (isolation tests — the hook is
+    // exercised directly and the strip via a hand-written shadow blob, so they
+    // pin the mechanism independent of the live create/update path)
     // -----------------------------------------------------------------
 
     fn f64_conv() -> crate::catalog::RegisteredConverter {
@@ -9260,6 +9282,41 @@ mod tests {
             db.get("Post", post.id),
             Err(EngineError::ObjectNotFound { .. })
         ));
+    }
+
+    /// Card 2d regression (review #1/#2): the background cover-refresh worker
+    /// MUST take `migration_lock.read()`, so the cutover's
+    /// `migration_lock.write()` pass mutually excludes it. Without the lock a
+    /// refresh racing the cutover could bake a `<field>__shadow` into a cover
+    /// (disarm between blob-read and strip-decision) or stamp a post-bump
+    /// `cover_v` onto a stale blob (defeating the cutover generation-bump).
+    /// Deterministic lock-discipline check: while a `write()` guard is held the
+    /// worker call must BLOCK; it completes only once the guard drops.
+    #[test]
+    fn cover_refresh_excluded_under_migration_write_lock() {
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { name: String }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let tid = db.resolve_type_id("User").unwrap();
+        let guard = db.migration_lock.write();
+        let (tx, rx) = mpsc::channel();
+        let db2 = Arc::clone(&db);
+        let handle = std::thread::spawn(move || {
+            tx.send(()).unwrap(); // signal: about to take migration_lock.read()
+            db2.refresh_covers_for_target(tid, 1)
+        });
+        rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !handle.is_finished(),
+            "cover-refresh ran while migration_lock.write() was held — it must take migration_lock.read()"
+        );
+        drop(guard);
+        handle.join().unwrap().unwrap();
     }
 
     #[test]

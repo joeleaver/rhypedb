@@ -773,25 +773,26 @@ pub struct MigrationReport {
 
 /// Lifecycle status of a chunked field-type migration plan (`c:P:<id>`).
 ///
-/// Quiesce (write-rejection on the migrating type) is in force for every
-/// non-`releases_quiesce` state. `is_terminal` means the worker is not
-/// running and will not auto-resume on its own.
+/// While `quiesces()` is true the plan is unsettled: the card-2 double-write
+/// hook stays armed (writes to the migrating field still need a shadow stamped,
+/// or fail closed if the converter is unresolved). `is_terminal` means the
+/// worker is not running and will not auto-resume on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationStatus {
-    /// Committed; worker not yet started (or not yet observed). Quiesced.
+    /// Committed; worker not yet started (or not yet observed). Hook armed.
     Pending,
-    /// Worker is converting chunks. Quiesced.
+    /// Worker is backfilling shadows (or cutting over). Hook armed.
     Running,
-    /// All rows converted, catalog kind flipped, quiesce released. Terminal.
+    /// All rows converted + cut over, catalog kind flipped, hook disarmed. Terminal.
     Completed,
-    /// Operator-cancelled. Quiesce released; field left partially
+    /// Operator-cancelled. Hook disarmed; field left partially
     /// converted (read-tolerant). Terminal.
     Cancelled,
-    /// Worker hit an unrecoverable error. Quiesce HELD for inspection.
-    /// Terminal (no auto-resume).
+    /// Worker hit an unrecoverable error. Hook stays armed (writes to the field
+    /// keep failing closed) for inspection. Terminal (no auto-resume).
     Failed,
     /// Resume found the pinned converter missing or version-changed.
-    /// Parked until re-registered or cancelled. Quiesce HELD; resumable.
+    /// Parked until re-registered or cancelled. Hook armed; resumable.
     AwaitingConverter,
 }
 
@@ -828,9 +829,11 @@ impl MigrationStatus {
         )
     }
 
-    /// True while the plan still quiesces its type (rejects writes). Only
-    /// `Completed` and `Cancelled` release quiesce; `Failed` HOLDS it so a
-    /// half-converted field isn't silently written to before inspection.
+    /// True while the plan is unsettled — the double-write hook must stay armed.
+    /// Only `Completed` and `Cancelled` settle it; `Failed` stays unsettled so a
+    /// half-converted field keeps failing writes closed before inspection.
+    /// (Name kept for back-compat; card 2 replaced type-wide quiesce with the
+    /// field-scoped double-write hook.)
     pub fn quiesces(self) -> bool {
         !matches!(self, MigrationStatus::Completed | MigrationStatus::Cancelled)
     }
@@ -841,9 +844,9 @@ impl MigrationStatus {
     }
 }
 
-/// A persisted chunked field-type migration (`c:P:<plan_id>`), the card-1
+/// A persisted chunked field-type migration (`c:P:<plan_id>`), the card-2
 /// state machine's durable record. Survives restart; auto-resume rebuilds
-/// the worker + the migrating-type quiesce set from these rows.
+/// the worker + the double-write hook from these rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MigrationPlan {
     pub plan_id: u64,
@@ -2867,9 +2870,9 @@ fn reconcile_into_txn(
     // SOURCE while the operator has reopened with the TARGET schema — the
     // legitimate "resume me" state. Recognise a *drivable* plan migrating
     // exactly `cat_kind -> want_kind` for this field and accept it; the
-    // open path's `auto_resume_migrations` arms quiesce and (once the
-    // converter is registered) drives the cutover that flips the catalog to
-    // match. Only a drivable plan licenses the mismatch — a `Failed` /
+    // open path's `auto_resume_migrations` arms the double-write hook and
+    // (once the converter is registered) drives the cutover that flips the
+    // catalog to match. Only a drivable plan licenses the mismatch — a `Failed` /
     // `AwaitingConverter` plan does NOT (it's parked, not in motion).
     let migration_plans = scan_migration_plans(storage, txn.snapshot())?;
     for (qual, &cat_kind) in &cat.field_kinds {
@@ -3851,16 +3854,17 @@ fn resumable_plan_for_kind_change(
 }
 
 // =====================================================================
-// Chunked field-type migration worker (card 1/5, increment 3)
+// Chunked field-type migration worker (card 2/5)
 //
 // The synchronous run-to-completion path: create a durable plan, arm the
-// type quiesce, convert the object keyspace in crash-safe chunks, then flip
-// the catalog kind. Async / cancel / pause are card 5.
+// double-write hook, backfill `<field>__shadow` siblings in crash-safe chunks,
+// then cut over (promote shadow → source + flip the catalog kind). Writes stay
+// ONLINE throughout via the hook. Async / cancel / pause are card 5.
 // =====================================================================
 
 /// Outcome of `create_migration_plan`: the durable plan id + its owning
-/// type id, so the Database orchestrator can `arm_quiesce` and drive without
-/// re-loading the catalog.
+/// type id, so the Database orchestrator can arm the double-write hook and
+/// drive without re-loading the catalog.
 pub(crate) struct CreatedMigration {
     pub plan_id: u64,
     pub type_id: u64,
@@ -3870,7 +3874,7 @@ pub(crate) struct CreatedMigration {
 /// in ONE commit (`c:P:<id>` + the `c:N:M` counter). Caller holds
 /// `migration_lock.write()`. Refuses if an unsettled plan already covers the
 /// field (same interlock the offline path uses). Status starts `Running`,
-/// cursor `0`; the caller arms quiesce then drives.
+/// cursor `0`; the caller arms the double-write hook then drives.
 // Each arg is an independent plan field with no natural grouping; a params
 // struct would just move the noise to the single call site.
 #[allow(clippy::too_many_arguments)]
@@ -4056,17 +4060,17 @@ fn object_id_from_key(key: &[u8]) -> u64 {
 /// correct. A `<field>__shadow` left by an OLD converter version is re-stamped.
 ///
 /// The per-chunk commit is wrapped in a bounded `WriteConflict` retry that
-/// re-snapshots and re-scans the chunk (a concurrent live double-writer in card-2
-/// inc 2d may have advanced a row's shadow; the idempotency skip then drops it).
-/// During inc 2c quiesce is still armed, so no conflict can occur — the retry is
-/// dormant until 2d lifts the write barrier.
+/// re-snapshots and re-scans the chunk: this backfill runs WITHOUT
+/// `migration_lock` (so writes to other types proceed), and a concurrent live
+/// double-writer (card 2d) may have advanced a row's shadow on the same `o:`
+/// key — the retry re-reads and the idempotency skip drops the now-current row.
 ///
 /// Does NOT bump the object generation (the source is unchanged, so covers stay
 /// correct during `Converting`) and does NOT flip the catalog kind — the caller
 /// invokes the cutover after this returns `Ok`. On a converter error, a
 /// converter that returns the wrong kind, or an on-disk row whose source kind is
-/// neither source nor target, the plan is parked `Failed` (quiesce stays armed
-/// for inspection) and the error is returned.
+/// neither source nor target, the plan is parked `Failed` (the double-write hook
+/// stays armed so writes to the field keep failing closed) and the error is returned.
 pub(crate) fn run_migration_chunks(
     storage: &LsmTree,
     plan_id: u64,
