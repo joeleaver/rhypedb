@@ -1861,53 +1861,51 @@ impl Database {
         Ok(created.plan_id)
     }
 
-    /// The double-driver gate (card 3/5): under the registry lock, refuse if an
-    /// ACTIVE driver already owns `plan_id`, else REAP a finished leftover (its
-    /// thread already `mark_done`d — drop its handle, detaching the spent thread)
-    /// and return a fresh `(control, signal)` plus a registry entry slot. The
-    /// caller fills the entry's handle (async) or leaves it `None` (inline). The
-    /// `is_finished` check is lock-free (the signal's atomic), so this never
-    /// nests the registry lock under the signal mutex.
-    fn gate_migration_driver(
-        &self,
+    /// The double-driver gate (card 3/5), run while HOLDING the registry lock:
+    /// refuse if an ACTIVE driver already owns `plan_id`, else REAP a finished
+    /// leftover (its thread already `mark_done`d — drop its handle, detaching the
+    /// spent thread). The `is_finished` check is lock-free (the signal's atomic),
+    /// so this never nests the registry lock under the signal mutex. Callers then
+    /// insert the fresh entry under the SAME lock (so the async path's handle is
+    /// stored atomically with the entry — no window where `Database::drop` /
+    /// `wait_for_migration` could see a `None` handle and fail to join the live
+    /// thread).
+    fn gate_locked(
+        reg: &mut HashMap<u64, MigrationDriver>,
         plan_id: u64,
-    ) -> EngineResult<(Arc<std::sync::atomic::AtomicU8>, Arc<MigrationSignal>)> {
-        use std::sync::atomic::AtomicU8;
-        let mut reg = self.migration_drivers.lock();
+    ) -> EngineResult<()> {
         if let Some(existing) = reg.get(&plan_id) {
             if !existing.signal.is_finished() {
                 return Err(EngineError::MigrationAlreadyRunning { plan_id });
             }
             reg.remove(&plan_id); // finished leftover — reap (detach its spent thread)
         }
-        let control = Arc::new(AtomicU8::new(crate::catalog::migration_control::RUN));
-        let signal = Arc::new(MigrationSignal::new());
-        reg.insert(
-            plan_id,
-            MigrationDriver {
-                control: Arc::clone(&control),
-                signal: Arc::clone(&signal),
-                handle: None,
-            },
-        );
-        Ok((control, signal))
+        Ok(())
     }
 
     /// Register + spawn the detached async migration driver for `plan_id` (card
-    /// 3/5). The driver does NOT remove its own entry on exit — it `mark_done`s
-    /// and returns, leaving the still-joinable handle for `wait_for_migration` /
-    /// `Database::drop` to join (this is what makes a `wait; drop; reopen`
-    /// race-free). Returns `MigrationAlreadyRunning` if an active driver already
-    /// owns the plan, or a spawn IO error.
+    /// 3/5), inserting the entry WITH its join handle atomically under the
+    /// registry lock. The driver does NOT remove its own entry on exit — it
+    /// `mark_done`s and returns, leaving the still-joinable handle for
+    /// `wait_for_migration` / `Database::drop` to join (this is what makes a
+    /// `wait; drop; reopen` race-free, AND ensures `Database::drop` always joins
+    /// a live driver). Returns `MigrationAlreadyRunning` if an active driver
+    /// already owns the plan, or a spawn IO error. Holding the registry lock
+    /// across the spawn is deadlock-free: `migration_driver_main` never takes the
+    /// registry lock (Design C — it never deregisters itself).
     fn spawn_migration_driver(
         &self,
         plan_id: u64,
         type_id: u64,
         converter: crate::catalog::RegisteredConverter,
     ) -> EngineResult<()> {
-        let (control, signal) = self.gate_migration_driver(plan_id)?;
+        use std::sync::atomic::AtomicU8;
         let weak = self.self_weak.lock().clone();
         let storage = Arc::clone(&self.storage);
+        let mut reg = self.migration_drivers.lock();
+        Self::gate_locked(&mut reg, plan_id)?;
+        let control = Arc::new(AtomicU8::new(crate::catalog::migration_control::RUN));
+        let signal = Arc::new(MigrationSignal::new());
         let handle = std::thread::Builder::new()
             .name("rhypedb-migration-driver".into())
             .spawn({
@@ -1920,11 +1918,14 @@ impl Database {
                 }
             })
             .map_err(|e| EngineError::Storage(rhypedb_storage::Error::Io(e)))?;
-        // Store the handle into the entry the gate inserted. The driver never
-        // touches the registry, so the entry is guaranteed still present here.
-        if let Some(entry) = self.migration_drivers.lock().get_mut(&plan_id) {
-            entry.handle = Some(handle);
-        }
+        reg.insert(
+            plan_id,
+            MigrationDriver {
+                control,
+                signal,
+                handle: Some(handle),
+            },
+        );
         Ok(())
     }
 
@@ -1937,7 +1938,20 @@ impl Database {
         &self,
         plan_id: u64,
     ) -> EngineResult<(Arc<std::sync::atomic::AtomicU8>, Arc<MigrationSignal>)> {
-        self.gate_migration_driver(plan_id)
+        use std::sync::atomic::AtomicU8;
+        let mut reg = self.migration_drivers.lock();
+        Self::gate_locked(&mut reg, plan_id)?;
+        let control = Arc::new(AtomicU8::new(crate::catalog::migration_control::RUN));
+        let signal = Arc::new(MigrationSignal::new());
+        reg.insert(
+            plan_id,
+            MigrationDriver {
+                control: Arc::clone(&control),
+                signal: Arc::clone(&signal),
+                handle: None,
+            },
+        );
+        Ok((control, signal))
     }
 
     /// Block until the migration driver for `plan_id` finishes — the async
@@ -8132,24 +8146,57 @@ mod tests {
         );
     }
 
+    /// Register a `widen` converter that BLOCKS every call until `release()` is
+    /// invoked, signalling (once) on a channel when the FIRST worker reaches it.
+    /// This makes a pause/reopen test DETERMINISTIC instead of sleep-timed: the
+    /// test waits for the start signal (the backfill is provably mid-flight, with
+    /// NO chunk committed yet because the first row of the first chunk is
+    /// blocked), sets the control byte, then releases — so every worker stops
+    /// after exactly its first chunk, well before completion, on every host.
+    fn register_gated_widen(
+        db: &Database,
+    ) -> (std::sync::mpsc::Receiver<()>, impl Fn() + use<>) {
+        use std::sync::{Arc, Condvar, Mutex};
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let tx = Mutex::new(Some(tx));
+        let rel = Arc::clone(&release);
+        db.register_converter("widen", 1, move |_oid, v| {
+            if let Some(t) = tx.lock().unwrap().take() {
+                let _ = t.send(());
+            }
+            let (m, cv) = &*rel;
+            let mut g = m.lock().unwrap();
+            while !*g {
+                g = cv.wait(g).unwrap();
+            }
+            drop(g);
+            match v {
+                Value::I64(i) => Ok(Value::F64(*i as f64)),
+                _ => unreachable!(),
+            }
+        });
+        let rel2 = Arc::clone(&release);
+        let release_fn = move || {
+            let (m, cv) = &*rel2;
+            *m.lock().unwrap() = true;
+            cv.notify_all();
+        };
+        (rx, release_fn)
+    }
+
     /// AC6: a pause request stops the parallel backfill BEFORE completion (every
     /// worker polls the control byte between chunks), leaving the plan resumable;
-    /// resume then completes it. A per-row sleep makes the backfill slow enough
-    /// that the pause (issued microseconds after create) lands mid-flight
-    /// deterministically.
+    /// resume then completes it. Deterministic via a gated converter: the pause is
+    /// set while a worker is provably blocked on the first row of its first chunk
+    /// (no chunk committed yet), so every worker stops after exactly one chunk.
     #[test]
     fn pause_migration_stops_before_completion_then_resumes() {
         use rhypedb_schema::{FieldType, ScalarType};
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
             .unwrap();
-        db.register_converter("slow", 1, |_oid, v| {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            match v {
-                Value::I64(i) => Ok(Value::F64(*i as f64)),
-                _ => unreachable!(),
-            }
-        });
+        let (started, release) = register_gated_widen(&db);
         let mut ids = Vec::new();
         for i in 0..150i64 {
             let mut f = FieldMap::new();
@@ -8161,14 +8208,17 @@ mod tests {
                 type_name: "User".into(),
                 field_name: "score".into(),
                 target_field_type: FieldType::Scalar(ScalarType::F64),
-                converter_name: "slow".into(),
+                converter_name: "widen".into(),
                 converter_version: 1,
                 chunk_size: 4,
             })
             .unwrap();
-        // Pause immediately — workers honor it within one chunk (~4ms) << the
-        // ~150ms total backfill.
+        // A worker has reached the (blocked) converter → backfill is mid-flight,
+        // nothing committed. Pause now, THEN release: every worker stops after its
+        // first chunk.
+        started.recv().unwrap();
         db.pause_migration(plan_id).unwrap();
+        release();
         db.wait_for_migration(plan_id).unwrap();
 
         let st = db.list_migrations().unwrap()[0].status;
@@ -8201,7 +8251,7 @@ mod tests {
         // to drive a plan whose handle still validates against the source kind).
         let db2 = Database::open(parse_schema(r#"type User { score: f64 }"#).unwrap(), dir.path())
             .unwrap();
-        db2.register_converter("slow", 1, |_oid, v| match v {
+        db2.register_converter("widen", 1, |_oid, v| match v {
             Value::I64(i) => Ok(Value::F64(*i as f64)),
             _ => unreachable!(),
         });
@@ -8227,15 +8277,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
             .unwrap();
-        let (_ctrl, sig) = db.gate_migration_driver(7).unwrap();
+        let (_ctrl, sig) = db.register_inline_driver(7).unwrap();
         // A second registration while the first is active is refused.
         assert!(matches!(
-            db.gate_migration_driver(7),
+            db.register_inline_driver(7),
             Err(EngineError::MigrationAlreadyRunning { plan_id: 7 })
         ));
         // Once the first signals finished, the gate reaps it and admits a new one.
         sig.mark_done(None);
-        assert!(db.gate_migration_driver(7).is_ok());
+        assert!(db.register_inline_driver(7).is_ok());
     }
 
     /// AC2: a parallel plan paused mid-backfill resumes PER-PARTITION across a
@@ -8251,13 +8301,9 @@ mod tests {
             let db =
                 Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
                     .unwrap();
-            db.register_converter("slow", 1, |_oid, v| {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                match v {
-                    Value::I64(i) => Ok(Value::F64(*i as f64)),
-                    _ => unreachable!(),
-                }
-            });
+            // Gated converter so the pause lands mid-backfill deterministically
+            // (a partial set of partitions converted → resume must finish them).
+            let (started, release) = register_gated_widen(&db);
             let mut v = Vec::new();
             for i in 0..150i64 {
                 let mut f = FieldMap::new();
@@ -8270,12 +8316,14 @@ mod tests {
                     type_name: "User".into(),
                     field_name: "score".into(),
                     target_field_type: FieldType::Scalar(ScalarType::F64),
-                    converter_name: "slow".into(),
+                    converter_name: "widen".into(),
                     converter_version: 1,
                     chunk_size: 4,
                 })
                 .unwrap();
+            started.recv().unwrap();
             db.pause_migration(plan_id).unwrap();
+            release();
             db.wait_for_migration(plan_id).unwrap();
             assert_ne!(
                 db.list_migrations().unwrap()[0].status,
@@ -8287,7 +8335,7 @@ mod tests {
         // converter, then resume — each partition continues from its c:S: cursor.
         let db = Database::open(parse_schema(r#"type User { score: f64 }"#).unwrap(), dir.path())
             .unwrap();
-        db.register_converter("slow", 1, |_oid, v| match v {
+        db.register_converter("widen", 1, |_oid, v| match v {
             Value::I64(i) => Ok(Value::F64(*i as f64)),
             _ => unreachable!(),
         });
