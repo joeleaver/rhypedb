@@ -53,6 +53,9 @@ enum MigrateAction {
         /// Per-row failure policy: stop | skip | quarantine.
         #[arg(long)]
         policy: Option<String>,
+        /// Quarantine/error cap (0 = engine default 100K); exceeding it auto-stops.
+        #[arg(long, default_value_t = 0)]
+        quarantine_cap: u64,
         #[arg(long)]
         dry_run: bool,
     },
@@ -170,7 +173,11 @@ fn print_object(obj: &ObjectJson) {
 /// treated as an error so a 4xx body (the server's `{"error": ...}`) is readable.
 fn admin_get(cli: &Cli, path: &str) -> Result<(u16, serde_json::Value), String> {
     let url = format!("{}{path}", cli.host);
-    let mut req = ureq::get(&url).config().http_status_as_error(false).build();
+    let mut req = ureq::get(&url)
+        .config()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build();
     if let Some(t) = &cli.admin_token {
         req = req.header("Authorization", format!("Bearer {t}"));
     }
@@ -191,7 +198,11 @@ fn admin_post(
     body: serde_json::Value,
 ) -> Result<(u16, serde_json::Value), String> {
     let url = format!("{}{path}", cli.host);
-    let mut req = ureq::post(&url).config().http_status_as_error(false).build();
+    let mut req = ureq::post(&url)
+        .config()
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build();
     if let Some(t) = &cli.admin_token {
         req = req.header("Authorization", format!("Bearer {t}"));
     }
@@ -207,11 +218,14 @@ fn admin_post(
     Ok((status, json))
 }
 
-/// Render a non-2xx response as an error string (the server's `error` field).
+/// Render a non-2xx response as an error string: the server's JSON `error`
+/// field, or a plain-text body (the auth 401/403 responses aren't JSON), else
+/// the bare status.
 fn http_error(status: u16, body: &serde_json::Value) -> String {
     let msg = body
         .get("error")
         .and_then(|e| e.as_str())
+        .or_else(|| body.as_str().map(str::trim).filter(|s| !s.is_empty()))
         .unwrap_or("(no detail)");
     format!("server returned {status}: {msg}")
 }
@@ -227,12 +241,13 @@ fn run_migrate(cli: &Cli, action: &MigrateAction) -> Result<(), String> {
             chunk,
             parallel,
             policy,
+            quarantine_cap,
             dry_run,
         } => {
             let mut body = serde_json::json!({
                 "type": type_name, "field": field, "to": to,
                 "converter": converter, "converter_version": converter_version,
-                "chunk": chunk, "dry_run": dry_run,
+                "chunk": chunk, "quarantine_cap": quarantine_cap, "dry_run": dry_run,
             });
             if let Some(p) = parallel {
                 body["parallel"] = serde_json::json!(p);
@@ -333,12 +348,14 @@ fn print_migration_table(rows: &[serde_json::Value]) {
             r["type"].as_str().unwrap_or("?"),
             r["field"].as_str().unwrap_or("?")
         );
+        // Pull numbers out as primitives — serde_json::Value's Display ignores the
+        // formatter width, so format them as integers for the columns to align.
         println!(
             "{:>5}  {:<20} {:<16} {:>10}  {}",
-            r["plan_id"],
+            r["plan_id"].as_u64().unwrap_or(0),
             tf,
             r["status"].as_str().unwrap_or("?"),
-            r["objects_converted"],
+            r["objects_converted"].as_u64().unwrap_or(0),
             r["converter"].as_str().unwrap_or("?"),
         );
     }
@@ -390,6 +407,7 @@ fn stream_events(cli: &Cli, id: u64) -> Result<(), String> {
         return Err(format!("server returned {status}"));
     }
     let reader = std::io::BufReader::new(resp.into_body().into_reader());
+    let mut saw_terminal = false;
     for line in reader.lines() {
         let line = line.map_err(|e| format!("stream error: {e}"))?;
         // SSE data frames: `data: {json}`. Skip event:/id:/keep-alive (`:`) lines.
@@ -406,15 +424,21 @@ fn stream_events(cli: &Cli, id: u64) -> Result<(), String> {
         };
         let kind = ev["type"].as_str().unwrap_or("?");
         println!("{kind}: {ev}");
-        let terminal = matches!(kind, "cutover_done" | "failed")
+        // Failed / a settled status_changed ends the stream. (cutover_done is
+        // always followed by a Completed status_changed, so it is not terminal.)
+        let terminal = kind == "failed"
             || (kind == "status_changed"
                 && matches!(
                     ev["status"].as_str(),
                     Some("Cancelled" | "Completed" | "DryRunCompleted")
                 ));
         if terminal {
+            saw_terminal = true;
             break;
         }
+    }
+    if !saw_terminal {
+        eprintln!("(stream closed before the migration settled — re-run `migrate status {id}`)");
     }
     Ok(())
 }

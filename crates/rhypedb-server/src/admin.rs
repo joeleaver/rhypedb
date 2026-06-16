@@ -246,19 +246,19 @@ async fn events(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Resp
     tokio::task::spawn_blocking(move || loop {
         match engine_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(ev) => {
-                let terminal = matches!(
-                    ev,
-                    MigrationEvent::CutoverDone { .. }
-                        | MigrationEvent::Failed { .. }
-                        | MigrationEvent::StatusChanged {
-                            status: MigrationStatus::Cancelled
-                                | MigrationStatus::Completed
-                                | MigrationStatus::DryRunCompleted,
-                            ..
-                        }
-                );
-                if tx.blocking_send(ev).is_err() {
-                    break; // client disconnected
+                // A terminal event ENDS the stream (CutoverDone is NOT terminal —
+                // a StatusChanged(Completed) always follows it). Mirrors the
+                // engine's MigrationEvent::is_terminal.
+                let terminal = ev.is_terminal();
+                // try_send (never block): a slow/hung-but-connected client must
+                // not park this blocking-pool thread on a full channel. Events are
+                // a best-effort, non-replayed live stream, so a dropped frame under
+                // backpressure is acceptable; only a CLOSED receiver (client gone)
+                // ends the forwarder.
+                match tx.try_send(ev) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                 }
                 if terminal {
                     break;
@@ -588,6 +588,40 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(code, Some(401));
+    }
+
+    /// Auth also gates the POST routes (not just GET): unset token → 403, wrong
+    /// token → 401 on POST /admin/migrations/:id/cancel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_post_routes_are_auth_gated() {
+        let base_403 = spawn(None, 0).await;
+        let code = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{base_403}/admin/migrations/1/cancel"))
+                .send_empty()
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(403), "POST with no server token must be 403");
+
+        let base_401 = spawn(Some("s3cret"), 0).await;
+        let code = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{base_401}/admin/migrations/1/cancel"))
+                .header("Authorization", "Bearer wrong")
+                .send_empty()
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(401), "POST with wrong token must be 401");
     }
 
     /// HTTP round-trip: start a migration, then read its detail — exercises the

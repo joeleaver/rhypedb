@@ -741,6 +741,23 @@ impl MigrationEvent {
             | MigrationEvent::Failed { plan_id, .. } => *plan_id,
         }
     }
+
+    /// True for an event that ENDS a plan's stream — a settled `StatusChanged`
+    /// or a `Failed`. (`CutoverDone` is always followed by a `Completed`
+    /// `StatusChanged`, so it is not itself terminal.) The hub drops a plan's
+    /// subscribers after a terminal event.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            MigrationEvent::Failed { .. } => true,
+            MigrationEvent::StatusChanged { status, .. } => matches!(
+                status,
+                crate::catalog::MigrationStatus::Completed
+                    | crate::catalog::MigrationStatus::Cancelled
+                    | crate::catalog::MigrationStatus::DryRunCompleted
+            ),
+            _ => false,
+        }
+    }
 }
 
 struct MigrationEventSub {
@@ -785,6 +802,11 @@ impl MigrationEventHub {
 
     pub(crate) fn publish(&self, event: MigrationEvent) {
         let plan = event.plan_id();
+        // A terminal event ends the plan's stream — after delivering it, drop ALL
+        // of that plan's subscribers (no further events will ever come, so an
+        // un-dropped receiver would otherwise linger in `subs` forever; lazy
+        // send-failure reaping only fires on a FUTURE publish that never happens).
+        let terminal = event.is_terminal();
         let mut dead = Vec::new();
         {
             let subs = self.subs.read();
@@ -794,7 +816,9 @@ impl MigrationEventHub {
                 }
             }
         }
-        if !dead.is_empty() {
+        if terminal {
+            self.subs.write().retain(|s| s.plan_id != plan);
+        } else if !dead.is_empty() {
             self.subs.write().retain(|s| !dead.contains(&s.id));
         }
     }
@@ -2441,7 +2465,12 @@ impl Database {
                     // cutover); a real plan cuts over (still under `_guard`, so a
                     // waiter wakes only after cutover finishes/fails).
                     if plan.dry_run {
-                        return crate::catalog::finalize_dry_run(&self.storage, plan_id);
+                        crate::catalog::finalize_dry_run(&self.storage, plan_id)?;
+                        self.migration_events.publish(MigrationEvent::StatusChanged {
+                            plan_id,
+                            status: crate::catalog::MigrationStatus::DryRunCompleted,
+                        });
+                        return Ok(());
                     }
                     return self.run_terminal_pass(plan_id, type_id);
                 }
@@ -3250,10 +3279,13 @@ impl Database {
         let (objects_per_sec, eta_unix_ms) = if running && objects_converted > 0 && elapsed_ms > 0 {
             let rate = (objects_converted as f64) * 1000.0 / (elapsed_ms as f64);
             // eta = now + remaining/rate = now + remaining*elapsed/converted.
-            // Saturating throughout: `remaining*elapsed` can be enormous.
-            let remaining = total_objects.saturating_sub(objects_converted);
-            let eta = now_ms
-                .saturating_add(remaining.saturating_mul(elapsed_ms) / objects_converted);
+            // Computed in f64 then clamped: an integer `remaining*elapsed` can
+            // overflow u64 at extreme scale, and `saturating_mul` would then cap
+            // the product at u64::MAX and divide it down to an astronomically
+            // wrong (but finite) estimate. f64 keeps the ratio meaningful.
+            let remaining = total_objects.saturating_sub(objects_converted) as f64;
+            let projected_ms = remaining * (elapsed_ms as f64) / (objects_converted as f64);
+            let eta = now_ms.saturating_add(projected_ms.min(u64::MAX as f64) as u64);
             (Some(rate), Some(eta))
         } else {
             (None, None)
@@ -6192,7 +6224,12 @@ fn drive_async_migration(
     // A dry-run preflight cleans up + marks DryRunCompleted (storage-only — no
     // hook was armed, no cutover).
     if plan.dry_run {
-        return crate::catalog::finalize_dry_run(storage, plan_id);
+        crate::catalog::finalize_dry_run(storage, plan_id)?;
+        events.publish(MigrationEvent::StatusChanged {
+            plan_id,
+            status: crate::catalog::MigrationStatus::DryRunCompleted,
+        });
+        return Ok(());
     }
     // Single-threaded cutover — skip if the DB is dropping (the next open's
     // auto-resume finishes it).
