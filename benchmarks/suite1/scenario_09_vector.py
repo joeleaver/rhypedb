@@ -340,23 +340,41 @@ def main() -> None:
         print(f"  {r.implementation:<14} {recall:>10.4f} {build:>12.1f} "
               f"{op.get('p50_us', 0):>14.2f} {op.get('mean_us', 0):>16.2f}")
 
-    print("\nMemory (the comparison that counts):")
+    print("\nMemory — RAM to serve k-NN (the comparison that counts):")
     n_train = ds.train.shape[0]
-    print(f"  {'impl':<14} {'RSS post-load':>14} {'RSS delta':>11} {'disk/idx MB':>12} {'bytes/vec':>11}")
+    # Headline 'serve B/vec' is the STEADY serving heap per vector, not the
+    # post-load peak. For rhypedb that is the marginal RssAnon (the HNSW index);
+    # its durable raw-f32 copy is mmap'd SST page cache (file-backed RssFile),
+    # which is reclaimable under pressure and never part of the serving heap, so
+    # it is reported separately rather than folded into the headline. For
+    # pgvector the serving footprint is its HNSW index (which stores the f32
+    # inline); its table heap is a second f32 copy. 'post-load pk' is the
+    # transient peak VmRSS right after the build, kept only as context.
+    print(f"  {'impl':<14} {'serve B/vec':>12} {'steady heap':>12} "
+          f"{'reclaimable':>12} {'post-load pk':>13} {'disk/idx MB':>12}")
     for r in results:
-        delta = r.rss_post_load_mb - r.rss_cold_mb
         if r.implementation == "pgvector":
-            idx_mb = r.metadata.get("pg_index_bytes", 0) / (1024 * 1024)
-            bpv = r.metadata.get("bytes_per_vector_index", 0.0)
-            note = f"idx={idx_mb:.0f} (heap={r.metadata.get('pg_table_bytes',0)/(1024*1024):.0f})"
+            serve_bpv = r.metadata.get("bytes_per_vector_index")
+            heap_mb = r.metadata.get("pg_index_bytes", 0) / (1024 * 1024)
+            reclaim_mb = r.metadata.get("pg_table_bytes", 0) / (1024 * 1024)
         else:
-            idx_mb = r.disk_mb
-            bpv = r.metadata.get("bytes_per_vector_rss", 0.0)
-            note = f"disk={idx_mb:.0f}"
-        print(f"  {r.implementation:<14} {r.rss_post_load_mb:>12.1f}MB {delta:>9.1f}MB "
-              f"{note:>12} {bpv:>9.1f}B")
-    print(f"  (n_train={n_train}; rhypedb bytes/vec = RSS delta/n; "
-          f"pgvector bytes/vec = HNSW index size/n, +f32 heap copy)")
+            # Recorded only when the server PID was found for RSS sampling; show
+            # n/a (not a misleading 0) if --server-pattern didn't match.
+            serve_bpv = r.metadata.get("bytes_per_vector_anon_steady")
+            heap_mb = r.metadata.get("rss_steady_anon_mb")
+            reclaim_mb = r.metadata.get("rss_steady_file_mb")
+        disk_idx = r.disk_mb
+        serve_s = f"{serve_bpv:>11.0f}B" if serve_bpv is not None else f"{'n/a':>12}"
+        heap_s = f"{heap_mb:>10.1f}MB" if heap_mb is not None else f"{'n/a':>12}"
+        reclaim_s = f"{reclaim_mb:>10.1f}MB" if reclaim_mb is not None else f"{'n/a':>12}"
+        print(f"  {r.implementation:<14} {serve_s} {heap_s} "
+              f"{reclaim_s} {r.rss_post_load_mb:>11.1f}MB {disk_idx:>12.0f}")
+    print(f"  (n_train={n_train}. serve B/vec = steady serving heap/vec: rhypedb = marginal "
+          f"RssAnon (HNSW index), pgvector = HNSW index size (f32 inline).")
+    print(f"   reclaimable = rhypedb mmap'd raw-f32 SST (file-backed, yields under pressure) / "
+          f"pgvector table heap f32 copy.")
+    print(f"   NOTE: bytes_per_vector_rss in the JSON is the post-load PEAK total VmRSS/vec — a "
+          f"transient peak, NOT the steady serving cost; do not headline it.)")
 
     common.write_results(results, args.out)
     print(f"\nWrote results to {args.out}")
