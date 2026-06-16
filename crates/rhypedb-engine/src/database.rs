@@ -3444,9 +3444,13 @@ impl Database {
 
         let mut txn = self.storage.begin_txn();
         let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
+        // Single object — no cross-row uniqueness to track, but the helper
+        // takes a staged set, so hand it a throwaway one.
+        let mut staged_unique: HashMap<Bytes, u64> = HashMap::new();
 
         let scalar_fields = self.stage_create_writes(
             &mut txn, type_name, type_def, type_id, object_id, &fields, &mut puts,
+            &mut staged_unique,
         )?;
 
         // `stage_create_writes` bumped this object's in-memory generation to 1
@@ -3492,10 +3496,12 @@ impl Database {
     /// stamps are read from the in-memory `version_counters` map (a live
     /// never-updated target reads 1; an absent/deleted target reads 0).
     ///
-    /// Unique-index puts are issued inline (the next row in `create_batch`
-    /// must see them through MVCC to detect intra-batch dup values). All
-    /// other writes accumulate into `puts` for the caller to flush via
-    /// `put_batch`. Returns the scalar-only `FieldMap` for the response.
+    /// Unique-index puts are issued inline (not buffered into `puts`) so they
+    /// commit atomically with the rest of the txn; intra-batch duplicate values
+    /// are caught via `staged`, which the caller threads across every row of a
+    /// `create_batch` (a buffered put can't be seen by a later row's
+    /// `storage.get`). All other writes accumulate into `puts` for the caller to
+    /// flush via `put_batch`. Returns the scalar-only `FieldMap` for the response.
     #[allow(clippy::too_many_arguments)]
     fn stage_create_writes(
         &self,
@@ -3506,6 +3512,7 @@ impl Database {
         object_id: u64,
         fields: &FieldMap,
         puts: &mut Vec<(Bytes, Bytes)>,
+        staged: &mut HashMap<Bytes, u64>,
     ) -> EngineResult<FieldMap> {
         // First pass: validate, split scalars from relations.
         let mut scalar_fields = FieldMap::new();
@@ -3616,13 +3623,14 @@ impl Database {
             serialize_fields(&scalar_fields)
         };
 
-        // Unique-index writes for scalar fields (inline — required for
-        // cross-row uniqueness detection inside a single `create_batch`).
+        // Unique-index writes for scalar fields. Issued inline (committed with
+        // the txn); `staged` carries claimed values across rows so a duplicate
+        // later in the same `create_batch` is rejected.
         for (field_name, value) in &scalar_fields {
             let field_def = type_def.get_field(field_name).unwrap();
             if field_def.is_unique() && !matches!(value, Value::Null) {
                 self.check_unique_and_insert(
-                    txn, type_name, type_id, field_name, value, object_id,
+                    txn, type_name, type_id, field_name, value, object_id, staged,
                 )?;
             }
         }
@@ -3711,17 +3719,23 @@ impl Database {
         let mut object_ids: Vec<u64> = Vec::with_capacity(rows.len());
         // Every put across the whole batch — object payload, secondary
         // index entries, forward + rev edges — accumulates here and
-        // flushes via one `put_batch` at the end. Unique-index puts stay
-        // inline because the next row's uniqueness check inside the same
-        // txn must see them. Per-row scalar FieldMaps are reconstructed
-        // post-batch for the published events / returned Objects.
+        // flushes via one `put_batch` at the end. Unique-index puts are
+        // issued inline (committed with the txn). Per-row scalar FieldMaps
+        // are reconstructed post-batch for the published events / returned
+        // Objects.
         let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(rows.len() * 2);
         let mut scalar_rows: Vec<FieldMap> = Vec::with_capacity(rows.len());
+        // Tracks the @unique values claimed so far in THIS batch. A buffered
+        // unique-index put is invisible to a later row's `storage.get` (reads
+        // resolve at the txn snapshot), so without this two rows sharing a
+        // `@unique` value would both commit. Threaded into every row.
+        let mut staged_unique: HashMap<Bytes, u64> = HashMap::new();
 
         for fields in &rows {
             let object_id = self.next_object_id.fetch_add(1, Ordering::SeqCst);
             match self.stage_create_writes(
                 &mut txn, type_name, type_def, type_id, object_id, fields, &mut puts,
+                &mut staged_unique,
             ) {
                 Ok(scalar_fields) => {
                     // stage_create_writes bumped this object to generation 1.
@@ -4778,7 +4792,11 @@ impl Database {
 
         let mut fields = deserialize_fields(&existing_data);
 
-        // Check unique constraints for updated fields.
+        // Check unique constraints for updated fields. This touches a SINGLE
+        // object, so there are no earlier rows whose buffered unique puts a
+        // later row would miss — the intra-batch hazard simply doesn't arise.
+        // Hand the helper a throwaway staged set to satisfy its signature.
+        let mut staged_unique: HashMap<Bytes, u64> = HashMap::new();
         for (field_name, value) in &updates {
             let field_def = type_def.get_field(field_name).unwrap();
             if field_def.is_unique() && !matches!(value, Value::Null) {
@@ -4789,7 +4807,7 @@ impl Database {
                     self.remove_unique_index(&mut txn, type_name, type_id, field_name, old_value)?;
                 }
                 self.check_unique_and_insert(
-                    &mut txn, type_name, type_id, field_name, value, object_id,
+                    &mut txn, type_name, type_id, field_name, value, object_id, &mut staged_unique,
                 )?;
             }
         }
@@ -5777,6 +5795,14 @@ impl Database {
     }
 
     /// Check that a unique value doesn't already exist, and insert the index entry.
+    ///
+    /// `staged` records every unique key this transaction has already claimed.
+    /// It is required because a buffered `put` is invisible to `storage.get`
+    /// (reads resolve at the txn snapshot; the write buffer is write-only), so
+    /// without it a second row in the SAME `create_batch` carrying a duplicate
+    /// `@unique` value would slip past the committed-data check and both rows
+    /// would commit. Callers driving a single object pass a throwaway map.
+    #[allow(clippy::too_many_arguments)]
     fn check_unique_and_insert(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
@@ -5785,26 +5811,39 @@ impl Database {
         field_name: &str,
         value: &Value,
         object_id: u64,
+        staged: &mut HashMap<Bytes, u64>,
     ) -> EngineResult<()> {
         let field_key = format!("{type_name}.{field_name}");
         let field_id = self.field_ids[&field_key];
         let value_bytes = value_to_index_bytes(value);
         let unique_key = KeyBuilder::unique_index(type_id, field_id, &value_bytes);
 
+        let violation = || EngineError::UniqueViolation {
+            type_name: type_name.into(),
+            field: field_name.into(),
+            value: value.to_string(),
+        };
+
+        // Intra-txn check FIRST: catch a duplicate value staged by an earlier
+        // row in this same transaction, which the committed-data probe below
+        // cannot see (the txn write buffer is write-only).
+        if let Some(&staged_id) = staged.get(&unique_key)
+            && staged_id != object_id
+        {
+            return Err(violation());
+        }
+
         if let Some(existing) = self.storage.get(txn, &unique_key)? {
             let existing_id = u64::from_be_bytes(existing[..8].try_into().unwrap());
             if existing_id != object_id {
-                return Err(EngineError::UniqueViolation {
-                    type_name: type_name.into(),
-                    field: field_name.into(),
-                    value: value.to_string(),
-                });
+                return Err(violation());
             }
         }
 
         let mut id_buf = bytes::BytesMut::with_capacity(8);
         bytes::BufMut::put_u64(&mut id_buf, object_id);
         self.storage.put(txn, &unique_key, id_buf.freeze())?;
+        staged.insert(unique_key, object_id);
 
         Ok(())
     }
@@ -12460,6 +12499,112 @@ mod tests {
         updates.insert("email".into(), Value::String("alice@example.com".into()));
         let result = db.update("User", bob.id, updates);
         assert!(matches!(result, Err(EngineError::UniqueViolation { .. })));
+    }
+
+    #[test]
+    fn unique_constraint_within_create_batch() {
+        // Rows in ONE create_batch carrying the same @unique value must be
+        // rejected wherever the collision sits. Regression: before the
+        // staged-set fix, a buffered unique-index put was invisible to a later
+        // row's storage read, so the dup rows committed silently (only
+        // collisions vs ALREADY-committed rows were caught).
+        let row = |name: &str, email: &str| {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(name.into()));
+            f.insert("email".into(), Value::String(email.into()));
+            f
+        };
+
+        // The duplicate's position inside the batch must not matter: adjacent,
+        // non-adjacent, and a triple all have to fail. Each runs in a fresh db
+        // so the atomicity assertion below is independent.
+        let layouts: Vec<Vec<FieldMap>> = vec![
+            // adjacent (rows 0,1)
+            vec![row("A", "dup@x.com"), row("B", "dup@x.com")],
+            // non-adjacent (rows 0,2; row 1 distinct)
+            vec![row("A", "dup@x.com"), row("B", "mid@x.com"), row("C", "dup@x.com")],
+            // triple identical
+            vec![row("A", "dup@x.com"), row("B", "dup@x.com"), row("C", "dup@x.com")],
+        ];
+        for layout in layouts {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::open(test_schema(), dir.path()).unwrap();
+            let result = db.create_batch("User", layout);
+            assert!(
+                matches!(result, Err(EngineError::UniqueViolation { .. })),
+                "a duplicate @unique value anywhere in one batch must violate, got {result:?}"
+            );
+            // Atomicity: the batch failed, so NO row may have landed — not even
+            // the distinct ones, otherwise the slot would now be taken.
+            assert!(
+                db.scan_type("User").unwrap().is_empty(),
+                "a failed create_batch must leave no rows behind"
+            );
+            // And the value is still free: a single create with it now succeeds.
+            db.create("User", row("Late", "dup@x.com")).unwrap();
+        }
+    }
+
+    #[test]
+    fn create_batch_rejects_dup_against_both_committed_and_staged() {
+        // Both checks must fire in the same batch: a value already committed
+        // (caught by the storage probe) AND an intra-batch dup (caught by the
+        // staged set).
+        let row = |name: &str, email: &str| {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(name.into()));
+            f.insert("email".into(), Value::String(email.into()));
+            f
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        // Pre-commit one row.
+        db.create("User", row("Alice", "alice@example.com")).unwrap();
+
+        // A batch colliding with the committed row (storage probe path).
+        assert!(matches!(
+            db.create_batch("User", vec![row("Eve", "alice@example.com")]),
+            Err(EngineError::UniqueViolation { .. })
+        ));
+        // A batch with a fresh-but-internally-duplicated value (staged path).
+        assert!(matches!(
+            db.create_batch("User", vec![row("Bob", "bob@example.com"), row("Bob2", "bob@example.com")]),
+            Err(EngineError::UniqueViolation { .. })
+        ));
+        // Only Alice ever committed.
+        assert_eq!(db.scan_type("User").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn create_batch_allows_distinct_unique_values() {
+        // The staged-set check must NOT reject a batch whose @unique values are
+        // all distinct.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let row = |name: &str, email: &str| {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(name.into()));
+            f.insert("email".into(), Value::String(email.into()));
+            f
+        };
+
+        let rows = vec![
+            row("Alice", "alice@example.com"),
+            row("Bob", "bob@example.com"),
+            row("Carol", "carol@example.com"),
+        ];
+        let out = db.create_batch("User", rows).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(db.scan_type("User").unwrap().len(), 3);
+
+        // A second batch colliding with an ALREADY-committed value still fails.
+        let collide = vec![row("Dave", "alice@example.com")];
+        assert!(matches!(
+            db.create_batch("User", collide),
+            Err(EngineError::UniqueViolation { .. })
+        ));
     }
 
     #[test]
