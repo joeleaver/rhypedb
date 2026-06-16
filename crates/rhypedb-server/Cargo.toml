@@ -28,6 +28,8 @@ onnx-dynamic = [
 
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
+# For mi_option_set, to tune the purge delay in-process (see main.rs).
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 rhypedb-storage = { workspace = true }
 rhypedb-schema = { workspace = true }
 rhypedb-engine = { workspace = true }
