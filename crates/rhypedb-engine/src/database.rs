@@ -569,6 +569,9 @@ pub struct MigrationPlanSpec {
     /// Card 4: cap on quarantined/errored rows; exceeding it auto-stops the
     /// migration (`Failed`). `0` → `DEFAULT_QUARANTINE_CAP` (100K).
     pub quarantine_cap: u64,
+    /// Card 5: override the number of parallel backfill workers. `None` →
+    /// auto (one per CPU, capped at 8). Clamped into `1..=MAX_PARALLEL_DEGREE`.
+    pub parallel_degree: Option<u8>,
 }
 
 impl Default for MigrationPlanSpec {
@@ -588,6 +591,7 @@ impl Default for MigrationPlanSpec {
             error_policy: crate::catalog::ErrorPolicy::Stop,
             dry_run: false,
             quarantine_cap: 0,
+            parallel_degree: None,
         }
     }
 }
@@ -2023,13 +2027,17 @@ impl Database {
                 version: spec.converter_version,
             })?;
 
-        // Resolve the parallel degree before the lock (cheap): one worker per CPU,
-        // capped at 8, clamped into `1..=64`.
-        let parallel_degree = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .clamp(1, 8)
-            .min(crate::catalog::MAX_PARALLEL_DEGREE as usize) as u8;
+        // Resolve the parallel degree before the lock (cheap): an explicit
+        // `spec.parallel_degree` override (card 5), else one worker per CPU capped
+        // at 8. Always clamped into `1..=MAX_PARALLEL_DEGREE`.
+        let parallel_degree = match spec.parallel_degree {
+            Some(n) => (n as usize).clamp(1, crate::catalog::MAX_PARALLEL_DEGREE as usize) as u8,
+            None => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .clamp(1, 8)
+                .min(crate::catalog::MAX_PARALLEL_DEGREE as usize) as u8,
+        };
 
         // Setup under the migration write-barrier: validate, allocate + persist
         // the plan (with the parallel degree + the pre-existing id upper bound),
@@ -2385,7 +2393,9 @@ impl Database {
                         plan_id,
                         signal,
                     };
-                    let disp = crate::catalog::run_parallel_backfill(
+                    // Capture the disposition WITHOUT `?` — a cancel that landed
+                    // mid-backfill must roll back even if a worker errored first.
+                    let disp_result = crate::catalog::run_parallel_backfill(
                         &self.storage,
                         plan_id,
                         type_id,
@@ -2404,15 +2414,16 @@ impl Database {
                         plan.quarantine_cap,
                         &plan.converter_name,
                         Some(&self.migration_events),
-                    )?;
-                    // B8 (card 5): re-load AFTER the backfill returns. A
-                    // `cancel_migration` that landed while the workers were
-                    // stopping (or that raced the AllDone→cutover handoff) has
-                    // durably flipped the plan to RollingBack under
-                    // `migration_lock.write()`; routing through the terminal pass
-                    // (which re-takes that lock + re-reads the phase) means the
-                    // cancel is never lost — cutover never runs on a plan the
-                    // operator cancelled.
+                    );
+                    // B8 (card 5): re-load AFTER the backfill returns, BEFORE
+                    // propagating any error. A `cancel_migration` that landed while
+                    // the workers were stopping (or that raced the AllDone→cutover
+                    // handoff, or that beat a Stop-policy worker error that parked
+                    // the plan Failed) has durably flipped the plan to RollingBack
+                    // under `migration_lock.write()`. Routing through the terminal
+                    // pass means the cancel is never lost — the rollback completes
+                    // and supersedes a backfill error (the partial state is being
+                    // discarded anyway); cutover never runs on a cancelled plan.
                     let post = {
                         let txn = self.storage.begin_txn();
                         crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
@@ -2420,6 +2431,9 @@ impl Database {
                     if post.phase == crate::catalog::MigrationPhase::RollingBack {
                         return self.run_terminal_pass(plan_id, type_id);
                     }
+                    // No cancel → surface a genuine backfill error (already parked
+                    // Failed) now.
+                    let disp = disp_result?;
                     if matches!(disp, crate::catalog::BackfillDisposition::Paused) {
                         return Ok(()); // genuine pause — plan left resumable
                     }
@@ -3018,9 +3032,13 @@ impl Database {
             // per-`Database` converter registry is empty after restart.
             let is_cutting = plan.phase == crate::catalog::MigrationPhase::CuttingOver;
             let is_rolling_back = plan.phase == crate::catalog::MigrationPhase::RollingBack;
-            if plan.status.is_drivable()
-                && (converter.is_some() || is_cutting || is_rolling_back)
-            {
+            // A RollingBack plan MUST always complete its rollback — even if a
+            // worker error parked it `Failed` before the cancel's strip ran (Failed
+            // is not `is_drivable`, so it is gated separately here). Forward passes
+            // (Converting/CuttingOver) still require a drivable status.
+            let drive = is_rolling_back
+                || (plan.status.is_drivable() && (converter.is_some() || is_cutting));
+            if drive {
                 // A RollingBack plan validates against the SOURCE kind (the
                 // operator abandoned the migration); forward passes need TARGET.
                 if is_rolling_back {
@@ -6113,8 +6131,11 @@ fn drive_async_migration(
         }
     };
     let mut disp_paused = false;
+    let mut backfill_err: Option<EngineError> = None;
     if plan.phase == crate::catalog::MigrationPhase::Converting {
         let n = plan.parallel_degree.unwrap_or(1).max(1);
+        // Capture the result WITHOUT `?` — a cancel that landed mid-backfill must
+        // roll back even if a worker errored first (Stop policy / I/O).
         match crate::catalog::run_parallel_backfill(
             storage,
             plan_id,
@@ -6134,15 +6155,18 @@ fn drive_async_migration(
             plan.quarantine_cap,
             &plan.converter_name,
             Some(events),
-        )? {
-            crate::catalog::BackfillDisposition::AllDone => {}
-            crate::catalog::BackfillDisposition::Paused => disp_paused = true,
+        ) {
+            Ok(crate::catalog::BackfillDisposition::AllDone) => {}
+            Ok(crate::catalog::BackfillDisposition::Paused) => disp_paused = true,
+            Err(e) => backfill_err = Some(e),
         }
     }
-    // B8 (card 5): re-load AFTER the backfill so a `cancel_migration` that
-    // landed while the workers were stopping (or that raced the AllDone→cutover
-    // handoff) is observed. A RollingBack plan routes through the terminal pass
-    // to the rollback (strip shadows), NOT cutover.
+    // B8 (card 5): re-load AFTER the backfill, BEFORE propagating any error. A
+    // `cancel_migration` that landed while the workers were stopping (or that
+    // raced the AllDone→cutover handoff, or that beat a Stop-policy worker error
+    // that parked the plan Failed) has durably flipped the plan to RollingBack.
+    // The rollback completes and supersedes a backfill error (the partial state
+    // is being discarded anyway); cutover never runs on a cancelled plan.
     let post = {
         let txn = storage.begin_txn();
         match crate::catalog::load_migration_plan(storage, &txn, plan_id) {
@@ -6157,6 +6181,10 @@ fn drive_async_migration(
             db.run_terminal_pass(plan_id, type_id)?;
         }
         return Ok(());
+    }
+    // No cancel → surface a genuine backfill error (already parked Failed) now.
+    if let Some(e) = backfill_err {
+        return Err(e);
     }
     if disp_paused {
         return Ok(()); // genuine pause — resumable
@@ -9430,8 +9458,12 @@ mod tests {
         db.pause_migration(plan_id).unwrap();
         release();
         db.wait_for_migration(plan_id).unwrap();
-        // Durably mark RollingBack WITHOUT driving it (simulates a cancel whose
-        // rollback crashed before completing).
+        // Simulate a cancel whose rollback crashed before completing AND whose
+        // backfill had errored: park Failed, then durably mark RollingBack WITHOUT
+        // driving it. A RollingBack plan must complete its rollback on reopen EVEN
+        // when Failed (Failed is not normally drivable; the rollback is gated in
+        // separately).
+        crate::catalog::park_migration_failed_keep_cursors(&db.storage, plan_id).unwrap();
         crate::catalog::set_plan_phase_rolling_back(&db.storage, plan_id).unwrap();
         drop(db);
 
@@ -9442,7 +9474,7 @@ mod tests {
         assert_eq!(
             db2.list_migrations().unwrap()[0].status,
             crate::catalog::MigrationStatus::Cancelled,
-            "auto-resume must complete the rollback"
+            "auto-resume must complete the rollback (even from Failed)"
         );
         assert_eq!(
             db2.migrating_field_count
@@ -9463,6 +9495,97 @@ mod tests {
                 !fields.contains_key("score__shadow")
                     && !fields.contains_key("score__shadow_cv"),
                 "row {id} still carries a shadow after resumed rollback"
+            );
+            assert_eq!(fields.get("score"), Some(&Value::I64(i)));
+        }
+    }
+
+    /// Card 5 (5c, impl-review regression): a cancel that RACES a Stop-policy
+    /// backfill error still rolls back. The worker's converter fails (parking the
+    /// plan Failed + returning Err) AFTER cancel durably set RollingBack — the
+    /// driver must complete the rollback (→ Cancelled, shadows stripped, hook
+    /// disarmed) and NOT surface the backfill error or wedge Failed+RollingBack.
+    #[test]
+    fn card5_cancel_then_backfill_error_still_rolls_back() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::{Arc, Condvar, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        // A gated converter that, once released, FAILS (Stop policy → park Failed).
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (tx, started) = std::sync::mpsc::channel::<()>();
+        let tx = Mutex::new(Some(tx));
+        let rel = Arc::clone(&release);
+        db.register_converter("widen", 1, move |oid, _v| {
+            if let Some(t) = tx.lock().unwrap().take() {
+                let _ = t.send(());
+            }
+            let (m, cv) = &*rel;
+            let mut g = m.lock().unwrap();
+            while !*g {
+                g = cv.wait(g).unwrap();
+            }
+            drop(g);
+            Err(EngineError::Catalog(
+                crate::CatalogError::FieldTypeChangeConverterFailed {
+                    qualified: "User.score".into(),
+                    object_id: oid,
+                    reason: "boom".into(),
+                },
+            ))
+        });
+        let mut ids = Vec::new();
+        for i in 0..40i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        // Worker is blocked in the converter; cancel durably marks RollingBack,
+        // THEN release so the converter fails (parks Failed + returns Err).
+        started.recv().unwrap();
+        db.cancel_migration(plan_id).unwrap();
+        {
+            let (m, cv) = &*release;
+            *m.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        // Must NOT surface the backfill error — the rollback supersedes it.
+        db.wait_for_migration(plan_id).unwrap();
+
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Cancelled,
+            "cancel must win over the Stop-policy backfill error"
+        );
+        assert_eq!(
+            db.migrating_field_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        let tid = db.resolve_type_id("User").unwrap();
+        let snap = db.storage.read_snapshot();
+        for (id, i) in ids.iter().zip(0i64..) {
+            let blob = db
+                .storage
+                .get_at(snap, &rhypedb_storage::key::KeyBuilder::object(tid, *id))
+                .unwrap()
+                .unwrap();
+            let fields = crate::object::deserialize_fields(&blob);
+            assert!(
+                !fields.contains_key("score__shadow")
+                    && !fields.contains_key("score__shadow_cv")
             );
             assert_eq!(fields.get("score"), Some(&Value::I64(i)));
         }
