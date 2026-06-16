@@ -283,6 +283,12 @@ pub struct Database {
     /// `control` to PAUSE, and joins each `Some(handle)` (mirrors the
     /// `cover_refresh_*` teardown, with the same self-join-skip guard).
     migration_drivers: parking_lot::Mutex<HashMap<u64, MigrationDriver>>,
+    /// Card 5: per-plan live event stream (ChunkCompleted / PartitionDone /
+    /// CutoverStarted / CutoverDone / RollbackStarted / StatusChanged / Failed).
+    /// `Arc` so the detached driver thread can publish independent of this
+    /// handle's lifetime (mirrors `subscriptions`). Carried across a
+    /// `_consuming` rebuild so live subscribers keep their channels.
+    migration_events: Arc<MigrationEventHub>,
     /// Write barrier excluding user-facing mutations during the catalog
     /// migration verbs. Read-locked by `create` / `create_batch` /
     /// `update` / `delete` / `link` / `unlink`; write-locked by
@@ -482,6 +488,9 @@ struct IndexedField {
 /// subscription hub keeps live channel receivers).
 pub(crate) struct CarryState {
     pub subscriptions: Arc<SubscriptionHub>,
+    /// SAME hub the OLD handle holds, so a `_consuming` rebuild keeps live
+    /// migration-event subscribers' channels (card 5).
+    pub migration_events: Arc<MigrationEventHub>,
     /// SAME `Arc<AtomicU64>` the OLD handle holds. Any `fetch_add` on
     /// either handle's pointer increments the same counter.
     pub next_object_id: Arc<AtomicU64>,
@@ -682,6 +691,109 @@ pub struct MigrationFilter {
 pub struct MigrationHandle {
     pub plan_id: u64,
     pub created_at_ms: u64,
+}
+
+/// One live event on a migration's progress stream (card 5,
+/// [`Database::subscribe_migration_events`]). Events are best-effort and
+/// non-replayed: a subscriber attached after an event was published never sees
+/// it (poll [`Database::query_migration_progress`] for the current state).
+/// Every variant carries `plan_id` so the hub can filter per subscriber.
+#[derive(Debug, Clone)]
+pub enum MigrationEvent {
+    /// A partition worker committed one chunk of shadow backfill.
+    ChunkCompleted {
+        plan_id: u64,
+        partition_idx: u8,
+        cursor: u64,
+        objects_converted: u64,
+    },
+    /// A partition exhausted its `[lo, hi)` range (durable `done`).
+    PartitionDone { plan_id: u64, partition_idx: u8 },
+    /// The cutover pass began (all partitions backfilled).
+    CutoverStarted { plan_id: u64 },
+    /// The cutover pass completed; the catalog kind is flipped.
+    CutoverDone { plan_id: u64 },
+    /// A terminal cancel's rollback pass began (card 5 — stripping shadows).
+    RollbackStarted { plan_id: u64 },
+    /// The plan reached a new durable status (Completed / Cancelled /
+    /// DryRunCompleted / Failed).
+    StatusChanged {
+        plan_id: u64,
+        status: crate::catalog::MigrationStatus,
+    },
+    /// The driver surfaced a terminal error (the plan parked `Failed`).
+    Failed { plan_id: u64, message: String },
+}
+
+impl MigrationEvent {
+    pub fn plan_id(&self) -> u64 {
+        match self {
+            MigrationEvent::ChunkCompleted { plan_id, .. }
+            | MigrationEvent::PartitionDone { plan_id, .. }
+            | MigrationEvent::CutoverStarted { plan_id }
+            | MigrationEvent::CutoverDone { plan_id }
+            | MigrationEvent::RollbackStarted { plan_id }
+            | MigrationEvent::StatusChanged { plan_id, .. }
+            | MigrationEvent::Failed { plan_id, .. } => *plan_id,
+        }
+    }
+}
+
+struct MigrationEventSub {
+    id: u64,
+    plan_id: u64,
+    sender: std::sync::mpsc::Sender<MigrationEvent>,
+}
+
+/// Per-plan migration event fan-out (card 5). Mirrors `SubscriptionHub`
+/// (`rhypedb-subscribe`): `std::sync::mpsc` channels (runtime-agnostic — the
+/// engine has no tokio dependency; the server bridges to async for SSE).
+/// `publish` is non-blocking (unbounded channel) and never holds a storage txn
+/// or `migration_lock` across the send, so a slow/absent consumer cannot
+/// backpressure a migration worker. Dead subscribers are reaped lazily on the
+/// first failed send (the receiver was dropped).
+pub(crate) struct MigrationEventHub {
+    subs: parking_lot::RwLock<Vec<MigrationEventSub>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+impl MigrationEventHub {
+    pub(crate) fn new() -> Self {
+        Self {
+            subs: parking_lot::RwLock::new(Vec::new()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    pub(crate) fn subscribe(
+        &self,
+        plan_id: u64,
+    ) -> (u64, std::sync::mpsc::Receiver<MigrationEvent>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.subs.write().push(MigrationEventSub {
+            id,
+            plan_id,
+            sender,
+        });
+        (id, receiver)
+    }
+
+    pub(crate) fn publish(&self, event: MigrationEvent) {
+        let plan = event.plan_id();
+        let mut dead = Vec::new();
+        {
+            let subs = self.subs.read();
+            for s in subs.iter() {
+                if s.plan_id == plan && s.sender.send(event.clone()).is_err() {
+                    dead.push(s.id);
+                }
+            }
+        }
+        if !dead.is_empty() {
+            self.subs.write().retain(|s| !dead.contains(&s.id));
+        }
+    }
 }
 
 impl Database {
@@ -1055,6 +1167,10 @@ impl Database {
             subscriptions: match &carry {
                 Some(c) => Arc::clone(&c.subscriptions),
                 None => Arc::new(SubscriptionHub::new()),
+            },
+            migration_events: match &carry {
+                Some(c) => Arc::clone(&c.migration_events),
+                None => Arc::new(MigrationEventHub::new()),
             },
             incoming_relations,
             cascade_meta_by_id,
@@ -1664,6 +1780,7 @@ impl Database {
         // operation.
         let carry = CarryState {
             subscriptions: Arc::clone(&self.subscriptions),
+            migration_events: Arc::clone(&self.migration_events),
             next_object_id: Arc::clone(&self.next_object_id),
             version_counters: Arc::clone(&self.version_counters),
             version_counter_count: Arc::clone(&self.version_counter_count),
@@ -2021,6 +2138,7 @@ impl Database {
         use std::sync::atomic::AtomicU8;
         let weak = self.self_weak.lock().clone();
         let storage = Arc::clone(&self.storage);
+        let events = Arc::clone(&self.migration_events);
         let mut reg = self.migration_drivers.lock();
         Self::gate_locked(&mut reg, plan_id)?;
         let control = Arc::new(AtomicU8::new(crate::catalog::migration_control::RUN));
@@ -2032,7 +2150,7 @@ impl Database {
                 let signal = Arc::clone(&signal);
                 move || {
                     migration_driver_main(
-                        weak, storage, converter, control, signal, plan_id, type_id,
+                        weak, storage, converter, control, signal, plan_id, type_id, events,
                     )
                 }
             })
@@ -2207,6 +2325,7 @@ impl Database {
                         plan.dry_run,
                         plan.quarantine_cap,
                         &plan.converter_name,
+                        Some(&self.migration_events),
                     )?;
                     if matches!(disp, crate::catalog::BackfillDisposition::Paused) {
                         return Ok(()); // paused/cancelled — plan left resumable
@@ -2288,6 +2407,8 @@ impl Database {
             self.storage.put(&mut txn, &k, v)?;
             self.storage.commit(&mut txn)?;
         }
+        self.migration_events
+            .publish(MigrationEvent::CutoverStarted { plan_id });
 
         let chunk_size = if plan.chunk_size == 0 {
             crate::catalog::DEFAULT_MIGRATION_CHUNK_SIZE
@@ -2487,6 +2608,13 @@ impl Database {
         // double-write hook. Already holding migration_lock.write().
         crate::catalog::finalize_migration_cutover(&self.storage, plan_id)?;
         self.disarm_field_hook(type_id, plan_id);
+        self.migration_events
+            .publish(MigrationEvent::CutoverDone { plan_id });
+        self.migration_events
+            .publish(MigrationEvent::StatusChanged {
+                plan_id,
+                status: crate::catalog::MigrationStatus::Completed,
+            });
         Ok(())
     }
 
@@ -2789,6 +2917,19 @@ impl Database {
             eta_unix_ms,
             partitions,
         })
+    }
+
+    /// Subscribe to a migration's live event stream (card 5). Returns an
+    /// `mpsc::Receiver` that yields [`MigrationEvent`]s for `plan_id` until the
+    /// receiver is dropped (which lazily deregisters it on the next publish).
+    /// Best-effort + non-replayed: subscribe BEFORE starting the migration to
+    /// observe the full sequence; a late subscriber misses earlier events and
+    /// should poll [`query_migration_progress`](Self::query_migration_progress).
+    pub fn subscribe_migration_events(
+        &self,
+        plan_id: u64,
+    ) -> std::sync::mpsc::Receiver<MigrationEvent> {
+        self.migration_events.subscribe(plan_id).1
     }
 
     /// Async operator entry point (card 5): start a field-type migration and
@@ -5576,6 +5717,7 @@ impl Drop for InlineDriveGuard<'_> {
 /// `catch_unwind` so a worker/cutover panic can't skip the `mark_done`
 /// (parking_lot locks don't poison, so an unwound `run_cutover` releases
 /// `migration_lock` cleanly).
+#[allow(clippy::too_many_arguments)]
 fn migration_driver_main(
     weak: std::sync::Weak<Database>,
     storage: Arc<LsmTree>,
@@ -5584,9 +5726,10 @@ fn migration_driver_main(
     signal: Arc<MigrationSignal>,
     plan_id: u64,
     type_id: u64,
+    events: Arc<MigrationEventHub>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drive_async_migration(&weak, &storage, &converter, &control, plan_id, type_id)
+        drive_async_migration(&weak, &storage, &converter, &control, plan_id, type_id, &events)
     }));
     // `Ok(Err(e))` = a parked Failed terminal (surfaced to the first waiter);
     // `Ok(Ok(()))` = completed or paused (both clean); `Err(_)` = a caught panic
@@ -5595,6 +5738,14 @@ fn migration_driver_main(
         Ok(Err(e)) => Some(e),
         _ => None,
     };
+    // Card 5: surface a terminal driver error on the event stream (the plan was
+    // already parked Failed by run_parallel_backfill / run_cutover).
+    if let Some(e) = &error {
+        events.publish(MigrationEvent::Failed {
+            plan_id,
+            message: e.to_string(),
+        });
+    }
     signal.mark_done(error);
 }
 
@@ -5612,6 +5763,7 @@ fn drive_async_migration(
     control: &std::sync::atomic::AtomicU8,
     plan_id: u64,
     type_id: u64,
+    events: &MigrationEventHub,
 ) -> EngineResult<()> {
     let plan = {
         let txn = storage.begin_txn();
@@ -5640,6 +5792,7 @@ fn drive_async_migration(
             plan.dry_run,
             plan.quarantine_cap,
             &plan.converter_name,
+            Some(events),
         )? {
             crate::catalog::BackfillDisposition::AllDone => {} // fall through to cutover / dry-run finish
             crate::catalog::BackfillDisposition::Paused => return Ok(()), // resumable
@@ -7857,6 +8010,73 @@ mod tests {
         );
     }
 
+    /// Card 5 (5b) AC `events_stream_emits_chunkcompleted_partitiondone_and_cutoverdone`:
+    /// a subscriber attached before start sees >=1 ChunkCompleted, >=1
+    /// PartitionDone, and exactly 1 CutoverDone (+ the Completed StatusChanged).
+    #[test]
+    fn card5_events_stream_emits_expected_sequence() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        for s in 0i64..10 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(s));
+            db.create("User", f).unwrap();
+        }
+        // Subscribe BEFORE starting so the full sequence is observed.
+        let plan_id = 1u64;
+        let rx = db.subscribe_migration_events(plan_id);
+        let started = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 3,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(started, plan_id);
+        db.wait_for_migration(plan_id).unwrap();
+
+        // Drain (sender side is closed once the driver thread exits + the hub is
+        // dropped at db drop; here we just collect what arrived).
+        let mut chunk = 0usize;
+        let mut part_done = 0usize;
+        let mut cutover_started = 0usize;
+        let mut cutover_done = 0usize;
+        let mut completed = 0usize;
+        while let Ok(ev) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            match ev {
+                MigrationEvent::ChunkCompleted { plan_id: p, .. } => {
+                    assert_eq!(p, plan_id);
+                    chunk += 1;
+                }
+                MigrationEvent::PartitionDone { .. } => part_done += 1,
+                MigrationEvent::CutoverStarted { .. } => cutover_started += 1,
+                MigrationEvent::CutoverDone { .. } => cutover_done += 1,
+                MigrationEvent::StatusChanged { status, .. } => {
+                    if status == crate::catalog::MigrationStatus::Completed {
+                        completed += 1;
+                        break; // terminal
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(chunk >= 1, "expected >=1 ChunkCompleted, got {chunk}");
+        assert!(part_done >= 1, "expected >=1 PartitionDone, got {part_done}");
+        assert_eq!(cutover_started, 1, "exactly one CutoverStarted");
+        assert_eq!(cutover_done, 1, "exactly one CutoverDone");
+        assert_eq!(completed, 1, "exactly one Completed StatusChanged");
+    }
+
     /// Acceptance: both passes commit at chunk boundaries — `ceil(rows/chunk)`
     /// commits each for the shadow backfill AND the cutover, NOT one big commit.
     #[test]
@@ -8344,7 +8564,7 @@ mod tests {
                 let outcome = crate::catalog::run_migration_partition(
                     &db.storage, created.plan_id, created.type_id, idx, lo, hi,
                     "User", "score", i64_kind, target, 1, 16, &converter, &control,
-                    crate::catalog::ErrorPolicy::Stop, false, &errs, 0, "widen",
+                    crate::catalog::ErrorPolicy::Stop, false, &errs, 0, "widen", None,
                 )
                 .unwrap();
                 assert_eq!(outcome, crate::catalog::PartitionDriveOutcome::Done);
@@ -8469,6 +8689,7 @@ mod tests {
             false,
             0,
             "widen",
+            None,
         )
         .unwrap();
         assert_eq!(disp, crate::catalog::BackfillDisposition::AllDone);
@@ -8559,7 +8780,7 @@ mod tests {
         let backfill = || {
             crate::catalog::run_parallel_backfill(
                 &db.storage, plan_id, tid, degree, u, "User", "score", i64k, f64k, 1, 4, &converter,
-                &ctrl, crate::catalog::ErrorPolicy::Stop, false, 0, "widen",
+                &ctrl, crate::catalog::ErrorPolicy::Stop, false, 0, "widen", None,
             )
         };
         assert_eq!(

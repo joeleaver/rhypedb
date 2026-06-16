@@ -5070,9 +5070,17 @@ pub(crate) fn run_migration_partition(
     error_counter: &std::sync::atomic::AtomicU64,
     quarantine_cap: u64,
     attempted_converter_name: &str,
+    // Card 5: live event sink (per-chunk ChunkCompleted + a PartitionDone when
+    // this run exhausts the partition's range). `None` → no publishing.
+    events: Option<&crate::database::MigrationEventHub>,
 ) -> EngineResult<PartitionDriveOutcome> {
     use std::sync::atomic::Ordering;
     const WRITE_CONFLICT_RETRIES: u32 = 8;
+    let publish = |ev: crate::database::MigrationEvent| {
+        if let Some(hub) = events {
+            hub.publish(ev);
+        }
+    };
     enum ChunkResult {
         Exhausted,
         // (advanced cursor, errors committed in THIS chunk).
@@ -5126,6 +5134,10 @@ pub(crate) fn run_migration_partition(
                 storage.put(&mut txn, &cursor_key, encode_partition_cursor(&pc))?;
                 storage.commit(&mut txn)?;
             }
+            publish(crate::database::MigrationEvent::PartitionDone {
+                plan_id,
+                partition_idx,
+            });
             return Ok(PartitionDriveOutcome::Done);
         }
         let start = KeyBuilder::object(type_id, start_id);
@@ -5241,10 +5253,21 @@ pub(crate) fn run_migration_partition(
                 let mut txn = storage.begin_txn();
                 storage.put(&mut txn, &cursor_key, encode_partition_cursor(&pc))?;
                 storage.commit(&mut txn)?;
+                publish(crate::database::MigrationEvent::PartitionDone {
+                    plan_id,
+                    partition_idx,
+                });
                 return Ok(PartitionDriveOutcome::Done);
             }
             ChunkResult::Committed(pc_after, errs) => {
                 pc = pc_after;
+                // Card 5: a chunk is durable — emit progress (cursor + count).
+                publish(crate::database::MigrationEvent::ChunkCompleted {
+                    plan_id,
+                    partition_idx,
+                    cursor: pc.cursor,
+                    objects_converted: pc.objects_converted,
+                });
                 // Roll this chunk's (now durable) errors into the GLOBAL counter
                 // AFTER the commit, so a WriteConflict re-scan never double-adds.
                 if errs > 0 {
@@ -5258,6 +5281,10 @@ pub(crate) fn run_migration_partition(
                     return Ok(PartitionDriveOutcome::CapExceeded);
                 }
                 if pc.done {
+                    publish(crate::database::MigrationEvent::PartitionDone {
+                        plan_id,
+                        partition_idx,
+                    });
                     return Ok(PartitionDriveOutcome::Done);
                 }
             }
@@ -5403,6 +5430,10 @@ pub(crate) fn run_parallel_backfill(
     dry_run: bool,
     quarantine_cap: u64,
     converter_name: &str,
+    // Card 5: per-plan live event sink (ChunkCompleted / PartitionDone). `None`
+    // suppresses publishing (e.g. a unit test driving a worker directly). The
+    // `&MigrationEventHub` is `Sync`, so it is shared across the scoped workers.
+    events: Option<&crate::database::MigrationEventHub>,
 ) -> EngineResult<BackfillDisposition> {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::AtomicU64;
@@ -5444,6 +5475,7 @@ pub(crate) fn run_parallel_backfill(
                 &error_counter,
                 quarantine_cap,
                 converter_name,
+                events,
             )
         }))
         .map_err(|_| ())
