@@ -36,6 +36,7 @@ rhypedb-embed = { workspace = true }
 rhypedb-vector = { workspace = true }
 rhypedb-subscribe = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -44,3 +45,4 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+ureq = { workspace = true }

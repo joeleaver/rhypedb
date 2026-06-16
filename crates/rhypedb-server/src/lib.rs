@@ -21,6 +21,8 @@ use rhypedb_engine::vectorizer::Vectorizer;
 use rhypedb_query::executor::{ExecContext, QueryOutput};
 use rhypedb_schema::parser::parse_schema;
 
+mod admin;
+mod converters;
 mod protocol;
 mod query_cache;
 
@@ -54,10 +56,15 @@ struct Cli {
     no_sync: bool,
 }
 
-struct AppState {
-    db: Arc<Database>,
+pub(crate) struct AppState {
+    pub(crate) db: Arc<Database>,
     vectorizer: Option<Arc<Vectorizer>>,
     query_cache: QueryCache,
+    /// Card 5: the `RHYPEDB_ADMIN_TOKEN` env value, read ONCE at startup.
+    /// `None` → the `/admin/migrations*` routes return 403 (admin disabled);
+    /// `Some` → a request must present a matching `Authorization: Bearer <token>`
+    /// or get 401. A quick safety net; real RBAC is a separate epic.
+    pub(crate) admin_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -325,6 +332,13 @@ pub async fn run() {
         );
     }
 
+    // Card 5: register the built-in named converters so operators can start
+    // migrations by name over HTTP/CLI, then resume any in-flight migration left
+    // by a prior run (open() armed its hook + completed rollbacks/cutovers that
+    // need no converter; a Converting plan needs its converter, now registered).
+    converters::register_builtins(&db);
+    converters::resume_inflight(&db);
+
     let has_vectorize = schema
         .types
         .values()
@@ -362,10 +376,15 @@ pub async fn run() {
         None
     };
 
+    // Card 5: read the admin token ONCE. Unset → admin endpoints return 403.
+    let admin_token = std::env::var("RHYPEDB_ADMIN_TOKEN").ok().filter(|t| !t.is_empty());
+    let admin_enabled = admin_token.is_some();
+
     let state = Arc::new(AppState {
         db,
         vectorizer,
         query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
+        admin_token,
     });
 
     let app = Router::new()
@@ -373,6 +392,8 @@ pub async fn run() {
         .route("/status", get(handle_status))
         .route("/health", get(handle_health))
         .route("/admin/compact", post(handle_admin_compact))
+        // Card 5: the migration admin surface, gated by RHYPEDB_ADMIN_TOKEN.
+        .merge(admin::admin_router(state.clone()))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&cli.listen)
@@ -393,6 +414,15 @@ pub async fn run() {
     println!("rhypedb binary TCP listening on {}", cli.tcp_listen);
     println!("  POST /query     — execute queries");
     println!("  GET  /health    — health check");
+    if admin_enabled {
+        println!("  *    /admin/migrations* — migration admin (RHYPEDB_ADMIN_TOKEN set)");
+        println!(
+            "       built-in converters: {}",
+            converters::BUILTIN_CONVERTER_NAMES.join(", ")
+        );
+    } else {
+        println!("  *    /admin/migrations* — DISABLED (set RHYPEDB_ADMIN_TOKEN to enable; returns 403)");
+    }
 
     // Spawn the binary TCP accept loop.
     let tcp_state = state.clone();
@@ -620,6 +650,7 @@ mod tcp_tests {
             db,
             vectorizer: None,
             query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
+            admin_token: None,
         })
     }
 
