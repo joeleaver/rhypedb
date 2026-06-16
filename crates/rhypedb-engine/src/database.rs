@@ -8438,6 +8438,75 @@ mod tests {
         );
     }
 
+    /// Card 5 AC `progress_eta_within_25pct_of_actual_on_uniform_load`: with a
+    /// converter that takes a fixed time per row (uniform load), the rate-based
+    /// ETA sampled mid-flight predicts the actual completion within 25%.
+    /// Single-partition for deterministic linear pacing.
+    #[test]
+    fn card5_eta_within_25pct_on_uniform_load() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        // ~2ms per row → ~800ms over 400 rows; uniform load.
+        db.register_converter("widen", 1, |_oid, v| {
+            std::thread::sleep(Duration::from_millis(2));
+            match v {
+                Value::I64(i) => Ok(Value::F64(*i as f64)),
+                _ => unreachable!(),
+            }
+        });
+        const N: i64 = 400;
+        for i in 0..N {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            db.create("User", f).unwrap();
+        }
+        let t0 = Instant::now();
+        let handle = db
+            .start_field_type_migration_async(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 8,
+                parallel_degree: Some(1), // single worker → linear pacing
+                ..Default::default()
+            })
+            .unwrap();
+        // Sample once a stable fraction (20–70%) has converted.
+        let mut sample = None;
+        for _ in 0..5000 {
+            let p = db.query_migration_progress(handle.plan_id).unwrap();
+            if p.status == crate::catalog::MigrationStatus::Running
+                && (80..=280).contains(&p.objects_converted)
+                && p.eta_unix_ms.is_some()
+            {
+                sample = Some(p);
+                break;
+            }
+            if !p.status.quiesces() {
+                break; // finished too fast — fail below
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        db.wait_for_migration(handle.plan_id).unwrap();
+        let actual_ms = t0.elapsed().as_millis() as u64;
+        let p = sample.expect("should have caught an in-flight sample");
+        let predicted_total_ms = p.eta_unix_ms.unwrap().saturating_sub(p.created_at_ms);
+        let lo = actual_ms * 75 / 100;
+        let hi = actual_ms * 125 / 100;
+        assert!(
+            predicted_total_ms >= lo && predicted_total_ms <= hi,
+            "ETA predicted total {predicted_total_ms}ms not within 25% of actual {actual_ms}ms \
+             (sampled at {} / {} converted)",
+            p.objects_converted,
+            p.total_objects
+        );
+    }
+
     /// Card 5 (5b) AC `events_stream_emits_chunkcompleted_partitiondone_and_cutoverdone`:
     /// a subscriber attached before start sees >=1 ChunkCompleted, >=1
     /// PartitionDone, and exactly 1 CutoverDone (+ the Completed StatusChanged).
