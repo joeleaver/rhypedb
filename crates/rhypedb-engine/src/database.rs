@@ -2240,22 +2240,93 @@ impl Database {
         Ok(())
     }
 
-    /// Request a CANCEL of the in-flight driver for `plan_id` (card 3/5). For now
-    /// this behaves like `pause_migration` — the workers stop at a chunk boundary
-    /// and the plan is left RESUMABLE. The CANCEL control byte is plumbed
-    /// end-to-end, but TERMINAL cancellation (disarm the hook + roll back the
-    /// partial `<field>__shadow` siblings) is deferred to card 5: disarming while
-    /// rows still carry a shadow sibling would let a later `update()` bake the
-    /// shadow into a cover (the cover strip is gated on a live hook), and the
-    /// rollback needs its own coordinated pass. See the design-review decision.
+    /// TERMINAL cancel of a field-type migration (card 5). Rolls the plan back:
+    /// stops any running workers, strips every partial `<field>__shadow` sibling
+    /// back off the `o:` blobs (the source field is untouched in the Converting
+    /// phase, so this restores the pre-migration shape losslessly), settles the
+    /// plan `Cancelled`, and disarms the double-write hook.
+    ///
+    /// Refused once cutover has begun (`MigrationCannotCancelInCutover`) — the
+    /// point of no return, since some source values have already been promoted to
+    /// the converted value. Idempotent on an already-`Cancelled` plan; refused on
+    /// a settled `Completed`/`DryRunCompleted` plan (`MigrationCannotCancelSettled`).
+    ///
+    /// Async-initiated when a driver is active: the durable `RollingBack` marker +
+    /// the CANCEL control byte are set and the call returns; the winding-down
+    /// driver runs the rollback (await via `wait_for_migration` / poll status).
+    /// With no active driver (paused / crashed / `Failed` / never started) the
+    /// rollback runs INLINE before returning.
     pub fn cancel_migration(&self, plan_id: u64) -> EngineResult<()> {
-        if let Some(d) = self.migration_drivers.lock().get(&plan_id) {
-            d.control.store(
-                crate::catalog::migration_control::CANCEL,
-                Ordering::SeqCst,
-            );
+        // Decide + durably mark intent UNDER `migration_lock.write()` so this can
+        // never race `run_cutover_locked` (which flips a plan to CuttingOver under
+        // the SAME lock): the loser observes the winner's durable phase and never
+        // acts on a half-decided plan.
+        let inline = {
+            let _guard = self.migration_lock.write();
+            let plan = {
+                let txn = self.storage.begin_txn();
+                crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
+            };
+            match plan.status {
+                crate::catalog::MigrationStatus::Cancelled => return Ok(()), // idempotent
+                crate::catalog::MigrationStatus::Completed
+                | crate::catalog::MigrationStatus::DryRunCompleted => {
+                    return Err(EngineError::MigrationCannotCancelSettled { plan_id });
+                }
+                _ => {}
+            }
+            if plan.phase == crate::catalog::MigrationPhase::CuttingOver {
+                return Err(EngineError::MigrationCannotCancelInCutover { plan_id });
+            }
+            let type_id = *self.type_ids.get(&plan.type_name).ok_or_else(|| {
+                EngineError::TypeNotFound(plan.type_name.clone())
+            })?;
+            // Durably mark RollingBack BEFORE signalling CANCEL: a winding-down
+            // driver that observes the (later) CANCEL store then re-loads the plan
+            // is guaranteed to see this committed phase (commit happens-before the
+            // SeqCst store; the worker's CANCEL read happens-after it).
+            crate::catalog::set_plan_phase_rolling_back(&self.storage, plan_id)?;
+            match self.migration_drivers.lock().get(&plan_id) {
+                Some(d) => {
+                    d.control
+                        .store(crate::catalog::migration_control::CANCEL, Ordering::SeqCst);
+                    None // an active driver completes the rollback on winddown
+                }
+                None => Some(type_id), // no driver → we roll back inline below
+            }
+        };
+        if let Some(type_id) = inline {
+            // No active driver: drive the rollback inline (routes RollingBack →
+            // run_cancel_rollback). `drive_migration_to_completion` registers an
+            // inline driver (gated against a concurrent driver) + takes the write
+            // lock inside the terminal pass, so the lock released above is re-taken
+            // there — no self-deadlock.
+            self.drive_migration_to_completion(plan_id, type_id, None)?;
         }
         Ok(())
+    }
+
+    /// Explicitly run a plan's cutover (card 5 — the `/admin/migrations/:id/cutover`
+    /// surface). For an AllDone-but-parked plan (e.g. after clearing a quarantine
+    /// block); the normal flow cuts over automatically at the end of the backfill.
+    /// Refuses a cancelled / rolling-back plan with `MigrationCancelledCannotCutover`.
+    pub fn cutover_migration(&self, plan_id: u64) -> EngineResult<()> {
+        let _guard = self.migration_lock.write();
+        let plan = {
+            let txn = self.storage.begin_txn();
+            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
+        };
+        if plan.status == crate::catalog::MigrationStatus::Cancelled
+            || plan.phase == crate::catalog::MigrationPhase::RollingBack
+        {
+            return Err(EngineError::MigrationCancelledCannotCutover { plan_id });
+        }
+        let type_id = *self
+            .type_ids
+            .get(&plan.type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(plan.type_name.clone()))?;
+        self.guard_resume_schema(&plan)?;
+        self.run_cutover_locked(plan, type_id)
     }
 
     /// Drive a plan from its current phase to completion (shadow-field card 2).
@@ -2282,6 +2353,13 @@ impl Database {
             let txn = self.storage.begin_txn();
             crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
         };
+        // Card 5: a plan already flipped to RollingBack (an operator cancel, or a
+        // crashed/auto-resumed rollback) skips the backfill entirely — the
+        // terminal pass strips its shadows. No converter required (rollback never
+        // converts).
+        if plan.phase == crate::catalog::MigrationPhase::RollingBack {
+            return self.run_terminal_pass(plan_id, type_id);
+        }
         // The converter is needed ONLY to backfill shadows in the Converting
         // phase. A plan resumed in the CuttingOver phase (a crash mid-cutover)
         // is a pure rename pass — don't demand a converter the operator has no
@@ -2327,8 +2405,23 @@ impl Database {
                         &plan.converter_name,
                         Some(&self.migration_events),
                     )?;
+                    // B8 (card 5): re-load AFTER the backfill returns. A
+                    // `cancel_migration` that landed while the workers were
+                    // stopping (or that raced the AllDone→cutover handoff) has
+                    // durably flipped the plan to RollingBack under
+                    // `migration_lock.write()`; routing through the terminal pass
+                    // (which re-takes that lock + re-reads the phase) means the
+                    // cancel is never lost — cutover never runs on a plan the
+                    // operator cancelled.
+                    let post = {
+                        let txn = self.storage.begin_txn();
+                        crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
+                    };
+                    if post.phase == crate::catalog::MigrationPhase::RollingBack {
+                        return self.run_terminal_pass(plan_id, type_id);
+                    }
                     if matches!(disp, crate::catalog::BackfillDisposition::Paused) {
-                        return Ok(()); // paused/cancelled — plan left resumable
+                        return Ok(()); // genuine pause — plan left resumable
                     }
                     // AllDone. A dry-run cleans up + marks DryRunCompleted (no
                     // cutover); a real plan cuts over (still under `_guard`, so a
@@ -2336,7 +2429,7 @@ impl Database {
                     if plan.dry_run {
                         return crate::catalog::finalize_dry_run(&self.storage, plan_id);
                     }
-                    return self.run_cutover(plan_id, type_id);
+                    return self.run_terminal_pass(plan_id, type_id);
                 }
                 None => {
                     // Legacy card-1/2 single-worker plan (no partitions): the
@@ -2345,7 +2438,28 @@ impl Database {
                 }
             }
         }
-        self.run_cutover(plan_id, type_id)
+        self.run_terminal_pass(plan_id, type_id)
+    }
+
+    /// Run the terminal pass for a plan whose backfill is done (card 5). Takes
+    /// `migration_lock.write()` ONCE, loads the plan UNDER the lock, and routes
+    /// by phase: `RollingBack` → `run_cancel_rollback_locked` (strip shadows),
+    /// else → `run_cutover_locked` (promote shadows). Routing under the single
+    /// write-lock acquisition is what makes cutover-vs-cancel race-free:
+    /// `cancel_migration` flips the plan to `RollingBack` under the SAME lock, so
+    /// the loser of that lock observes the winner's durable decision and never
+    /// runs the wrong pass on a half-decided plan.
+    fn run_terminal_pass(&self, plan_id: u64, type_id: u64) -> EngineResult<()> {
+        let _guard = self.migration_lock.write();
+        let plan = {
+            let txn = self.storage.begin_txn();
+            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
+        };
+        if plan.phase == crate::catalog::MigrationPhase::RollingBack {
+            self.run_cancel_rollback_locked(plan, type_id)
+        } else {
+            self.run_cutover_locked(plan, type_id)
+        }
     }
 
     /// Cutover pass (shadow-field card 2): promote every `<field>__shadow`
@@ -2353,10 +2467,11 @@ impl Database {
     /// `rewrite_object_and_maintain_covers`, then flip the catalog kind and
     /// disarm the double-write hook.
     ///
-    /// Holds `migration_lock.write()` for the WHOLE pass. The write-lock spans
-    /// every commit, so once it is acquired no in-flight writer (card-2 inc 2d)
-    /// AND no background cover-refresh pass (which also takes
-    /// `migration_lock.read()`) can add a shadow or stamp a stale `cover_v`
+    /// `_locked`: the caller (`run_terminal_pass` / `cutover_migration`) HOLDS
+    /// `migration_lock.write()` for the WHOLE pass and has loaded `plan` under
+    /// it. The write-lock spans every commit, so once it is acquired no in-flight
+    /// writer (card-2 inc 2d) AND no background cover-refresh pass (which also
+    /// takes `migration_lock.read()`) can add a shadow or stamp a stale `cover_v`
     /// racing a rename, and a reader (which needs no lock) sees each row
     /// transition source→target atomically (each row's rename is one commit).
     /// Reads stay available throughout — only writes are drained.
@@ -2368,14 +2483,22 @@ impl Database {
     /// is skipped). The bounded `WriteConflict` retry is belt-and-suspenders for
     /// any same-keyspace racer; the generation over-bump on a retry is harmless
     /// (monotonic staleness counter).
-    fn run_cutover(&self, plan_id: u64, type_id: u64) -> EngineResult<()> {
+    fn run_cutover_locked(
+        &self,
+        mut plan: crate::catalog::MigrationPlan,
+        type_id: u64,
+    ) -> EngineResult<()> {
         const WRITE_CONFLICT_RETRIES: u32 = 8;
-        let _guard = self.migration_lock.write();
-
-        let mut plan = {
-            let txn = self.storage.begin_txn();
-            crate::catalog::load_migration_plan(&self.storage, &txn, plan_id)?
-        };
+        let plan_id = plan.plan_id;
+        // Defense in depth (card 5): never cut over a cancelled / rolling-back
+        // plan. `run_terminal_pass` routes a RollingBack plan to the rollback;
+        // `cutover_migration` refuses earlier — this guards any direct path so a
+        // promotion can never overwrite the source of a plan being abandoned.
+        if plan.status == crate::catalog::MigrationStatus::Cancelled
+            || plan.phase == crate::catalog::MigrationPhase::RollingBack
+        {
+            return Err(EngineError::MigrationCancelledCannotCutover { plan_id });
+        }
         let type_name = plan.type_name.clone();
         let field_name = plan.field_name.clone();
         let target_kind = plan.target_kind;
@@ -2618,6 +2741,179 @@ impl Database {
         Ok(())
     }
 
+    /// Terminal-cancel rollback pass (card 5) — the INVERSE of
+    /// `run_cutover_locked`. Strips every `<field>__shadow`/`<field>__shadow_cv`
+    /// sibling back off the `o:` blobs (the source field is never mutated in the
+    /// Converting phase, so this restores the pre-migration shape losslessly),
+    /// reconciling covers/indexes via the shared
+    /// `rewrite_object_and_maintain_covers` (the gen-bump invalidates any cover
+    /// embedding the row so it re-fetches the now-shadow-free blob after the hook
+    /// disarms). Then settles the plan `Cancelled` and disarms the hook.
+    ///
+    /// `_locked`: the caller (`run_terminal_pass`) HOLDS `migration_lock.write()`
+    /// for the whole pass + loaded `plan` under it. Same crash-safe per-chunk
+    /// order as cutover: `[cover-maint, stripped o: blob, plan(cutover_cursor)
+    /// LAST]` — a torn tail drops only the cursor advance and resume re-strips the
+    /// chunk idempotently (a row already shadow-free is skipped). Reuses
+    /// `cutover_cursor` as the rollback cursor.
+    ///
+    /// Why the hook stays armed until the end: while armed,
+    /// `migration_in_flight()` is true, so every cover builder strips shadows — no
+    /// cover can bake one in. Disarming runs LAST (after every `o:` is
+    /// shadow-free), so there is never a window where a shadow is on disk with the
+    /// hook gone (the leak the deferral warned about).
+    fn run_cancel_rollback_locked(
+        &self,
+        mut plan: crate::catalog::MigrationPlan,
+        type_id: u64,
+    ) -> EngineResult<()> {
+        const WRITE_CONFLICT_RETRIES: u32 = 8;
+        let plan_id = plan.plan_id;
+        let type_name = plan.type_name.clone();
+        let field_name = plan.field_name.clone();
+        let shadow_name = format!("{field_name}__shadow");
+        let shadow_cv_name = format!("{field_name}__shadow_cv");
+
+        // Establish the durable RollingBack marker if a direct call reached here
+        // without `cancel_migration` having set it (idempotent otherwise).
+        if plan.phase != crate::catalog::MigrationPhase::RollingBack {
+            crate::catalog::set_plan_phase_rolling_back(&self.storage, plan_id)?;
+            plan.phase = crate::catalog::MigrationPhase::RollingBack;
+            plan.cutover_cursor = 0;
+        }
+        self.migration_events
+            .publish(MigrationEvent::RollbackStarted { plan_id });
+
+        let chunk_size = if plan.chunk_size == 0 {
+            crate::catalog::DEFAULT_MIGRATION_CHUNK_SIZE
+        } else {
+            plan.chunk_size
+        } as usize;
+        let object_prefix = KeyBuilder::object_prefix(type_id);
+        let mut cursor = plan.cutover_cursor;
+
+        loop {
+            let start = if cursor == 0 {
+                object_prefix.clone()
+            } else {
+                match cursor.checked_add(1) {
+                    Some(next) => KeyBuilder::object(type_id, next),
+                    None => break,
+                }
+            };
+
+            let mut attempts = 0u32;
+            let committed: Option<(crate::catalog::MigrationPlan, bool)> = loop {
+                let mut txn = self.storage.begin_txn();
+                let snap = txn.snapshot();
+                let chunk = self.storage.scan_chunk_raw(snap, &object_prefix, &start, chunk_size)?;
+                let Some(high_water) = chunk.high_water.clone() else {
+                    self.storage.abort(&mut txn);
+                    break None;
+                };
+                let more = chunk.more;
+                let next_cursor =
+                    u64::from_be_bytes(high_water[high_water.len() - 8..].try_into().unwrap());
+
+                let mut bumped: Vec<u64> = Vec::new();
+                for (key, blob) in &chunk.live {
+                    let object_id =
+                        u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                    let mut fields = deserialize_fields(blob);
+                    // Skip a row with no shadow: either already rolled back, or it
+                    // never carried one (the converter never reached it, or a Null
+                    // source). The source field is left exactly as-is.
+                    if !fields.contains_key(&shadow_name)
+                        && !fields.contains_key(&shadow_cv_name)
+                    {
+                        continue;
+                    }
+                    // Snapshot indexed-field values BEFORE stripping (the migrating
+                    // field is non-indexed, so the indexed siblings are unchanged —
+                    // this drives the covering re-put / gen-bump).
+                    let old_indexed_snapshot: Vec<Option<Value>> =
+                        if let Some(idx_fields) = self.indexed_fields.get(&type_name) {
+                            idx_fields
+                                .iter()
+                                .map(|ifd| fields.get(&ifd.name).cloned())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                    // Strip both shadow siblings; KEEP the source field.
+                    fields.remove(&shadow_name);
+                    fields.remove(&shadow_cv_name);
+                    let serialized = serialize_fields(&fields);
+                    // Cover/index maintenance FIRST, stripped o: blob LAST (the
+                    // write that flips this row's "already stripped?" decision).
+                    self.rewrite_object_and_maintain_covers(
+                        &mut txn,
+                        &type_name,
+                        type_id,
+                        object_id,
+                        &fields,
+                        &serialized,
+                        &old_indexed_snapshot,
+                        true,
+                    )?;
+                    bumped.push(object_id);
+                    self.storage.put(&mut txn, key, serialized.clone())?;
+                }
+
+                let mut plan_after = plan.clone();
+                plan_after.cutover_cursor = next_cursor;
+                let (k, v) = crate::catalog::migration_plan_record(&plan_after);
+                self.storage.put(&mut txn, &k, v)?;
+                match self.storage.commit(&mut txn) {
+                    Ok(_) => break Some((plan_after, more)),
+                    Err(rhypedb_storage::Error::WriteConflict)
+                        if attempts < WRITE_CONFLICT_RETRIES =>
+                    {
+                        self.storage.abort(&mut txn);
+                        for oid in &bumped {
+                            self.rollback_version(type_id, *oid);
+                        }
+                        attempts += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        self.storage.abort(&mut txn);
+                        for oid in &bumped {
+                            self.rollback_version(type_id, *oid);
+                        }
+                        return Err(match e {
+                            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                            other => EngineError::Storage(other),
+                        });
+                    }
+                }
+            };
+
+            match committed {
+                None => break,
+                Some((plan_after, more)) => {
+                    plan = plan_after;
+                    cursor = plan.cutover_cursor;
+                    if !more {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Settle Cancelled (delete c:S:/c:Q:, NO kind flip), then disarm the hook.
+        // Already holding migration_lock.write(); the strip above completed first,
+        // so once Cancelled is durable no shadow remains on disk.
+        crate::catalog::finalize_migration_cancelled(&self.storage, plan_id)?;
+        self.disarm_field_hook(type_id, plan_id);
+        self.migration_events
+            .publish(MigrationEvent::StatusChanged {
+                plan_id,
+                status: crate::catalog::MigrationStatus::Cancelled,
+            });
+        Ok(())
+    }
+
     /// Refuse to DRIVE a plan unless the open schema declares the field at the
     /// plan's TARGET kind (shadow-field card 1, blocker F3). Driving flips the
     /// catalog to the target; if this handle still validates writes against
@@ -2625,15 +2921,28 @@ impl Database {
     /// migration would silently corrupt. The operator must reopen with the
     /// target schema first.
     fn guard_resume_schema(&self, plan: &crate::catalog::MigrationPlan) -> EngineResult<()> {
+        self.guard_resume_schema_for(plan, plan.target_kind)
+    }
+
+    /// Card 5: phase-aware variant of [`guard_resume_schema`]. A forward
+    /// migration (Converting/CuttingOver) demands the TARGET kind; a RollingBack
+    /// plan demands the SOURCE kind (the operator abandoned the migration, so
+    /// their SDL reverted the field to `src_kind`). Driving the wrong direction
+    /// against a mismatched schema would corrupt, so refuse.
+    fn guard_resume_schema_for(
+        &self,
+        plan: &crate::catalog::MigrationPlan,
+        want_kind: u8,
+    ) -> EngineResult<()> {
         let want = self
             .schema
             .get_type(&plan.type_name)
             .and_then(|td| td.fields.iter().find(|f| f.name == plan.field_name))
             .map(|fd| crate::catalog::schema_kind_byte_public(&fd.field_type));
-        if want != Some(plan.target_kind) {
+        if want != Some(want_kind) {
             return Err(EngineError::MigrationResumeSchemaMismatch {
                 plan_id: plan.plan_id,
-                expected: crate::catalog::kind_name_public(plan.target_kind),
+                expected: crate::catalog::kind_name_public(want_kind),
                 found: want
                     .map(crate::catalog::kind_name_public)
                     .unwrap_or("<absent>"),
@@ -2703,12 +3012,22 @@ impl Database {
             // Drive a drivable plan when we can: a Converting plan needs its
             // converter registered (carried across a _consuming rebuild, or a
             // re-open where the operator registered before open); a CuttingOver
-            // plan (crashed mid-cutover) is a pure rename pass and resumes with
-            // NO converter — so a reopen finishes the cutover even though the
+            // plan (crashed mid-cutover) is a pure rename pass; a RollingBack plan
+            // (card 5 — a crashed terminal cancel) is a pure strip pass — both
+            // resume with NO converter, so a reopen finishes them even though the
             // per-`Database` converter registry is empty after restart.
             let is_cutting = plan.phase == crate::catalog::MigrationPhase::CuttingOver;
-            if plan.status.is_drivable() && (converter.is_some() || is_cutting) {
-                self.guard_resume_schema(&plan)?;
+            let is_rolling_back = plan.phase == crate::catalog::MigrationPhase::RollingBack;
+            if plan.status.is_drivable()
+                && (converter.is_some() || is_cutting || is_rolling_back)
+            {
+                // A RollingBack plan validates against the SOURCE kind (the
+                // operator abandoned the migration); forward passes need TARGET.
+                if is_rolling_back {
+                    self.guard_resume_schema_for(&plan, plan.src_kind)?;
+                } else {
+                    self.guard_resume_schema(&plan)?;
+                }
                 self.drive_migration_to_completion(
                     plan.plan_id,
                     type_id,
@@ -2750,6 +3069,27 @@ impl Database {
         // one. (drive_migration_to_completion re-checks this for the Converting
         // branch, but failing here avoids arming for a plan we can't drive.)
         let converter = self.resolve_converter(&plan.converter_name, plan.converter_version);
+        // Card 5: a RollingBack plan (a crashed terminal cancel) resumes as a
+        // pure strip pass — no converter, validated against the SOURCE kind. Arm
+        // the hook (a None converter is fine: the strip runs under the write lock
+        // so no live write hits the rejecting hook), then drive → rollback.
+        if plan.phase == crate::catalog::MigrationPhase::RollingBack {
+            self.guard_resume_schema_for(&plan, plan.src_kind)?;
+            {
+                let _guard = self.migration_lock.write();
+                self.arm_field_hook(
+                    type_id,
+                    MigratingFieldHook {
+                        field_name: plan.field_name.clone(),
+                        converter: converter.clone(),
+                        target_kind: plan.target_kind,
+                        converter_version: plan.converter_version,
+                        plan_id,
+                    },
+                );
+            }
+            return self.drive_migration_to_completion(plan_id, type_id, converter.as_ref());
+        }
         if plan.phase == crate::catalog::MigrationPhase::Converting && converter.is_none() {
             return Err(EngineError::ConverterNotRegistered {
                 name: plan.converter_name.clone(),
@@ -5772,6 +6112,7 @@ fn drive_async_migration(
             Err(_) => return Ok(()), // plan vanished — nothing to drive
         }
     };
+    let mut disp_paused = false;
     if plan.phase == crate::catalog::MigrationPhase::Converting {
         let n = plan.parallel_degree.unwrap_or(1).max(1);
         match crate::catalog::run_parallel_backfill(
@@ -5794,19 +6135,41 @@ fn drive_async_migration(
             &plan.converter_name,
             Some(events),
         )? {
-            crate::catalog::BackfillDisposition::AllDone => {} // fall through to cutover / dry-run finish
-            crate::catalog::BackfillDisposition::Paused => return Ok(()), // resumable
+            crate::catalog::BackfillDisposition::AllDone => {}
+            crate::catalog::BackfillDisposition::Paused => disp_paused = true,
         }
-        // A dry-run preflight cleans up + marks DryRunCompleted (storage-only —
-        // no hook was armed, no cutover); it never reaches the cutover below.
-        if plan.dry_run {
-            return crate::catalog::finalize_dry_run(storage, plan_id);
+    }
+    // B8 (card 5): re-load AFTER the backfill so a `cancel_migration` that
+    // landed while the workers were stopping (or that raced the AllDone→cutover
+    // handoff) is observed. A RollingBack plan routes through the terminal pass
+    // to the rollback (strip shadows), NOT cutover.
+    let post = {
+        let txn = storage.begin_txn();
+        match crate::catalog::load_migration_plan(storage, &txn, plan_id) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
         }
+    };
+    if post.phase == crate::catalog::MigrationPhase::RollingBack {
+        // Needs the `Database` (cover/index maintenance). If it is dropping, the
+        // next open's auto-resume finishes the rollback.
+        if let Some(db) = weak.upgrade() {
+            db.run_terminal_pass(plan_id, type_id)?;
+        }
+        return Ok(());
+    }
+    if disp_paused {
+        return Ok(()); // genuine pause — resumable
+    }
+    // A dry-run preflight cleans up + marks DryRunCompleted (storage-only — no
+    // hook was armed, no cutover).
+    if plan.dry_run {
+        return crate::catalog::finalize_dry_run(storage, plan_id);
     }
     // Single-threaded cutover — skip if the DB is dropping (the next open's
     // auto-resume finishes it).
     if let Some(db) = weak.upgrade() {
-        db.run_cutover(plan_id, type_id)?;
+        db.run_terminal_pass(plan_id, type_id)?;
     }
     Ok(())
 }
@@ -8218,7 +8581,7 @@ mod tests {
         }
 
         // Cut over: promote every shadow to the source field + flip the kind.
-        db.run_cutover(created.plan_id, created.type_id).unwrap();
+        db.run_terminal_pass(created.plan_id, created.type_id).unwrap();
         assert_eq!(
             db.list_migrations().unwrap()[0].status,
             crate::catalog::MigrationStatus::Completed
@@ -8447,7 +8810,7 @@ mod tests {
         )
         .unwrap();
         // Cut over WITHOUT backfilling any shadows → first row refuses.
-        let err = db.run_cutover(created.plan_id, created.type_id).unwrap_err();
+        let err = db.run_terminal_pass(created.plan_id, created.type_id).unwrap_err();
         assert!(
             matches!(err, EngineError::MigrationCutoverShadowMissing { .. }),
             "got {err:?}"
@@ -8498,7 +8861,7 @@ mod tests {
             )
             .unwrap();
         db.storage.commit(&mut txn).unwrap();
-        let err = db.run_cutover(created.plan_id, created.type_id).unwrap_err();
+        let err = db.run_terminal_pass(created.plan_id, created.type_id).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -8805,7 +9168,7 @@ mod tests {
         }
 
         // Cutover refuses the missing shadow → park_migration_failed_rewind.
-        let err = db.run_cutover(plan_id, tid).unwrap_err();
+        let err = db.run_terminal_pass(plan_id, tid).unwrap_err();
         assert!(matches!(
             err,
             EngineError::MigrationCutoverShadowMissing { .. }
@@ -8827,7 +9190,7 @@ mod tests {
             backfill().unwrap(),
             crate::catalog::BackfillDisposition::AllDone
         );
-        db.run_cutover(plan_id, tid).unwrap();
+        db.run_terminal_pass(plan_id, tid).unwrap();
         assert_eq!(
             db.list_migrations().unwrap()[0].status,
             crate::catalog::MigrationStatus::Completed
@@ -8955,6 +9318,279 @@ mod tests {
                 "row {id} must be converted exactly once"
             );
         }
+    }
+
+    /// Card 5 (5c): a TERMINAL cancel rolls the migration back — strips every
+    /// partial `<field>__shadow` sibling, leaves the source value intact, settles
+    /// `Cancelled`, and disarms the hook (migrating_field_count → 0). Deterministic
+    /// via the gated converter: cancel is issued while a worker is provably
+    /// mid-backfill, so some shadows exist to strip.
+    #[test]
+    fn card5_cancel_rolls_back_strips_shadows_and_disarms() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        let (started, release) = register_gated_widen(&db);
+        let mut ids = Vec::new();
+        for i in 0..120i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        // Backfill is provably mid-flight (a worker blocked in the converter).
+        started.recv().unwrap();
+        // An active driver owns the plan → cancel marks RollingBack + CANCEL and
+        // returns; the driver completes the rollback on winddown.
+        db.cancel_migration(plan_id).unwrap();
+        release();
+        db.wait_for_migration(plan_id).unwrap();
+
+        // Settled Cancelled, the catalog kind NOT flipped (still i64).
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Cancelled
+        );
+        // Hook disarmed.
+        assert_eq!(
+            db.migrating_field_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "cancel must disarm the double-write hook"
+        );
+        // NO shadow remains on any object; the source value is intact (I64).
+        let tid = db.resolve_type_id("User").unwrap();
+        let snap = db.storage.read_snapshot();
+        for (id, i) in ids.iter().zip(0i64..) {
+            let blob = db
+                .storage
+                .get_at(snap, &rhypedb_storage::key::KeyBuilder::object(tid, *id))
+                .unwrap()
+                .unwrap();
+            let fields = crate::object::deserialize_fields(&blob);
+            assert!(
+                !fields.contains_key("score__shadow")
+                    && !fields.contains_key("score__shadow_cv"),
+                "row {id} still carries a shadow after rollback"
+            );
+            assert_eq!(fields.get("score"), Some(&Value::I64(i)), "source row {id} mutated");
+        }
+        // Reads return the source value (no kind flip, handle still valid).
+        assert_eq!(
+            db.get("User", ids[0]).unwrap().fields.get("score"),
+            Some(&Value::I64(0))
+        );
+        // A subsequent cancel is idempotent.
+        db.cancel_migration(plan_id).unwrap();
+    }
+
+    /// Card 5 (5c): a terminal cancel that CRASHES mid-rollback resumes on the
+    /// next open. The durable `RollingBack` phase survives; auto-resume re-drives
+    /// the strip from a fresh open with the SOURCE schema (no converter), settling
+    /// `Cancelled` and stripping every shadow. Deterministic: a paused plan with
+    /// partial shadows is durably flipped to RollingBack, the handle dropped, then
+    /// reopened.
+    #[test]
+    fn card5_cancel_rollback_resumes_after_reopen() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        let (started, release) = register_gated_widen(&db);
+        let mut ids = Vec::new();
+        for i in 0..120i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        // Pause mid-flight so SOME shadows are durably written, then quiesce.
+        started.recv().unwrap();
+        db.pause_migration(plan_id).unwrap();
+        release();
+        db.wait_for_migration(plan_id).unwrap();
+        // Durably mark RollingBack WITHOUT driving it (simulates a cancel whose
+        // rollback crashed before completing).
+        crate::catalog::set_plan_phase_rolling_back(&db.storage, plan_id).unwrap();
+        drop(db);
+
+        // Reopen with the SOURCE schema (the operator abandoned the migration).
+        // auto-resume must complete the rollback even with no converter registered.
+        let db2 = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        assert_eq!(
+            db2.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Cancelled,
+            "auto-resume must complete the rollback"
+        );
+        assert_eq!(
+            db2.migrating_field_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "rollback must disarm the hook"
+        );
+        let tid = db2.resolve_type_id("User").unwrap();
+        let snap = db2.storage.read_snapshot();
+        for (id, i) in ids.iter().zip(0i64..) {
+            let blob = db2
+                .storage
+                .get_at(snap, &rhypedb_storage::key::KeyBuilder::object(tid, *id))
+                .unwrap()
+                .unwrap();
+            let fields = crate::object::deserialize_fields(&blob);
+            assert!(
+                !fields.contains_key("score__shadow")
+                    && !fields.contains_key("score__shadow_cv"),
+                "row {id} still carries a shadow after resumed rollback"
+            );
+            assert_eq!(fields.get("score"), Some(&Value::I64(i)));
+        }
+    }
+
+    /// Card 5 (5c) AC `cancel_does_not_run_cutover`: an explicit cutover of a
+    /// cancelled plan is refused with `MigrationCancelledCannotCutover`.
+    #[test]
+    fn card5_cancel_does_not_run_cutover() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        let (started, release) = register_gated_widen(&db);
+        for i in 0..40i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            db.create("User", f).unwrap();
+        }
+        let plan_id = db
+            .create_field_type_migration(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        started.recv().unwrap();
+        db.cancel_migration(plan_id).unwrap();
+        release();
+        db.wait_for_migration(plan_id).unwrap();
+        assert_eq!(
+            db.list_migrations().unwrap()[0].status,
+            crate::catalog::MigrationStatus::Cancelled
+        );
+        assert!(matches!(
+            db.cutover_migration(plan_id),
+            Err(EngineError::MigrationCancelledCannotCutover { plan_id: p }) if p == plan_id
+        ));
+    }
+
+    /// Card 5 (5c) AC `start_pause_resume_cancel_progress_via_public_api`: drive
+    /// the full operator surface through the PUBLIC verbs. Plan A exercises
+    /// start_async → progress → pause → resume → complete; plan B exercises
+    /// cancel. Deterministic via the gated converter.
+    #[test]
+    fn card5_start_pause_resume_cancel_progress_via_public_api() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        let (started, release) = register_gated_widen(&db);
+        let mut ids = Vec::new();
+        for i in 0..150i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let handle = db
+            .start_field_type_migration_async(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        started.recv().unwrap();
+        // progress while Running.
+        let p = db.query_migration_progress(handle.plan_id).unwrap();
+        assert_eq!(p.status, crate::catalog::MigrationStatus::Running);
+        assert_eq!(p.total_objects, 150);
+        // pause → release → wait (resumable, partial).
+        db.pause_migration(handle.plan_id).unwrap();
+        release();
+        db.wait_for_migration(handle.plan_id).unwrap();
+        let st = db.list_migrations().unwrap()[0].status;
+        assert!(st.quiesces() && st != crate::catalog::MigrationStatus::Completed);
+        drop(db);
+
+        // resume to completion (reopen with the TARGET schema + a plain converter).
+        let db2 = Database::open(parse_schema(r#"type User { score: f64 }"#).unwrap(), dir.path())
+            .unwrap();
+        db2.register_converter("widen", 1, |_oid, v| match v {
+            Value::I64(i) => Ok(Value::F64(*i as f64)),
+            _ => unreachable!(),
+        });
+        db2.resume_field_type_migration(handle.plan_id).unwrap();
+        let done = db2.query_migration_progress(handle.plan_id).unwrap();
+        assert_eq!(done.status, crate::catalog::MigrationStatus::Completed);
+        assert!(done.eta_unix_ms.is_none(), "completed plan has no ETA");
+        drop(db2);
+
+        // Plan B: cancel via the public verb (fresh db, source schema).
+        let dir_b = tempfile::tempdir().unwrap();
+        let db_b =
+            Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir_b.path())
+                .unwrap();
+        let (started_b, release_b) = register_gated_widen(&db_b);
+        for i in 0..40i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(i));
+            db_b.create("User", f).unwrap();
+        }
+        let hb = db_b
+            .start_field_type_migration_async(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 4,
+                ..Default::default()
+            })
+            .unwrap();
+        started_b.recv().unwrap();
+        db_b.cancel_migration(hb.plan_id).unwrap();
+        release_b();
+        db_b.wait_for_migration(hb.plan_id).unwrap();
+        assert_eq!(
+            db_b.query_migration_progress(hb.plan_id).unwrap().status,
+            crate::catalog::MigrationStatus::Cancelled
+        );
     }
 
     /// The double-driver gate (card 3/5): at most one ACTIVE driver per plan id
@@ -9546,7 +10182,7 @@ mod tests {
         });
         crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &poison).unwrap();
         // Cutover still completes correctly.
-        db.run_cutover(created.plan_id, created.type_id).unwrap();
+        db.run_terminal_pass(created.plan_id, created.type_id).unwrap();
         drop(db);
         let db2 = Database::open(
             parse_schema(r#"type User { score: f64 }"#).unwrap(),
@@ -9605,7 +10241,7 @@ mod tests {
             .unwrap();
         db.storage.commit(&mut txn).unwrap();
 
-        let err = db.run_cutover(created.plan_id, created.type_id).unwrap_err();
+        let err = db.run_terminal_pass(created.plan_id, created.type_id).unwrap_err();
         assert!(matches!(err, EngineError::MigrationCutoverShadowMissing { .. }));
         // REWOUND to a clean Converting start (status Failed, cursors reset).
         let plans = crate::catalog::scan_migration_plans(&db.storage, db.storage.begin_txn().snapshot())
@@ -11313,7 +11949,7 @@ mod tests {
 
         // Backfill the remaining rows + cut over.
         crate::catalog::run_migration_chunks(&db.storage, created.plan_id, &converter).unwrap();
-        db.run_cutover(created.plan_id, created.type_id).unwrap();
+        db.run_terminal_pass(created.plan_id, created.type_id).unwrap();
         drop(db);
 
         let db2 = Database::open(

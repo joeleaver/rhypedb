@@ -263,6 +263,10 @@ const MP_ERROR_POLICY_QUARANTINE: u8 = 0x02;
 // MigrationPhase payload bytes for TLV_MP_PHASE.
 const MP_PHASE_CONVERTING: u8 = 0x00;
 const MP_PHASE_CUTTING_OVER: u8 = 0x01;
+// Card 5: a terminal cancel is rolling back (stripping `<field>__shadow`
+// siblings). Durable so a crash mid-rollback resumes the strip, not the
+// forward migration.
+const MP_PHASE_ROLLING_BACK: u8 = 0x02;
 
 /// Default per-migration quarantine cap (card 4). Exceeding it auto-STOPS the
 /// migration (parks `Failed`) — a tripwire against a runaway error field (e.g. a
@@ -1021,6 +1025,11 @@ pub enum MigrationPhase {
     Converting,
     /// Renaming `<field>__shadow` → `<field>` per object (cutover in progress).
     CuttingOver,
+    /// Card 5: a terminal cancel is in progress — stripping every
+    /// `<field>__shadow` sibling back off the `o:` blobs (the source field is
+    /// untouched, so the migration rolls back losslessly). The hook stays armed
+    /// until the strip completes, then the plan settles `Cancelled`.
+    RollingBack,
 }
 
 impl MigrationPhase {
@@ -1028,12 +1037,14 @@ impl MigrationPhase {
         match self {
             MigrationPhase::Converting => MP_PHASE_CONVERTING,
             MigrationPhase::CuttingOver => MP_PHASE_CUTTING_OVER,
+            MigrationPhase::RollingBack => MP_PHASE_ROLLING_BACK,
         }
     }
     fn from_byte(b: u8) -> Option<Self> {
         Some(match b {
             MP_PHASE_CONVERTING => MigrationPhase::Converting,
             MP_PHASE_CUTTING_OVER => MigrationPhase::CuttingOver,
+            MP_PHASE_ROLLING_BACK => MigrationPhase::RollingBack,
             _ => return None,
         })
     }
@@ -4721,6 +4732,81 @@ pub(crate) fn park_migration_failed_keep_cursors(
         }
     };
     plan.status = MigrationStatus::Failed;
+    let (key, value) = migration_plan_record(&plan);
+    storage.put(&mut txn, &key, value)?;
+    storage.commit(&mut txn)?;
+    Ok(())
+}
+
+/// Card 5: durably mark a plan `RollingBack` (a terminal cancel) in its own txn,
+/// resetting `cutover_cursor=0` so the rollback strip starts from the top. The
+/// status is LEFT as-is (Running/Pending/etc.) — it stays `quiesces()`+drivable
+/// so a crash mid-rollback re-arms the hook and resumes the strip via
+/// auto-resume. Idempotent (already RollingBack → no-op). The caller holds
+/// `migration_lock.write()`, and partition workers never write `c:P:`, so this
+/// can't race a concurrent backfill commit. MUST run BEFORE the in-memory CANCEL
+/// control store so a winding-down driver's re-load observes it.
+pub(crate) fn set_plan_phase_rolling_back(storage: &LsmTree, plan_id: u64) -> EngineResult<()> {
+    let mut txn = storage.begin_txn();
+    let mut plan = match require_migration_plan(storage, &txn, plan_id) {
+        Ok(p) => p,
+        Err(e) => {
+            storage.abort(&mut txn);
+            return Err(e);
+        }
+    };
+    if plan.phase == MigrationPhase::RollingBack {
+        storage.abort(&mut txn);
+        return Ok(());
+    }
+    plan.phase = MigrationPhase::RollingBack;
+    plan.cutover_cursor = 0; // reused as the rollback cursor — start from the top
+    let (key, value) = migration_plan_record(&plan);
+    storage.put(&mut txn, &key, value)?;
+    storage.commit(&mut txn)?;
+    Ok(())
+}
+
+/// Card 5: settle a rolled-back plan `Cancelled`. Deletes the plan's per-partition
+/// cursors (`c:S:`) and quarantine sidecars (`c:Q:`) FIRST (they are exempt from
+/// `recover_partial_into_txn`, so leaving them orphans them), then writes
+/// `status=Cancelled` (plan record LAST), all in ONE txn. Does NOT flip the
+/// catalog kind (the field stays at `src_kind`) and does NOT bump the format
+/// floor. Idempotent.
+///
+/// Crash-safety: the caller (`run_cancel_rollback_locked`) has ALREADY stripped
+/// every `<field>__shadow` from the `o:` blobs BEFORE this runs. Once this commit
+/// lands, `status=Cancelled` does NOT `quiesces()`, so a reopen re-arms no hook —
+/// but no shadow remains on disk, so there is no window where a shadow is present
+/// while the hook is gone (the leak the deferral warned about). Disarm itself is
+/// in-memory (the `migrating_fields` ArcSwap) and is done by the caller under the
+/// still-held write lock, mirroring `finalize_migration_cutover`.
+pub(crate) fn finalize_migration_cancelled(storage: &LsmTree, plan_id: u64) -> EngineResult<()> {
+    let mut txn = storage.begin_txn();
+    let snap = txn.snapshot();
+    let mut plan = match require_migration_plan(storage, &txn, plan_id) {
+        Ok(p) => p,
+        Err(e) => {
+            storage.abort(&mut txn);
+            return Err(e);
+        }
+    };
+    // Delete c:S: + c:Q: for this plan FIRST (dead state — the plan is settled).
+    let mut dead: Vec<Bytes> = storage
+        .scan_prefix_at(snap, &KeyBuilder::catalog_partition_cursor_plan_prefix(plan_id))?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    dead.extend(
+        storage
+            .scan_prefix_at(snap, &KeyBuilder::catalog_quarantine_plan_prefix(plan_id))?
+            .into_iter()
+            .map(|(k, _)| k),
+    );
+    if !dead.is_empty() {
+        storage.delete_batch(&mut txn, &dead)?;
+    }
+    plan.status = MigrationStatus::Cancelled;
     let (key, value) = migration_plan_record(&plan);
     storage.put(&mut txn, &key, value)?;
     storage.commit(&mut txn)?;

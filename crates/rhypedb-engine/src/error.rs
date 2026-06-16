@@ -188,6 +188,24 @@ pub enum EngineError {
     /// triage the quarantine.
     #[error("migration plan {plan_id} exceeded its quarantine cap ({cap}); parked Failed")]
     MigrationQuarantineCapExceeded { plan_id: u64, cap: u64 },
+
+    /// Card 5: cutover refused because the plan was cancelled (or is rolling
+    /// back). A terminal cancel strips the partial `<field>__shadow` siblings and
+    /// settles the plan `Cancelled` — there is nothing to promote.
+    #[error("cutover of plan {plan_id} refused: it is cancelled or rolling back")]
+    MigrationCancelledCannotCutover { plan_id: u64 },
+
+    /// Card 5: cancel refused because the plan is already in its cutover pass —
+    /// the point of no return. Some rows have had their source value promoted to
+    /// the converted value (the original is gone), so a lossless rollback is
+    /// impossible. Let the cutover finish.
+    #[error("cancel of plan {plan_id} refused: cutover already in progress (point of no return)")]
+    MigrationCannotCancelInCutover { plan_id: u64 },
+
+    /// Card 5: cancel refused because the plan is already settled
+    /// (`Completed` / `DryRunCompleted`). Nothing to cancel.
+    #[error("cancel of plan {plan_id} refused: already settled (completed or a finished dry-run)")]
+    MigrationCannotCancelSettled { plan_id: u64 },
 }
 
 /// Failures specific to the persisted schema catalog (see
