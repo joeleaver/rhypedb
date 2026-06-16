@@ -1506,7 +1506,7 @@ impl Database {
             old: old.into(),
             new: new.into(),
         }];
-        crate::catalog::apply_migration(&self.storage, &self.schema, &verbs)
+        crate::catalog::apply_migration_with_cover(&self.storage, &self.schema, &verbs, Some(self))
     }
 
     /// Rename a live field from `type_name.old` to `type_name.new`. The
@@ -1526,9 +1526,13 @@ impl Database {
     ///   with the OLD field name (the `cover_v` stamp matches because
     ///   rename doesn't bump it, so the existing staleness fall-through
     ///   never fires).
-    /// * Secondary index entries (`i:<type>:<field_id>:…`) and unique
-    ///   index entries (`u:<type>:<field_id>:…`) — both keyed by
-    ///   `field_id`, untouched by the rename.
+    /// * Unique index entries (`u:<type>:<field_id>:…`) — keyed by
+    ///   `field_id` with the object_id as value, untouched by the rename.
+    /// * Secondary index entries (`i:<type>:<field_id>:…`) — the KEYS are
+    ///   keyed by `field_id` (untouched), but each entry's covering value is
+    ///   a full object FieldMap embedding field names, so it is rewritten with
+    ///   the new name in the same atomic batch (any sibling `@indexed` field's
+    ///   cover too, since it also embeds the renamed field).
     /// * SST zone-map pruning — v5 zone columns are also keyed by
     ///   `field_id`, so existing block bounds keep pruning correctly
     ///   under the new name.
@@ -1561,7 +1565,7 @@ impl Database {
             old: old.into(),
             new: new.into(),
         }];
-        crate::catalog::apply_migration(&self.storage, &self.schema, &verbs)
+        crate::catalog::apply_migration_with_cover(&self.storage, &self.schema, &verbs, Some(self))
     }
 
     /// Apply pending migrations from the supplied list, idempotent
@@ -6989,6 +6993,44 @@ impl crate::catalog::FieldCoverMaintainer for Database {
         }
         out
     }
+
+    fn rename_index_cover_puts(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        fields: &FieldMap,
+        serialized: &Bytes,
+        old_name: &str,
+        new_name: &str,
+    ) -> Vec<(Bytes, Bytes)> {
+        let mut out = Vec::new();
+        let Some(idx_fields) = self.indexed_fields.get(type_name) else {
+            return out;
+        };
+        let Some(&type_id) = self.type_ids.get(type_name) else {
+            return out;
+        };
+        for ifd in idx_fields {
+            // `indexed_fields` still carries the pre-rename name (the live
+            // handle hasn't reopened). The renamed field's value now lives
+            // under `new_name` in the rewritten FieldMap; every other indexed
+            // field keeps its name. field_id/kind are stable, so the rebuilt
+            // i: key matches the existing entry and the put overwrites it.
+            let lookup = if ifd.name == old_name {
+                new_name
+            } else {
+                ifd.name.as_str()
+            };
+            if let Some(value) = fields.get(lookup)
+                && !matches!(value, Value::Null)
+                && let Some(key) =
+                    build_field_index_key(type_id, ifd.field_id, ifd.kind, value, object_id)
+            {
+                out.push((key, serialized.clone()));
+            }
+        }
+        out
+    }
 }
 
 /// Build the secondary-index key for one `(type_id, field_id, value, object_id)`
@@ -7534,7 +7576,12 @@ mod tests {
     /// errors. Smoke-test that the indexed-field refusal surfaces
     /// without a catalog state mutation.
     #[test]
-    fn rename_field_indexed_field_refused_at_db_layer() {
+    fn rename_field_indexed_filter_scan_correct_post_rename() {
+        // Phase 3 @indexed lift: after renaming an @indexed field, a COVERED
+        // filter_scan on the new name returns objects whose FieldMap carries
+        // the new name. The i: covering payloads (full object FieldMaps) were
+        // refreshed in the rename batch; without that, the cover fast-path
+        // would hand back the OLD field name.
         let dir = tempfile::tempdir().unwrap();
         let schema = parse_schema(
             r#"
@@ -7546,14 +7593,387 @@ mod tests {
         )
         .unwrap();
         let db = Database::open(schema, dir.path()).unwrap();
-        let err = db.rename_field("Movie", "year", "released_in").unwrap_err();
+        for (t, y) in [("A", 2000u32), ("B", 2010), ("C", 2000)] {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(t.into()));
+            f.insert("year".into(), Value::U32(y));
+            db.create("Movie", f).unwrap();
+        }
+        db.storage.flush().unwrap();
+        let report = db.rename_field("Movie", "year", "released_in").unwrap();
+        assert_eq!(report.renamed_fields[0].objects_rewritten, 3);
+        drop(db);
+
+        let schema_after = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                released_in: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        let results = db2
+            .filter_scan(
+                "Movie",
+                "released_in",
+                rhypedb_storage::zone::CompareOp::Eq,
+                2000,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 2, "two movies match released_in == 2000");
+        for obj in &results {
+            assert_eq!(
+                obj.fields.get("released_in"),
+                Some(&Value::U32(2000)),
+                "covered result must expose the value under the NEW name; got {:?}",
+                obj.fields
+            );
+            assert!(
+                !obj.fields.contains_key("year"),
+                "covered result must NOT retain the old name; got {:?}",
+                obj.fields
+            );
+        }
+    }
+
+    #[test]
+    fn chained_rename_with_objects_via_separate_migrations() {
+        // The production path: chaining renames as SEPARATE migrations (each its
+        // own commit + reopen) correctly carries objects to the terminal name —
+        // no half-renamed objects. (A single multi-verb plan is refused.)
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                year: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("title".into(), Value::String("Aliens".into()));
+        f.insert("year".into(), Value::U32(1986));
+        let m = db.create("Movie", f).unwrap();
+        db.rename_field("Movie", "year", "released_in").unwrap();
+        drop(db);
+
+        let mid = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                released_in: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(mid, dir.path()).unwrap();
+        db.rename_field("Movie", "released_in", "year_released").unwrap();
+        drop(db);
+
+        let after = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                year_released: u32
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(after, dir.path()).unwrap();
+        let got = db2.get("Movie", m.id).unwrap();
+        assert_eq!(
+            got.fields.get("year_released"),
+            Some(&Value::U32(1986)),
+            "object must carry the terminal name after a chained rename; got {:?}",
+            got.fields
+        );
+        assert!(!got.fields.contains_key("year"));
+        assert!(!got.fields.contains_key("released_in"));
+    }
+
+    #[test]
+    fn rename_plain_field_refreshes_sibling_indexed_cover() {
+        // Latent phase-2 bug, fixed in phase 3: renaming a PLAIN scalar field
+        // must refresh SIBLING @indexed covers — a covering blob is a full
+        // object FieldMap, so it embeds the renamed plain field's name too.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                year: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("title".into(), Value::String("Aliens".into()));
+        f.insert("year".into(), Value::U32(1986));
+        db.create("Movie", f).unwrap();
+        db.storage.flush().unwrap();
+        // Rename the PLAIN field `title`; `year` stays @indexed.
+        db.rename_field("Movie", "title", "name").unwrap();
+        drop(db);
+
+        let after = parse_schema(
+            r#"
+            type Movie {
+                name: String
+                year: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(after, dir.path()).unwrap();
+        // A covered filter_scan on the SIBLING @indexed `year` must return the
+        // object with the renamed plain field under its NEW name.
+        let results = db2
+            .filter_scan(
+                "Movie",
+                "year",
+                rhypedb_storage::zone::CompareOp::Eq,
+                1986,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].fields.get("name"),
+            Some(&Value::String("Aliens".into())),
+            "sibling @indexed cover must carry the renamed plain field under its new name; got {:?}",
+            results[0].fields
+        );
+        assert!(
+            !results[0].fields.contains_key("title"),
+            "old name must be gone from the sibling cover: {:?}",
+            results[0].fields
+        );
+    }
+
+    #[test]
+    fn rename_field_unique_preserves_constraint_post_rename() {
+        // Phase 3 @unique lift: u: keys are field_id-keyed with object_id as
+        // value, so the constraint survives a rename untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                email: String @unique
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        f.insert("email".into(), Value::String("a@x.com".into()));
+        db.create("User", f).unwrap();
+        db.rename_field("User", "email", "email_addr").unwrap();
+        drop(db);
+
+        let schema_after = parse_schema(
+            r#"
+            type User {
+                name: String
+                email_addr: String @unique
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        // The pre-rename value is still indexed under the same field_id, so a
+        // colliding insert under the NEW name is rejected.
+        let mut dup = FieldMap::new();
+        dup.insert("name".into(), Value::String("Bob".into()));
+        dup.insert("email_addr".into(), Value::String("a@x.com".into()));
         assert!(matches!(
-            err,
-            EngineError::Catalog(crate::CatalogError::RenameFieldDirectiveUnsupported {
-                directive: "@indexed",
-                ..
-            })
+            db2.create("User", dup),
+            Err(EngineError::UniqueViolation { .. })
         ));
+        // A different value still inserts.
+        let mut ok = FieldMap::new();
+        ok.insert("name".into(), Value::String("Carol".into()));
+        ok.insert("email_addr".into(), Value::String("c@x.com".into()));
+        db2.create("User", ok).unwrap();
+    }
+
+    #[test]
+    fn rename_relation_field_rewrites_rev_edge_covers() {
+        // Phase 3 relation lift: renaming a relation field rewrites both the
+        // bare peer key AND the __cover / __cover_v sidecars embedded in OTHER
+        // forward-1:1 relations' rev_edge covers.
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(
+            r#"
+            type User {
+                name: String
+                favourite: Movie
+                recommendation: Movie
+            }
+            type Movie {
+                title: String
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+        let mut m1 = FieldMap::new();
+        m1.insert("title".into(), Value::String("Inception".into()));
+        let movie1 = db.create("Movie", m1).unwrap();
+        let mut m2 = FieldMap::new();
+        m2.insert("title".into(), Value::String("Tenet".into()));
+        let movie2 = db.create("Movie", m2).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        db.link("User", user.id, "favourite", movie1.id, None).unwrap();
+        db.link("User", user.id, "recommendation", movie2.id, None)
+            .unwrap();
+
+        // Rename the `favourite` RELATION field. Its peer sidecars
+        // (favourite__cover / __cover_v) live inside `recommendation`'s
+        // rev_edge cover; its bare key lives in its own rev_edge cover.
+        let report = db.rename_field("User", "favourite", "top_pick").unwrap();
+        assert_eq!(report.renamed_fields.len(), 1);
+        assert!(
+            report.renamed_fields[0].covers_rewritten >= 1,
+            "expected at least one rev_edge cover rewrite, got {}",
+            report.renamed_fields[0].covers_rewritten
+        );
+
+        use rhypedb_storage::key::KeyBuilder;
+        // recommendation's rev_edge cover embeds the `favourite` peer sidecars.
+        let rec_rel_id = db.rel_ids()["User.recommendation"];
+        let rev_key = KeyBuilder::reverse_edge(movie2.id, rec_rel_id, user.id);
+        let txn = db.storage().begin_txn();
+        let rev_val = db
+            .storage()
+            .get(&txn, &rev_key)
+            .unwrap()
+            .expect("rev_edge for the recommendation link must exist");
+        drop(txn);
+        let cover = crate::object::deserialize_fields(&rev_val);
+        assert!(
+            cover.contains_key("top_pick"),
+            "renamed peer key present in cover: {cover:?}"
+        );
+        assert!(
+            cover.contains_key("top_pick__cover"),
+            "renamed peer __cover present in cover: {cover:?}"
+        );
+        assert!(
+            !cover.contains_key("favourite") && !cover.contains_key("favourite__cover"),
+            "old peer keys must be gone from cover: {cover:?}"
+        );
+    }
+
+    #[test]
+    fn cascade_delete_via_renamed_relation_field() {
+        // Phase 3 relation lift: an @on_delete(cascade) relation still fires
+        // after the relation field is renamed — the rebuilt cascade cache +
+        // rewritten rev_edge cover resolve the NEW name.
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(
+            r#"
+            type User {
+                name: String
+            }
+            type Post {
+                title: String
+                author: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        let mut pf = FieldMap::new();
+        pf.insert("title".into(), Value::String("Hello".into()));
+        pf.insert("author".into(), Value::U64(user.id));
+        let post = db.create("Post", pf).unwrap();
+
+        let report = db.rename_field("Post", "author", "writer").unwrap();
+        assert_eq!(report.renamed_fields.len(), 1);
+        drop(db);
+
+        let schema_after = parse_schema(
+            r#"
+            type User {
+                name: String
+            }
+            type Post {
+                title: String
+                writer: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(schema_after, dir.path()).unwrap();
+        assert!(db2.get("Post", post.id).is_ok(), "post survives the rename");
+        // Deleting the referenced user cascades to delete the post, resolving
+        // the relationship via the renamed `writer` field.
+        db2.delete("User", user.id).unwrap();
+        assert!(
+            db2.get("Post", post.id).is_err(),
+            "post must be cascade-deleted via the renamed relation"
+        );
+        assert!(db2.get("User", user.id).is_err());
+    }
+
+    #[test]
+    fn rename_many_relation_field_preserves_links() {
+        // A MANY relation has no rev_edge covers (covers_rewritten == 0), but
+        // the dual catalog re-key + reopen must keep forward links resolvable
+        // under the NEW name (edges are rel_id-keyed and stable).
+        let dir = tempfile::tempdir().unwrap();
+        let schema_before = parse_schema(
+            r#"
+            type User {
+                name: String
+                friends: [User]
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema_before, dir.path()).unwrap();
+        let mut a = FieldMap::new();
+        a.insert("name".into(), Value::String("A".into()));
+        let ua = db.create("User", a).unwrap();
+        let mut b = FieldMap::new();
+        b.insert("name".into(), Value::String("B".into()));
+        let ub = db.create("User", b).unwrap();
+        db.link("User", ua.id, "friends", ub.id, None).unwrap();
+
+        let report = db.rename_field("User", "friends", "buddies").unwrap();
+        assert_eq!(report.renamed_fields.len(), 1);
+        assert_eq!(
+            report.renamed_fields[0].covers_rewritten, 0,
+            "a many relation carries no rev_edge covers to rewrite"
+        );
+        drop(db);
+
+        let after = parse_schema(
+            r#"
+            type User {
+                name: String
+                buddies: [User]
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(after, dir.path()).unwrap();
+        let links = db2.get_links("User", ua.id, "buddies").unwrap();
+        assert_eq!(links.len(), 1, "the link must resolve under the new name");
+        assert_eq!(links[0].0, ub.id);
     }
 
     /// rename_field rewrites the embedded source-side FieldMap inside

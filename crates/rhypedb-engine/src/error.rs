@@ -526,25 +526,20 @@ pub enum CatalogError {
     #[error("migration plan {plan_id} cutover gate is inconsistent (a partition reported Done but its cursor is not marked done); parked Failed")]
     MigrationPartitionGateInconsistent { plan_id: u64 },
 
-    /// Card 3/5 phase 2 of rename_field refuses fields carrying
-    /// `@indexed`, `@unique`, or `@vectorize`. Each requires follow-on
-    /// rewriting that's deliberately deferred (covering-index values
-    /// would be stale, uniqueness re-check has to know whether the
-    /// rename collides with an existing record under the new name in
-    /// the abstract namespace, the vectorize source ref has to update).
-    /// Refuse up-front rather than ship a half-correct rewrite.
-    #[error("rename_field {qualified:?}: field carries the {directive:?} directive which is not supported by the phase-2 verb; lift this restriction in a follow-on card")]
-    RenameFieldDirectiveUnsupported {
-        qualified: String,
-        directive: &'static str,
-    },
+    // (phase 3) `RenameFieldDirectiveUnsupported` and
+    // `RenameFieldRelationUnsupported` were removed: rename_field now supports
+    // @indexed / @unique / @vectorize and relation fields. See
+    // `apply_field_rename_verb` / `apply_relation_rename_verb`.
 
-    /// Relation fields aren't supported by rename_field phase 2 — every
-    /// reverse-edge cover blob from this source type embeds the field
-    /// by name, and an in-flight rewrite of those covers is deferred to
-    /// the same follow-on card as the directive lift.
-    #[error("rename_field {qualified:?}: relation fields cannot be renamed by the phase-2 verb; lift this restriction in a follow-on card")]
-    RenameFieldRelationUnsupported { qualified: String },
+    /// A single rename plan names the same type in more than one verb (a field
+    /// chain `A→B→C`, two field renames of one type, or a type rename paired
+    /// with a field rename of that type). Every verb in a plan shares ONE
+    /// storage snapshot, so a later verb cannot see an earlier verb's buffered
+    /// object/cover rewrites — committing both would leave the type's objects
+    /// half-renamed. Split such renames into SEPARATE migrations: each commits
+    /// on its own snapshot and observes the previous one's result.
+    #[error("rename plan touches type {type_name:?} with more than one verb; chained or multi-field renames of one type must be separate migrations (a single plan shares one snapshot and would leave objects half-renamed)")]
+    RenameMultiVerbSameType { type_name: String },
 
     /// The supplied migration list has fewer entries than the catalog
     /// reports already-applied. Indicates that the binary was downgraded

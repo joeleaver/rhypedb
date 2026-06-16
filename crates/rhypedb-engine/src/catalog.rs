@@ -1081,10 +1081,28 @@ pub struct FieldTypeChangePair {
 /// `CATALOG_INIT_LOCK` for the entire call so a concurrent reconcile
 /// or other migrate cannot race. Commits exactly one atomic LSM batch
 /// per `apply` call. Returns a structured report or a typed error.
+/// Cover-less convenience wrapper used by catalog-only tests (no `Database`
+/// maintainer in hand). Production callers go through `apply_migration_with_cover`
+/// so a field rename can refresh `@indexed` covers.
+#[cfg(test)]
 pub(crate) fn apply_migration(
     storage: &LsmTree,
     schema: &Schema,
     verbs: &[RenameVerb],
+) -> EngineResult<MigrationReport> {
+    apply_migration_with_cover(storage, schema, verbs, None)
+}
+
+/// `apply_migration` plus a [`FieldCoverMaintainer`] so a field rename can
+/// refresh the renamed type's `@indexed` covering payloads in the same atomic
+/// batch (the covers embed field names, which change under a rename). Callers
+/// that hold a `Database` (or a `MigrationContext` carrying one) thread it in;
+/// catalog-only callers pass `None`.
+pub(crate) fn apply_migration_with_cover(
+    storage: &LsmTree,
+    schema: &Schema,
+    verbs: &[RenameVerb],
+    cover: Option<&dyn FieldCoverMaintainer>,
 ) -> EngineResult<MigrationReport> {
     let _guard = CATALOG_INIT_LOCK.lock();
 
@@ -1115,23 +1133,41 @@ pub(crate) fn apply_migration(
             ..MigrationReport::default()
         };
 
-        // Pre-flight directive check across the WHOLE verbs slice.
-        // Chained field renames (V1: A→B, V2: B→C) need their
-        // directive check (refuse @indexed / @unique / @vectorize /
-        // relation) to fire even when intermediate names don't appear
-        // in the supplied schema. We walk the chain to compute the
-        // terminal name for each chain, then look up that terminal in
-        // the caller-supplied (post-all-renames) schema and check
-        // directives. Failure here aborts the entire plan before any
-        // storage write — no half-applied state.
+        // Phase 3 lifted the former pre-flight directive refusal: renaming a
+        // field carrying @indexed / @unique / @vectorize, or a relation field,
+        // is now supported. Index/unique/vector/edge keys are field_id- and
+        // rel_id-keyed (stable across a rename), and the per-verb path below
+        // rewrites the covers/catalog rows that DO embed field NAMES, all in the
+        // same atomic batch. So there is nothing left to refuse on directive
+        // grounds — the old chained-rename-bypass hazard only mattered while a
+        // refusal existed.
         //
-        // Without this, V1's per-verb check at `apply_field_rename_verb`
-        // would short-circuit (the schema has neither A nor B — only
-        // C), V1 commits the rename, V2 then refuses with
-        // `RenameFieldDirectiveUnsupported`. Catalog ends up in B state
-        // with the migration log entry NOT written; re-run fails with
-        // RenameSourceNotFound. Migration permanently stuck.
-        check_field_rename_chain_directives(schema, verbs)?;
+        // BUT: every verb in a plan reads from ONE storage snapshot (`snap`,
+        // taken above). A later verb cannot see an earlier verb's buffered
+        // object/cover rewrites (the txn buffer is write-only), so two verbs
+        // that rewrite the SAME type's objects — a field chain `A→B→C`, two
+        // field renames of one type, or a type rename paired with a field
+        // rename of that type — would commit half-renamed objects. Production
+        // never builds such plans (each `Database` / `MigrationContext` rename
+        // is its own single-verb commit), so refuse them up front and direct
+        // the operator to split into separate migrations.
+        {
+            let mut seen_types: std::collections::HashSet<&str> =
+                std::collections::HashSet::new();
+            for verb in verbs {
+                let touched = match verb {
+                    RenameVerb::Type { old, .. } => old.as_str(),
+                    RenameVerb::Field { type_name, .. } => type_name.as_str(),
+                };
+                if !seen_types.insert(touched) {
+                    return Err(EngineError::Catalog(
+                        CatalogError::RenameMultiVerbSameType {
+                            type_name: touched.into(),
+                        },
+                    ));
+                }
+            }
+        }
 
         // Refuse renaming a type or field that has an UNSETTLED chunked
         // field-type migration plan. A rename re-keys the catalog entry by
@@ -1163,9 +1199,12 @@ pub(crate) fn apply_migration(
             }
         }
 
-        // Per-verb pre-flight + mutation. The whole plan succeeds or
-        // fails as a unit before any storage write happens. Within a
-        // single plan, each verb's effect is visible to the next.
+        // Per-verb pre-flight + mutation. The whole plan succeeds or fails as a
+        // unit before any storage write happens. Each verb's effect on the
+        // IN-MEMORY catalog (`cat`) is visible to the next, but its STORAGE
+        // rewrites are buffered (not visible through `snap`) — which is why the
+        // same-type multi-verb guard above forbids two verbs from rewriting one
+        // type's objects in a single plan.
         let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
         let mut deletes: Vec<Bytes> = Vec::new();
         let now_ms = now_unix_millis();
@@ -1187,19 +1226,48 @@ pub(crate) fn apply_migration(
                     old,
                     new,
                 } => {
-                    apply_field_rename_verb(
-                        storage,
-                        schema,
-                        snap,
-                        &mut cat,
-                        type_name,
-                        old,
-                        new,
-                        now_ms,
-                        &mut puts,
-                        &mut deletes,
-                        &mut report,
-                    )?;
+                    // Relation fields live in a separate catalog namespace
+                    // (`rel_entries`) and require edge-cover rewrites instead of
+                    // an object-payload rewrite. Route a LIVE relation to its own
+                    // verb; everything else (scalar/vector, or a not-found field)
+                    // goes through the scalar verb, which also surfaces the
+                    // "source not found" error.
+                    let old_qual = format!("{type_name}.{old}");
+                    let is_live_relation = cat
+                        .rel_entries
+                        .get(&old_qual)
+                        .map(|e| e.status != TombstoneStatus::Tombstoned)
+                        .unwrap_or(false);
+                    if is_live_relation {
+                        apply_relation_rename_verb(
+                            storage,
+                            schema,
+                            snap,
+                            &mut cat,
+                            type_name,
+                            old,
+                            new,
+                            now_ms,
+                            &mut puts,
+                            &mut deletes,
+                            &mut report,
+                        )?;
+                    } else {
+                        apply_field_rename_verb(
+                            storage,
+                            schema,
+                            snap,
+                            &mut cat,
+                            type_name,
+                            old,
+                            new,
+                            now_ms,
+                            &mut puts,
+                            &mut deletes,
+                            &mut report,
+                            cover,
+                        )?;
+                    }
                 }
             }
         }
@@ -1459,103 +1527,13 @@ fn apply_type_rename_verb(
 /// fsync — fine for planned maintenance, not for hot online use. The
 /// resumable-cursor shadow-field design (Epic #3) is the right answer
 /// for the latter.
-/// Pre-flight check across an entire `apply_migration` verbs slice.
 ///
-/// For each `RenameVerb::Field`, computes the chain's terminal name
-/// (after any prior `Field` verbs in this plan have applied) and looks
-/// up the resulting field in the caller-supplied schema. If the field
-/// carries `@indexed` / `@unique` / `@vectorize` or is a relation
-/// field, refuse the entire plan with the same typed error the
-/// per-verb check used to surface. Doing this up-front prevents the
-/// chained-rename bypass: V1 (name→handle) where the schema's terminal
-/// name is `username` would otherwise short-circuit V1's directive
-/// check (the schema has neither `name` nor `handle` — only
-/// `username`), V1 commits, V2 (handle→username) refuses, and the
-/// catalog ends up in a partial state with no migration log entry.
-fn check_field_rename_chain_directives(
-    schema: &Schema,
-    verbs: &[RenameVerb],
-) -> EngineResult<()> {
-    // For each chain, accumulate every name the chain has been known
-    // by (original old + every intermediate + terminal new). The
-    // caller-supplied schema may be pre-rename (Database::rename_field
-    // direct call with the pre-rename schema), post-all-renames
-    // (run_migrations contract), or somewhere in between — looking up
-    // by ANY name in the chain handles all cases without forcing the
-    // caller into a specific schema shape.
-    let mut chains: Vec<(String, Vec<String>)> = Vec::new(); // (type, [names])
-    for verb in verbs {
-        if let RenameVerb::Field {
-            type_name,
-            old,
-            new,
-        } = verb
-        {
-            let mut extended = false;
-            for chain in chains.iter_mut() {
-                if chain.0 == *type_name && chain.1.last() == Some(old) {
-                    chain.1.push(new.clone());
-                    extended = true;
-                    break;
-                }
-            }
-            if !extended {
-                chains.push((type_name.clone(), vec![old.clone(), new.clone()]));
-            }
-        }
-    }
-
-    for (type_name, names) in &chains {
-        let Some(type_def) = schema.types.get(type_name) else {
-            continue;
-        };
-        let Some(fd) = type_def
-            .fields
-            .iter()
-            .find(|f| names.iter().any(|n| n == &f.name))
-        else {
-            // None of the chain's names appear in the schema. Either
-            // the caller passed a stale schema or the field was
-            // renamed-then-dropped — let the per-verb path surface the
-            // RenameSourceNotFound error.
-            continue;
-        };
-        // Qualify by whichever name the schema actually carries — most
-        // useful in the operator's error message.
-        let qualified = format!("{type_name}.{}", fd.name);
-        if matches!(fd.field_type, FieldType::Relation(_)) {
-            return Err(EngineError::Catalog(
-                CatalogError::RenameFieldRelationUnsupported { qualified },
-            ));
-        }
-        if fd.is_indexed() {
-            return Err(EngineError::Catalog(
-                CatalogError::RenameFieldDirectiveUnsupported {
-                    qualified,
-                    directive: "@indexed",
-                },
-            ));
-        }
-        if fd.is_unique() {
-            return Err(EngineError::Catalog(
-                CatalogError::RenameFieldDirectiveUnsupported {
-                    qualified,
-                    directive: "@unique",
-                },
-            ));
-        }
-        if fd.vectorize().is_some() {
-            return Err(EngineError::Catalog(
-                CatalogError::RenameFieldDirectiveUnsupported {
-                    qualified,
-                    directive: "@vectorize",
-                },
-            ));
-        }
-    }
-    Ok(())
-}
-
+/// **Directives (phase 3):** a field carrying `@indexed` / `@unique` /
+/// `@vectorize` is supported. `u:`/`i:`/`v:`/`s:` keys are `field_id`-keyed
+/// (stable), so only the `@indexed` covering VALUES (full FieldMaps embedding
+/// names) are refreshed — via the `cover` maintainer, in the same batch.
+/// `@unique` and `@vectorize` need no on-disk rewrite. Relation-field renames
+/// go through `apply_relation_rename_verb` instead (separate catalog namespace).
 #[allow(clippy::too_many_arguments)]
 fn apply_field_rename_verb(
     storage: &LsmTree,
@@ -1569,6 +1547,7 @@ fn apply_field_rename_verb(
     puts: &mut Vec<(Bytes, Bytes)>,
     deletes: &mut Vec<Bytes>,
     report: &mut MigrationReport,
+    cover: Option<&dyn FieldCoverMaintainer>,
 ) -> EngineResult<()> {
     // No-op rejection.
     if old == new {
@@ -1674,12 +1653,12 @@ fn apply_field_rename_verb(
         ));
     }
 
-    // Directive refusal (@indexed / @unique / @vectorize / relation
-    // fields) is handled by `check_field_rename_chain_directives`
-    // pre-flight in `apply_migration`, which walks the entire verbs
-    // slice up front and aborts before any storage write. We don't
-    // re-check here — doing so would re-introduce the chained-rename
-    // bypass surfaced by adversarial review.
+    // This verb handles scalar/vector fields. Relation fields are routed to
+    // `apply_relation_rename_verb` by the dispatch in `apply_migration_with_cover`
+    // (they live in `rel_entries`, a different catalog namespace). `@indexed` /
+    // `@unique` / `@vectorize` are supported here (phase 3): their keys are
+    // field_id-keyed, so only the `@indexed` covers (refreshed below via `cover`)
+    // need rewriting.
 
     // ---- Object FieldMap rewrite ----------------------------------
     // Every existing object of this type encodes the old field name in
@@ -1703,10 +1682,14 @@ fn apply_field_rename_verb(
     let mut source_object_ids: Vec<u64> = Vec::with_capacity(entries.len());
     for (key, data) in entries {
         // Object key tail is the u64 BE object_id.
-        if key.len() >= 8 {
+        let object_id = if key.len() >= 8 {
             let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-            source_object_ids.push(u64::from_be_bytes(id_bytes));
-        }
+            let id = u64::from_be_bytes(id_bytes);
+            source_object_ids.push(id);
+            Some(id)
+        } else {
+            None
+        };
         let mut fields = crate::object::deserialize_fields(&data);
         // Only rewrite when the field is present — an object may have
         // been written before the field existed in the schema (legacy
@@ -1715,6 +1698,18 @@ fn apply_field_rename_verb(
         if let Some(value) = fields.remove(old) {
             fields.insert(new.into(), value);
             let new_blob = crate::object::serialize_fields(&fields);
+            // Refresh this type's @indexed covering payloads with the renamed
+            // blob. A cover is a full copy of the object FieldMap (field names
+            // embedded), so a rename stales every i: entry on the type — the
+            // renamed field's own AND any sibling's — and a covered
+            // `filter_scan_via_index` would otherwise return the old name.
+            // field_id is stable, so each rebuilt key overwrites in place. Same
+            // atomic batch; no-op without a maintainer or @indexed fields.
+            if let (Some(cover), Some(object_id)) = (cover, object_id) {
+                puts.extend(cover.rename_index_cover_puts(
+                    type_name, object_id, &fields, &new_blob, old, new,
+                ));
+            }
             puts.push((key.clone(), new_blob));
             objects_rewritten += 1;
         }
@@ -1733,10 +1728,11 @@ fn apply_field_rename_verb(
     // Bounded work: O(edges where source = type_name's objects via a
     // forward relation). Scans `e:<obj_id>:<rel_id>:` to enumerate
     // targets, then reads + rewrites each `r:<tgt>:<rel>:<obj_id>` in
-    // place. The directive-refusal block above rules out relation
-    // fields, so the renamed field is always a plain scalar — meaning
-    // we only need to rename the bare `<old>` key, not `<old>__cover`
-    // or `<old>__cover_v` sidecars.
+    // place. This verb only ever renames a scalar/vector field (relation
+    // fields are routed to `apply_relation_rename_verb`), so the renamed
+    // name appears in the cover as the bare `<old>` key only — no
+    // `<old>__cover` / `<old>__cover_v` sidecars to touch (those belong to
+    // relation fields).
     let mut forward_rel_ids: Vec<u64> = Vec::new();
     if let Some(type_def) = schema.types.get(type_name) {
         for field in &type_def.fields {
@@ -1828,6 +1824,287 @@ fn apply_field_rename_verb(
     Ok(())
 }
 
+/// rename_field verb for a RELATION field (phase 3). Relation fields live in
+/// the `rel_entries` catalog namespace (not `field_entries`) and — unlike
+/// scalar fields — are NOT stored in object payloads. They live in the edge
+/// index: forward edges `e:<src>:<rel_id>:<tgt>` and reverse edges
+/// `r:<tgt>:<rel_id>:<src>`, both keyed by the STABLE `rel_id`. So a relation
+/// rename rewrites no object blobs and no edge KEYS. What DOES embed the
+/// relation field NAME is:
+///   * the catalog row `c:R:<type>\x00<name>` (re-keyed, `field_id` preserved,
+///     `RenameRecord` appended), and
+///   * reverse-edge COVER blobs — `<name>: U64(target)` for the linked relation
+///     and, for every OTHER forward-1:1 relation of the source, the peer
+///     sidecars `<name>__cover` / `<name>__cover_v`.
+///
+/// Both are rewritten here in one atomic batch. In-memory name-keyed caches
+/// (`incoming_relations`, `cascade_meta`) are rebuilt on the mandatory
+/// post-rename reopen, so cascade-delete then resolves the new name correctly.
+#[allow(clippy::too_many_arguments)]
+fn apply_relation_rename_verb(
+    storage: &LsmTree,
+    _schema: &Schema,
+    snap: u64,
+    cat: &mut Catalog,
+    type_name: &str,
+    old: &str,
+    new: &str,
+    now_ms: u64,
+    puts: &mut Vec<(Bytes, Bytes)>,
+    deletes: &mut Vec<Bytes>,
+    report: &mut MigrationReport,
+) -> EngineResult<()> {
+    // No-op rejection.
+    if old == new {
+        return Err(EngineError::Catalog(CatalogError::RenameNoOp {
+            kind: "field",
+            name: format!("{type_name}.{old}"),
+        }));
+    }
+    check_identifier(new)?;
+
+    // Parent type must exist and be live.
+    let type_entry = cat
+        .type_entries
+        .get(type_name)
+        .ok_or_else(|| {
+            EngineError::Catalog(CatalogError::RenameSourceNotFound {
+                kind: "type",
+                name: type_name.into(),
+            })
+        })?
+        .clone();
+    if type_entry.status == TombstoneStatus::Tombstoned {
+        return Err(EngineError::Catalog(CatalogError::RenameSourceRetired {
+            kind: "type",
+            name: type_name.into(),
+            retired_id: type_entry.id,
+            retired_at_ms: type_entry.retired_at_ms.unwrap_or(0),
+        }));
+    }
+
+    let old_qual = format!("{type_name}.{old}");
+    let new_qual = format!("{type_name}.{new}");
+
+    // Source relation must exist and be live.
+    let rel_entry = cat
+        .rel_entries
+        .get(&old_qual)
+        .ok_or_else(|| {
+            EngineError::Catalog(CatalogError::RenameSourceNotFound {
+                kind: "field",
+                name: old_qual.clone(),
+            })
+        })?
+        .clone();
+    if rel_entry.status == TombstoneStatus::Tombstoned {
+        return Err(EngineError::Catalog(CatalogError::RenameSourceRetired {
+            kind: "field",
+            name: old_qual.clone(),
+            retired_id: rel_entry.id,
+            retired_at_ms: rel_entry.retired_at_ms.unwrap_or(0),
+        }));
+    }
+
+    // Target name must not collide with a live/retired field OR relation.
+    if let Some(existing) = cat.field_entries.get(&new_qual) {
+        if existing.status == TombstoneStatus::Tombstoned {
+            return Err(EngineError::Catalog(CatalogError::RenameTargetIsRetired {
+                kind: "field",
+                name: new_qual.clone(),
+                retired_id: existing.id,
+            }));
+        }
+        return Err(EngineError::Catalog(CatalogError::RenameTargetCollision {
+            kind: "field",
+            name: new_qual.clone(),
+            existing_id: existing.id,
+        }));
+    }
+    if let Some(existing) = cat.rel_entries.get(&new_qual) {
+        if existing.status == TombstoneStatus::Tombstoned {
+            return Err(EngineError::Catalog(CatalogError::RenameTargetIsRetired {
+                kind: "field",
+                name: new_qual.clone(),
+                retired_id: existing.id,
+            }));
+        }
+        return Err(EngineError::Catalog(CatalogError::RenameTargetCollision {
+            kind: "field",
+            name: new_qual.clone(),
+            existing_id: existing.id,
+        }));
+    }
+    if cat.tombstoned_field_quals.contains(&new_qual)
+        || cat.tombstoned_rel_quals.contains(&new_qual)
+    {
+        return Err(EngineError::Catalog(CatalogError::RenameTargetIsRetired {
+            kind: "field",
+            name: new_qual.clone(),
+            retired_id: 0,
+        }));
+    }
+
+    // History-cap check.
+    if rel_entry.previous_names.len() + 1 > MAX_RENAME_HISTORY {
+        return Err(EngineError::Catalog(
+            CatalogError::RenameHistoryCapExceeded {
+                kind: "field",
+                name: old_qual.clone(),
+                cap: MAX_RENAME_HISTORY,
+            },
+        ));
+    }
+
+    // ---- Reverse-edge cover rewrite -------------------------------
+    // The relation NAME appears inside reverse-edge cover blobs in two roles:
+    //   (a) the renamed relation's OWN rev_edges carry `<old>: U64(target)`;
+    //   (b) every OTHER forward-1:1 relation's rev_edge cover carries the peer
+    //       sidecars `<old>`, `<old>__cover`, `<old>__cover_v`.
+    // Scan every live relation of this type from the CATALOG (schema-shape
+    // independent — robust whether the caller passed a pre- or post-rename
+    // schema), walk each source object's forward edges, and rewrite the
+    // matching keys in each target's rev_edge value. Inverse relations have no
+    // forward edges (the scan finds nothing); many-relations have empty covers
+    // (skipped). Bounded by O(edges out of this type's objects).
+    let type_id = *cat.type_ids.get(type_name).ok_or_else(|| {
+        EngineError::Catalog(CatalogError::RenameSourceNotFound {
+            kind: "type",
+            name: type_name.into(),
+        })
+    })?;
+    let mut rel_ids: Vec<u64> = Vec::new();
+    for (qual, &rid) in &cat.rel_ids {
+        let (t, _) = split_qualified(qual);
+        if t == type_name {
+            rel_ids.push(rid);
+        }
+    }
+    let obj_prefix = KeyBuilder::object_prefix(type_id);
+    let obj_entries = storage.scan_prefix_at(snap, &obj_prefix)?;
+    let mut source_ids: Vec<u64> = Vec::with_capacity(obj_entries.len());
+    for (key, _) in &obj_entries {
+        if key.len() >= 8 {
+            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            source_ids.push(u64::from_be_bytes(id_bytes));
+        }
+    }
+
+    let old_cover = format!("{old}__cover");
+    let old_cover_v = format!("{old}__cover_v");
+    let new_cover = format!("{new}__cover");
+    let new_cover_v = format!("{new}__cover_v");
+
+    let mut covers_rewritten: u64 = 0;
+    for src_id in &source_ids {
+        for &rel_id in &rel_ids {
+            let edge_prefix = KeyBuilder::edge_prefix(*src_id, rel_id);
+            let edges = storage.scan_prefix_at(snap, &edge_prefix)?;
+            for (edge_key, _) in edges {
+                if edge_key.len() < 8 {
+                    continue;
+                }
+                let tgt_bytes: [u8; 8] = edge_key[edge_key.len() - 8..].try_into().unwrap();
+                let tgt_id = u64::from_be_bytes(tgt_bytes);
+                let rev_key = KeyBuilder::reverse_edge(tgt_id, rel_id, *src_id);
+                let Some(rev_bytes) = storage.get_at(snap, &rev_key)? else {
+                    continue;
+                };
+                if rev_bytes.is_empty() {
+                    continue;
+                }
+                let mut cover_fields = crate::object::deserialize_fields(&rev_bytes);
+                let mut changed = false;
+                if let Some(v) = cover_fields.remove(old) {
+                    cover_fields.insert(new.into(), v);
+                    changed = true;
+                }
+                if let Some(v) = cover_fields.remove(&old_cover) {
+                    cover_fields.insert(new_cover.clone(), v);
+                    changed = true;
+                }
+                if let Some(v) = cover_fields.remove(&old_cover_v) {
+                    cover_fields.insert(new_cover_v.clone(), v);
+                    changed = true;
+                }
+                if changed {
+                    let new_blob = crate::object::serialize_fields(&cover_fields);
+                    puts.push((rev_key, new_blob));
+                    covers_rewritten += 1;
+                }
+            }
+        }
+    }
+
+    // ---- Catalog row mutation -------------------------------------
+    // A relation field has TWO catalog rows: the generic field row (`c:E:`,
+    // tracked in field_entries/field_ids/field_kinds) AND the relation row
+    // (`c:R:`, tracked in rel_entries/rel_ids). Re-key BOTH, each preserving its
+    // own id and appending a RenameRecord. The Tombstoned-quals sets are NOT
+    // touched: a rename leaves the old name free for reuse.
+    let preserved_field_id = if let Some(field_entry) = cat.field_entries.get(&old_qual).cloned() {
+        let mut new_field_entry = field_entry;
+        let id = new_field_entry.id;
+        new_field_entry.previous_names.insert(
+            0,
+            RenameRecord {
+                from: old.into(),
+                to: new.into(),
+                wall_time_unix_ms: now_ms,
+            },
+        );
+        new_field_entry.last_renamed_at_ms = Some(now_ms);
+        puts.push((
+            KeyBuilder::catalog_field(type_name, new),
+            encode_id_entry(&new_field_entry),
+        ));
+        deletes.push(KeyBuilder::catalog_field(type_name, old));
+        cat.field_ids.remove(&old_qual);
+        cat.field_ids.insert(new_qual.clone(), id);
+        if let Some(kind) = cat.field_kinds.remove(&old_qual) {
+            cat.field_kinds.insert(new_qual.clone(), kind);
+        }
+        cat.field_entries.remove(&old_qual);
+        cat.field_entries.insert(new_qual.clone(), new_field_entry);
+        id
+    } else {
+        // A relation with no generic field row should not happen, but report
+        // the rel_id rather than panic.
+        rel_entry.id
+    };
+
+    let mut new_rel_entry = rel_entry.clone();
+    let preserved_rel_id = new_rel_entry.id;
+    new_rel_entry.previous_names.insert(
+        0,
+        RenameRecord {
+            from: old.into(),
+            to: new.into(),
+            wall_time_unix_ms: now_ms,
+        },
+    );
+    new_rel_entry.last_renamed_at_ms = Some(now_ms);
+    puts.push((
+        KeyBuilder::catalog_rel(type_name, new),
+        encode_id_entry(&new_rel_entry),
+    ));
+    deletes.push(KeyBuilder::catalog_rel(type_name, old));
+    cat.rel_ids.remove(&old_qual);
+    cat.rel_ids.insert(new_qual.clone(), preserved_rel_id);
+    cat.rel_entries.remove(&old_qual);
+    cat.rel_entries.insert(new_qual.clone(), new_rel_entry);
+
+    report.renamed_fields.push(FieldRenamePair {
+        type_name: type_name.into(),
+        from: old.into(),
+        to: new.into(),
+        field_id: preserved_field_id,
+        objects_rewritten: 0,
+        covers_rewritten,
+    });
+    Ok(())
+}
+
 // =====================================================================
 // FIELD-TYPE CHANGE — re-encode every object's value for a field whose
 // kind is changing (card 4/5 phase 1).
@@ -1867,6 +2144,28 @@ pub(crate) trait FieldCoverMaintainer {
         object_id: u64,
         fields: &crate::object::FieldMap,
         serialized: &Bytes,
+    ) -> Vec<(Bytes, Bytes)>;
+
+    /// Rename-time variant: refresh EVERY `@indexed` field's covering payload
+    /// for this object with the post-rename blob `serialized`. A covering blob
+    /// is a full copy of the object FieldMap (every field's NAME embedded), so a
+    /// field rename stales EVERY index cover on the type — not just the
+    /// renamed field's own — and `filter_scan_via_index` would otherwise hand
+    /// back objects whose `fields.get(new_name)` is `None`. Unlike
+    /// `sibling_index_cover_puts`, the renamed field may itself be `@indexed`:
+    /// its value now lives under `new_name` in `fields` while the in-memory
+    /// index metadata still carries `old_name`. `field_id`/`kind` are stable
+    /// across a rename, so each existing `i:` key is reproduced exactly and the
+    /// `put` overwrites the stale-name blob in place. No-op when the type has no
+    /// `@indexed` fields.
+    fn rename_index_cover_puts(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        fields: &crate::object::FieldMap,
+        serialized: &Bytes,
+        old_name: &str,
+        new_name: &str,
     ) -> Vec<(Bytes, Bytes)>;
 }
 
@@ -2342,7 +2641,7 @@ impl MigrationContext<'_> {
             old: old.into(),
             new: new.into(),
         }];
-        apply_migration(self.storage, self.schema, &verbs)?;
+        apply_migration_with_cover(self.storage, self.schema, &verbs, self.cover)?;
         Ok(())
     }
 
@@ -2357,7 +2656,7 @@ impl MigrationContext<'_> {
             old: old.into(),
             new: new.into(),
         }];
-        apply_migration(self.storage, self.schema, &verbs)?;
+        apply_migration_with_cover(self.storage, self.schema, &verbs, self.cover)?;
         Ok(())
     }
 
@@ -6110,6 +6409,25 @@ mod tests {
         }
     }
 
+    fn scalar_unique(name: &str, st: ScalarType) -> FieldDef {
+        FieldDef {
+            name: name.into(),
+            field_type: FieldType::Scalar(st),
+            directives: vec![Directive::Unique],
+        }
+    }
+
+    fn vector_vectorize(name: &str, dimensions: u32, source: &str) -> FieldDef {
+        FieldDef {
+            name: name.into(),
+            field_type: FieldType::Vector(rhypedb_schema::VectorType { dimensions }),
+            directives: vec![Directive::Vectorize(rhypedb_schema::VectorizeDef {
+                source_field: source.into(),
+                model: "test-model".into(),
+            })],
+        }
+    }
+
     fn open_lsm(dir: &TempDir) -> std::sync::Arc<LsmTree> {
         let config = LsmConfig::new(dir.path());
         LsmTree::open(config).unwrap()
@@ -7793,10 +8111,13 @@ mod tests {
     /// intermediate verb whose `old`/`new` aren't in the schema).
     /// Regression for PR #6 adversarial-review finding #5.
     #[test]
-    fn rename_field_chained_indexed_refused_up_front() {
+    fn rename_field_chained_indexed_succeeds() {
+        // Phase 3: a field can be renamed THROUGH a chain when each link is a
+        // SEPARATE migration — the safe pattern, since each commits on its own
+        // snapshot. (A single plan with both verbs is refused — see
+        // `rename_plan_multi_verb_same_type_refused`.) field_id is preserved.
         let dir = TempDir::new().unwrap();
         let storage = open_lsm(&dir);
-        // Pre-rename catalog state has Movie.year @indexed.
         let pre = schema_with(vec![(
             "Movie",
             vec![
@@ -7804,10 +8125,16 @@ mod tests {
                 scalar_indexed("year", ScalarType::U32),
             ],
         )]);
-        let _ = load_or_initialize(&storage, &pre, false).unwrap();
+        let cat_pre = load_or_initialize(&storage, &pre, false).unwrap();
+        let orig_id = cat_pre.field_ids["Movie.year"];
 
-        // Plan: year → released_in → year_released. Post-all-renames
-        // schema has only `year_released` with @indexed.
+        let mid = schema_with(vec![(
+            "Movie",
+            vec![
+                scalar("title", ScalarType::String),
+                scalar_indexed("released_in", ScalarType::U32),
+            ],
+        )]);
         let post = schema_with(vec![(
             "Movie",
             vec![
@@ -7815,9 +8142,50 @@ mod tests {
                 scalar_indexed("year_released", ScalarType::U32),
             ],
         )]);
-        let err = apply_migration(
+        apply_migration(
+            &storage,
+            &mid,
+            &[RenameVerb::Field {
+                type_name: "Movie".into(),
+                old: "year".into(),
+                new: "released_in".into(),
+            }],
+        )
+        .unwrap();
+        apply_migration(
             &storage,
             &post,
+            &[RenameVerb::Field {
+                type_name: "Movie".into(),
+                old: "released_in".into(),
+                new: "year_released".into(),
+            }],
+        )
+        .unwrap();
+        let cat_after = load_or_initialize(&storage, &post, false).unwrap();
+        assert!(!cat_after.field_ids.contains_key("Movie.year"));
+        assert!(!cat_after.field_ids.contains_key("Movie.released_in"));
+        assert_eq!(cat_after.field_ids["Movie.year_released"], orig_id);
+    }
+
+    #[test]
+    fn rename_plan_multi_verb_same_type_refused() {
+        // A single plan that names one type in two verbs is refused: all verbs
+        // share one snapshot, so a later verb can't see an earlier verb's
+        // buffered object rewrites — committing both would half-rename objects.
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![(
+            "Movie",
+            vec![
+                scalar("title", ScalarType::String),
+                scalar("year", ScalarType::U32),
+            ],
+        )]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+        let err = apply_migration(
+            &storage,
+            &schema,
             &[
                 RenameVerb::Field {
                     type_name: "Movie".into(),
@@ -7826,29 +8194,28 @@ mod tests {
                 },
                 RenameVerb::Field {
                     type_name: "Movie".into(),
-                    old: "released_in".into(),
-                    new: "year_released".into(),
+                    old: "title".into(),
+                    new: "name".into(),
                 },
             ],
         )
         .unwrap_err();
         assert!(matches!(
             err,
-            EngineError::Catalog(CatalogError::RenameFieldDirectiveUnsupported {
-                directive: "@indexed",
-                ..
-            })
+            EngineError::Catalog(CatalogError::RenameMultiVerbSameType { .. })
         ));
-        // And NOTHING should have been committed — the field is still
-        // at its original name in the catalog.
-        let cat_after = load_or_initialize(&storage, &pre, false).unwrap();
-        assert!(cat_after.field_ids.contains_key("Movie.year"));
-        assert!(!cat_after.field_ids.contains_key("Movie.released_in"));
-        assert!(!cat_after.field_ids.contains_key("Movie.year_released"));
+        // Nothing committed — both fields keep their original names.
+        let cat = load_or_initialize(&storage, &schema, false).unwrap();
+        assert!(cat.field_ids.contains_key("Movie.year"));
+        assert!(cat.field_ids.contains_key("Movie.title"));
     }
 
     #[test]
-    fn rename_field_indexed_field_refused() {
+    fn rename_field_indexed_succeeds() {
+        // Phase 3: renaming an @indexed field is allowed. The i: keys are
+        // field_id-keyed (preserved); covering payloads are refreshed by the
+        // Database maintainer (exercised end-to-end in the database tests). At
+        // the catalog layer there are no objects, so assert the catalog re-key.
         let dir = TempDir::new().unwrap();
         let storage = open_lsm(&dir);
         let schema = schema_with(vec![(
@@ -7858,8 +8225,9 @@ mod tests {
                 scalar_indexed("year", ScalarType::U32),
             ],
         )]);
-        let _ = load_or_initialize(&storage, &schema, false).unwrap();
-        let err = apply_migration(
+        let cat_pre = load_or_initialize(&storage, &schema, false).unwrap();
+        let orig_id = cat_pre.field_ids["Movie.year"];
+        apply_migration(
             &storage,
             &schema,
             &[RenameVerb::Field {
@@ -7868,18 +8236,99 @@ mod tests {
                 new: "released_in".into(),
             }],
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            EngineError::Catalog(CatalogError::RenameFieldDirectiveUnsupported {
-                directive: "@indexed",
-                ..
-            })
-        ));
+        .unwrap();
+        let post = schema_with(vec![(
+            "Movie",
+            vec![
+                scalar("title", ScalarType::String),
+                scalar_indexed("released_in", ScalarType::U32),
+            ],
+        )]);
+        let cat_after = load_or_initialize(&storage, &post, false).unwrap();
+        assert!(!cat_after.field_ids.contains_key("Movie.year"));
+        assert_eq!(cat_after.field_ids["Movie.released_in"], orig_id);
     }
 
     #[test]
-    fn rename_field_relation_field_refused() {
+    fn rename_field_unique_succeeds() {
+        // Phase 3: renaming a @unique field is allowed. u: keys are field_id-
+        // keyed with the object_id as value — nothing on disk references the
+        // name, so it's a pure catalog re-key.
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![(
+            "User",
+            vec![
+                scalar("name", ScalarType::String),
+                scalar_unique("email", ScalarType::String),
+            ],
+        )]);
+        let cat_pre = load_or_initialize(&storage, &schema, false).unwrap();
+        let orig_id = cat_pre.field_ids["User.email"];
+        apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "User".into(),
+                old: "email".into(),
+                new: "email_addr".into(),
+            }],
+        )
+        .unwrap();
+        let post = schema_with(vec![(
+            "User",
+            vec![
+                scalar("name", ScalarType::String),
+                scalar_unique("email_addr", ScalarType::String),
+            ],
+        )]);
+        let cat_after = load_or_initialize(&storage, &post, false).unwrap();
+        assert!(!cat_after.field_ids.contains_key("User.email"));
+        assert_eq!(cat_after.field_ids["User.email_addr"], orig_id);
+    }
+
+    #[test]
+    fn rename_field_vectorize_succeeds() {
+        // Phase 3: renaming a Vector field carrying @vectorize is allowed.
+        // v:/s: keys are field_id-keyed (stable); the directive's `source`
+        // ref points at another field by name and is unchanged. Pure re-key.
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![(
+            "Doc",
+            vec![
+                scalar("body", ScalarType::String),
+                vector_vectorize("embedding", 8, "body"),
+            ],
+        )]);
+        let cat_pre = load_or_initialize(&storage, &schema, false).unwrap();
+        let orig_id = cat_pre.field_ids["Doc.embedding"];
+        apply_migration(
+            &storage,
+            &schema,
+            &[RenameVerb::Field {
+                type_name: "Doc".into(),
+                old: "embedding".into(),
+                new: "embedding_v2".into(),
+            }],
+        )
+        .unwrap();
+        let post = schema_with(vec![(
+            "Doc",
+            vec![
+                scalar("body", ScalarType::String),
+                vector_vectorize("embedding_v2", 8, "body"),
+            ],
+        )]);
+        let cat_after = load_or_initialize(&storage, &post, false).unwrap();
+        assert!(!cat_after.field_ids.contains_key("Doc.embedding"));
+        assert_eq!(cat_after.field_ids["Doc.embedding_v2"], orig_id);
+    }
+
+    #[test]
+    fn rename_field_relation_succeeds() {
+        // Phase 3: relation fields can be renamed (routed to
+        // apply_relation_rename_verb). rel_id is preserved; old name freed.
         let dir = TempDir::new().unwrap();
         let storage = open_lsm(&dir);
         let schema = schema_with(vec![
@@ -7892,8 +8341,9 @@ mod tests {
             ),
             ("Movie", vec![scalar("title", ScalarType::String)]),
         ]);
-        let _ = load_or_initialize(&storage, &schema, false).unwrap();
-        let err = apply_migration(
+        let cat_pre = load_or_initialize(&storage, &schema, false).unwrap();
+        let orig_rel_id = cat_pre.rel_ids["User.favourite"];
+        apply_migration(
             &storage,
             &schema,
             &[RenameVerb::Field {
@@ -7902,11 +8352,20 @@ mod tests {
                 new: "pick".into(),
             }],
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            EngineError::Catalog(CatalogError::RenameFieldRelationUnsupported { .. })
-        ));
+        .unwrap();
+        let post = schema_with(vec![
+            (
+                "User",
+                vec![
+                    scalar("name", ScalarType::String),
+                    relation("pick", "Movie", false),
+                ],
+            ),
+            ("Movie", vec![scalar("title", ScalarType::String)]),
+        ]);
+        let cat_after = load_or_initialize(&storage, &post, false).unwrap();
+        assert!(!cat_after.rel_ids.contains_key("User.favourite"));
+        assert_eq!(cat_after.rel_ids["User.pick"], orig_rel_id);
     }
 
     #[test]
