@@ -40,6 +40,7 @@ pub(crate) fn admin_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/migrations/{id}/cancel", post(cancel))
         .route("/admin/migrations/{id}/cutover", post(cutover))
         .route("/admin/migrations/{id}/quarantine", get(quarantine))
+        .route("/admin/migrations/{id}/quarantine/retry", post(retry_quarantine))
         .route("/admin/migrations/{id}/events", get(events))
         // Auth applies to these routes only (NOT /query, /health, /admin/compact).
         .route_layer(middleware::from_fn_with_state(state, admin_auth))
@@ -197,6 +198,39 @@ async fn quarantine(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> 
             let arr: Vec<JsonValue> = rows.iter().map(quarantine_json).collect();
             (StatusCode::OK, Json(json!({ "quarantined": arr }))).into_response()
         }
+        Err(e) => err_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RetryQuarantineRequest {
+    new_converter: String,
+    /// Specific object ids to retry; empty / omitted → every quarantined row.
+    #[serde(default)]
+    ids: Vec<u64>,
+}
+
+async fn retry_quarantine(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+    Json(req): Json<RetryQuarantineRequest>,
+) -> Response {
+    let db = state.db.clone();
+    let resolved = spawn_blocking_engine(move || {
+        // Empty ids → retry the whole current quarantine set.
+        let ids = if req.ids.is_empty() {
+            db.list_quarantined(id)?
+                .into_iter()
+                .map(|q| q.object_id)
+                .collect::<Vec<_>>()
+        } else {
+            req.ids
+        };
+        db.retry_quarantined(id, &ids, &req.new_converter)
+    })
+    .await;
+    match resolved {
+        Ok(n) => (StatusCode::OK, Json(json!({ "resolved": n }))).into_response(),
         Err(e) => err_response(e),
     }
 }
