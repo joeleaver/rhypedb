@@ -223,6 +223,15 @@ def run_pgvector(
                 for i in range(n):
                     cp.write_row((i, _fmt_vec(train[i])))
 
+            # Fairness: pgvector's HNSW build must fit its graph in
+            # maintenance_work_mem or it spills to disk (the default 64MB spills
+            # after ~28k tuples and tanks build time). Give it headroom, and let
+            # it use more than the default 2 parallel workers (capped by the
+            # container's max_worker_processes). rhypedb's build uses all cores;
+            # this is the closest apples-to-apples on the box.
+            cur.execute("SET maintenance_work_mem = '2GB'")
+            cur.execute("SET max_parallel_maintenance_workers = 7")
+
             # Build the HNSW index — this is the build-time number.
             build_start = common.time_ns()
             cur.execute(

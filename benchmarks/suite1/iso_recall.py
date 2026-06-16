@@ -133,6 +133,12 @@ def main():
         ("baseline ef=50", 0, 0), ("ef:200", 200, 0), ("ef:500", 500, 0),
         ("rerank:50", 0, 50), ("rerank:100", 0, 100), ("rerank:200", 0, 200),
         ("rerank:500", 0, 500), ("rerank:1000", 0, 1000),
+        # Combined ef+rerank — the efficient path to high recall (widen the net
+        # cheaply with ef, then break the 4-bit quant ceiling with a modest
+        # rerank). Candidates for a sensible out-of-box default.
+        ("ef:100+rr:50", 100, 50), ("ef:100+rr:100", 100, 100),
+        ("ef:200+rr:100", 200, 100), ("ef:200+rr:200", 200, 200),
+        ("ef:300+rr:100", 300, 100),
     ]
     for label, ef, rr in rhypedb_cfgs:
         ret, us = eval_rhypedb(client, test, k, id_to_idx, ef, rr)

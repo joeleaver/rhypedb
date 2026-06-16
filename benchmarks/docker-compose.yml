@@ -24,6 +24,10 @@ services:
       POSTGRES_DB: bench
     ports:
       - "127.0.0.1:5433:5432"
+    # pgvector's PARALLEL HNSW build shares the graph via a DSM segment sized
+    # ~maintenance_work_mem; the Docker default /dev/shm (64MB) is far too small
+    # and the build fails with DiskFull. Give it headroom (> maintenance_work_mem).
+    shm_size: "4gb"
     volumes:
       - ./schemas/bench1.sql:/docker-entrypoint-initdb.d/01-bench1.sql:ro
       - pgdata:/var/lib/postgresql/data
