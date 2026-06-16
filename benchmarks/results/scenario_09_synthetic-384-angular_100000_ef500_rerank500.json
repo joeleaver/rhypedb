@@ -1,0 +1,50 @@
+[
+  {
+    "scenario": "2.1 vector_knn",
+    "implementation": "rhypedb-tcp",
+    "iterations": 1,
+    "iteration_stats": {
+      "min_ms": 9836.68554,
+      "p50_ms": 9836.68554,
+      "p95_ms": 9836.68554,
+      "p99_ms": 9836.68554,
+      "max_ms": 9836.68554,
+      "mean_ms": 9836.68554
+    },
+    "operation_stats": {
+      "n": 1000,
+      "min_us": 300.706,
+      "p50_us": 4110.552,
+      "p95_us": 4758.703,
+      "p99_us": 5097.902,
+      "max_us": 7153.934,
+      "mean_us": 4145.732888,
+      "total_ms": 4145.732888
+    },
+    "rss_cold_mb": 16.42578125,
+    "rss_post_load_mb": 81.6875,
+    "rss_peak_mb": 81.6875,
+    "rss_steady_mb": 236.3359375,
+    "disk_mb": 159.86842918395996,
+    "metadata": {
+      "dataset": "synthetic-384-angular",
+      "n_train": 100000,
+      "dim": 384,
+      "k": 10,
+      "n_queries": 1000,
+      "hnsw_m": 16,
+      "hnsw_ef_construction": 100,
+      "rhypedb_ef": 500,
+      "rhypedb_rerank": 500,
+      "rss_cold_anon_mb": 3.4296875,
+      "build_ms": 9836.68554,
+      "rss_post_load_anon_mb": 67.01171875,
+      "rss_post_load_file_mb": 13.11328125,
+      "recall_at_k": 0.9917,
+      "rss_steady_anon_mb": 67.40625,
+      "rss_steady_file_mb": 13.11328125,
+      "bytes_per_vector_anon_steady": 670.84288,
+      "bytes_per_vector_rss": 684.31872
+    }
+  }
+]

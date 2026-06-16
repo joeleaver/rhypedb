@@ -1,0 +1,24 @@
+
+build: rhypedb 10217 ms | pgvector 78815 ms (n=100000, 500 queries, k=10)
+
+engine    config              recall@10   mean_us
+--------------------------------------------------
+rhypedb   baseline ef=50         0.7754       431
+rhypedb   ef:200                 0.8602      1139
+rhypedb   ef:500                 0.8624      2289
+rhypedb   rerank:50              0.8938       664
+pgvector  ef_search=10           0.9302       483
+rhypedb   rerank:100             0.9776      1070
+rhypedb   ef:100+rr:50           0.9776       897
+rhypedb   ef:100+rr:100          0.9776      1126
+rhypedb   rerank:200             0.9888      1889
+rhypedb   ef:200+rr:100          0.9888      1638
+rhypedb   ef:200+rr:200          0.9888      1941
+rhypedb   ef:300+rr:100          0.9908      1997
+rhypedb   rerank:500             0.9912      4165
+rhypedb   rerank:1000            0.9922      8058
+pgvector  ef_search=40           0.9998       898
+pgvector  ef_search=100          0.9998      1864
+pgvector  ef_search=200          0.9998      3453
+pgvector  ef_search=400          1.0000      6478
+pgvector  ef_search=800          1.0000     12326
