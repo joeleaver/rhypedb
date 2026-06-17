@@ -1,11 +1,12 @@
 //! Card 5: HTTP admin surface for field-type migrations.
 //!
-//! Routes live under `/admin/migrations*` and are gated by a single static
-//! token (`RHYPEDB_ADMIN_TOKEN`, read once at startup): unset → 403, mismatch →
-//! 401. A quick safety net; real RBAC is a separate epic. Engine calls are
-//! blocking, so each handler hops onto `spawn_blocking` (the established pattern
-//! from `handle_admin_compact`). Responses are built with `serde_json::json!`
-//! over the engine's public structs so the engine stays serde-free.
+//! Routes live under `/admin/*` (migrations, `/admin/reload`, `/admin/compact`)
+//! and are gated by a single static token (`RHYPEDB_ADMIN_TOKEN`, read once at
+//! startup): unset → 403, mismatch → 401. A quick safety net; real RBAC is a
+//! separate epic. Engine calls are blocking, so each handler hops onto
+//! `spawn_blocking` (the established pattern from `handle_admin_compact`).
+//! Responses are built with `serde_json::json!` over the engine's public structs
+//! so the engine stays serde-free.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +47,10 @@ pub(crate) fn admin_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // In-place schema hot-reload (post-cutover stale handle, or general SDL
         // drift). Body = the updated SDL; refused while a migration is in flight.
         .route("/admin/reload", post(reload))
-        // Auth applies to these routes only (NOT /query, /health, /admin/compact).
+        // Force-flush + compact. Mutating + expensive, so gated like the rest of
+        // the admin surface. The handler lives in lib.rs next to /query.
+        .route("/admin/compact", post(crate::handle_admin_compact))
+        // Auth applies to these routes only (NOT /query, /status, /health).
         .route_layer(middleware::from_fn_with_state(state, admin_auth))
 }
 
@@ -883,6 +887,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(code, Some(401), "POST with wrong token must be 401");
+    }
+
+    /// `/admin/compact` is operational (mutating + expensive: force-flush +
+    /// full compaction) and must be gated like the migration routes — it was
+    /// previously mounted on the OPEN router, so anyone could trigger a
+    /// compaction unauthenticated. Unset token → 403, wrong token → 401, correct
+    /// token → 200 with the handler actually running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_compact_is_auth_gated() {
+        // No server token → admin disabled → 403.
+        let base_403 = spawn(None, 0).await;
+        let code = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{base_403}/admin/compact"))
+                .send_empty()
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(403), "compact with no server token must be 403");
+
+        // Wrong token → 401.
+        let base_401 = spawn(Some("s3cret"), 0).await;
+        let code = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{base_401}/admin/compact"))
+                .header("Authorization", "Bearer wrong")
+                .send_empty()
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(401), "compact with wrong token must be 401");
+
+        // Correct token → 200, and the handler runs end-to-end (flush + compact)
+        // — proves moving the route into admin_router didn't break it.
+        let base_ok = spawn(Some("tok"), 4).await;
+        let body = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{base_ok}/admin/compact"))
+                .header("Authorization", "Bearer tok")
+                .send_empty()
+                .unwrap()
+                .body_mut()
+                .read_json::<serde_json::Value>()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(body["flush_ok"], true, "compact must run with a valid token");
+        assert_eq!(body["compact_ok"], true);
     }
 
     /// HTTP round-trip: start a migration, then read its detail — exercises the

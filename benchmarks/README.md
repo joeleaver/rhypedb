@@ -632,7 +632,8 @@ memtable and pushes the SST count past the threshold, the next read
 sees fewer layers — fewer bloom checks, smaller BTreeMap merge, less
 memcmp. Cuts filter scan from 230 → 200 µs (-13%), pays back on every
 read path that crosses multiple layers. Manual `POST /admin/compact`
-also added for operator-triggered compaction during benchmarking.
+also added for operator-triggered compaction during benchmarking
+(gated by `RHYPEDB_ADMIN_TOKEN` — send `Authorization: Bearer <token>`).
 
 ### Allocator-friendly TCP response encoding (broad win)
 

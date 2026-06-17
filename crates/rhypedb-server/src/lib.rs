@@ -264,10 +264,11 @@ async fn handle_health(
 }
 
 /// Force-flush the active memtable + compact all SST files into one.
-/// Operational only — no auth, no admin gating. For benchmarking and
-/// manual triggering during development. Auto-compaction is the proper
-/// long-term answer.
-async fn handle_admin_compact(
+/// Operational (mutating + expensive), so gated by `RHYPEDB_ADMIN_TOKEN`
+/// alongside the migration admin routes — the route is registered inside
+/// `admin::admin_router`, not on the open router. For benchmarking and manual
+/// triggering; auto-compaction is the proper long-term answer.
+pub(crate) async fn handle_admin_compact(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let storage = state.db().storage().clone();
@@ -433,8 +434,8 @@ pub async fn run() {
         .route("/query", post(handle_query))
         .route("/status", get(handle_status))
         .route("/health", get(handle_health))
-        .route("/admin/compact", post(handle_admin_compact))
-        // Card 5: the migration admin surface, gated by RHYPEDB_ADMIN_TOKEN.
+        // All admin/operational routes (/admin/compact, /admin/reload,
+        // /admin/migrations*) are gated by RHYPEDB_ADMIN_TOKEN inside admin_router.
         .merge(admin::admin_router(state.clone()))
         .with_state(state.clone());
 
@@ -457,13 +458,13 @@ pub async fn run() {
     println!("  POST /query     — execute queries");
     println!("  GET  /health    — health check");
     if admin_enabled {
-        println!("  *    /admin/migrations* — migration admin (RHYPEDB_ADMIN_TOKEN set)");
+        println!("  *    /admin/* (compact, reload, migrations*) — admin (RHYPEDB_ADMIN_TOKEN set)");
         println!(
             "       built-in converters: {}",
             converters::BUILTIN_CONVERTER_NAMES.join(", ")
         );
     } else {
-        println!("  *    /admin/migrations* — DISABLED (set RHYPEDB_ADMIN_TOKEN to enable; returns 403)");
+        println!("  *    /admin/* (compact, reload, migrations*) — DISABLED (set RHYPEDB_ADMIN_TOKEN to enable; returns 403)");
     }
 
     // Spawn the binary TCP accept loop.
