@@ -1098,6 +1098,121 @@ pub(crate) fn apply_migration(
 /// batch (the covers embed field names, which change under a rename). Callers
 /// that hold a `Database` (or a `MigrationContext` carrying one) thread it in;
 /// catalog-only callers pass `None`.
+/// In-memory view of the writes a multi-verb rename plan has buffered SO FAR,
+/// layered over the plan's storage snapshot. Storage has NO read-your-own-writes
+/// (a `Transaction`'s puts/deletes only reach the memtable at commit), so within
+/// `apply_migration_with_cover` a later verb reading at `snap` cannot otherwise
+/// see an earlier verb's object/cover rewrites — committing both would leave the
+/// type's objects/covers half-renamed. This overlay closes that gap: it is folded
+/// forward one verb at a time (`absorb`) and consulted at every storage read site
+/// (`get_at` / `scan_prefix_at`).
+///
+/// It is ALSO the authoritative net write-set for the commit (`net_sets`): folding
+/// verb-ordered last-write-wins resolves every key to a single `Some(put)` /
+/// `None(delete)`, so a key never lands in BOTH the put and the delete batch.
+/// That matters because storage applies all puts THEN all deletes — for a chain
+/// `A→B→C` the intermediate `c:E:T\0B` is put by verb 1 then deleted by verb 2
+/// (net = delete, correct), while a name-reuse `[A→B, X→A]` re-PUTs `c:E:T\0A`
+/// after deleting it (net = put, correct); the raw put-then-delete batches would
+/// mis-resolve the reuse case and drop the field.
+///
+/// Only built for multi-verb plans (`verbs.len() > 1`); single-verb plans leave it
+/// empty and never call `net_sets`, so the common production path is byte-for-byte
+/// unchanged.
+#[derive(Default)]
+struct WriteOverlay {
+    /// Net state per key: `Some(value)` = put, `None` = delete. A `BTreeMap`
+    /// (not a hash map) so a prefix scan is a `range`, not a full-map walk.
+    map: std::collections::BTreeMap<Bytes, Option<Bytes>>,
+}
+
+impl WriteOverlay {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one verb's freshly-appended writes into the net state, in order
+    /// (later wins: a delete after a put tombstones the key; a put after a delete
+    /// revives it — matching the sequential composition of the verbs).
+    fn absorb(&mut self, puts: &[(Bytes, Bytes)], deletes: &[Bytes]) {
+        for (k, v) in puts {
+            self.map.insert(k.clone(), Some(v.clone()));
+        }
+        for k in deletes {
+            self.map.insert(k.clone(), None);
+        }
+    }
+
+    /// Point read layered over `snap`: an overlay hit wins (`Some` = value,
+    /// `None` = deleted); otherwise fall through to the snapshot.
+    fn get_at(&self, storage: &LsmTree, snap: u64, key: &[u8]) -> EngineResult<Option<Bytes>> {
+        match self.map.get(key) {
+            Some(Some(v)) => Ok(Some(v.clone())),
+            Some(None) => Ok(None),
+            None => Ok(storage.get_at(snap, key)?),
+        }
+    }
+
+    /// Prefix scan layered over `snap`: take the snapshot scan, then apply every
+    /// overlay entry under `prefix` (`Some` overrides/adds, `None` removes).
+    ///
+    /// The `None`-removal branch is currently UNREACHABLE through the rename verbs
+    /// (the only scanned prefixes are `o:`/`e:`, both put-only; catalog `c:` rows
+    /// are the only deletes and are read from the in-memory `Catalog`, never
+    /// scanned through storage). It is implemented for generality and pinned by a
+    /// unit test so it can't silently rot.
+    fn scan_prefix_at(
+        &self,
+        storage: &LsmTree,
+        snap: u64,
+        prefix: &[u8],
+    ) -> EngineResult<Vec<(Bytes, Bytes)>> {
+        let base = storage.scan_prefix_at(snap, prefix)?;
+        let lower = Bytes::copy_from_slice(prefix);
+        // Fast path: no buffered write under this prefix → return the snapshot
+        // scan verbatim (avoids rebuilding a BTreeMap for the per-edge `e:` scans,
+        // which never have overlay entries — keeps the scan from going quadratic).
+        let any_overlay = self
+            .map
+            .range(lower.clone()..)
+            .next()
+            .is_some_and(|(k, _)| k.starts_with(prefix));
+        if !any_overlay {
+            return Ok(base);
+        }
+        let mut merged: std::collections::BTreeMap<Bytes, Bytes> = base.into_iter().collect();
+        for (k, v) in self.map.range(lower..) {
+            if !k.starts_with(prefix) {
+                break;
+            }
+            match v {
+                Some(val) => {
+                    merged.insert(k.clone(), val.clone());
+                }
+                None => {
+                    merged.remove(k);
+                }
+            }
+        }
+        Ok(merged.into_iter().collect())
+    }
+
+    /// The net write-set for the commit: every key resolved to exactly ONE of a
+    /// put (`Some`) or a delete (`None`), so the put and delete batches are
+    /// disjoint (the storage commit's put-then-delete ordering becomes moot).
+    fn net_sets(&self) -> (Vec<(Bytes, Bytes)>, Vec<Bytes>) {
+        let mut puts = Vec::new();
+        let mut deletes = Vec::new();
+        for (k, v) in &self.map {
+            match v {
+                Some(val) => puts.push((k.clone(), val.clone())),
+                None => deletes.push(k.clone()),
+            }
+        }
+        (puts, deletes)
+    }
+}
+
 pub(crate) fn apply_migration_with_cover(
     storage: &LsmTree,
     schema: &Schema,
@@ -1133,41 +1248,20 @@ pub(crate) fn apply_migration_with_cover(
             ..MigrationReport::default()
         };
 
-        // Phase 3 lifted the former pre-flight directive refusal: renaming a
-        // field carrying @indexed / @unique / @vectorize, or a relation field,
-        // is now supported. Index/unique/vector/edge keys are field_id- and
-        // rel_id-keyed (stable across a rename), and the per-verb path below
-        // rewrites the covers/catalog rows that DO embed field NAMES, all in the
-        // same atomic batch. So there is nothing left to refuse on directive
-        // grounds — the old chained-rename-bypass hazard only mattered while a
-        // refusal existed.
-        //
-        // BUT: every verb in a plan reads from ONE storage snapshot (`snap`,
-        // taken above). A later verb cannot see an earlier verb's buffered
-        // object/cover rewrites (the txn buffer is write-only), so two verbs
-        // that rewrite the SAME type's objects — a field chain `A→B→C`, two
-        // field renames of one type, or a type rename paired with a field
-        // rename of that type — would commit half-renamed objects. Production
-        // never builds such plans (each `Database` / `MigrationContext` rename
-        // is its own single-verb commit), so refuse them up front and direct
-        // the operator to split into separate migrations.
-        {
-            let mut seen_types: std::collections::HashSet<&str> =
-                std::collections::HashSet::new();
-            for verb in verbs {
-                let touched = match verb {
-                    RenameVerb::Type { old, .. } => old.as_str(),
-                    RenameVerb::Field { type_name, .. } => type_name.as_str(),
-                };
-                if !seen_types.insert(touched) {
-                    return Err(EngineError::Catalog(
-                        CatalogError::RenameMultiVerbSameType {
-                            type_name: touched.into(),
-                        },
-                    ));
-                }
-            }
-        }
+        // Phase 3 lifted the former pre-flight directive refusal (renaming a field
+        // carrying @indexed / @unique / @vectorize, or a relation field, is
+        // supported). The multi-verb-same-type refusal it left behind is ALSO
+        // lifted now (Overboard cmqgvlf6b): a single plan may chain renames of one
+        // type (`A→B→C`) or rename several of its fields. Every verb still reads
+        // from ONE storage snapshot (`snap`) with no read-your-own-writes, so a
+        // later verb is handed a `WriteOverlay` (`overlay`) layering the prior
+        // verbs' buffered object/cover rewrites over `snap`. For a multi-verb plan
+        // the overlay's net state is also the commit write-set, so chained/reused
+        // catalog keys resolve correctly (see `WriteOverlay`). Production still only
+        // ever builds single-verb plans (each `Database` / `MigrationContext` rename
+        // is its own commit), which skip the overlay entirely.
+        let multi_verb = verbs.len() > 1;
+        let mut overlay = WriteOverlay::new();
 
         // Refuse renaming a type or field that has an UNSETTLED chunked
         // field-type migration plan. A rename re-keys the catalog entry by
@@ -1201,14 +1295,15 @@ pub(crate) fn apply_migration_with_cover(
 
         // Per-verb pre-flight + mutation. The whole plan succeeds or fails as a
         // unit before any storage write happens. Each verb's effect on the
-        // IN-MEMORY catalog (`cat`) is visible to the next, but its STORAGE
-        // rewrites are buffered (not visible through `snap`) — which is why the
-        // same-type multi-verb guard above forbids two verbs from rewriting one
-        // type's objects in a single plan.
+        // IN-MEMORY catalog (`cat`) is visible to the next; its STORAGE rewrites
+        // are buffered (not visible through `snap`) and made visible to later
+        // verbs via the `overlay`, folded forward after each verb.
         let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
         let mut deletes: Vec<Bytes> = Vec::new();
         let now_ms = now_unix_millis();
         for verb in verbs {
+            let puts_before = puts.len();
+            let deletes_before = deletes.len();
             match verb {
                 RenameVerb::Type { old, new } => {
                     apply_type_rename_verb(
@@ -1243,6 +1338,7 @@ pub(crate) fn apply_migration_with_cover(
                             storage,
                             schema,
                             snap,
+                            &overlay,
                             &mut cat,
                             type_name,
                             old,
@@ -1257,6 +1353,7 @@ pub(crate) fn apply_migration_with_cover(
                             storage,
                             schema,
                             snap,
+                            &overlay,
                             &mut cat,
                             type_name,
                             old,
@@ -1270,12 +1367,31 @@ pub(crate) fn apply_migration_with_cover(
                     }
                 }
             }
+            // Fold this verb's buffered writes forward so the NEXT verb's reads —
+            // and, for a multi-verb plan, the final commit set (`net_sets` below) —
+            // observe them. Single-verb plans have no next verb and commit the raw
+            // batches unchanged, so skip the fold.
+            if multi_verb {
+                overlay.absorb(&puts[puts_before..], &deletes[deletes_before..]);
+            }
         }
 
         if report.renamed_types.is_empty() && report.renamed_fields.is_empty() {
             // No-op plan. Abort the txn; don't bump format or touch
             // digest.
             return Ok((report, false));
+        }
+
+        // For a multi-verb plan the overlay's net state IS the commit write-set:
+        // it collapses per-key last-write-wins across verbs so the put and delete
+        // batches are disjoint (no put-then-delete mis-ordering for a chained or
+        // reused catalog key). MUST run before the catalog-format put below, which
+        // is a unique key never produced by a verb and is appended onto the rebuilt
+        // `puts`. Single-verb plans keep their raw batches (overlay untouched).
+        if multi_verb {
+            let (net_puts, net_deletes) = overlay.net_sets();
+            puts = net_puts;
+            deletes = net_deletes;
         }
 
         // Bump catalog format. A rename_type plan minimally bumps to v3
@@ -1537,8 +1653,9 @@ fn apply_type_rename_verb(
 #[allow(clippy::too_many_arguments)]
 fn apply_field_rename_verb(
     storage: &LsmTree,
-    schema: &Schema,
+    _schema: &Schema,
     snap: u64,
+    overlay: &WriteOverlay,
     cat: &mut Catalog,
     type_name: &str,
     old: &str,
@@ -1672,8 +1789,26 @@ fn apply_field_rename_verb(
             name: type_name.into(),
         })
     })?;
+
+    // Map each of this type's fields to its CURRENT bare name keyed by STABLE
+    // field_id, for the @indexed cover refresh below. `cat.field_ids` already
+    // reflects EARLIER verbs' renames; THIS verb's rename (old→new) is applied as
+    // an override because `cat` isn't re-keyed for it until after the object loop
+    // (the rewritten object blob already carries `new`). A single old→new remap
+    // can't resolve a field that an earlier verb in the same plan renamed, which
+    // is why the maintainer takes this map instead.
+    let mut current_field_name: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
+    for (qual, &fid) in &cat.field_ids {
+        let (t, f) = split_qualified(qual);
+        if t == type_name {
+            current_field_name.insert(fid, f.to_string());
+        }
+    }
+    current_field_name.insert(field_entry.id, new.to_string());
+
     let prefix = KeyBuilder::object_prefix(type_id);
-    let entries = storage.scan_prefix_at(snap, &prefix)?;
+    let entries = overlay.scan_prefix_at(storage, snap, &prefix)?;
     let mut objects_rewritten: u64 = 0;
     // Collect source object IDs for the rev_edge cover rewrite pass
     // below — every rev_edge whose source is one of these objects
@@ -1707,7 +1842,11 @@ fn apply_field_rename_verb(
             // atomic batch; no-op without a maintainer or @indexed fields.
             if let (Some(cover), Some(object_id)) = (cover, object_id) {
                 puts.extend(cover.rename_index_cover_puts(
-                    type_name, object_id, &fields, &new_blob, old, new,
+                    type_name,
+                    object_id,
+                    &fields,
+                    &new_blob,
+                    &current_field_name,
                 ));
             }
             puts.push((key.clone(), new_blob));
@@ -1733,18 +1872,18 @@ fn apply_field_rename_verb(
     // name appears in the cover as the bare `<old>` key only — no
     // `<old>__cover` / `<old>__cover_v` sidecars to touch (those belong to
     // relation fields).
+    // Which forward relations' rev-edge covers carry this type's object payloads:
+    // derive from the catalog by STABLE rel_id (split each rel qual's type), NOT
+    // from the immutable plan `schema`'s field NAMES. In a multi-verb plan an
+    // earlier relation rename re-keys `cat.rel_ids`, so a name-based lookup would
+    // miss and skip those covers, leaving this scalar field's name stale in them.
+    // Mirrors `apply_relation_rename_verb`; inverse relations have no forward edges
+    // so the `e:` scan below finds nothing for them (same covers as before).
     let mut forward_rel_ids: Vec<u64> = Vec::new();
-    if let Some(type_def) = schema.types.get(type_name) {
-        for field in &type_def.fields {
-            if let FieldType::Relation(_) = &field.field_type {
-                if field.inverse().is_some() {
-                    continue;
-                }
-                let rel_qual = format!("{type_name}.{}", field.name);
-                if let Some(&rel_id) = cat.rel_ids.get(&rel_qual) {
-                    forward_rel_ids.push(rel_id);
-                }
-            }
+    for (qual, &rel_id) in &cat.rel_ids {
+        let (t, _) = split_qualified(qual);
+        if t == type_name {
+            forward_rel_ids.push(rel_id);
         }
     }
 
@@ -1752,7 +1891,7 @@ fn apply_field_rename_verb(
     for src_id in &source_object_ids {
         for &rel_id in &forward_rel_ids {
             let edge_prefix = KeyBuilder::edge_prefix(*src_id, rel_id);
-            let edges = storage.scan_prefix_at(snap, &edge_prefix)?;
+            let edges = overlay.scan_prefix_at(storage, snap, &edge_prefix)?;
             for (edge_key, _) in edges {
                 // Edge key layout: `e:<src 8 BE>:<rel 8 BE>:<tgt 8 BE>`.
                 // The last 8 bytes are the target_id.
@@ -1763,7 +1902,7 @@ fn apply_field_rename_verb(
                     edge_key[edge_key.len() - 8..].try_into().unwrap();
                 let tgt_id = u64::from_be_bytes(tgt_bytes);
                 let rev_key = KeyBuilder::reverse_edge(tgt_id, rel_id, *src_id);
-                let Some(rev_bytes) = storage.get_at(snap, &rev_key)? else {
+                let Some(rev_bytes) = overlay.get_at(storage, snap, &rev_key)? else {
                     continue;
                 };
                 // Empty cover means "use fall-through" — nothing to rewrite.
@@ -1845,6 +1984,7 @@ fn apply_relation_rename_verb(
     storage: &LsmTree,
     _schema: &Schema,
     snap: u64,
+    overlay: &WriteOverlay,
     cat: &mut Catalog,
     type_name: &str,
     old: &str,
@@ -1981,7 +2121,7 @@ fn apply_relation_rename_verb(
         }
     }
     let obj_prefix = KeyBuilder::object_prefix(type_id);
-    let obj_entries = storage.scan_prefix_at(snap, &obj_prefix)?;
+    let obj_entries = overlay.scan_prefix_at(storage, snap, &obj_prefix)?;
     let mut source_ids: Vec<u64> = Vec::with_capacity(obj_entries.len());
     for (key, _) in &obj_entries {
         if key.len() >= 8 {
@@ -1999,7 +2139,7 @@ fn apply_relation_rename_verb(
     for src_id in &source_ids {
         for &rel_id in &rel_ids {
             let edge_prefix = KeyBuilder::edge_prefix(*src_id, rel_id);
-            let edges = storage.scan_prefix_at(snap, &edge_prefix)?;
+            let edges = overlay.scan_prefix_at(storage, snap, &edge_prefix)?;
             for (edge_key, _) in edges {
                 if edge_key.len() < 8 {
                     continue;
@@ -2007,7 +2147,7 @@ fn apply_relation_rename_verb(
                 let tgt_bytes: [u8; 8] = edge_key[edge_key.len() - 8..].try_into().unwrap();
                 let tgt_id = u64::from_be_bytes(tgt_bytes);
                 let rev_key = KeyBuilder::reverse_edge(tgt_id, rel_id, *src_id);
-                let Some(rev_bytes) = storage.get_at(snap, &rev_key)? else {
+                let Some(rev_bytes) = overlay.get_at(storage, snap, &rev_key)? else {
                     continue;
                 };
                 if rev_bytes.is_empty() {
@@ -2151,12 +2291,17 @@ pub(crate) trait FieldCoverMaintainer {
     /// is a full copy of the object FieldMap (every field's NAME embedded), so a
     /// field rename stales EVERY index cover on the type — not just the
     /// renamed field's own — and `filter_scan_via_index` would otherwise hand
-    /// back objects whose `fields.get(new_name)` is `None`. Unlike
-    /// `sibling_index_cover_puts`, the renamed field may itself be `@indexed`:
-    /// its value now lives under `new_name` in `fields` while the in-memory
-    /// index metadata still carries `old_name`. `field_id`/`kind` are stable
-    /// across a rename, so each existing `i:` key is reproduced exactly and the
-    /// `put` overwrites the stale-name blob in place. No-op when the type has no
+    /// back objects whose `fields.get(<current name>)` is `None`.
+    ///
+    /// `current_field_name` maps each field's STABLE `field_id` to its CURRENT
+    /// bare name in `fields` — the caller folds in earlier verbs' renames AND this
+    /// verb's own old→new. The in-memory index metadata (`indexed_fields`) still
+    /// carries pre-plan names, so the maintainer resolves each indexed field's
+    /// lookup name through this map by `field_id`. This is correct even when an
+    /// EARLIER verb in the same plan already renamed an indexed field (a single
+    /// old→new remap cannot resolve that). `field_id`/`kind` are stable across a
+    /// rename, so each existing `i:` key is reproduced exactly and the `put`
+    /// overwrites the stale-name blob in place. No-op when the type has no
     /// `@indexed` fields.
     fn rename_index_cover_puts(
         &self,
@@ -2164,8 +2309,7 @@ pub(crate) trait FieldCoverMaintainer {
         object_id: u64,
         fields: &crate::object::FieldMap,
         serialized: &Bytes,
-        old_name: &str,
-        new_name: &str,
+        current_field_name: &std::collections::HashMap<u64, String>,
     ) -> Vec<(Bytes, Bytes)>;
 }
 
@@ -8191,10 +8335,11 @@ mod tests {
     }
 
     #[test]
-    fn rename_plan_multi_verb_same_type_refused() {
-        // A single plan that names one type in two verbs is refused: all verbs
-        // share one snapshot, so a later verb can't see an earlier verb's
-        // buffered object rewrites — committing both would half-rename objects.
+    fn rename_plan_multi_verb_two_fields_same_type_succeeds() {
+        // Overboard cmqgvlf6b: a single plan may now rename TWO fields of one
+        // type. (Formerly refused with RenameMultiVerbSameType.) Both land and
+        // each field_id is preserved. Catalog-only check (no objects/covers); the
+        // object + @indexed-cover behaviour is exercised in the database tests.
         let dir = TempDir::new().unwrap();
         let storage = open_lsm(&dir);
         let schema = schema_with(vec![(
@@ -8204,8 +8349,10 @@ mod tests {
                 scalar("year", ScalarType::U32),
             ],
         )]);
-        let _ = load_or_initialize(&storage, &schema, false).unwrap();
-        let err = apply_migration(
+        let cat_pre = load_or_initialize(&storage, &schema, false).unwrap();
+        let year_id = cat_pre.field_ids["Movie.year"];
+        let title_id = cat_pre.field_ids["Movie.title"];
+        apply_migration(
             &storage,
             &schema,
             &[
@@ -8221,15 +8368,96 @@ mod tests {
                 },
             ],
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            EngineError::Catalog(CatalogError::RenameMultiVerbSameType { .. })
-        ));
-        // Nothing committed — both fields keep their original names.
-        let cat = load_or_initialize(&storage, &schema, false).unwrap();
-        assert!(cat.field_ids.contains_key("Movie.year"));
-        assert!(cat.field_ids.contains_key("Movie.title"));
+        .unwrap();
+        // Load with the TERMINAL schema (the rename left the names re-keyed).
+        let post = schema_with(vec![(
+            "Movie",
+            vec![
+                scalar("name", ScalarType::String),
+                scalar("released_in", ScalarType::U32),
+            ],
+        )]);
+        let cat = load_or_initialize(&storage, &post, false).unwrap();
+        assert!(!cat.field_ids.contains_key("Movie.year"));
+        assert!(!cat.field_ids.contains_key("Movie.title"));
+        assert_eq!(cat.field_ids["Movie.released_in"], year_id);
+        assert_eq!(cat.field_ids["Movie.name"], title_id);
+    }
+
+    #[test]
+    fn write_overlay_layers_reads_and_net_sets() {
+        // Unit test for the WriteOverlay mechanics, incl. the None-in-snap-scan
+        // removal branch that the rename verbs don't otherwise exercise (object/
+        // cover/rev-edge keys are put-only).
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        // Seed three keys under a common prefix at a snapshot.
+        let pfx: &[u8] = b"o:test:";
+        let k1 = Bytes::from_static(b"o:test:1");
+        let k2 = Bytes::from_static(b"o:test:2");
+        let k3 = Bytes::from_static(b"o:test:3");
+        let mut txn = storage.begin_txn();
+        storage
+            .put_batch(
+                &mut txn,
+                &[
+                    (k1.clone(), Bytes::from_static(b"v1")),
+                    (k2.clone(), Bytes::from_static(b"v2")),
+                    (k3.clone(), Bytes::from_static(b"v3")),
+                ],
+            )
+            .unwrap();
+        storage.commit(&mut txn).unwrap();
+        let snap = storage.begin_txn().snapshot();
+
+        let mut overlay = WriteOverlay::new();
+        // verb-1-style writes: override k1, tombstone k2, leave k3, add k4.
+        let k4 = Bytes::from_static(b"o:test:4");
+        overlay.absorb(
+            &[
+                (k1.clone(), Bytes::from_static(b"v1b")),
+                (k4.clone(), Bytes::from_static(b"v4")),
+            ],
+            std::slice::from_ref(&k2),
+        );
+
+        // get_at: override wins, tombstone reads None, untouched falls through.
+        assert_eq!(
+            overlay.get_at(&storage, snap, &k1).unwrap().as_deref(),
+            Some(&b"v1b"[..])
+        );
+        assert_eq!(overlay.get_at(&storage, snap, &k2).unwrap(), None);
+        assert_eq!(
+            overlay.get_at(&storage, snap, &k3).unwrap().as_deref(),
+            Some(&b"v3"[..])
+        );
+        assert_eq!(
+            overlay.get_at(&storage, snap, &k4).unwrap().as_deref(),
+            Some(&b"v4"[..])
+        );
+
+        // scan_prefix_at: k1 overridden, k2 removed (tombstone branch), k3 base,
+        // k4 added — sorted by key.
+        let scanned = overlay.scan_prefix_at(&storage, snap, pfx).unwrap();
+        assert_eq!(
+            scanned,
+            vec![
+                (k1.clone(), Bytes::from_static(b"v1b")),
+                (k3.clone(), Bytes::from_static(b"v3")),
+                (k4.clone(), Bytes::from_static(b"v4")),
+            ]
+        );
+
+        // net_sets: puts sorted, the tombstoned key in deletes.
+        let (puts, deletes) = overlay.net_sets();
+        assert_eq!(
+            puts,
+            vec![
+                (k1, Bytes::from_static(b"v1b")),
+                (k4, Bytes::from_static(b"v4")),
+            ]
+        );
+        assert_eq!(deletes, vec![k2]);
     }
 
     #[test]

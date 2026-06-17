@@ -7059,8 +7059,7 @@ impl crate::catalog::FieldCoverMaintainer for Database {
         object_id: u64,
         fields: &FieldMap,
         serialized: &Bytes,
-        old_name: &str,
-        new_name: &str,
+        current_field_name: &std::collections::HashMap<u64, String>,
     ) -> Vec<(Bytes, Bytes)> {
         let mut out = Vec::new();
         let Some(idx_fields) = self.indexed_fields.get(type_name) else {
@@ -7070,17 +7069,16 @@ impl crate::catalog::FieldCoverMaintainer for Database {
             return out;
         };
         for ifd in idx_fields {
-            // `indexed_fields` still carries the pre-rename name (the live
-            // handle hasn't reopened). The renamed field's value now lives
-            // under `new_name` in the rewritten FieldMap; every other indexed
-            // field keeps its name. field_id/kind are stable, so the rebuilt
-            // i: key matches the existing entry and the put overwrites it.
-            let lookup = if ifd.name == old_name {
-                new_name
-            } else {
-                ifd.name.as_str()
+            // `indexed_fields` still carries the pre-plan name (the live handle
+            // hasn't reopened), so resolve each indexed field's CURRENT name via
+            // its stable field_id. This tracks a field renamed by an EARLIER verb
+            // in the same plan — which a single old→new remap could not — and the
+            // caller folds in THIS verb's own rename too. field_id/kind are stable,
+            // so the rebuilt i: key matches the existing entry and overwrites it.
+            let Some(lookup) = current_field_name.get(&ifd.field_id) else {
+                continue;
             };
-            if let Some(value) = fields.get(lookup)
+            if let Some(value) = fields.get(lookup.as_str())
                 && !matches!(value, Value::Null)
                 && let Some(key) =
                     build_field_index_key(type_id, ifd.field_id, ifd.kind, value, object_id)
@@ -7753,6 +7751,348 @@ mod tests {
         );
         assert!(!got.fields.contains_key("year"));
         assert!(!got.fields.contains_key("released_in"));
+    }
+
+    #[test]
+    fn rename_chain_and_field_one_plan_indexed_cover_correct() {
+        // Overboard cmqgvlf6b: a SINGLE plan chains an @indexed field
+        // (year→released_in→year_made) AND renames a sibling (title→name) on one
+        // type. Verifies the objects carry the terminal names AND the @indexed
+        // COVERING payload is refreshed to the fully-renamed blob — a covered
+        // filter_scan returns `name`, not the stale `title`. The old single
+        // old→new cover remap could not resolve this across a chain.
+        use crate::catalog::RenameVerb;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Movie {
+                title: String
+                year: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("title".into(), Value::String("Aliens".into()));
+        f.insert("year".into(), Value::U32(1986));
+        let m = db.create("Movie", f).unwrap();
+        db.storage.flush().unwrap();
+
+        let verbs = [
+            RenameVerb::Field {
+                type_name: "Movie".into(),
+                old: "year".into(),
+                new: "released_in".into(),
+            },
+            RenameVerb::Field {
+                type_name: "Movie".into(),
+                old: "released_in".into(),
+                new: "year_made".into(),
+            },
+            RenameVerb::Field {
+                type_name: "Movie".into(),
+                old: "title".into(),
+                new: "name".into(),
+            },
+        ];
+        let report =
+            crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+                .unwrap();
+        // Per-verb counters: the chain rewrites the ONE object once per step
+        // (3 verbs → 3), it is not an object COUNT.
+        let total: u64 = report
+            .renamed_fields
+            .iter()
+            .map(|r| r.objects_rewritten)
+            .sum();
+        assert_eq!(total, 3, "one object rewritten once per verb");
+        drop(db);
+
+        let after = parse_schema(
+            r#"
+            type Movie {
+                name: String
+                year_made: u32 @indexed
+            }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(after, dir.path()).unwrap();
+        let got = db2.get("Movie", m.id).unwrap();
+        assert_eq!(got.fields.get("year_made"), Some(&Value::U32(1986)));
+        assert_eq!(
+            got.fields.get("name"),
+            Some(&Value::String("Aliens".into()))
+        );
+        assert!(!got.fields.contains_key("year"));
+        assert!(!got.fields.contains_key("released_in"));
+        assert!(!got.fields.contains_key("title"));
+
+        let results = db2
+            .filter_scan(
+                "Movie",
+                "year_made",
+                rhypedb_storage::zone::CompareOp::Eq,
+                1986,
+                None,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].fields.get("name"),
+            Some(&Value::String("Aliens".into())),
+            "covered result exposes the renamed sibling under its NEW name; got {:?}",
+            results[0].fields
+        );
+        assert!(
+            !results[0].fields.contains_key("title"),
+            "covered result must not retain the old sibling name; got {:?}",
+            results[0].fields
+        );
+        assert!(!results[0].fields.contains_key("year"));
+    }
+
+    #[test]
+    fn rename_two_different_types_one_plan() {
+        // A multi-verb plan touching DIFFERENT types in one apply was already
+        // allowed (the old guard only refused a REPEATED type); the new overlay
+        // path now runs it, so pin the disjoint case end-to-end.
+        use crate::catalog::RenameVerb;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Movie { year: u32 @indexed }
+            type Actor { age: u32 @indexed }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("year".into(), Value::U32(1986));
+        let m = db.create("Movie", mf).unwrap();
+        let mut af = FieldMap::new();
+        af.insert("age".into(), Value::U32(42));
+        let a = db.create("Actor", af).unwrap();
+        db.storage.flush().unwrap();
+
+        let verbs = [
+            RenameVerb::Field {
+                type_name: "Movie".into(),
+                old: "year".into(),
+                new: "released_in".into(),
+            },
+            RenameVerb::Field {
+                type_name: "Actor".into(),
+                old: "age".into(),
+                new: "years".into(),
+            },
+        ];
+        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+            .unwrap();
+        drop(db);
+
+        let after = parse_schema(
+            r#"
+            type Movie { released_in: u32 @indexed }
+            type Actor { years: u32 @indexed }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(after, dir.path()).unwrap();
+        assert_eq!(
+            db2.get("Movie", m.id).unwrap().fields.get("released_in"),
+            Some(&Value::U32(1986))
+        );
+        assert_eq!(
+            db2.get("Actor", a.id).unwrap().fields.get("years"),
+            Some(&Value::U32(42))
+        );
+        let mr = db2
+            .filter_scan(
+                "Movie",
+                "released_in",
+                rhypedb_storage::zone::CompareOp::Eq,
+                1986,
+                None,
+            )
+            .unwrap();
+        assert_eq!(mr.len(), 1);
+        assert_eq!(mr[0].fields.get("released_in"), Some(&Value::U32(1986)));
+        let ar = db2
+            .filter_scan(
+                "Actor",
+                "years",
+                rhypedb_storage::zone::CompareOp::Eq,
+                42,
+                None,
+            )
+            .unwrap();
+        assert_eq!(ar.len(), 1);
+        assert_eq!(ar[0].fields.get("years"), Some(&Value::U32(42)));
+    }
+
+    #[test]
+    fn rename_relation_then_scalar_same_type_cover_correct() {
+        // Regression for the design-review BLOCKER: renaming a RELATION field
+        // BEFORE a SCALAR field of the SAME type in one plan. The scalar verb must
+        // still rewrite the rev-edge covers for that relation — it enumerates
+        // forward relations by stable rel_id from the catalog, not by the (already
+        // re-keyed) field name — so the scalar field's NEW name lands in the cover.
+        // Needs TWO forward-1:1 relations so the rev covers are populated at all
+        // (the recommendation rev cover carries the source's scalar fields + the
+        // favourite peer sidecars).
+        use crate::catalog::RenameVerb;
+        use rhypedb_storage::key::KeyBuilder;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                favourite: Movie
+                recommendation: Movie
+            }
+            type Movie { title: String }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut m1 = FieldMap::new();
+        m1.insert("title".into(), Value::String("Inception".into()));
+        let movie1 = db.create("Movie", m1).unwrap();
+        let mut m2 = FieldMap::new();
+        m2.insert("title".into(), Value::String("Tenet".into()));
+        let movie2 = db.create("Movie", m2).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        db.link("User", user.id, "favourite", movie1.id, None).unwrap();
+        db.link("User", user.id, "recommendation", movie2.id, None)
+            .unwrap();
+        // recommendation is the 2nd-linked 1:1 relation, so ITS rev cover is the
+        // populated one (carries the user's `name` + favourite's peer sidecars).
+        let rec_id = db.rel_ids()["User.recommendation"];
+
+        // Relation rename FIRST, then the scalar rename — the order that broke.
+        let verbs = [
+            RenameVerb::Field {
+                type_name: "User".into(),
+                old: "favourite".into(),
+                new: "top_pick".into(),
+            },
+            RenameVerb::Field {
+                type_name: "User".into(),
+                old: "name".into(),
+                new: "handle".into(),
+            },
+        ];
+        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+            .unwrap();
+
+        let rev_key = KeyBuilder::reverse_edge(movie2.id, rec_id, user.id);
+        let txn = db.storage().begin_txn();
+        let rev_val = db
+            .storage()
+            .get(&txn, &rev_key)
+            .unwrap()
+            .expect("populated rev_edge cover exists");
+        drop(txn);
+        let cover = crate::object::deserialize_fields(&rev_val);
+        assert!(
+            cover.contains_key("handle"),
+            "renamed scalar present in cover: {cover:?}"
+        );
+        assert!(
+            !cover.contains_key("name"),
+            "old scalar name gone from cover: {cover:?}"
+        );
+        assert!(
+            cover.contains_key("top_pick") || cover.contains_key("top_pick__cover"),
+            "renamed relation peer sidecar present: {cover:?}"
+        );
+        assert!(
+            !cover.contains_key("favourite") && !cover.contains_key("favourite__cover"),
+            "old relation peer keys gone: {cover:?}"
+        );
+    }
+
+    #[test]
+    fn rename_two_relations_one_plan() {
+        // Two forward-1:1 relations of one type renamed in ONE plan: the second
+        // verb must read the first verb's cover rewrite through the overlay (the
+        // rev cover carries the OTHER relation's peer sidecars), else verb 2 would
+        // clobber verb 1's rename. Both renamed keys must survive in the cover.
+        use crate::catalog::RenameVerb;
+        use rhypedb_storage::key::KeyBuilder;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                favourite: Movie
+                recommendation: Movie
+            }
+            type Movie { title: String }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut m1 = FieldMap::new();
+        m1.insert("title".into(), Value::String("Inception".into()));
+        let movie1 = db.create("Movie", m1).unwrap();
+        let mut m2 = FieldMap::new();
+        m2.insert("title".into(), Value::String("Tenet".into()));
+        let movie2 = db.create("Movie", m2).unwrap();
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", uf).unwrap();
+        db.link("User", user.id, "favourite", movie1.id, None).unwrap();
+        db.link("User", user.id, "recommendation", movie2.id, None)
+            .unwrap();
+        let rec_id = db.rel_ids()["User.recommendation"];
+
+        let verbs = [
+            RenameVerb::Field {
+                type_name: "User".into(),
+                old: "favourite".into(),
+                new: "top_pick".into(),
+            },
+            RenameVerb::Field {
+                type_name: "User".into(),
+                old: "recommendation".into(),
+                new: "suggested".into(),
+            },
+        ];
+        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+            .unwrap();
+
+        // suggested's (=recommendation's) rev cover holds top_pick's (=favourite's)
+        // peer sidecars AND its own renamed key. Both renames must survive.
+        let rev_key = KeyBuilder::reverse_edge(movie2.id, rec_id, user.id);
+        let txn = db.storage().begin_txn();
+        let rev_val = db
+            .storage()
+            .get(&txn, &rev_key)
+            .unwrap()
+            .expect("rev cover exists");
+        drop(txn);
+        let cover = crate::object::deserialize_fields(&rev_val);
+        assert!(
+            cover.contains_key("suggested"),
+            "own renamed key present: {cover:?}"
+        );
+        assert!(
+            cover.contains_key("top_pick") || cover.contains_key("top_pick__cover"),
+            "peer renamed sidecar present: {cover:?}"
+        );
+        assert!(
+            !cover.contains_key("favourite") && !cover.contains_key("favourite__cover"),
+            "old peer keys gone: {cover:?}"
+        );
+        assert!(
+            !cover.contains_key("recommendation"),
+            "old own key gone: {cover:?}"
+        );
     }
 
     #[test]

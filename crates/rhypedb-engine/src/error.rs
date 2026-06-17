@@ -538,16 +538,11 @@ pub enum CatalogError {
     // `RenameFieldRelationUnsupported` were removed: rename_field now supports
     // @indexed / @unique / @vectorize and relation fields. See
     // `apply_field_rename_verb` / `apply_relation_rename_verb`.
-
-    /// A single rename plan names the same type in more than one verb (a field
-    /// chain `A→B→C`, two field renames of one type, or a type rename paired
-    /// with a field rename of that type). Every verb in a plan shares ONE
-    /// storage snapshot, so a later verb cannot see an earlier verb's buffered
-    /// object/cover rewrites — committing both would leave the type's objects
-    /// half-renamed. Split such renames into SEPARATE migrations: each commits
-    /// on its own snapshot and observes the previous one's result.
-    #[error("rename plan touches type {type_name:?} with more than one verb; chained or multi-field renames of one type must be separate migrations (a single plan shares one snapshot and would leave objects half-renamed)")]
-    RenameMultiVerbSameType { type_name: String },
+    //
+    // (Overboard cmqgvlf6b) `RenameMultiVerbSameType` was removed: a single plan
+    // may now chain renames of one type, or rename several of its fields. Later
+    // verbs read prior verbs' buffered rewrites through `WriteOverlay`, and the
+    // overlay's net state is the commit write-set. See `apply_migration_with_cover`.
 
     /// The supplied migration list has fewer entries than the catalog
     /// reports already-applied. Indicates that the binary was downgraded
