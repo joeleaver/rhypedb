@@ -192,13 +192,18 @@ async fn pause(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Respo
 }
 
 async fn resume(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Response {
+    // Hold the schema-epoch read guard across the resume so a hot-reload (write
+    // guard) can't swap the handle while resume arms the hook on it — the same
+    // arm-vs-swap fence `start` uses. (`resume_field_type_migration` drives the
+    // plan inline to completion, so this also serializes the whole resume vs a
+    // reload; a concurrent reload waits, then sees the settled plan.)
+    let _epoch = state.reload_lock.read().await;
     let db = state.db();
     match spawn_blocking_engine(move || db.resume_field_type_migration(id)).await {
         Ok(()) => {
-            // A resumed plan can still reach Completed (e.g. a Failed plan the
-            // operator fixed) → make sure a completion watcher exists so it
-            // hot-reloads on cutover. Idempotent: a duplicate watcher is harmless
-            // (the stash is consumed once).
+            // A resumed plan may now be Completed (it drives inline) — arm a
+            // watcher whose subscribe-then-recheck reloads the live handle even
+            // though completion already happened. Idempotent (stash consumed once).
             ensure_reload_watcher(&state, id);
             (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
         }
@@ -315,6 +320,14 @@ async fn events(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Resp
 /// change (e.g. after a `change_field_type` migration cuts over). `400` on a
 /// parse error; `409` if a migration is still in flight; on a rebuild error the
 /// old handle stays live and serving.
+///
+/// The reload runs the same catalog reconcile as a reopen, with its limits: a
+/// field-kind change with no settled plan is refused (`FieldKindChanged`) and a
+/// type/field drop needs the shrink opt-in. NOTE: like a reopen, NEWLY adding
+/// `@indexed`/`@unique` to an already-populated field does NOT backfill the
+/// secondary index for existing rows — only rows written after the reload are
+/// indexed. The intended use is picking up a post-cutover field-kind flip, not
+/// arbitrary index/constraint changes on populated data.
 async fn reload(State(state): State<Arc<AppState>>, body: String) -> Response {
     let schema = match parse_schema(&body) {
         Ok(s) => s,
@@ -349,34 +362,57 @@ async fn do_reload(state: &Arc<AppState>, target_schema: Schema) -> Result<Arc<D
     Ok(new)
 }
 
-/// Ensure a completion watcher + a stashed target schema exist for `plan_id`, so
-/// that when the plan settles `Completed` the live handle hot-reloads to the
-/// post-cutover schema. No-op for a settled / dry-run / non-scalar-target plan.
-/// Idempotent at the reload level: the stash is consumed exactly once, so a
-/// duplicate watcher (e.g. start + a later resume) does nothing the second time.
+/// Look up `plan_id` and, if the live handle is stale w.r.t. it, arm a reload
+/// watcher. Used by `start` / `resume` after a verb returns.
 fn ensure_reload_watcher(state: &Arc<AppState>, plan_id: u64) {
     let db = state.db();
-    let summary = match db.list_migrations() {
-        Ok(all) => all.into_iter().find(|s| s.plan_id == plan_id),
-        Err(e) => {
-            eprintln!("reload watcher: could not read plan {plan_id}: {e}");
-            None
+    match db.list_migrations() {
+        Ok(all) => {
+            if let Some(s) = all.iter().find(|s| s.plan_id == plan_id) {
+                arm_reload_watcher(state, s);
+            }
         }
-    };
-    let Some(s) = summary else { return };
-    // A dry-run never cuts over; Completed/Cancelled/DryRunCompleted can't reach
-    // Completed again. (Failed IS watched — the operator may fix + resume it.)
+        Err(e) => eprintln!("reload watcher: could not read plan {plan_id}: {e}"),
+    }
+}
+
+/// If the live handle is STALE w.r.t. this plan's target kind, stash the target
+/// schema and spawn a completion watcher. No-op when:
+/// - the plan can never flip the catalog (dry-run / Cancelled / DryRunCompleted),
+/// - the target kind is non-scalar (`change_field_type` never produces this), or
+/// - the live handle ALREADY declares the target kind (opened with the target
+///   SDL, or already reloaded — keeps this idempotent and skips the common
+///   already-correct case).
+///
+/// Otherwise the watcher (see [`spawn_reload_watcher`]) hot-reloads on completion
+/// — covering the still-Running, the just-`Completed` (e.g. a synchronous
+/// `resume`), and the post-restart cases uniformly.
+fn arm_reload_watcher(state: &Arc<AppState>, s: &MigrationSummary) {
     if s.dry_run
         || matches!(
             s.status,
-            MigrationStatus::Completed
-                | MigrationStatus::Cancelled
-                | MigrationStatus::DryRunCompleted
+            MigrationStatus::Cancelled | MigrationStatus::DryRunCompleted
         )
     {
         return;
     }
-    let Some(target) = s.target_field_type else { return };
+    let Some(target) = s.target_field_type.clone() else {
+        eprintln!(
+            "reload watcher: plan {} has a non-scalar target; skipping auto-reload",
+            s.plan_id
+        );
+        return;
+    };
+    let db = state.db();
+    let already_target = db
+        .schema()
+        .get_type(&s.type_name)
+        .and_then(|t| t.get_field(&s.field_name))
+        .map(|f| f.field_type == target)
+        .unwrap_or(false);
+    if already_target {
+        return;
+    }
     let Some(schema) = db.schema().with_field_type(&s.type_name, &s.field_name, target) else {
         return;
     };
@@ -384,17 +420,21 @@ fn ensure_reload_watcher(state: &Arc<AppState>, plan_id: u64) {
         .pending_reload_schemas
         .lock()
         .unwrap()
-        .insert(plan_id, schema);
-    spawn_reload_watcher(state.clone(), plan_id);
+        .insert(s.plan_id, schema);
+    spawn_reload_watcher(state.clone(), s.plan_id);
 }
 
-/// Watch one plan's `MigrationEvent`s; on `StatusChanged{Completed}` hot-reload
-/// the live handle to the stashed target schema. Mirrors the `events` SSE bridge
-/// (a blocking forwarder drains the engine's std mpsc into a tokio channel; an
-/// async task consumes it). The hub drops subscribers after a terminal event, so
-/// both tasks exit on settle. Cancelled/Failed settle WITHOUT a reload (the
-/// catalog kind didn't flip).
+/// Watch one plan and hot-reload the live handle to the stashed target schema
+/// when it reaches `Completed`. The engine event hub is **non-replayed** (a
+/// subscriber attached after an event was published never sees it), and the
+/// driver runs concurrently with — or, on the `resume`/startup paths, BEFORE —
+/// this call. So after subscribing we RE-CHECK the plan's status: if it already
+/// `Completed`, reload directly. This subscribe-then-recheck closes the race
+/// where a fast/empty migration (or a synchronous resume) settles before we
+/// subscribe. Otherwise we wait for the live `Completed` event.
 fn spawn_reload_watcher(state: Arc<AppState>, plan_id: u64) {
+    // Subscribe FIRST, so any event published from here on is delivered; the
+    // recheck below then covers anything published just before the subscribe.
     let engine_rx = state.db().subscribe_migration_events(plan_id);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<MigrationEvent>(16);
     tokio::task::spawn_blocking(move || loop {
@@ -417,6 +457,12 @@ fn spawn_reload_watcher(state: Arc<AppState>, plan_id: u64) {
         }
     });
     tokio::spawn(async move {
+        // Recheck: catch a completion that landed before we subscribed.
+        if migration_completed(&state, plan_id).await {
+            try_reload_from_stash(&state, plan_id).await;
+            state.pending_reload_schemas.lock().unwrap().remove(&plan_id);
+            return;
+        }
         while let Some(ev) = rx.recv().await {
             if matches!(
                 ev,
@@ -425,14 +471,7 @@ fn spawn_reload_watcher(state: Arc<AppState>, plan_id: u64) {
                     ..
                 }
             ) {
-                // Consume the stash so the reload fires at most once even if a
-                // duplicate watcher is alive.
-                let schema = state.pending_reload_schemas.lock().unwrap().remove(&plan_id);
-                if let Some(schema) = schema
-                    && let Err(e) = do_reload(&state, schema).await
-                {
-                    eprintln!("auto-reload after migration {plan_id} completed failed: {e}");
-                }
+                try_reload_from_stash(&state, plan_id).await;
             }
             if ev.is_terminal() {
                 // Cancelled / Failed (or an already-handled Completed): clear any
@@ -444,26 +483,41 @@ fn spawn_reload_watcher(state: Arc<AppState>, plan_id: u64) {
     });
 }
 
-/// Re-arm completion watchers at startup for migrations a prior run left in
-/// flight, so a plan that finishes its backfill post-restart still hot-reloads.
-/// Mirrors `converters::resume_inflight`: only `Pending`/`Running` plans are
-/// auto-driven post-restart, so only they can reach `Completed` unattended.
+/// Consume the stashed target schema for `plan_id` (removing it, so the reload
+/// fires at most once even with a duplicate watcher) and hot-reload to it.
+async fn try_reload_from_stash(state: &Arc<AppState>, plan_id: u64) {
+    let schema = state.pending_reload_schemas.lock().unwrap().remove(&plan_id);
+    if let Some(schema) = schema
+        && let Err(e) = do_reload(state, schema).await
+    {
+        eprintln!("auto-reload after migration {plan_id} completed failed: {e}");
+    }
+}
+
+/// Current status of `plan_id` is `Completed` (best-effort; `false` on any error).
+async fn migration_completed(state: &Arc<AppState>, plan_id: u64) -> bool {
+    let db = state.db();
+    matches!(
+        spawn_blocking_engine(move || db.query_migration_progress(plan_id)).await,
+        Ok(p) if p.status == MigrationStatus::Completed
+    )
+}
+
+/// Re-arm reload watchers at startup for every migration plan a prior run left
+/// behind. `arm_reload_watcher` self-filters: it arms only plans whose target
+/// kind the live handle does not yet declare (i.e. the handle is stale), so a
+/// plan that finished its backfill post-restart — including one that completes in
+/// the `resume_inflight` window between open and here — still hot-reloads, while
+/// already-correct plans are skipped.
 pub(crate) fn resume_reload_watchers(state: &Arc<AppState>) {
     let db = state.db();
-    let plans = match db.list_migrations() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("reload watchers: could not list plans at startup: {e}");
-            return;
+    match db.list_migrations() {
+        Ok(plans) => {
+            for s in &plans {
+                arm_reload_watcher(state, s);
+            }
         }
-    };
-    for s in plans {
-        if matches!(
-            s.status,
-            MigrationStatus::Pending | MigrationStatus::Running
-        ) {
-            ensure_reload_watcher(state, s.plan_id);
-        }
+        Err(e) => eprintln!("reload watchers: could not list plans at startup: {e}"),
     }
 }
 
@@ -932,6 +986,64 @@ mod tests {
         assert!(
             state.pending_reload_schemas.lock().unwrap().is_empty(),
             "the per-plan target schema is consumed once the reload lands"
+        );
+    }
+
+    /// Regression for the subscribe-after-complete race: with an EMPTY table the
+    /// migration settles almost instantly — likely BEFORE the watcher subscribes.
+    /// The subscribe-then-recheck path must still hot-reload the live handle (a
+    /// pure event-driven watcher would silently miss it and leave the handle
+    /// stale forever).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hotreload_auto_fires_when_migration_completes_before_subscribe() {
+        let (base, state) = spawn_app(Some("tok"), 0).await; // empty table
+        assert_eq!(
+            field_kind(&state, "User", "score"),
+            FieldType::Scalar(ScalarType::I64)
+        );
+
+        let b2 = base.clone();
+        tokio::task::spawn_blocking(move || {
+            let start: serde_json::Value = ureq::post(&format!("{b2}/admin/migrations"))
+                .header("Authorization", "Bearer tok")
+                .send_json(serde_json::json!({
+                    "type": "User", "field": "score", "to": "f64",
+                    "converter": "widen_int_to_f64", "converter_version": 1
+                }))
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            let id = start["migration_id"].as_u64().unwrap();
+            for _ in 0..100 {
+                let last: serde_json::Value = ureq::get(&format!("{b2}/admin/migrations/{id}"))
+                    .header("Authorization", "Bearer tok")
+                    .call()
+                    .unwrap()
+                    .body_mut()
+                    .read_json()
+                    .unwrap();
+                if last["status"] == "Completed" {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("migration did not complete");
+        })
+        .await
+        .unwrap();
+
+        let mut reloaded = false;
+        for _ in 0..150 {
+            if field_kind(&state, "User", "score") == FieldType::Scalar(ScalarType::F64) {
+                reloaded = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            reloaded,
+            "empty-table migration must still hot-reload via subscribe-then-recheck"
         );
     }
 
