@@ -1059,6 +1059,11 @@ pub struct FieldRenamePair {
     pub from: String,
     pub to: String,
     pub field_id: u64,
+    /// PER-VERB count of object FieldMaps rewritten. In a multi-verb plan that
+    /// chains renames of one type, the SAME physical object is counted once per
+    /// verb that touches it — this is an operation count, not a distinct-object
+    /// count (summing across a chain's pairs over-counts). Same for
+    /// `covers_rewritten`.
     pub objects_rewritten: u64,
     /// Count of `r:*` reverse-edge cover blobs whose embedded source-side
     /// FieldMap was rewritten in the same atomic batch as the catalog row
@@ -1262,6 +1267,37 @@ pub(crate) fn apply_migration_with_cover(
         // is its own commit), which skip the overlay entirely.
         let multi_verb = verbs.len() > 1;
         let mut overlay = WriteOverlay::new();
+
+        // Narrow refusal retained: a TYPE rename combined with a FIELD rename of
+        // that same type (either order). Field-only multi-verb plans are the lifted
+        // case; this one stays refused because a field verb resolves its @indexed
+        // cover maintainer (the live handle) by type NAME, which a same-plan type
+        // rename makes stale — the index covering payload would silently not
+        // refresh. Match the field's type against BOTH the old and new names of
+        // every type verb. Out of scope for cmqgvlf6b (field renames); split it.
+        if multi_verb {
+            let mut renamed_type_names: std::collections::HashSet<&str> =
+                std::collections::HashSet::new();
+            for verb in verbs {
+                if let RenameVerb::Type { old, new } = verb {
+                    renamed_type_names.insert(old.as_str());
+                    renamed_type_names.insert(new.as_str());
+                }
+            }
+            if !renamed_type_names.is_empty() {
+                for verb in verbs {
+                    if let RenameVerb::Field { type_name, .. } = verb
+                        && renamed_type_names.contains(type_name.as_str())
+                    {
+                        return Err(EngineError::Catalog(
+                            CatalogError::RenameTypeWithFieldSamePlan {
+                                type_name: type_name.clone(),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
 
         // Refuse renaming a type or field that has an UNSETTLED chunked
         // field-type migration plan. A rename re-keys the catalog entry by
@@ -8382,6 +8418,67 @@ mod tests {
         assert!(!cat.field_ids.contains_key("Movie.title"));
         assert_eq!(cat.field_ids["Movie.released_in"], year_id);
         assert_eq!(cat.field_ids["Movie.name"], title_id);
+    }
+
+    #[test]
+    fn rename_type_and_field_same_type_one_plan_refused() {
+        // Out of cmqgvlf6b's scope (field renames). A TYPE rename + a FIELD rename
+        // of that type in ONE plan stays refused (either order): the field verb's
+        // @indexed cover maintainer keys by the pre-rename type name, which the
+        // same-plan type rename makes stale. Split into separate migrations.
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let schema = schema_with(vec![("Movie", vec![scalar("year", ScalarType::U32)])]);
+        let _ = load_or_initialize(&storage, &schema, false).unwrap();
+
+        // Type first, field on the NEW type name.
+        let err = apply_migration(
+            &storage,
+            &schema,
+            &[
+                RenameVerb::Type {
+                    old: "Movie".into(),
+                    new: "Film".into(),
+                },
+                RenameVerb::Field {
+                    type_name: "Film".into(),
+                    old: "year".into(),
+                    new: "released_in".into(),
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(CatalogError::RenameTypeWithFieldSamePlan { .. })
+        ));
+
+        // Field first (on the OLD type name), type second — also refused.
+        let err2 = apply_migration(
+            &storage,
+            &schema,
+            &[
+                RenameVerb::Field {
+                    type_name: "Movie".into(),
+                    old: "year".into(),
+                    new: "released_in".into(),
+                },
+                RenameVerb::Type {
+                    old: "Movie".into(),
+                    new: "Film".into(),
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err2,
+            EngineError::Catalog(CatalogError::RenameTypeWithFieldSamePlan { .. })
+        ));
+
+        // Nothing committed: original names intact.
+        let cat = load_or_initialize(&storage, &schema, false).unwrap();
+        assert!(cat.type_ids.contains_key("Movie"));
+        assert!(cat.field_ids.contains_key("Movie.year"));
     }
 
     #[test]

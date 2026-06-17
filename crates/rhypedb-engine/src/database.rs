@@ -7933,6 +7933,73 @@ mod tests {
     }
 
     #[test]
+    fn rename_type_and_field_different_types_one_plan() {
+        // The type+field guard is NARROW: it only refuses the SAME type. A type
+        // rename PLUS a field rename of a DIFFERENT type in one plan is allowed and
+        // correct (the field verb's cover maintainer keys by the un-renamed type).
+        use crate::catalog::RenameVerb;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Movie { title: String }
+            type Actor { age: u32 @indexed }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut mf = FieldMap::new();
+        mf.insert("title".into(), Value::String("Heat".into()));
+        let m = db.create("Movie", mf).unwrap();
+        let mut af = FieldMap::new();
+        af.insert("age".into(), Value::U32(42));
+        let a = db.create("Actor", af).unwrap();
+        db.storage.flush().unwrap();
+
+        let verbs = [
+            RenameVerb::Type {
+                old: "Movie".into(),
+                new: "Film".into(),
+            },
+            RenameVerb::Field {
+                type_name: "Actor".into(),
+                old: "age".into(),
+                new: "years".into(),
+            },
+        ];
+        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+            .unwrap();
+        drop(db);
+
+        let after = parse_schema(
+            r#"
+            type Film { title: String }
+            type Actor { years: u32 @indexed }
+            "#,
+        )
+        .unwrap();
+        let db2 = Database::open(after, dir.path()).unwrap();
+        assert_eq!(
+            db2.get("Film", m.id).unwrap().fields.get("title"),
+            Some(&Value::String("Heat".into()))
+        );
+        assert_eq!(
+            db2.get("Actor", a.id).unwrap().fields.get("years"),
+            Some(&Value::U32(42))
+        );
+        let ar = db2
+            .filter_scan(
+                "Actor",
+                "years",
+                rhypedb_storage::zone::CompareOp::Eq,
+                42,
+                None,
+            )
+            .unwrap();
+        assert_eq!(ar.len(), 1);
+        assert_eq!(ar[0].fields.get("years"), Some(&Value::U32(42)));
+    }
+
+    #[test]
     fn rename_relation_then_scalar_same_type_cover_correct() {
         // Regression for the design-review BLOCKER: renaming a RELATION field
         // BEFORE a SCALAR field of the SAME type in one plan. The scalar verb must
@@ -7969,16 +8036,23 @@ mod tests {
         db.link("User", user.id, "favourite", movie1.id, None).unwrap();
         db.link("User", user.id, "recommendation", movie2.id, None)
             .unwrap();
-        // recommendation is the 2nd-linked 1:1 relation, so ITS rev cover is the
-        // populated one (carries the user's `name` + favourite's peer sidecars).
+        // recommendation is the 2nd-linked 1:1 relation, so ITS OWN rev cover is
+        // the populated one (carries the user's `name` + favourite's peer
+        // sidecars). Rename THAT relation so its non-empty cover is what the scalar
+        // verb must refresh — the only shape that fails under name-based relation
+        // enumeration.
         let rec_id = db.rel_ids()["User.recommendation"];
 
         // Relation rename FIRST, then the scalar rename — the order that broke.
+        // verb 1 re-keys cat.rel_ids (recommendation→suggested); verb 2 (scalar)
+        // must STILL find that relation by rel_id to refresh `name`→`handle` in its
+        // cover (fix 3), AND read verb 1's rewrite through the overlay so it does
+        // not clobber the recommendation→suggested rename (fix 1).
         let verbs = [
             RenameVerb::Field {
                 type_name: "User".into(),
-                old: "favourite".into(),
-                new: "top_pick".into(),
+                old: "recommendation".into(),
+                new: "suggested".into(),
             },
             RenameVerb::Field {
                 type_name: "User".into(),
@@ -7998,6 +8072,7 @@ mod tests {
             .expect("populated rev_edge cover exists");
         drop(txn);
         let cover = crate::object::deserialize_fields(&rev_val);
+        // fix 3: the scalar's NEW name reached the renamed relation's own cover.
         assert!(
             cover.contains_key("handle"),
             "renamed scalar present in cover: {cover:?}"
@@ -8006,13 +8081,14 @@ mod tests {
             !cover.contains_key("name"),
             "old scalar name gone from cover: {cover:?}"
         );
+        // fix 1: verb 1's relation rename survived verb 2's overlay-read rewrite.
         assert!(
-            cover.contains_key("top_pick") || cover.contains_key("top_pick__cover"),
-            "renamed relation peer sidecar present: {cover:?}"
+            cover.contains_key("suggested"),
+            "renamed relation key present: {cover:?}"
         );
         assert!(
-            !cover.contains_key("favourite") && !cover.contains_key("favourite__cover"),
-            "old relation peer keys gone: {cover:?}"
+            !cover.contains_key("recommendation"),
+            "old relation key gone: {cover:?}"
         );
     }
 

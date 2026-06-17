@@ -544,6 +544,16 @@ pub enum CatalogError {
     // verbs read prior verbs' buffered rewrites through `WriteOverlay`, and the
     // overlay's net state is the commit write-set. See `apply_migration_with_cover`.
 
+    /// A single rename plan combines a TYPE rename with a FIELD rename of that
+    /// same type (in either order). Field-only multi-verb plans (chains, several
+    /// fields of one type) are supported, but a type rename re-keys the type by
+    /// NAME, while a field verb's `@indexed` cover maintainer (the live handle)
+    /// still keys covers by the pre-rename type name — so the index covering
+    /// payload would not refresh. Split into separate migrations: rename the type,
+    /// reopen, then rename its fields.
+    #[error("rename plan combines a type rename with a field rename of type {type_name:?}; rename the type in a separate migration, reopen, then rename its fields")]
+    RenameTypeWithFieldSamePlan { type_name: String },
+
     /// The supplied migration list has fewer entries than the catalog
     /// reports already-applied. Indicates that the binary was downgraded
     /// or the operator's source-controlled migration list lost entries.
