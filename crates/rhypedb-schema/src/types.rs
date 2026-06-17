@@ -14,6 +14,20 @@ impl Schema {
     pub fn type_names(&self) -> impl Iterator<Item = &str> {
         self.types.keys().map(|s| s.as_str())
     }
+
+    /// Return a clone of this schema with `type_name.field_name`'s scalar/field
+    /// type replaced by `field_type`, leaving every directive
+    /// (`@indexed`/`@unique`/...) intact. Returns `None` if the type or field
+    /// does not exist. Used by the server to build the post-cutover target
+    /// schema for an in-place hot-reload after a `change_field_type` migration —
+    /// the one field's kind is flipped, everything else carries verbatim.
+    pub fn with_field_type(&self, type_name: &str, field_name: &str, field_type: FieldType) -> Option<Schema> {
+        let mut next = self.clone();
+        let td = next.types.get_mut(type_name)?;
+        let fd = td.fields.iter_mut().find(|f| f.name == field_name)?;
+        fd.field_type = field_type;
+        Some(next)
+    }
 }
 
 /// Definition of a single object type.
@@ -192,4 +206,45 @@ pub enum QuantizationType {
     TurboQuant3Bit,
     TurboQuant4Bit,
     None,
+}
+
+#[cfg(test)]
+mod with_field_type_tests {
+    use crate::parser::parse_schema;
+    use crate::types::{FieldType, ScalarType};
+
+    #[test]
+    fn flips_one_field_kind_preserving_directives_and_other_fields() {
+        let s = parse_schema(r#"type User { id: i64 @unique  score: i64 @indexed  name: String }"#)
+            .unwrap();
+        let out = s
+            .with_field_type("User", "score", FieldType::Scalar(ScalarType::F64))
+            .expect("type+field exist");
+        let user = out.get_type("User").unwrap();
+        // The migrated field flipped to F64 but kept its @indexed directive.
+        let score = user.get_field("score").unwrap();
+        assert_eq!(score.field_type, FieldType::Scalar(ScalarType::F64));
+        assert!(score.is_indexed(), "directives are preserved across the flip");
+        // Sibling fields are untouched.
+        assert_eq!(
+            user.get_field("id").unwrap().field_type,
+            FieldType::Scalar(ScalarType::I64)
+        );
+        assert!(user.get_field("id").unwrap().is_unique());
+        assert_eq!(
+            user.get_field("name").unwrap().field_type,
+            FieldType::Scalar(ScalarType::String)
+        );
+    }
+
+    #[test]
+    fn returns_none_for_unknown_type_or_field() {
+        let s = parse_schema(r#"type User { score: i64 }"#).unwrap();
+        assert!(s
+            .with_field_type("Nope", "score", FieldType::Scalar(ScalarType::F64))
+            .is_none());
+        assert!(s
+            .with_field_type("User", "nope", FieldType::Scalar(ScalarType::F64))
+            .is_none());
+    }
 }
