@@ -9,3 +9,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rustyline = { workspace = true }
 ureq = { workspace = true }
+# Unpack a streamed `/admin/backup/stream` tar (download/restore/verify).
+tar = "0.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }

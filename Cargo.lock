@@ -2459,6 +2459,8 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "tar",
+ "tempfile",
  "ureq",
 ]
 
