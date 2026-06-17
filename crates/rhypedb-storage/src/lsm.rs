@@ -9,7 +9,7 @@ use crate::memtable::MemTable;
 use crate::mvcc::{Transaction, TransactionManager};
 use crate::sst::{SstReader, SstWriter};
 use crate::wal::{RecordType, Wal};
-use crate::Result;
+use crate::{Error, Result};
 
 const DEFAULT_MEMTABLE_FLUSH_SIZE: usize = 4 * 1024 * 1024; // 4MB
 const DEFAULT_COMPACT_TRIGGER_SSTS: usize = 4;
@@ -75,6 +75,15 @@ struct CompactionState {
     pending: bool,
     running: bool,
     shutdown: bool,
+}
+
+/// What [`LsmTree::snapshot_to`] captured: the SST file names linked/copied into
+/// the snapshot dir, the max committed version across them, and the WAL byte size.
+#[derive(Debug, Clone)]
+pub struct SstSnapshotManifest {
+    pub sst_names: Vec<String>,
+    pub max_version: u64,
+    pub wal_bytes: u64,
 }
 
 /// LSM-tree storage engine.
@@ -960,7 +969,14 @@ impl LsmTree {
         // else a writer can land its row in the new memtable while its WAL
         // record is truncated → committed data lost across reopen.
         let _fg = self.flush_lock.write();
+        self.flush_locked()
+    }
 
+    /// Flush body, assuming the caller ALREADY holds `flush_lock.write()`.
+    /// `flush_lock` is a non-reentrant `parking_lot::RwLock`, so a path that
+    /// must flush WHILE holding the write lock (e.g. `snapshot_to`) calls this
+    /// instead of `flush()` to avoid a self-deadlock.
+    fn flush_locked(&self) -> Result<()> {
         // Rotate memtable: current becomes immutable, new empty one becomes active.
         let old_memtable = {
             let mut active = self.active_memtable.write();
@@ -1003,6 +1019,87 @@ impl LsmTree {
         *self.wal.lock() = new_wal;
 
         Ok(())
+    }
+
+    /// Take a consistent online physical snapshot of this LSM into `dst` (a
+    /// fresh directory). Flushes the active memtable so all committed data lands
+    /// in immutable SSTs, then HARD-LINKS each SST into `dst/sst/` (falling back
+    /// to a byte copy across filesystems) and REAL-COPIES `wal.log`. The result
+    /// reopens via [`LsmTree::open`] to exactly the committed state at snapshot
+    /// time. Returns the captured SST names + WAL byte size.
+    ///
+    /// Consistency: holds `flush_lock.write()` (excludes every writer and any
+    /// concurrent flush) for the whole pass, and `compaction_mutex` across the
+    /// SST enumeration + linking (so a merge cannot splice the set mid-snapshot).
+    /// SSTs are written-once + fsync'd and only ever unlinked (never mutated), so
+    /// a hard link pins the inode even if a later compaction removes the source.
+    /// The WAL is mutable, so it is always copied (never linked) — post-flush it
+    /// is header-only.
+    pub fn snapshot_to(&self, dst: &Path) -> Result<SstSnapshotManifest> {
+        let _fg = self.flush_lock.write();
+        // All committed data into immutable SSTs; WAL becomes header-only.
+        self.flush_locked()?;
+        // Exclude a concurrent merge from splicing the SST set mid-enumeration.
+        let _cg = self.compaction_mutex.lock();
+
+        let dst_sst = dst.join("sst");
+        std::fs::create_dir_all(&dst_sst)?;
+
+        // Hard-link only when `dst` is on the SAME filesystem as the data dir
+        // (O(1), no bytes copied, the link pins the immutable inode); otherwise
+        // copy. A cross-device hard_link fails with EXDEV — handled by the
+        // `is_ok()` fall-through below regardless of this hint.
+        let prefer_link = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                matches!(
+                    (std::fs::metadata(&self.config.data_dir), std::fs::metadata(dst)),
+                    (Ok(a), Ok(b)) if a.dev() == b.dev()
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+
+        let mut sst_names = Vec::new();
+        let mut max_version = 0u64;
+        {
+            let ssts = self.sst_files.read();
+            for reader in ssts.iter() {
+                let src = reader.path();
+                let name = src.file_name().ok_or_else(|| {
+                    Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "SST path has no file name",
+                    ))
+                })?;
+                let dest = dst_sst.join(name);
+                // Immutable SSTs are safe to hard-link; fall back to a byte copy
+                // on any link failure (cross-device EXDEV, etc.).
+                if !(prefer_link && std::fs::hard_link(src, &dest).is_ok()) {
+                    std::fs::copy(src, &dest)?;
+                }
+                sst_names.push(name.to_string_lossy().into_owned());
+                max_version = max_version.max(reader.max_version());
+            }
+        }
+
+        // The WAL is mutable (truncated + recreated on flush), so ALWAYS copy
+        // its bytes — never hard-link (a link would alias the live file and a
+        // later truncate would corrupt the snapshot). Header-only post-flush.
+        let wal_bytes = std::fs::copy(
+            self.config.data_dir.join("wal.log"),
+            dst.join("wal.log"),
+        )?;
+
+        Ok(SstSnapshotManifest {
+            sst_names,
+            max_version,
+            wal_bytes,
+        })
     }
 
     /// Compact all SST files into a single new SST, dropping old versions
@@ -3132,5 +3229,73 @@ mod tests {
         tree.put_batch(&mut txn, &[]).unwrap();
         tree.delete_batch(&mut txn, &[]).unwrap();
         tree.commit(&mut txn).unwrap();
+    }
+
+    #[test]
+    fn snapshot_to_roundtrip_reopens_with_same_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        // Mix flushed (in an SST) + unflushed (only WAL/memtable) data so the
+        // snapshot's flush-first step is exercised.
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"k:a", Bytes::from_static(b"va")).unwrap();
+        tree.put(&mut txn, b"k:b", Bytes::from_static(b"vb")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap(); // a + b now durable in an SST
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"k:c", Bytes::from_static(b"vc")).unwrap();
+        tree.commit(&mut txn).unwrap(); // c only in the WAL/memtable
+
+        // Snapshot to a fresh dir (same filesystem → hard-links).
+        let snap_dir = tempfile::tempdir().unwrap();
+        let manifest = tree.snapshot_to(snap_dir.path()).unwrap();
+        assert!(
+            !manifest.sst_names.is_empty(),
+            "snapshot must capture at least one SST"
+        );
+
+        // Reopening the snapshot yields ALL committed data, incl. the row that
+        // was only in the WAL at snapshot time (snapshot_to flushes first).
+        let restored = LsmTree::open(test_config(snap_dir.path())).unwrap();
+        let s = restored.read_snapshot();
+        assert_eq!(restored.get_at(s, b"k:a").unwrap().as_deref(), Some(&b"va"[..]));
+        assert_eq!(restored.get_at(s, b"k:b").unwrap().as_deref(), Some(&b"vb"[..]));
+        assert_eq!(restored.get_at(s, b"k:c").unwrap().as_deref(), Some(&b"vc"[..]));
+    }
+
+    #[test]
+    fn snapshot_is_independent_point_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"k:1", Bytes::from_static(b"before")).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        let snap_dir = tempfile::tempdir().unwrap();
+        tree.snapshot_to(snap_dir.path()).unwrap();
+
+        // Keep writing to the ORIGINAL after the snapshot, then churn the SST
+        // set with a compaction (which unlinks the old source SSTs the snapshot
+        // hard-linked — the linked inodes must survive).
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"k:2", Bytes::from_static(b"after")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+        tree.compact().unwrap();
+
+        // The snapshot is a frozen point-in-time: k:1 present, post-snapshot
+        // k:2 absent, and the compaction of the original did not corrupt it.
+        let restored = LsmTree::open(test_config(snap_dir.path())).unwrap();
+        let s = restored.read_snapshot();
+        assert_eq!(
+            restored.get_at(s, b"k:1").unwrap().as_deref(),
+            Some(&b"before"[..])
+        );
+        assert_eq!(
+            restored.get_at(s, b"k:2").unwrap(),
+            None,
+            "a write made AFTER the snapshot must not appear in it"
+        );
     }
 }

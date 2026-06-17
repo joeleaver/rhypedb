@@ -599,6 +599,24 @@ impl Default for MigrationPlanSpec {
 /// Operator-facing snapshot of a persisted migration plan
 /// ([`Database::list_migrations`]). Kind bytes and forward-compat TLVs are
 /// deliberately not exposed.
+/// What [`Database::backup_to`] captured. Plain data (the engine stays
+/// serde-free); the caller serializes this into the on-disk `MANIFEST.json`.
+#[derive(Debug, Clone)]
+pub struct BackupManifest {
+    /// SST file names hard-linked/copied into `<dst>/sst/`.
+    pub sst_names: Vec<String>,
+    /// Highest committed version across the captured SSTs.
+    pub max_version: u64,
+    /// Byte size of the captured (post-flush, header-only) `wal.log`.
+    pub wal_bytes: u64,
+    /// `hnsw_*.bin` vector-index snapshots copied alongside (may be empty).
+    pub hnsw_files: Vec<String>,
+    /// `(plan_id, converter_name)` of migrations in flight at backup time.
+    pub in_flight_migrations: Vec<(u64, String)>,
+    /// Wall-clock backup time (ms since epoch); 0 if the clock is unavailable.
+    pub created_at_ms: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct MigrationSummary {
     pub plan_id: u64,
@@ -5845,6 +5863,62 @@ impl Database {
         &self.storage
     }
 
+    /// Take a consistent physical backup of this database into `dst` (a fresh,
+    /// empty directory): the LSM SSTs + WAL (via [`LsmTree::snapshot_to`], which
+    /// flushes first and holds the right locks) plus a copy of every
+    /// `hnsw_*.bin` vector-index snapshot. The result is openable via
+    /// `Database::open(<the schema this DB was opened with>, dst)`.
+    ///
+    /// Two things are deliberately the CALLER's job: (1) freshening the HNSW
+    /// snapshots — the server owns the vectorizer and calls `save_snapshots()`
+    /// first; here the `.bin` files are copied as-is and a missing/stale one is
+    /// rebuilt from the LSM on open. (2) Writing the on-disk `MANIFEST.json` —
+    /// the engine stays serde-free, so the caller serializes the returned
+    /// [`BackupManifest`] and writes it LAST, its presence marking the backup
+    /// complete.
+    pub fn backup_to(&self, dst: &std::path::Path) -> EngineResult<BackupManifest> {
+        // SSTs + WAL — the consistent, load-bearing part.
+        let sst = self.storage.snapshot_to(dst)?;
+
+        // Copy each hnsw_*.bin (skip the *.bin.tmp the writer renames from).
+        let data_dir = self.storage.data_dir();
+        let mut hnsw_files = Vec::new();
+        for entry in std::fs::read_dir(data_dir).map_err(rhypedb_storage::Error::Io)? {
+            let entry = entry.map_err(rhypedb_storage::Error::Io)?;
+            let fname = entry.file_name();
+            let name = fname.to_string_lossy();
+            if name.starts_with("hnsw_") && name.ends_with(".bin") {
+                std::fs::copy(entry.path(), dst.join(&*name))
+                    .map_err(rhypedb_storage::Error::Io)?;
+                hnsw_files.push(name.into_owned());
+            }
+        }
+
+        // In-flight (non-terminal) migrations + their converter names — so an
+        // operator restoring a mid-migration backup knows it will auto-resume
+        // and which converters must be registered first.
+        let in_flight_migrations = self
+            .list_migrations()?
+            .into_iter()
+            .filter(|m| !m.status.is_terminal())
+            .map(|m| (m.plan_id, m.converter_name))
+            .collect();
+
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        Ok(BackupManifest {
+            sst_names: sst.sst_names,
+            max_version: sst.max_version,
+            wal_bytes: sst.wal_bytes,
+            hnsw_files,
+            in_flight_migrations,
+            created_at_ms,
+        })
+    }
+
     pub fn type_ids(&self) -> &HashMap<String, u64> {
         &self.type_ids
     }
@@ -7997,6 +8071,41 @@ mod tests {
             .unwrap();
         assert_eq!(ar.len(), 1);
         assert_eq!(ar[0].fields.get("years"), Some(&Value::U32(42)));
+    }
+
+    #[test]
+    fn backup_to_roundtrip_reopens_with_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type Movie { title: String year: u32 }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut ids = Vec::new();
+        for (t, y) in [("Aliens", 1986u32), ("Heat", 1995)] {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(t.into()));
+            f.insert("year".into(), Value::U32(y));
+            ids.push(db.create("Movie", f).unwrap().id);
+        }
+
+        // Back up to a fresh dir (same filesystem → hard-linked SSTs).
+        let backup_dir = tempfile::tempdir().unwrap();
+        let manifest = db.backup_to(backup_dir.path()).unwrap();
+        assert!(
+            !manifest.sst_names.is_empty(),
+            "backup must capture at least one SST"
+        );
+        assert!(manifest.in_flight_migrations.is_empty());
+
+        // Reopen the BACKUP as an independent database — all objects present.
+        let schema2 = parse_schema(r#"type Movie { title: String year: u32 }"#).unwrap();
+        let restored = Database::open(schema2, backup_dir.path()).unwrap();
+        assert_eq!(
+            restored.get("Movie", ids[0]).unwrap().fields.get("title"),
+            Some(&Value::String("Aliens".into()))
+        );
+        assert_eq!(
+            restored.get("Movie", ids[1]).unwrap().fields.get("year"),
+            Some(&Value::U32(1995))
+        );
     }
 
     #[test]
