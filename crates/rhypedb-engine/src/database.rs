@@ -604,6 +604,11 @@ pub struct MigrationSummary {
     pub plan_id: u64,
     pub type_name: String,
     pub field_name: String,
+    /// The field type this plan migrates the field TO. `None` only for a
+    /// non-scalar target (which `change_field_type` rejects, so in practice
+    /// always `Some`). Lets the server build the post-cutover schema for an
+    /// in-place hot-reload without a `catalog → Schema` reconstructor.
+    pub target_field_type: Option<FieldType>,
     pub status: crate::catalog::MigrationStatus,
     /// Highest object id whose conversion is durably committed.
     pub cursor: u64,
@@ -1831,6 +1836,58 @@ impl Database {
         // becomes: on Err, drop the OLD handle and reopen.
         self.migrated
             .store(true, std::sync::atomic::Ordering::Release);
+        Self::rebuild_with_arc_storage(
+            Arc::clone(&self.storage),
+            post_schema,
+            self.opts.clone(),
+            Arc::clone(&self.zone_field_id_lookup),
+            Some(carry),
+        )
+    }
+
+    /// Hot schema-reload primitive (server `/admin/reload` + auto-reload on
+    /// migration completion). Rebuilds a fresh `Arc<Database>` under
+    /// `post_schema`, sharing the SAME `Arc<LsmTree>` / subscribers / counters /
+    /// converters as `self` (no second LSM/WAL open, no rescan) — i.e. exactly
+    /// the `clone_into_new_handle` carry — but WITHOUT making a catalog change.
+    ///
+    /// Two deliberate differences from `clone_into_new_handle`:
+    ///
+    /// * **Non-poisoning.** `self.migrated` is left `false`, so the OLD handle
+    ///   stays fully live. If the rebuild FAILS (e.g. the supplied SDL disagrees
+    ///   with the on-disk catalog → `FieldKindChanged`), the caller still has a
+    ///   working handle and the server keeps serving — a bad reload can't brick
+    ///   it. The server quiesces in-flight requests around the swap (a
+    ///   write-locked schema epoch), so nothing observes the old handle's stale
+    ///   caches mid-request; the only other old-handle holders (the draining
+    ///   cover-refresh worker, the vectorizer's schema snapshot) are benign for a
+    ///   scalar field-type reload.
+    ///
+    /// * **Refuses while a migration is in flight.** The rebuilt handle does NOT
+    ///   carry `migrating_fields` (CarryState omits it — the `_consuming`
+    ///   invariant is "no unsettled plan"), so reloading mid-migration would
+    ///   silently disarm the double-write hook → source-only writes that cutover
+    ///   later loses/refuses. Holding `migration_lock.write()` across the check +
+    ///   rebuild makes the guard race-free vs a concurrent migration arm/disarm.
+    pub fn reload_handle(self: &Arc<Self>, post_schema: Schema) -> EngineResult<Arc<Self>> {
+        self.check_not_migrated()?;
+        let _guard = self.migration_lock.write();
+        let armed = self
+            .migrating_field_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if armed > 0 {
+            return Err(EngineError::ReloadBlockedByActiveMigration { armed });
+        }
+        let carry = CarryState {
+            subscriptions: Arc::clone(&self.subscriptions),
+            migration_events: Arc::clone(&self.migration_events),
+            next_object_id: Arc::clone(&self.next_object_id),
+            version_counters: Arc::clone(&self.version_counters),
+            version_counter_count: Arc::clone(&self.version_counter_count),
+            migration_lock: Arc::clone(&self.migration_lock),
+            converters: Arc::clone(&self.converters),
+        };
+        // NON-poisoning: self.migrated stays false (see doc comment).
         Self::rebuild_with_arc_storage(
             Arc::clone(&self.storage),
             post_schema,
@@ -3186,6 +3243,8 @@ impl Database {
                 plan_id: p.plan_id,
                 type_name: p.type_name,
                 field_name: p.field_name,
+                target_field_type: crate::catalog::scalar_type_from_kind(p.target_kind)
+                    .map(FieldType::Scalar),
                 status: p.status,
                 cursor: p.cursor,
                 objects_converted: p.objects_converted,
@@ -8895,6 +8954,135 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    /// Hot schema-reload: after an async `change_field_type` settles, the live
+    /// handle's in-memory schema is stale (source kind). `reload_handle` swaps in
+    /// a fresh handle on the SAME storage under the target schema — proving the
+    /// in-place fix for the post-cutover stale handle (the offline analog
+    /// drop()+reopen is `migrate_change_field_type_i64_to_f64_reopen`). Also
+    /// proves it is NON-poisoning: a failing reload leaves the handle live.
+    #[test]
+    fn reload_handle_swaps_schema_in_place_shares_storage_no_poison() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        // A second, non-migrated type lets us exercise the OLD handle after the
+        // reload without touching the migrated field — a poisoned handle would
+        // return `DatabaseMigratedAway` for any resolve.
+        const SRC: &str = r#"type User { score: i64 } type Tag { label: String }"#;
+        const DST: &str = r#"type User { score: f64 } type Tag { label: String }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(SRC).unwrap(), dir.path()).unwrap();
+        db.register_converter("widen", 1, widen_i64_to_f64("User.score"));
+        let scores = [5i64, 10, 15, 20, 25];
+        let mut ids = Vec::new();
+        for s in scores {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(s));
+            ids.push(db.create("User", f).unwrap().id);
+        }
+        let handle = db
+            .start_field_type_migration_async(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        db.wait_for_migration(handle.plan_id).unwrap();
+
+        // The reload: same storage, target schema. Migrated rows decode as F64
+        // through the new handle without any drop()/reopen().
+        let reloaded = db.reload_handle(parse_schema(DST).unwrap()).unwrap();
+        for (id, s) in ids.iter().zip(scores.iter()) {
+            match reloaded.get("User", *id).unwrap().fields.get("score") {
+                Some(Value::F64(f)) => assert_eq!(*f, *s as f64),
+                other => panic!("expected F64 after reload, got {other:?}"),
+            }
+        }
+        // Shared storage + next_object_id: a create on the reloaded handle
+        // continues the id sequence from the OLD handle (5 User objects → id 6).
+        let mut t = FieldMap::new();
+        t.insert("label".into(), Value::String("a".into()));
+        assert_eq!(reloaded.create("Tag", t).unwrap().id, 6);
+
+        // NON-poisoning: the OLD handle is still live (it was never marked
+        // migrated). Resolving a non-migrated type succeeds where a poisoned
+        // handle would return `DatabaseMigratedAway`.
+        let mut t2 = FieldMap::new();
+        t2.insert("label".into(), Value::String("b".into()));
+        let old_tag = db
+            .create("Tag", t2)
+            .expect("old handle must stay live after a non-poisoning reload");
+        assert_eq!(old_tag.id, 7, "old + new handles share next_object_id");
+    }
+
+    /// Hot schema-reload MUST refuse while a migration is in flight: the rebuilt
+    /// handle does not carry `migrating_fields`, so reloading mid-backfill would
+    /// silently disarm the double-write hook → source-only writes that cutover
+    /// loses. A converter that blocks on the first row holds the plan provably
+    /// armed-but-unsettled while we attempt the reload.
+    #[test]
+    fn reload_handle_refused_while_migration_armed() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+            .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let entered_tx = std::sync::Mutex::new(entered_tx);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let blocked_once = AtomicBool::new(false);
+        db.register_converter("widen", 1, move |_oid, v| {
+            // Block only on the FIRST row so the plan is armed-but-unsettled while
+            // the test attempts the reload; subsequent rows pass straight through.
+            if !blocked_once.swap(true, Ordering::SeqCst) {
+                entered_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            match v {
+                Value::I64(i) => Ok(Value::F64(*i as f64)),
+                _ => unreachable!(),
+            }
+        });
+        for s in [1i64, 2, 3] {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(s));
+            db.create("User", f).unwrap();
+        }
+        let handle = db
+            .start_field_type_migration_async(MigrationPlanSpec {
+                type_name: "User".into(),
+                field_name: "score".into(),
+                target_field_type: FieldType::Scalar(ScalarType::F64),
+                converter_name: "widen".into(),
+                converter_version: 1,
+                chunk_size: 1,
+                parallel_degree: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        // A worker is now inside the converter → hook armed, plan running.
+        entered_rx.recv().unwrap();
+        let err = match db.reload_handle(parse_schema(r#"type User { score: f64 }"#).unwrap()) {
+            Ok(_) => panic!("reload must be refused while a migration is armed"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, EngineError::ReloadBlockedByActiveMigration { armed } if armed > 0),
+            "reload must refuse a mid-flight migration, got {err:?}"
+        );
+        // Release; once settled, the same reload succeeds.
+        release_tx.send(()).unwrap();
+        db.wait_for_migration(handle.plan_id).unwrap();
+        let reloaded = db
+            .reload_handle(parse_schema(r#"type User { score: f64 }"#).unwrap())
+            .unwrap();
+        assert!(reloaded.get("User", 1).is_ok());
     }
 
     /// Card 5 AC `progress_eta_within_25pct_of_actual_on_uniform_load`: with a

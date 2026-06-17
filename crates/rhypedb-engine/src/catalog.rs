@@ -6128,6 +6128,28 @@ fn schema_kind_byte(ft: &FieldType) -> u8 {
     }
 }
 
+/// Inverse of the scalar arm of [`schema_kind_byte`]: map a persisted kind byte
+/// back to its `ScalarType`, or `None` for a non-scalar / unset kind. Lets the
+/// engine surface a migration plan's target field type (e.g. so the server can
+/// build the post-cutover schema for an in-place hot-reload).
+pub(crate) fn scalar_type_from_kind(k: u8) -> Option<ScalarType> {
+    use kind_byte::*;
+    Some(match k {
+        SCALAR_STRING => ScalarType::String,
+        SCALAR_U32 => ScalarType::U32,
+        SCALAR_U64 => ScalarType::U64,
+        SCALAR_I32 => ScalarType::I32,
+        SCALAR_I64 => ScalarType::I64,
+        SCALAR_F32 => ScalarType::F32,
+        SCALAR_F64 => ScalarType::F64,
+        SCALAR_BOOL => ScalarType::Bool,
+        SCALAR_DATETIME => ScalarType::DateTime,
+        SCALAR_BYTES => ScalarType::Bytes,
+        SCALAR_JSON => ScalarType::Json,
+        _ => return None,
+    })
+}
+
 fn kind_name(k: u8) -> &'static str {
     use kind_byte::*;
     match k {

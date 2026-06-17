@@ -206,6 +206,14 @@ pub enum EngineError {
     /// (`Completed` / `DryRunCompleted`). Nothing to cancel.
     #[error("cancel of plan {plan_id} refused: already settled (completed or a finished dry-run)")]
     MigrationCannotCancelSettled { plan_id: u64 },
+
+    /// Hot schema-reload (`reload_handle`) refused because a double-write hook is
+    /// still armed (a migration is mid-flight). The rebuilt handle does NOT carry
+    /// `migrating_fields`, so reloading now would silently disarm the hook —
+    /// source-only writes that cutover would later refuse / lose. Wait for the
+    /// plan to settle, then reload.
+    #[error("hot reload refused: {armed} migrating field hook(s) still armed; wait for the migration to settle")]
+    ReloadBlockedByActiveMigration { armed: usize },
 }
 
 /// Failures specific to the persisted schema catalog (see
