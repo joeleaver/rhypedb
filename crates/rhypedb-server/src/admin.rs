@@ -23,11 +23,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use rhypedb_engine::database::{
-    MigrationEvent, MigrationFilter, MigrationPlanSpec, MigrationProgress, MigrationSummary,
-    QuarantineEntry,
+    Database, MigrationEvent, MigrationFilter, MigrationPlanSpec, MigrationProgress,
+    MigrationSummary, QuarantineEntry,
 };
 use rhypedb_engine::{EngineError, ErrorPolicy, MigrationPhase, MigrationStatus};
-use rhypedb_schema::{FieldType, ScalarType};
+use rhypedb_schema::parser::parse_schema;
+use rhypedb_schema::{FieldType, ScalarType, Schema};
 
 use crate::AppState;
 
@@ -42,6 +43,9 @@ pub(crate) fn admin_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/migrations/{id}/quarantine", get(quarantine))
         .route("/admin/migrations/{id}/quarantine/retry", post(retry_quarantine))
         .route("/admin/migrations/{id}/events", get(events))
+        // In-place schema hot-reload (post-cutover stale handle, or general SDL
+        // drift). Body = the updated SDL; refused while a migration is in flight.
+        .route("/admin/reload", post(reload))
         // Auth applies to these routes only (NOT /query, /health, /admin/compact).
         .route_layer(middleware::from_fn_with_state(state, admin_auth))
 }
@@ -126,16 +130,24 @@ async fn start(
         quarantine_cap: req.quarantine_cap,
         parallel_degree: req.parallel,
     };
-    let db = state.db.clone();
+    // Hold the schema-epoch read guard across the arm so a hot-reload (write
+    // guard) can't swap the handle between create and the hook being armed.
+    let _epoch = state.reload_lock.read().await;
+    let db = state.db();
     match spawn_blocking_engine(move || db.start_field_type_migration_async(spec)).await {
-        Ok(handle) => (
-            StatusCode::OK,
-            Json(json!({
-                "migration_id": handle.plan_id,
-                "created_at_ms": handle.created_at_ms,
-            })),
-        )
-            .into_response(),
+        Ok(handle) => {
+            // Register the completion watcher so the live handle hot-reloads to
+            // the post-cutover schema when this plan finishes — no restart.
+            ensure_reload_watcher(&state, handle.plan_id);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "migration_id": handle.plan_id,
+                    "created_at_ms": handle.created_at_ms,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => err_response(e),
     }
 }
@@ -157,7 +169,7 @@ async fn list(State(state): State<Arc<AppState>>, Query(q): Query<ListQuery>) ->
         status,
         type_name: q.type_name,
     };
-    let db = state.db.clone();
+    let db = state.db();
     match spawn_blocking_engine(move || db.list_migrations_filtered(&filter)).await {
         Ok(rows) => {
             let arr: Vec<JsonValue> = rows.iter().map(summary_json).collect();
@@ -168,7 +180,7 @@ async fn list(State(state): State<Arc<AppState>>, Query(q): Query<ListQuery>) ->
 }
 
 async fn detail(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Response {
-    let db = state.db.clone();
+    let db = state.db();
     match spawn_blocking_engine(move || db.query_migration_progress(id)).await {
         Ok(p) => (StatusCode::OK, Json(progress_json(&p))).into_response(),
         Err(e) => err_response(e),
@@ -180,7 +192,18 @@ async fn pause(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Respo
 }
 
 async fn resume(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Response {
-    verb(state, move |db| db.resume_field_type_migration(id)).await
+    let db = state.db();
+    match spawn_blocking_engine(move || db.resume_field_type_migration(id)).await {
+        Ok(()) => {
+            // A resumed plan can still reach Completed (e.g. a Failed plan the
+            // operator fixed) → make sure a completion watcher exists so it
+            // hot-reloads on cutover. Idempotent: a duplicate watcher is harmless
+            // (the stash is consumed once).
+            ensure_reload_watcher(&state, id);
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
+        Err(e) => err_response(e),
+    }
 }
 
 async fn cancel(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Response {
@@ -192,7 +215,7 @@ async fn cutover(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Res
 }
 
 async fn quarantine(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Response {
-    let db = state.db.clone();
+    let db = state.db();
     match spawn_blocking_engine(move || db.list_quarantined(id)).await {
         Ok(rows) => {
             let arr: Vec<JsonValue> = rows.iter().map(quarantine_json).collect();
@@ -215,7 +238,7 @@ async fn retry_quarantine(
     Path(id): Path<u64>,
     Json(req): Json<RetryQuarantineRequest>,
 ) -> Response {
-    let db = state.db.clone();
+    let db = state.db();
     let resolved = spawn_blocking_engine(move || {
         // Empty ids → retry the whole current quarantine set.
         let ids = if req.ids.is_empty() {
@@ -241,7 +264,7 @@ async fn retry_quarantine(
 /// terminal event, on the client disconnecting (tokio sender closed), or on the
 /// hub dropping the engine sender — so it never parks a thread forever.
 async fn events(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Response {
-    let engine_rx = state.db.subscribe_migration_events(id);
+    let engine_rx = state.db().subscribe_migration_events(id);
     let (tx, rx) = tokio::sync::mpsc::channel::<MigrationEvent>(64);
     tokio::task::spawn_blocking(move || loop {
         match engine_rx.recv_timeout(Duration::from_secs(2)) {
@@ -284,6 +307,167 @@ async fn events(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Resp
 }
 
 // ---------------------------------------------------------------------------
+// In-place schema hot-reload
+// ---------------------------------------------------------------------------
+
+/// `POST /admin/reload` — body is the updated SDL. Hot-reloads the live handle in
+/// place so the operator never has to restart the server to pick up a schema
+/// change (e.g. after a `change_field_type` migration cuts over). `400` on a
+/// parse error; `409` if a migration is still in flight; on a rebuild error the
+/// old handle stays live and serving.
+async fn reload(State(state): State<Arc<AppState>>, body: String) -> Response {
+    let schema = match parse_schema(&body) {
+        Ok(s) => s,
+        Err(e) => return bad_request(&format!("schema parse error: {e}")),
+    };
+    match do_reload(&state, schema).await {
+        Ok(new) => {
+            let types: Vec<JsonValue> = new
+                .schema()
+                .types
+                .iter()
+                .map(|(name, td)| json!({ "type": name, "fields": td.fields.len() }))
+                .collect();
+            (StatusCode::OK, Json(json!({ "ok": true, "schema": types }))).into_response()
+        }
+        Err(e) => err_response(e),
+    }
+}
+
+/// Swap the live `Database` handle for a fresh one built on the SAME storage
+/// under `target_schema`. The schema-epoch WRITE guard drains in-flight
+/// schema-driven ops (query execute, migration `start`) and blocks new ones for
+/// the swap, so nothing straddles it. The engine refuses
+/// (`ReloadBlockedByActiveMigration` → 409) if any migration hook is still
+/// armed; a failed rebuild leaves the old handle untouched (no brick). Returns
+/// the new handle.
+async fn do_reload(state: &Arc<AppState>, target_schema: Schema) -> Result<Arc<Database>, EngineError> {
+    let _epoch = state.reload_lock.write().await;
+    let db = state.db();
+    let new = spawn_blocking_engine(move || db.reload_handle(target_schema)).await?;
+    state.db.store(new.clone());
+    Ok(new)
+}
+
+/// Ensure a completion watcher + a stashed target schema exist for `plan_id`, so
+/// that when the plan settles `Completed` the live handle hot-reloads to the
+/// post-cutover schema. No-op for a settled / dry-run / non-scalar-target plan.
+/// Idempotent at the reload level: the stash is consumed exactly once, so a
+/// duplicate watcher (e.g. start + a later resume) does nothing the second time.
+fn ensure_reload_watcher(state: &Arc<AppState>, plan_id: u64) {
+    let db = state.db();
+    let summary = match db.list_migrations() {
+        Ok(all) => all.into_iter().find(|s| s.plan_id == plan_id),
+        Err(e) => {
+            eprintln!("reload watcher: could not read plan {plan_id}: {e}");
+            None
+        }
+    };
+    let Some(s) = summary else { return };
+    // A dry-run never cuts over; Completed/Cancelled/DryRunCompleted can't reach
+    // Completed again. (Failed IS watched — the operator may fix + resume it.)
+    if s.dry_run
+        || matches!(
+            s.status,
+            MigrationStatus::Completed
+                | MigrationStatus::Cancelled
+                | MigrationStatus::DryRunCompleted
+        )
+    {
+        return;
+    }
+    let Some(target) = s.target_field_type else { return };
+    let Some(schema) = db.schema().with_field_type(&s.type_name, &s.field_name, target) else {
+        return;
+    };
+    state
+        .pending_reload_schemas
+        .lock()
+        .unwrap()
+        .insert(plan_id, schema);
+    spawn_reload_watcher(state.clone(), plan_id);
+}
+
+/// Watch one plan's `MigrationEvent`s; on `StatusChanged{Completed}` hot-reload
+/// the live handle to the stashed target schema. Mirrors the `events` SSE bridge
+/// (a blocking forwarder drains the engine's std mpsc into a tokio channel; an
+/// async task consumes it). The hub drops subscribers after a terminal event, so
+/// both tasks exit on settle. Cancelled/Failed settle WITHOUT a reload (the
+/// catalog kind didn't flip).
+fn spawn_reload_watcher(state: Arc<AppState>, plan_id: u64) {
+    let engine_rx = state.db().subscribe_migration_events(plan_id);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<MigrationEvent>(16);
+    tokio::task::spawn_blocking(move || loop {
+        match engine_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(ev) => {
+                let terminal = ev.is_terminal();
+                if tx.blocking_send(ev).is_err() {
+                    break; // consumer gone
+                }
+                if terminal {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if tx.is_closed() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    });
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if matches!(
+                ev,
+                MigrationEvent::StatusChanged {
+                    status: MigrationStatus::Completed,
+                    ..
+                }
+            ) {
+                // Consume the stash so the reload fires at most once even if a
+                // duplicate watcher is alive.
+                let schema = state.pending_reload_schemas.lock().unwrap().remove(&plan_id);
+                if let Some(schema) = schema
+                    && let Err(e) = do_reload(&state, schema).await
+                {
+                    eprintln!("auto-reload after migration {plan_id} completed failed: {e}");
+                }
+            }
+            if ev.is_terminal() {
+                // Cancelled / Failed (or an already-handled Completed): clear any
+                // remaining stash and stop watching.
+                state.pending_reload_schemas.lock().unwrap().remove(&plan_id);
+                break;
+            }
+        }
+    });
+}
+
+/// Re-arm completion watchers at startup for migrations a prior run left in
+/// flight, so a plan that finishes its backfill post-restart still hot-reloads.
+/// Mirrors `converters::resume_inflight`: only `Pending`/`Running` plans are
+/// auto-driven post-restart, so only they can reach `Completed` unattended.
+pub(crate) fn resume_reload_watchers(state: &Arc<AppState>) {
+    let db = state.db();
+    let plans = match db.list_migrations() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("reload watchers: could not list plans at startup: {e}");
+            return;
+        }
+    };
+    for s in plans {
+        if matches!(
+            s.status,
+            MigrationStatus::Pending | MigrationStatus::Running
+        ) {
+            ensure_reload_watcher(state, s.plan_id);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -293,7 +477,7 @@ async fn verb<F>(state: Arc<AppState>, f: F) -> Response
 where
     F: FnOnce(&rhypedb_engine::database::Database) -> Result<(), EngineError> + Send + 'static,
 {
-    let db = state.db.clone();
+    let db = state.db();
     match spawn_blocking_engine(move || f(&db)).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
         Err(e) => err_response(e),
@@ -324,6 +508,7 @@ fn err_response(e: EngineError) -> Response {
         | EngineError::MigrationCannotCancelInCutover { .. }
         | EngineError::MigrationCannotCancelSettled { .. }
         | EngineError::MigrationAlreadyRunning { .. }
+        | EngineError::ReloadBlockedByActiveMigration { .. }
         | EngineError::MigrationCutoverHasErrors { .. } => StatusCode::CONFLICT,
         EngineError::ConverterNotRegistered { .. }
         | EngineError::MigrationResumeSchemaMismatch { .. }
@@ -525,6 +710,13 @@ mod tests {
     /// ephemeral port, and return the base URL. The temp dir + server task are
     /// leaked for the lifetime of the test process (fine for a unit test).
     async fn spawn(token: Option<&str>, rows: i64) -> String {
+        spawn_app(token, rows).await.0
+    }
+
+    /// Like [`spawn`] but also returns the `Arc<AppState>` so a test can inspect
+    /// the live handle directly (e.g. assert it hot-reloaded). The temp dir +
+    /// server task are leaked for the test process lifetime.
+    async fn spawn_app(token: Option<&str>, rows: i64) -> (String, Arc<AppState>) {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(
             parse_schema(r#"type User { score: i64 }"#).unwrap(),
@@ -539,18 +731,33 @@ mod tests {
         }
         std::mem::forget(dir); // keep the data dir alive
         let state = Arc::new(AppState {
-            db,
+            db: arc_swap::ArcSwap::from(db),
             vectorizer: None,
             query_cache: QueryCache::new(16),
             admin_token: token.map(|s| s.to_string()),
+            reload_lock: tokio::sync::RwLock::new(()),
+            pending_reload_schemas: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let app = Router::new()
             .merge(admin_router(state.clone()))
-            .with_state(state);
+            .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}")
+        (format!("http://{addr}"), state)
+    }
+
+    /// The live handle's declared type for `Type.field`.
+    fn field_kind(state: &Arc<AppState>, ty: &str, field: &str) -> FieldType {
+        state
+            .db()
+            .schema()
+            .get_type(ty)
+            .unwrap()
+            .get_field(field)
+            .unwrap()
+            .field_type
+            .clone()
     }
 
     /// AC `admin_endpoints_return_403_when_token_unset`.
@@ -665,5 +872,170 @@ mod tests {
         assert_eq!(body["field"], "score");
         assert_eq!(body["status"], "Completed");
         assert_eq!(body["total_objects"].as_u64().unwrap(), 20);
+    }
+
+    /// The headline feature: after an online migration completes, the live server
+    /// handle hot-reloads to the post-cutover schema WITHOUT a restart. Drives a
+    /// real i64→f64 migration over the admin HTTP API, then asserts the in-memory
+    /// schema kind flipped on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hotreload_auto_swaps_handle_after_migration_completes() {
+        let (base, state) = spawn_app(Some("tok"), 12).await;
+        assert_eq!(
+            field_kind(&state, "User", "score"),
+            FieldType::Scalar(ScalarType::I64),
+            "live handle starts at the source kind"
+        );
+
+        let b2 = base.clone();
+        tokio::task::spawn_blocking(move || {
+            let start: serde_json::Value = ureq::post(&format!("{b2}/admin/migrations"))
+                .header("Authorization", "Bearer tok")
+                .send_json(serde_json::json!({
+                    "type": "User", "field": "score", "to": "f64",
+                    "converter": "widen_int_to_f64", "converter_version": 1, "chunk": 4
+                }))
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap();
+            let id = start["migration_id"].as_u64().unwrap();
+            for _ in 0..100 {
+                let last: serde_json::Value = ureq::get(&format!("{b2}/admin/migrations/{id}"))
+                    .header("Authorization", "Bearer tok")
+                    .call()
+                    .unwrap()
+                    .body_mut()
+                    .read_json()
+                    .unwrap();
+                if last["status"] == "Completed" {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("migration did not complete");
+        })
+        .await
+        .unwrap();
+
+        // The completion watcher hot-reloads the live handle to f64. It fires
+        // asynchronously after the Completed event, so poll for it.
+        let mut reloaded = false;
+        for _ in 0..150 {
+            if field_kind(&state, "User", "score") == FieldType::Scalar(ScalarType::F64) {
+                reloaded = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(reloaded, "live handle should hot-reload to f64 with no restart");
+        assert!(
+            state.pending_reload_schemas.lock().unwrap().is_empty(),
+            "the per-plan target schema is consumed once the reload lands"
+        );
+    }
+
+    /// `POST /admin/reload` with an unparseable SDL → 400, and the server keeps
+    /// serving on the untouched handle (no brick). A subsequent valid reload to
+    /// the same schema succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_rejects_bad_sdl_and_stays_live() {
+        let (base, state) = spawn_app(Some("tok"), 3).await;
+
+        let b2 = base.clone();
+        let code = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{b2}/admin/reload"))
+                .header("Authorization", "Bearer tok")
+                .send("type User { this is not valid")
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(400));
+        // Untouched + live.
+        assert_eq!(
+            field_kind(&state, "User", "score"),
+            FieldType::Scalar(ScalarType::I64)
+        );
+
+        let b3 = base.clone();
+        let ok = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{b3}/admin/reload"))
+                .header("Authorization", "Bearer tok")
+                .send("type User { score: i64 }")
+                .is_ok()
+        })
+        .await
+        .unwrap();
+        assert!(ok, "a valid reload with no migration in flight succeeds");
+    }
+
+    /// `POST /admin/reload` is refused with 409 while a migration is in flight —
+    /// reloading then would silently disarm the double-write hook (data loss). A
+    /// converter that blocks on the first row holds the plan provably armed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reload_returns_409_while_migration_in_flight() {
+        use rhypedb_engine::object::Value as EngineValue;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let (base, state) = spawn_app(Some("tok"), 3).await;
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let entered_tx = std::sync::Mutex::new(entered_tx);
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let blocked = AtomicBool::new(false);
+        state.db().register_converter("blocker", 1, move |_oid, v| {
+            if !blocked.swap(true, Ordering::SeqCst) {
+                entered_tx.lock().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            match v {
+                EngineValue::I64(i) => Ok(EngineValue::F64(*i as f64)),
+                _ => unreachable!(),
+            }
+        });
+
+        let b2 = base.clone();
+        tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{b2}/admin/migrations"))
+                .header("Authorization", "Bearer tok")
+                .send_json(serde_json::json!({
+                    "type": "User", "field": "score", "to": "f64",
+                    "converter": "blocker", "converter_version": 1, "chunk": 1, "parallel": 1
+                }))
+                .unwrap()
+                .body_mut()
+                .read_json::<serde_json::Value>()
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        // Wait until a worker is inside the converter → the plan is armed.
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let b3 = base.clone();
+        let code = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{b3}/admin/reload"))
+                .header("Authorization", "Bearer tok")
+                .send("type User { score: f64 }")
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(409), "reload must be refused mid-migration");
+
+        // Unblock so the migration (and its background driver) can finish.
+        release_tx.send(()).unwrap();
     }
 }

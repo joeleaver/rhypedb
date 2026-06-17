@@ -2502,6 +2502,7 @@ dependencies = [
 name = "rhypedb-server"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "clap",
  "libmimalloc-sys",

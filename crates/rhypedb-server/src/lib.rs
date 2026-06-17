@@ -15,11 +15,13 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use arc_swap::ArcSwap;
 use rhypedb_engine::database::Database;
 use rhypedb_engine::object::{Object, Value};
 use rhypedb_engine::vectorizer::Vectorizer;
 use rhypedb_query::executor::{ExecContext, QueryOutput};
 use rhypedb_schema::parser::parse_schema;
+use rhypedb_schema::Schema;
 
 mod admin;
 mod converters;
@@ -57,7 +59,11 @@ struct Cli {
 }
 
 pub(crate) struct AppState {
-    pub(crate) db: Arc<Database>,
+    /// The live database handle. Wrapped in `ArcSwap` so an in-place hot-reload
+    /// (after a `change_field_type` migration cuts over, or via `/admin/reload`)
+    /// can swap in a fresh handle on the SAME storage under the post-cutover
+    /// schema — no process restart. Read it via [`AppState::db`].
+    pub(crate) db: ArcSwap<Database>,
     vectorizer: Option<Arc<Vectorizer>>,
     query_cache: QueryCache,
     /// Card 5: the `RHYPEDB_ADMIN_TOKEN` env value, read ONCE at startup.
@@ -65,6 +71,26 @@ pub(crate) struct AppState {
     /// `Some` → a request must present a matching `Authorization: Bearer <token>`
     /// or get 401. A quick safety net; real RBAC is a separate epic.
     pub(crate) admin_token: Option<String>,
+    /// Schema-epoch lock for in-place hot-reload. Every operation that uses the
+    /// handle for schema-driven work (query execute, migration `start`) takes
+    /// `.read()` for that ONE operation; a reload takes `.write()`, which drains
+    /// in-flight readers, swaps `db`, then releases — so nothing straddles the
+    /// swap. Uncontended in steady state (writers appear only on reload).
+    pub(crate) reload_lock: tokio::sync::RwLock<()>,
+    /// Target schemas captured at migration-create time, keyed by `plan_id`, so
+    /// the per-plan completion watcher can hot-reload to the post-cutover schema
+    /// without reconstructing it from the catalog (no `catalog → Schema` exists).
+    /// Entries are removed when the plan settles.
+    pub(crate) pending_reload_schemas: std::sync::Mutex<HashMap<u64, Schema>>,
+}
+
+impl AppState {
+    /// Load the current database handle (a cheap `ArcSwap` load). Operations that
+    /// do schema-driven work should hold [`AppState::reload_lock`]`.read()` around
+    /// the load + use so a hot-reload cannot swap the handle mid-operation.
+    pub(crate) fn db(&self) -> Arc<Database> {
+        self.db.load_full()
+    }
 }
 
 #[derive(Deserialize)]
@@ -144,12 +170,21 @@ async fn handle_query(
         }
     };
 
-    let ctx = ExecContext {
-        db: &state.db,
-        vectorizer: state.vectorizer.as_deref(),
+    // Hold the schema-epoch read guard only across execute (the schema-driven
+    // work); a hot-reload (write guard) can't swap the handle mid-query.
+    // Materialized results decode self-describingly afterward, so the guard need
+    // not extend over response building.
+    let result = {
+        let _epoch = state.reload_lock.read().await;
+        let db = state.db();
+        let ctx = ExecContext {
+            db: &db,
+            vectorizer: state.vectorizer.as_deref(),
+        };
+        rhypedb_query::executor::execute(&ctx, &query)
     };
 
-    match rhypedb_query::executor::execute(&ctx, &query) {
+    match result {
         Ok(QueryOutput::Objects(objs)) => (
             StatusCode::OK,
             Json(QueryResponse {
@@ -162,7 +197,7 @@ async fn handle_query(
         Ok(QueryOutput::Single(obj)) => {
             // Enqueue vectorization for created/updated objects.
             if let Some(vectorizer) = &state.vectorizer {
-                enqueue_vectorize(vectorizer, &state.db, &obj);
+                enqueue_vectorize(vectorizer, &state.db(), &obj);
             }
             (
                 StatusCode::OK,
@@ -224,7 +259,7 @@ async fn handle_health(
 ) -> String {
     format!(
         "ok (subscriptions: {})",
-        state.db.subscriptions().subscription_count()
+        state.db().subscriptions().subscription_count()
     )
 }
 
@@ -235,7 +270,7 @@ async fn handle_health(
 async fn handle_admin_compact(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let storage = state.db.storage();
+    let storage = state.db().storage().clone();
     let t0 = std::time::Instant::now();
     let flush_result = tokio::task::spawn_blocking({
         let storage = storage.clone();
@@ -279,7 +314,7 @@ async fn handle_status(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let mut result = serde_json::json!({
-        "subscriptions": state.db.subscriptions().subscription_count(),
+        "subscriptions": state.db().subscriptions().subscription_count(),
     });
 
     if let Some(vectorizer) = &state.vectorizer {
@@ -381,11 +416,18 @@ pub async fn run() {
     let admin_enabled = admin_token.is_some();
 
     let state = Arc::new(AppState {
-        db,
+        db: ArcSwap::from(db),
         vectorizer,
         query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
         admin_token,
+        reload_lock: tokio::sync::RwLock::new(()),
+        pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
     });
+
+    // Re-register completion watchers for any migration left in flight by a prior
+    // run, so a plan that finishes its backfill post-restart still hot-reloads the
+    // live handle to the target schema instead of waiting for an operator.
+    admin::resume_reload_watchers(&state);
 
     let app = Router::new()
         .route("/query", post(handle_query))
@@ -507,7 +549,12 @@ where
                     }
                 };
 
-                let response = execute_query(&state, &query_text);
+                // Schema-epoch read guard around execute only (see handle_query);
+                // released before the frame write, which touches no handle state.
+                let response = {
+                    let _epoch = state.reload_lock.read().await;
+                    execute_query(&state, &query_text)
+                };
                 let write_result = match response {
                     Ok(QueryOutput::Objects(objs)) => {
                         protocol::write_frame_buffered(
@@ -521,7 +568,7 @@ where
                     }
                     Ok(QueryOutput::Single(obj)) => {
                         if let Some(vectorizer) = &state.vectorizer {
-                            enqueue_vectorize(vectorizer, &state.db, &obj);
+                            enqueue_vectorize(vectorizer, &state.db(), &obj);
                         }
                         protocol::write_frame_buffered(
                             writer,
@@ -620,8 +667,9 @@ fn execute_query(state: &AppState, query_text: &str) -> Result<QueryOutput, Stri
         .query_cache
         .get_or_parse(query_text)
         .map_err(|e| format!("parse error: {e}"))?;
+    let db = state.db();
     let ctx = ExecContext {
-        db: &state.db,
+        db: &db,
         vectorizer: state.vectorizer.as_deref(),
     };
     rhypedb_query::executor::execute(&ctx, &query).map_err(|e| format!("{e}"))
@@ -647,10 +695,12 @@ mod tcp_tests {
         // Leak the tempdir — it will live for the test process lifetime.
         std::mem::forget(dir);
         Arc::new(AppState {
-            db,
+            db: ArcSwap::from(db),
             vectorizer: None,
             query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
             admin_token: None,
+            reload_lock: tokio::sync::RwLock::new(()),
+            pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
