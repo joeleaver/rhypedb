@@ -50,6 +50,11 @@ pub(crate) fn admin_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Force-flush + compact. Mutating + expensive, so gated like the rest of
         // the admin surface. The handler lives in lib.rs next to /query.
         .route("/admin/compact", post(crate::handle_admin_compact))
+        // Physical backup: snapshot the live data dir. `POST /admin/backup`
+        // writes a snapshot dir to a server path; `GET /admin/backup/stream`
+        // streams the snapshot back as a tar.
+        .route("/admin/backup", post(backup))
+        .route("/admin/backup/stream", get(backup_stream))
         // Auth applies to these routes only (NOT /query, /status, /health).
         .route_layer(middleware::from_fn_with_state(state, admin_auth))
 }
@@ -557,6 +562,182 @@ where
     }
 }
 
+// ===================================================================
+// Physical backup (Overboard cmqiioa2y).
+// ===================================================================
+
+fn io_err(e: std::io::Error) -> EngineError {
+    EngineError::Storage(rhypedb_storage::Error::Io(e))
+}
+
+/// Freeze a complete physical backup into `dir` (which must be fresh): the LSM
+/// SSTs + WAL + `hnsw_*.bin` (via [`Database::backup_to`]), the SDL schema copied
+/// in (it is NOT in the data dir but is required to open the restore), and a
+/// `MANIFEST.json` written LAST — a reader treats its presence as "complete".
+/// Returns the manifest as JSON. NOTE: backup does NOT hold `reload_lock` — a hot
+/// reload swaps the handle to a fresh one on the SAME `Arc<LsmTree>`, and the
+/// captured `db` keeps working on that shared storage; `flush_lock` (on the
+/// storage) already serializes the snapshot vs writers.
+fn backup_into_dir(
+    db: &Database,
+    schema_path: &std::path::Path,
+    dir: &std::path::Path,
+) -> Result<JsonValue, EngineError> {
+    let manifest = db.backup_to(dir)?;
+    // The schema is mandatory — a data-dir-only backup will not open.
+    std::fs::copy(schema_path, dir.join("schema.rhype")).map_err(io_err)?;
+    let in_flight: Vec<JsonValue> = manifest
+        .in_flight_migrations
+        .iter()
+        .map(|(id, conv)| json!({ "plan_id": id, "converter": conv }))
+        .collect();
+    let manifest_json = json!({
+        "format": "rhypedb-physical-backup-v1",
+        "created_at_ms": manifest.created_at_ms,
+        "max_version": manifest.max_version,
+        "wal_bytes": manifest.wal_bytes,
+        "ssts": manifest.sst_names,
+        "hnsw_files": manifest.hnsw_files,
+        "schema_file": "schema.rhype",
+        "in_flight_migrations": in_flight,
+    });
+    let bytes = serde_json::to_vec_pretty(&manifest_json)
+        .map_err(|e| io_err(std::io::Error::other(e.to_string())))?;
+    // LAST.
+    std::fs::write(dir.join("MANIFEST.json"), bytes).map_err(io_err)?;
+    Ok(manifest_json)
+}
+
+fn sanitize_label(l: &str) -> String {
+    l.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn backup_dir_name(label: Option<&str>) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    match label {
+        Some(l) if !l.is_empty() => format!("rhypedb-backup-{ts}-{}", sanitize_label(l)),
+        _ => format!("rhypedb-backup-{ts}"),
+    }
+}
+
+#[derive(Deserialize)]
+struct BackupReq {
+    /// Directory on the SERVER's filesystem to place the snapshot under. A
+    /// timestamped `rhypedb-backup-<ms>[-<label>]/` subdir is created in it.
+    dest: String,
+    label: Option<String>,
+}
+
+/// `POST /admin/backup` — write a physical snapshot to a path on the server.
+async fn backup(State(state): State<Arc<AppState>>, Json(req): Json<BackupReq>) -> Response {
+    let db = state.db();
+    let schema_path = state.schema_path.clone();
+    let dest = std::path::PathBuf::from(req.dest);
+    let label = req.label;
+    match spawn_blocking_engine(move || {
+        let dir = dest.join(backup_dir_name(label.as_deref()));
+        std::fs::create_dir_all(&dir).map_err(io_err)?;
+        let manifest_json = backup_into_dir(&db, &schema_path, &dir)?;
+        Ok(json!({
+            "ok": true,
+            "path": dir.to_string_lossy(),
+            "manifest": manifest_json,
+        }))
+    })
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+/// Removes its directory on drop (best-effort temp cleanup).
+struct TempDirGuard(std::path::PathBuf);
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `std::io::Write` that forwards each chunk to an async mpsc channel so a
+/// blocking tar build can stream out a response body without buffering.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+}
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tx
+            .blocking_send(Ok(buf.to_vec()))
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected")
+            })?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", std::process::id(), nanos)
+}
+
+/// `GET /admin/backup/stream` — freeze a snapshot into a temp dir on the data
+/// dir's filesystem (so SSTs hard-link), then stream it back as a `tar` archive
+/// (chunked, never buffered — OOM-safe). The temp dir is removed afterward.
+async fn backup_stream(State(state): State<Arc<AppState>>) -> Response {
+    let db = state.db();
+    let schema_path = state.schema_path.clone();
+    let data_dir = state.data_dir.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+
+    tokio::task::spawn_blocking(move || {
+        // Temp snapshot dir INSIDE the data dir → guaranteed same filesystem, so
+        // the SST hard-links work. Removed on drop (incl. the error path).
+        let tmp = data_dir.join(format!(".rhypedb-backup-stream-{}", unique_suffix()));
+        let _guard = TempDirGuard(tmp.clone());
+        let build = (|| -> Result<(), std::io::Error> {
+            std::fs::create_dir_all(&tmp)?;
+            backup_into_dir(&db, &schema_path, &tmp)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let mut builder = tar::Builder::new(ChannelWriter { tx: tx.clone() });
+            builder.append_dir_all(".", &tmp)?;
+            builder.finish()?;
+            Ok(())
+        })();
+        if let Err(e) = build {
+            let _ = tx.blocking_send(Err(e));
+        }
+    });
+
+    let body =
+        axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-tar")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"rhypedb-backup.tar\"",
+        )
+        .body(body)
+        .expect("valid backup-stream response")
+}
+
 fn err_response(e: EngineError) -> Response {
     let code = match &e {
         EngineError::MigrationPlanNotFound { .. } | EngineError::TypeNotFound(_) => {
@@ -776,17 +957,17 @@ mod tests {
     /// server task are leaked for the test process lifetime.
     async fn spawn_app(token: Option<&str>, rows: i64) -> (String, Arc<AppState>) {
         let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(
-            parse_schema(r#"type User { score: i64 }"#).unwrap(),
-            dir.path(),
-        )
-        .unwrap();
+        let sdl = r#"type User { score: i64 }"#;
+        let schema_path = dir.path().join("schema.rhype");
+        std::fs::write(&schema_path, sdl).unwrap();
+        let db = Database::open(parse_schema(sdl).unwrap(), dir.path()).unwrap();
         crate::converters::register_builtins(&db);
         for i in 0..rows {
             let mut f = FieldMap::new();
             f.insert("score".into(), Value::I64(i));
             db.create("User", f).unwrap();
         }
+        let data_dir = dir.path().to_path_buf();
         std::mem::forget(dir); // keep the data dir alive
         let state = Arc::new(AppState {
             db: arc_swap::ArcSwap::from(db),
@@ -795,6 +976,8 @@ mod tests {
             admin_token: token.map(|s| s.to_string()),
             reload_lock: tokio::sync::RwLock::new(()),
             pending_reload_schemas: std::sync::Mutex::new(std::collections::HashMap::new()),
+            data_dir,
+            schema_path,
         });
         let app = Router::new()
             .merge(admin_router(state.clone()))
@@ -943,6 +1126,115 @@ mod tests {
         .unwrap();
         assert_eq!(body["flush_ok"], true, "compact must run with a valid token");
         assert_eq!(body["compact_ok"], true);
+    }
+
+    /// `/admin/backup` is gated like the rest of the admin surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backup_endpoints_are_auth_gated() {
+        let base_403 = spawn(None, 0).await;
+        let code = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{base_403}/admin/backup"))
+                .send_json(serde_json::json!({ "dest": "/tmp/nope" }))
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(403), "backup with no server token must be 403");
+
+        let base_401 = spawn(Some("s3cret"), 0).await;
+        let code = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{base_401}/admin/backup"))
+                .header("Authorization", "Bearer wrong")
+                .send_json(serde_json::json!({ "dest": "/tmp/nope" }))
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(401), "backup with wrong token must be 401");
+    }
+
+    /// `POST /admin/backup` writes a complete, openable snapshot dir.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backup_path_writes_openable_snapshot() {
+        let (base, _state) = spawn_app(Some("tok"), 3).await;
+        let dest = tempfile::tempdir().unwrap();
+        let dest_str = dest.path().to_string_lossy().to_string();
+        let b2 = base.clone();
+        let resp: serde_json::Value = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{b2}/admin/backup"))
+                .header("Authorization", "Bearer tok")
+                .send_json(serde_json::json!({ "dest": dest_str, "label": "nightly" }))
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["manifest"]["schema_file"], "schema.rhype");
+        assert!(
+            !resp["manifest"]["ssts"].as_array().unwrap().is_empty(),
+            "manifest lists at least one SST"
+        );
+        let path = std::path::PathBuf::from(resp["path"].as_str().unwrap());
+        assert!(path.join("MANIFEST.json").is_file());
+        assert!(path.join("schema.rhype").is_file());
+        assert!(path.join("sst").is_dir());
+        // The snapshot opens as an independent database with the 3 rows.
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            &path,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get("User", 1).unwrap().fields.get("score"),
+            Some(&Value::I64(0))
+        );
+        std::mem::forget(dest);
+    }
+
+    /// `GET /admin/backup/stream` streams a tar that unpacks to an openable dir.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backup_stream_returns_openable_tar() {
+        let (base, _state) = spawn_app(Some("tok"), 2).await;
+        let b2 = base.clone();
+        let bytes: Vec<u8> = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut resp = ureq::get(&format!("{b2}/admin/backup/stream"))
+                .header("Authorization", "Bearer tok")
+                .call()
+                .unwrap();
+            let mut buf = Vec::new();
+            resp.body_mut().as_reader().read_to_end(&mut buf).unwrap();
+            buf
+        })
+        .await
+        .unwrap();
+        assert!(!bytes.is_empty(), "tar stream is non-empty");
+
+        let out = tempfile::tempdir().unwrap();
+        tar::Archive::new(&bytes[..]).unpack(out.path()).unwrap();
+        assert!(out.path().join("MANIFEST.json").is_file());
+        assert!(out.path().join("schema.rhype").is_file());
+        assert!(out.path().join("sst").is_dir());
+        let db = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            out.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get("User", 1).unwrap().fields.get("score"),
+            Some(&Value::I64(0))
+        );
     }
 
     /// HTTP round-trip: start a migration, then read its detail — exercises the

@@ -82,6 +82,12 @@ pub(crate) struct AppState {
     /// without reconstructing it from the catalog (no `catalog → Schema` exists).
     /// Entries are removed when the plan settles.
     pub(crate) pending_reload_schemas: std::sync::Mutex<HashMap<u64, Schema>>,
+    /// The `--data-dir` the engine opened. Used by `/admin/backup/stream` to
+    /// place the temporary snapshot dir on the SAME filesystem (so SSTs hard-link).
+    pub(crate) data_dir: std::path::PathBuf,
+    /// The `--schema` SDL file. There is no `Schema → SDL` serializer, so a backup
+    /// copies this file in so the restored data dir is openable.
+    pub(crate) schema_path: std::path::PathBuf,
 }
 
 impl AppState {
@@ -423,6 +429,8 @@ pub async fn run() {
         admin_token,
         reload_lock: tokio::sync::RwLock::new(()),
         pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
+        data_dir: cli.data_dir.clone(),
+        schema_path: cli.schema.clone(),
     });
 
     // Re-register completion watchers for any migration left in flight by a prior
@@ -693,8 +701,10 @@ mod tcp_tests {
         )
         .unwrap();
         let db = Database::open(schema, dir.path()).unwrap();
+        let data_dir = dir.path().to_path_buf();
         // Leak the tempdir — it will live for the test process lifetime.
         std::mem::forget(dir);
+        let schema_path = data_dir.join("schema.rhype");
         Arc::new(AppState {
             db: ArcSwap::from(db),
             vectorizer: None,
@@ -702,6 +712,8 @@ mod tcp_tests {
             admin_token: None,
             reload_lock: tokio::sync::RwLock::new(()),
             pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
+            data_dir,
+            schema_path,
         })
     }
 

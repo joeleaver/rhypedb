@@ -45,6 +45,8 @@ serde_json = { workspace = true }
 clap = { workspace = true }
 parking_lot = { workspace = true }
 arc-swap = { workspace = true }
+# Streaming `/admin/backup/stream` tar archive.
+tar = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }
