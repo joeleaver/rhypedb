@@ -39,7 +39,7 @@ enum Commands {
         #[arg(long, conflicts_with = "dest")]
         download: Option<PathBuf>,
         /// Optional label folded into the server-side snapshot dir name (--dest).
-        #[arg(long)]
+        #[arg(long, requires = "dest")]
         label: Option<String>,
     },
     /// Restore a snapshot directory into a fresh data dir (server must be STOPPED).
@@ -533,12 +533,38 @@ fn download_backup(cli: &Cli, into: &Path) -> Result<(), String> {
         let text = resp.body_mut().read_to_string().unwrap_or_default();
         return Err(format!("server returned {status}: {}", text.trim()));
     }
+    let existed = into.exists();
     std::fs::create_dir_all(into).map_err(|e| format!("create {}: {e}", into.display()))?;
     let reader = resp.body_mut().as_reader();
-    tar::Archive::new(reader)
-        .unpack(into)
-        .map_err(|e| format!("unpack tar: {e}"))?;
+    if let Err(e) = tar::Archive::new(reader).unpack(into) {
+        // A truncated stream leaves a half-unpacked dir — remove what WE created.
+        if !existed {
+            let _ = std::fs::remove_dir_all(into);
+        }
+        return Err(format!("unpack tar (incomplete download): {e}"));
+    }
     Ok(())
+}
+
+/// Files a complete snapshot must contain per its manifest. Empty = complete.
+fn backup_missing_files(dir: &Path, manifest: &serde_json::Value) -> Vec<String> {
+    let mut missing = Vec::new();
+    if let Some(ssts) = manifest.get("ssts").and_then(|v| v.as_array()) {
+        for s in ssts.iter().filter_map(|s| s.as_str()) {
+            if !dir.join("sst").join(s).is_file() {
+                missing.push(format!("sst/{s}"));
+            }
+        }
+    }
+    if !dir.join("wal.log").is_file() {
+        missing.push("wal.log".to_string());
+    }
+    if let Some(sf) = manifest.get("schema_file").and_then(|v| v.as_str())
+        && !dir.join(sf).is_file()
+    {
+        missing.push(sf.to_string());
+    }
+    missing
 }
 
 fn run_restore(src: &Path, data_dir: &Path, force: bool) -> Result<(), String> {
@@ -548,15 +574,41 @@ fn run_restore(src: &Path, data_dir: &Path, force: bool) -> Result<(), String> {
     let manifest: serde_json::Value =
         serde_json::from_str(&manifest_text).map_err(|e| format!("invalid MANIFEST.json: {e}"))?;
 
+    // Refuse an INCOMPLETE source — else the restored DB silently loses data
+    // (LsmTree::open has no manifest; it loads whatever SSTs are present).
+    let missing = backup_missing_files(src, &manifest);
+    if !missing.is_empty() {
+        return Err(format!(
+            "source backup is INCOMPLETE — missing: {}",
+            missing.join(", ")
+        ));
+    }
+
     if data_dir.exists() {
+        // A read_dir failure means we CAN'T confirm it's empty → require --force.
         let non_empty = std::fs::read_dir(data_dir)
             .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
+            .unwrap_or(true);
         if non_empty && !force {
             return Err(format!(
                 "{} exists and is not empty (use --force to overwrite)",
                 data_dir.display()
             ));
+        }
+    }
+
+    // Clear any stale data first so a --force restore over a DIFFERENT database
+    // can't mix the two: LsmTree::open loads EVERY *.sst in sst/ (no manifest
+    // file), so a leftover foreign SST would corrupt the restore.
+    let _ = std::fs::remove_dir_all(data_dir.join("sst"));
+    let _ = std::fs::remove_file(data_dir.join("wal.log"));
+    if let Ok(rd) = std::fs::read_dir(data_dir) {
+        for entry in rd.flatten() {
+            let n = entry.file_name();
+            let n = n.to_string_lossy();
+            if n.starts_with("hnsw_") && n.ends_with(".bin") {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
     std::fs::create_dir_all(data_dir.join("sst")).map_err(|e| format!("create data dir: {e}"))?;
@@ -616,22 +668,7 @@ fn run_verify(dir: &Path) -> Result<(), String> {
     let manifest: serde_json::Value =
         serde_json::from_str(&manifest_text).map_err(|e| format!("invalid MANIFEST.json: {e}"))?;
 
-    let mut missing = Vec::new();
-    if let Some(ssts) = manifest.get("ssts").and_then(|v| v.as_array()) {
-        for s in ssts.iter().filter_map(|s| s.as_str()) {
-            if !dir.join("sst").join(s).is_file() {
-                missing.push(format!("sst/{s}"));
-            }
-        }
-    }
-    if !dir.join("wal.log").is_file() {
-        missing.push("wal.log".to_string());
-    }
-    if let Some(sf) = manifest.get("schema_file").and_then(|v| v.as_str())
-        && !dir.join(sf).is_file()
-    {
-        missing.push(sf.to_string());
-    }
+    let missing = backup_missing_files(dir, &manifest);
     if !missing.is_empty() {
         return Err(format!("backup INCOMPLETE — missing: {}", missing.join(", ")));
     }
@@ -783,5 +820,35 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let err = run_restore(src.path(), &out.path().join("x"), false).unwrap_err();
         assert!(err.contains("not a valid backup"), "got: {err}");
+    }
+
+    #[test]
+    fn restore_force_clears_stale_ssts() {
+        let src = tempfile::tempdir().unwrap();
+        write_fake_backup(src.path()); // sst/00000001.sst
+        let out = tempfile::tempdir().unwrap();
+        let data_dir = out.path().join("restored");
+        // Pre-populate the target with a STALE foreign SST + wal.
+        std::fs::create_dir_all(data_dir.join("sst")).unwrap();
+        std::fs::write(data_dir.join("sst").join("99999999.sst"), b"foreign").unwrap();
+        std::fs::write(data_dir.join("wal.log"), b"old").unwrap();
+
+        run_restore(src.path(), &data_dir, true).unwrap();
+        assert!(data_dir.join("sst").join("00000001.sst").is_file());
+        assert!(
+            !data_dir.join("sst").join("99999999.sst").exists(),
+            "a --force restore must clear the stale foreign SST (else open() mixes both DBs)"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_incomplete_source() {
+        let src = tempfile::tempdir().unwrap();
+        write_fake_backup(src.path());
+        // Remove the SST the manifest lists → the source is incomplete.
+        std::fs::remove_file(src.path().join("sst").join("00000001.sst")).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let err = run_restore(src.path(), &out.path().join("x"), false).unwrap_err();
+        assert!(err.contains("INCOMPLETE"), "got: {err}");
     }
 }

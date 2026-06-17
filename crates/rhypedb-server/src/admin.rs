@@ -570,6 +570,59 @@ fn io_err(e: std::io::Error) -> EngineError {
     EngineError::Storage(rhypedb_storage::Error::Io(e))
 }
 
+/// fsync a file's contents OR a directory's entries (a read-only fd is fine for
+/// fsync). Used to make a backup crash-durable.
+fn fsync_path(p: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(p)?.sync_all()
+}
+
+/// Sync the CONTENTS of every snapshot data file, then the directories holding
+/// them (so the dir entries — hard links + copies — persist). Hard-linked SSTs
+/// already have durable inode data; the sync_all is then a cheap no-op fsync.
+fn sync_backup_data(dir: &std::path::Path) -> std::io::Result<()> {
+    let sst_dir = dir.join("sst");
+    if let Ok(rd) = std::fs::read_dir(&sst_dir) {
+        for e in rd.flatten() {
+            fsync_path(&e.path())?;
+        }
+    }
+    for name in ["wal.log", "schema.rhype"] {
+        let p = dir.join(name);
+        if p.is_file() {
+            fsync_path(&p)?;
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            if n.starts_with("hnsw_") && n.ends_with(".bin") {
+                fsync_path(&e.path())?;
+            }
+        }
+    }
+    fsync_path(&sst_dir)?;
+    fsync_path(dir)?;
+    Ok(())
+}
+
+/// Remove orphaned `.rhypedb-backup-stream-*` temp dirs left in `data_dir` by a
+/// previous process that was HARD-killed mid-stream (TempDirGuard never ran).
+/// They hard-link SSTs, so leaving them pins old inodes and leaks disk. Called
+/// once at startup; the pid in each name belongs to a dead process.
+pub(crate) fn reap_backup_temp_dirs(data_dir: &std::path::Path) {
+    if let Ok(rd) = std::fs::read_dir(data_dir) {
+        for e in rd.flatten() {
+            if e.file_name()
+                .to_string_lossy()
+                .starts_with(".rhypedb-backup-stream-")
+            {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+}
+
 /// Freeze a complete physical backup into `dir` (which must be fresh): the LSM
 /// SSTs + WAL + `hnsw_*.bin` (via [`Database::backup_to`]), the SDL schema copied
 /// in (it is NOT in the data dir but is required to open the restore), and a
@@ -603,8 +656,14 @@ fn backup_into_dir(
     });
     let bytes = serde_json::to_vec_pretty(&manifest_json)
         .map_err(|e| io_err(std::io::Error::other(e.to_string())))?;
-    // LAST.
+    // Crash-durability: sync every data file's CONTENTS + the dirs, THEN write +
+    // sync the manifest, THEN fsync the dir LAST — so a durable "MANIFEST.json
+    // present" implies every file it vouches for is durable too (the backup is
+    // reached for precisely after a crash).
+    sync_backup_data(dir).map_err(io_err)?;
     std::fs::write(dir.join("MANIFEST.json"), bytes).map_err(io_err)?;
+    fsync_path(&dir.join("MANIFEST.json")).map_err(io_err)?;
+    fsync_path(dir).map_err(io_err)?;
     Ok(manifest_json)
 }
 
@@ -648,12 +707,18 @@ async fn backup(State(state): State<Arc<AppState>>, Json(req): Json<BackupReq>) 
     match spawn_blocking_engine(move || {
         let dir = dest.join(backup_dir_name(label.as_deref()));
         std::fs::create_dir_all(&dir).map_err(io_err)?;
-        let manifest_json = backup_into_dir(&db, &schema_path, &dir)?;
-        Ok(json!({
-            "ok": true,
-            "path": dir.to_string_lossy(),
-            "manifest": manifest_json,
-        }))
+        match backup_into_dir(&db, &schema_path, &dir) {
+            Ok(manifest_json) => Ok(json!({
+                "ok": true,
+                "path": dir.to_string_lossy(),
+                "manifest": manifest_json,
+            })),
+            Err(e) => {
+                // Don't leave a partial (manifest-less) dir behind on failure.
+                let _ = std::fs::remove_dir_all(&dir);
+                Err(e)
+            }
+        }
     })
     .await
     {
@@ -700,6 +765,10 @@ fn unique_suffix() -> String {
 /// `GET /admin/backup/stream` — freeze a snapshot into a temp dir on the data
 /// dir's filesystem (so SSTs hard-link), then stream it back as a `tar` archive
 /// (chunked, never buffered — OOM-safe). The temp dir is removed afterward.
+///
+/// A failure AFTER the 200 response begins (e.g. a snapshot/tar error mid-stream)
+/// can only truncate the body, so clients MUST validate the tar's end-of-archive
+/// marker before trusting a download (the CLI's `tar::Archive::unpack` does).
 async fn backup_stream(State(state): State<Arc<AppState>>) -> Response {
     let db = state.db();
     let schema_path = state.schema_path.clone();
@@ -1126,6 +1195,29 @@ mod tests {
         .unwrap();
         assert_eq!(body["flush_ok"], true, "compact must run with a valid token");
         assert_eq!(body["compact_ok"], true);
+    }
+
+    #[test]
+    fn reap_removes_orphaned_stream_temp_dirs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        // An orphaned streaming-backup temp dir + real data alongside it.
+        std::fs::create_dir_all(dir.path().join(".rhypedb-backup-stream-123-456").join("sst"))
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("sst")).unwrap();
+        std::fs::write(dir.path().join("sst").join("00000001.sst"), b"x").unwrap();
+        std::fs::write(dir.path().join("wal.log"), b"x").unwrap();
+
+        reap_backup_temp_dirs(dir.path());
+
+        assert!(
+            !dir.path().join(".rhypedb-backup-stream-123-456").exists(),
+            "orphaned temp dir must be reaped"
+        );
+        assert!(
+            dir.path().join("sst").join("00000001.sst").exists(),
+            "real data must be untouched"
+        );
+        assert!(dir.path().join("wal.log").exists());
     }
 
     /// `/admin/backup` is gated like the rest of the admin surface.

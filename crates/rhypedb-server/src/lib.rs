@@ -438,6 +438,11 @@ pub async fn run() {
     // live handle to the target schema instead of waiting for an operator.
     admin::resume_reload_watchers(&state);
 
+    // Sweep orphaned `.rhypedb-backup-stream-*` temp dirs from a previously
+    // hard-killed run (their TempDirGuard never ran) so leaked hard-linked SST
+    // inodes don't accumulate on the volume.
+    admin::reap_backup_temp_dirs(&cli.data_dir);
+
     let app = Router::new()
         .route("/query", post(handle_query))
         .route("/status", get(handle_status))
