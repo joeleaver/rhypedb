@@ -25,6 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+        with:
+          # Enable Pages (build_type=workflow) if it isn't already, so the
+          # workflow is self-sufficient and doesn't depend on manual setup.
+          enablement: true
       - name: Install mdBook
         env:
           MDBOOK_VERSION: '0.4.52'
