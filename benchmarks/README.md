@@ -28,7 +28,7 @@ cargo build --release -p rhypedb-server
 
 mkdir -p /tmp/bench-rhypedb-data
 target/release/rhypedb-server \
-  --schema benchmarks/schemas/bench1.sdl \
+  --schema benchmarks/schemas/bench1.rhype \
   --data-dir /tmp/bench-rhypedb-data \
   --listen 127.0.0.1:4300 \
   --tcp-listen 127.0.0.1:4301
@@ -684,7 +684,7 @@ benchmarks/
 ├── docker-compose.yml                 # Postgres 16 on host 5433
 ├── requirements.txt                   # psycopg
 ├── schemas/
-│   ├── bench1.sdl                     # rhypedb schema
+│   ├── bench1.rhype                   # rhypedb schema
 │   └── bench1.sql                     # postgres DDL (loaded via initdb hook)
 ├── harness/
 │   ├── common.py                      # latency/memory/results utilities

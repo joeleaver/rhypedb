@@ -34,11 +34,11 @@ echo "dataset=$DATASET dim=$DIM subset=$SUBSET queries=$QUERIES k=$K"
 pkill -f 'rhypedb-server.*vecbench-rhypedb-data' 2>/dev/null || true
 timeout 10 bash -c 'until ! (exec 3<>/dev/tcp/127.0.0.1/'"$TCP_PORT"') 2>/dev/null; do :; done' || true
 rm -rf "$DATA"; mkdir -p "$DATA"
-printf 'type Vec {\n    embedding: Vector<%s>\n}\n' "$DIM" > "$DATA/vec.sdl"
+printf 'type Vec {\n    embedding: Vector<%s>\n}\n' "$DIM" > "$DATA/vec.rhype"
 
 # 3) Start the server.
 target/release/rhypedb-server \
-  --schema "$DATA/vec.sdl" --data-dir "$DATA" \
+  --schema "$DATA/vec.rhype" --data-dir "$DATA" \
   --listen 127.0.0.1:"$HTTP_PORT" --tcp-listen 127.0.0.1:"$TCP_PORT" --no-sync \
   >/tmp/vecbench_server.log 2>&1 &
 SRV=$!

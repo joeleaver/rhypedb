@@ -1,4 +1,4 @@
--- Suite 1 schema: mirrors benchmarks/schemas/bench1.sdl as closely as Postgres
+-- Suite 1 schema: mirrors benchmarks/schemas/bench1.rhype as closely as Postgres
 -- allows. Mounted into the bench container at /docker-entrypoint-initdb.d/ so
 -- it runs once on first container start.
 --

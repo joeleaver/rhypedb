@@ -1,0 +1,12 @@
+[book]
+title = "rhypedb"
+authors = ["Joe Leaver"]
+description = "Documentation for rhypedb — a strongly-typed object database with first-class relationships and native vector search."
+src = "src"
+language = "en"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/joeleaver/rhypedb"
+edit-url-template = "https://github.com/joeleaver/rhypedb/edit/master/docs/{path}"
