@@ -1165,7 +1165,21 @@ impl LsmTree {
             self.config.zone_extractor.clone(),
         )?;
         let mut prev_user_key: Option<Vec<u8>> = None;
-        let mut kept_latest_for_key = false;
+        // Entries arrive newest-version-first within each user key (version is
+        // stored bit-complemented, so larger versions sort first). For each key
+        // we keep every version down to AND INCLUDING the "floor" — the newest
+        // version that is <= min_snapshot. That floor is the value the OLDEST
+        // active reader (min_active_snapshot) still sees; every version strictly
+        // older than the floor is invisible to all readers and is dropped.
+        //
+        // Keeping only "latest + versions >= min_snapshot" (the previous rule)
+        // wrongly dropped a floor version that sits STRICTLY BELOW min_snapshot,
+        // stranding a long-lived reader whose visible version of a
+        // concurrently-updated key is below its snapshot — e.g. a logical export
+        // that pins a snapshot while another txn updates a row it has not yet
+        // scanned. With no active reader, min_snapshot is u64::MAX, the latest
+        // version is itself the floor, and this collapses to "keep only latest".
+        let mut floor_kept_for_key = false;
 
         for (key, value) in &all_entries {
             if key.len() < 8 {
@@ -1181,18 +1195,18 @@ impl LsmTree {
 
             if !same_key {
                 prev_user_key = Some(user_key.to_vec());
-                kept_latest_for_key = false;
+                floor_kept_for_key = false;
             }
 
-            if !kept_latest_for_key {
-                // Always keep the latest version of each key.
+            if !floor_kept_for_key {
+                // Newest-first: keep until (and including) the floor at
+                // min_snapshot. The latest version is always the first kept.
                 writer.add(key, value)?;
-                kept_latest_for_key = true;
-            } else if version >= min_snapshot {
-                // Keep versions that might still be visible to active transactions.
-                writer.add(key, value)?;
+                if version <= min_snapshot {
+                    floor_kept_for_key = true;
+                }
             }
-            // Older versions below min_snapshot are dropped.
+            // Once the floor is kept, strictly older versions are dropped.
         }
 
         let meta = writer.finish()?;
@@ -2396,6 +2410,59 @@ mod tests {
             tree.get(&txn3, b"versioned").unwrap(),
             Some(Bytes::from("v2"))
         );
+    }
+
+    #[test]
+    fn compaction_preserves_floor_version_for_active_reader() {
+        // A long-lived reader holds a snapshot ABOVE a key's committed version
+        // (so its visible value is the "floor" version, strictly below the
+        // snapshot). A concurrent update + flush + compaction must NOT GC that
+        // floor version out from under the reader — the data-loss path a logical
+        // export exposed. Exercises BOTH fixes together: the floor-preserving
+        // compaction rule AND refcounted active snapshots (the updater shares the
+        // reader's snapshot value, so a plain-set remove on its commit would
+        // wrongly evict the reader's registration and raise min_active).
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut t = tree.begin_txn();
+        tree.put(&mut t, b"K", Bytes::from("v1")).unwrap();
+        tree.commit(&mut t).unwrap();
+        // Advance the version well past K's commit so the reader's snapshot sits
+        // strictly above K's version (K is the floor, below the snapshot).
+        for i in 0..5 {
+            let mut p = tree.begin_txn();
+            tree.put(&mut p, format!("pad{i}").as_bytes(), Bytes::from("x"))
+                .unwrap();
+            tree.commit(&mut p).unwrap();
+        }
+        tree.flush().unwrap();
+
+        // The long-lived reader pins (and registers) a snapshot.
+        let reader = tree.begin_txn();
+        assert_eq!(tree.get(&reader, b"K").unwrap(), Some(Bytes::from("v1")));
+
+        // Concurrent update of K (new version > the reader's snapshot) + flush +
+        // compaction, all while `reader` is still open. The updater begins at the
+        // SAME visible version as the reader, so it shares the snapshot value.
+        let mut u = tree.begin_txn();
+        tree.put(&mut u, b"K", Bytes::from("v2")).unwrap();
+        tree.commit(&mut u).unwrap();
+        tree.flush().unwrap();
+        assert!(tree.sst_count() >= 2);
+        tree.compact().unwrap();
+
+        // The reader still sees its pinned floor version — not the concurrent
+        // update, and not a vanished key.
+        assert_eq!(
+            tree.get(&reader, b"K").unwrap(),
+            Some(Bytes::from("v1")),
+            "compaction must not GC the floor version an active reader still sees"
+        );
+
+        // And a fresh reader correctly sees the latest value.
+        let after = tree.begin_txn();
+        assert_eq!(tree.get(&after, b"K").unwrap(), Some(Bytes::from("v2")));
     }
 
     #[test]

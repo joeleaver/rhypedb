@@ -6073,8 +6073,6 @@ impl Database {
         writer: &mut dyn std::io::Write,
         opts: &crate::logical::LogicalExportOptions,
     ) -> EngineResult<crate::logical::LogicalExportSummary> {
-        use crate::logical::{self, TypeCounts, VectorMode};
-
         // Refuse mid field-type migration: stored values diverge from the
         // declared schema until cutover completes, so the dump would be
         // internally inconsistent. The server maps this to HTTP 409.
@@ -6099,11 +6097,38 @@ impl Database {
         };
         type_names.sort();
         type_names.dedup();
+
+        // Pin a REGISTERED read snapshot for the whole dump. begin_txn() inserts
+        // it into the MVCC active set, so a concurrent flush+compaction cannot GC
+        // versions visible at this snapshot out from under the long-running,
+        // multi-pass export and silently drop objects from a dump still marked
+        // complete:true. read_snapshot() only reads current_version() and is NOT
+        // registered, so it would not hold compaction back. Transaction's Drop
+        // does NOT unregister — abort() must run on every path, so the fallible
+        // body lives in export_sections and we abort unconditionally after it.
+        let mut txn = self.storage.begin_txn();
+        let snapshot = txn.snapshot();
+        let result = self.export_sections(writer, opts, &type_names, snapshot);
+        self.storage.abort(&mut txn);
+        result
+    }
+
+    /// Write the header → schema → objects → edges → vectors → trailer sections
+    /// of a logical export at the caller-pinned `snapshot`. Split out from
+    /// [`logical_export_stream`](Self::logical_export_stream) so its snapshot
+    /// transaction is reliably aborted on every return path — including the `?`
+    /// early-returns when the writer (a disconnected client, a full disk) fails.
+    fn export_sections(
+        &self,
+        writer: &mut dyn std::io::Write,
+        opts: &crate::logical::LogicalExportOptions,
+        type_names: &[String],
+        snapshot: u64,
+    ) -> EngineResult<crate::logical::LogicalExportSummary> {
+        use crate::logical::{self, TypeCounts, VectorMode};
+
         let included: std::collections::HashSet<&str> =
             type_names.iter().map(String::as_str).collect();
-
-        // One MVCC snapshot for the entire multi-section dump.
-        let snapshot = self.storage.read_snapshot();
         let chunk_size = LOGICAL_EXPORT_CHUNK_SIZE;
 
         let created_at_ms = std::time::SystemTime::now()
@@ -6139,12 +6164,12 @@ impl Database {
 
         let mut counts: std::collections::BTreeMap<String, TypeCounts> =
             std::collections::BTreeMap::new();
-        for t in &type_names {
+        for t in type_names {
             counts.insert(t.clone(), TypeCounts::default());
         }
 
         // (3) OBJECT lines — every type, ascending object id, scalars only.
-        for type_name in &type_names {
+        for type_name in type_names {
             let mut cursor = 0u64;
             loop {
                 let chunk = self.scan_chunk(type_name, snapshot, cursor, chunk_size)?;
@@ -6172,7 +6197,7 @@ impl Database {
         // fields are the reverse view of another type's forward edge and would
         // duplicate them. Read at the pinned snapshot (not get_links, which
         // takes its own).
-        for type_name in &type_names {
+        for type_name in type_names {
             let type_def = self.schema.get_type(type_name).unwrap();
             // (field name, rel_id, target-type-included?) for each forward rel.
             let forward: Vec<(&str, u64, bool)> = type_def
@@ -6235,7 +6260,7 @@ impl Database {
         // keyspace. The stored value is already big-endian f32, shipped
         // verbatim as base64; import decodes it and rebuilds the HNSW graph.
         if opts.vectors == VectorMode::Raw {
-            for type_name in &type_names {
+            for type_name in type_names {
                 let type_def = self.schema.get_type(type_name).unwrap();
                 // field_id -> field name for this type's LIVE vector fields;
                 // leftover vectors of a retired field are skipped (no field to
@@ -8847,6 +8872,80 @@ mod tests {
         );
         assert_eq!(summary.total_dangling_skipped(), 2, "both posts' author edges");
         assert_eq!(lines.last().unwrap()["complete"], true);
+    }
+
+    #[test]
+    fn logical_export_survives_concurrent_compaction() {
+        use crate::logical::LogicalExportOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type Item { n: u32 }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut ids = Vec::new();
+        for n in 0..20u32 {
+            let mut f = FieldMap::new();
+            f.insert("n".into(), Value::U32(n));
+            ids.push(db.create("Item", f).unwrap().id);
+        }
+        // Flush the originals to SST1 so a later flush+compact has >= 2 SSTs to
+        // merge (compact() is a no-op below 2). The victim is NOT the last-written
+        // object, so its committed version is strictly below the export snapshot.
+        db.storage.flush().unwrap();
+        let victim = ids[5];
+
+        // A sink that, on the first byte written (the header line — before any
+        // object is scanned), performs a concurrent update + flush + compaction
+        // on the same DB: the worst-case interleave for a long-lived export.
+        // Without the registered snapshot + floor-preserving compaction, the
+        // victim's pinned version is GC'd and it vanishes from a dump still
+        // marked complete:true.
+        struct CompactMidStream {
+            db: Arc<Database>,
+            victim: u64,
+            fired: bool,
+            out: Vec<u8>,
+        }
+        impl std::io::Write for CompactMidStream {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if !self.fired {
+                    self.fired = true;
+                    let mut f = FieldMap::new();
+                    f.insert("n".into(), Value::U32(99999));
+                    self.db.update("Item", self.victim, f).unwrap();
+                    self.db.storage.flush().unwrap();
+                    self.db.storage.compact().unwrap();
+                }
+                self.out.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut sink = CompactMidStream {
+            db: db.clone(),
+            victim,
+            fired: false,
+            out: Vec::new(),
+        };
+        let summary = db
+            .logical_export_stream(&mut sink, &LogicalExportOptions::default())
+            .unwrap();
+
+        let lines = parse_ndjson(&sink.out);
+        let objects: Vec<_> = lines.iter().filter(|l| l["kind"] == "object").collect();
+        assert_eq!(objects.len(), 20, "no object GC'd out from under the pinned export");
+        let victim_id = victim.to_string();
+        let victim_line = objects
+            .iter()
+            .find(|o| o["id"] == victim_id)
+            .expect("victim survived");
+        assert_eq!(
+            victim_line["fields"]["n"]["v"], "5",
+            "export reads the pinned-snapshot value, not the concurrent update"
+        );
+        assert_eq!(summary.counts["Item"].objects, 20);
     }
 
     #[test]

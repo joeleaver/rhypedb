@@ -47,7 +47,15 @@ pub struct TransactionManager {
     visible_version: AtomicU64,
     /// Serializes the entire commit critical section (see `CommitState`).
     commit_mu: Mutex<CommitState>,
-    active_snapshots: RwLock<HashSet<u64>>,
+    /// Active read snapshots, REFCOUNTED by snapshot version. Two transactions
+    /// can begin at the same visible version (no commit between their `begin`s),
+    /// so the same snapshot value can be held by several readers at once; a plain
+    /// set would let one transaction's commit/abort evict a value another reader
+    /// still holds, wrongly raising `min_active_snapshot()` and letting
+    /// compaction GC a version — or the conflict-log trim drop an entry — that
+    /// the surviving reader still needs. The count is incremented at `begin` and
+    /// decremented at commit/abort; the key is removed at zero.
+    active_snapshots: RwLock<HashMap<u64, u64>>,
     max_committed_log_size: usize,
 }
 
@@ -65,7 +73,7 @@ impl TransactionManager {
                 next_version: 1,
                 committed_log: VecDeque::new(),
             }),
-            active_snapshots: RwLock::new(HashSet::new()),
+            active_snapshots: RwLock::new(HashMap::new()),
             max_committed_log_size: 1024,
         }
     }
@@ -79,7 +87,7 @@ impl TransactionManager {
                 next_version: version + 1,
                 committed_log: VecDeque::new(),
             }),
-            active_snapshots: RwLock::new(HashSet::new()),
+            active_snapshots: RwLock::new(HashMap::new()),
             max_committed_log_size: 1024,
         }
     }
@@ -87,12 +95,25 @@ impl TransactionManager {
     /// Start a new transaction, returning its snapshot version.
     pub fn begin(&self) -> Transaction {
         let snapshot = self.visible_version.load(Ordering::Acquire);
-        self.active_snapshots.write().insert(snapshot);
+        *self.active_snapshots.write().entry(snapshot).or_insert(0) += 1;
         Transaction {
             snapshot,
             writes: Vec::new(),
             index: HashMap::default(),
             committed: false,
+        }
+    }
+
+    /// Release one hold on `snapshot`, removing it from the active set only when
+    /// the last transaction holding that version commits or aborts. See
+    /// [`active_snapshots`](Self::active_snapshots).
+    fn release_snapshot(&self, snapshot: u64) {
+        let mut guard = self.active_snapshots.write();
+        if let Some(count) = guard.get_mut(&snapshot) {
+            *count -= 1;
+            if *count == 0 {
+                guard.remove(&snapshot);
+            }
         }
     }
 
@@ -120,7 +141,7 @@ impl TransactionManager {
     {
         if txn.writes.is_empty() {
             txn.committed = true;
-            self.active_snapshots.write().remove(&txn.snapshot);
+            self.release_snapshot(txn.snapshot);
             return Ok(txn.snapshot);
         }
 
@@ -165,7 +186,7 @@ impl TransactionManager {
         let min_active = self
             .active_snapshots
             .read()
-            .iter()
+            .keys()
             .copied()
             .min()
             .unwrap_or(u64::MAX);
@@ -186,7 +207,7 @@ impl TransactionManager {
         drop(state);
 
         txn.committed = true;
-        self.active_snapshots.write().remove(&txn.snapshot);
+        self.release_snapshot(txn.snapshot);
         Ok(commit_version)
     }
 
@@ -194,7 +215,7 @@ impl TransactionManager {
     /// its snapshot. Nothing to undo — the writes never reached the memtable.
     pub fn abort(&self, txn: &mut Transaction) {
         txn.committed = true; // prevent the drop warning / double-release
-        self.active_snapshots.write().remove(&txn.snapshot);
+        self.release_snapshot(txn.snapshot);
     }
 
     /// Returns the minimum active snapshot version, or u64::MAX if none active.
@@ -202,7 +223,7 @@ impl TransactionManager {
     pub fn min_active_snapshot(&self) -> u64 {
         self.active_snapshots
             .read()
-            .iter()
+            .keys()
             .copied()
             .min()
             .unwrap_or(u64::MAX)
