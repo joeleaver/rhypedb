@@ -95,6 +95,12 @@ pub struct SstSnapshotManifest {
 /// - MVCC transaction manager for snapshot isolation
 /// - Optional background compaction worker (`background_compaction` config)
 pub struct LsmTree {
+    /// Single-writer guard for `config.data_dir`: an advisory `flock` (held for
+    /// this tree's lifetime, released when this field drops) plus an owner-fence
+    /// token re-checked at destructive boundaries. Field drops run AFTER the
+    /// custom `Drop for LsmTree` body, which joins the compaction worker — so
+    /// the lock is released only once nothing is still touching the files.
+    dir_guard: crate::lock::DataDirGuard,
     config: LsmConfig,
     active_memtable: Arc<RwLock<Arc<MemTable>>>,
     immutable_memtables: Arc<RwLock<Vec<Arc<MemTable>>>>,
@@ -172,6 +178,10 @@ impl LsmTree {
     pub fn open(config: LsmConfig) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&config.data_dir)?;
         std::fs::create_dir_all(config.data_dir.join("sst"))?;
+
+        // Claim single-writer ownership BEFORE reading any state — fail fast if
+        // another process already holds this data dir (see `crate::lock`).
+        let dir_guard = crate::lock::DataDirGuard::acquire(&config.data_dir)?;
 
         let mut max_version = 0u64;
 
@@ -252,6 +262,7 @@ impl LsmTree {
 
         let background_compaction = config.background_compaction;
         let tree = Arc::new(Self {
+            dir_guard,
             config,
             active_memtable: Arc::new(RwLock::new(memtable)),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
@@ -876,6 +887,10 @@ impl LsmTree {
     /// `write_all` (so a clean crash is recoverable) but no fsync syscall
     /// runs; matches Postgres's `fsync=off` mode.
     pub fn commit(&self, txn: &mut Transaction) -> Result<u64> {
+        // Fail fast if a concurrent opener has been detected (poisoned guard):
+        // cheap atomic load, no I/O. Keeps us from writing into a data dir a
+        // second process has stamped (see `crate::lock`).
+        self.dir_guard.check_fenced()?;
         // Apply the transaction's buffered writes durably, then publish.
         //
         // Lock order: `flush_lock.read()` (coordinate with flush's WAL truncate,
@@ -977,6 +992,12 @@ impl LsmTree {
     /// must flush WHILE holding the write lock (e.g. `snapshot_to`) calls this
     /// instead of `flush()` to avoid a self-deadlock.
     fn flush_locked(&self) -> Result<()> {
+        // Destructive boundary: this pass writes a new SST (whose id could
+        // collide with a second writer's) and truncates the shared WAL. Confirm
+        // we still own the data dir BEFORE touching either — on a foreign
+        // owner-stamp this poisons the guard and aborts here, rather than
+        // clobbering the other writer.
+        self.dir_guard.verify_owner()?;
         // Rotate memtable: current becomes immutable, new empty one becomes active.
         let old_memtable = {
             let mut active = self.active_memtable.write();
@@ -1118,6 +1139,9 @@ impl LsmTree {
     /// hold `compaction_mutex` so this body never runs concurrently with
     /// itself.
     fn compact_inner(&self) -> Result<()> {
+        // Destructive boundary: compaction writes a merged SST and unlinks the
+        // inputs. Confirm data-dir ownership before mutating the SST set.
+        self.dir_guard.verify_owner()?;
         let ssts = self.sst_files.read();
         if ssts.len() < 2 {
             return Ok(());
@@ -2602,6 +2626,68 @@ mod tests {
         let txn = tree2.begin_txn();
         let v = tree2.get(&txn, b"k0").unwrap();
         assert_eq!(v, Some(Bytes::from("v0")));
+    }
+
+    // --- single-writer data-dir guard (crate::lock) ---------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn open_refuses_second_tree_on_same_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let _t1 = LsmTree::open(test_config(dir.path())).unwrap();
+        // Second open while the first is alive must be refused, not silently
+        // allowed to corrupt the shared LSM. (`Arc<LsmTree>` isn't `Debug`, so
+        // match rather than `unwrap_err`.)
+        let err = match LsmTree::open(test_config(dir.path())) {
+            Err(e) => e,
+            Ok(_) => panic!("second open should be refused while first is alive"),
+        };
+        assert!(matches!(err, crate::Error::DataDirLocked(_)), "got {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_tree_releases_dir_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _t1 = LsmTree::open(test_config(dir.path())).unwrap();
+        }
+        // Lock released on drop → a fresh open succeeds.
+        let _t2 = LsmTree::open(test_config(dir.path())).unwrap();
+    }
+
+    #[test]
+    fn flush_halts_when_owner_token_stomped() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"k", Bytes::from("v")).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        // Simulate a second writer that got past a no-op flock (network FS)
+        // stamping its own owner token over the LOCK file.
+        std::fs::write(
+            dir.path().join("LOCK"),
+            "owner_id=0000000000000000000000000000beef\npid=1\nhost=other\n",
+        )
+        .unwrap();
+
+        // The destructive flush detects the foreign owner and halts BEFORE
+        // writing a colliding SST / truncating the WAL.
+        let err = tree.flush().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataDirOwnershipLost(_)),
+            "got {err:?}"
+        );
+
+        // Guard is poisoned: further commits fail fast.
+        let mut txn2 = tree.begin_txn();
+        tree.put(&mut txn2, b"k2", Bytes::from("v2")).unwrap();
+        let err2 = tree.commit(&mut txn2).unwrap_err();
+        assert!(
+            matches!(err2, crate::Error::DataDirOwnershipLost(_)),
+            "got {err2:?}"
+        );
     }
 
     #[test]

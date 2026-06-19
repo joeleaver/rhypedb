@@ -10,8 +10,15 @@ crc32fast = { workspace = true }
 crossbeam-skiplist = { workspace = true }
 memmap2 = "0.9"
 parking_lot = { workspace = true }
+rand = { workspace = true }
 thiserror = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Advisory `flock(2)` on the data dir (layer 1 of the single-writer guard).
+# Target-gated: the lock engages only on unix; other platforms fall through to
+# the owner-fence (layer 2), which makes a double-open detectable regardless.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

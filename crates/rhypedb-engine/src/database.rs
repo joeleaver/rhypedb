@@ -13349,6 +13349,10 @@ mod tests {
         let migs = db.list_migrations().unwrap();
         assert_eq!(migs.len(), 1, "plan wiped by recover_partial");
         assert_eq!(migs[0].plan_id, plan_id);
+        // Drop this handle before reopening: the data-dir guard holds an
+        // exclusive lock for a handle's lifetime, so the next open must not
+        // overlap it (a real reopen follows a process exit, which releases it).
+        drop(db);
         // Counter survived: a new plan on a DIFFERENT type gets the NEXT id,
         // not a reissued one. (A second plan on the SAME type is refused by
         // the type-scoped interlock, so use Post.)
