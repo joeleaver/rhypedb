@@ -128,8 +128,8 @@ backup  --download <local-dir> [--label L]
 restore <snapshot-dir> <data-dir> [--force]
 verify  <snapshot-dir>
 
-export  --dest <server-path>  [--label L] [--types A,B] [--vectors raw|none]
-export  --download <local-file> [--types A,B] [--vectors raw|none]
+export  --dest <server-path>  [--label L] [--types A,B] [--vectors raw|none|reembed]
+export  --download <local-file> [--types A,B] [--vectors raw|none|reembed]
 verify-export <export-file>
 ```
 
@@ -142,7 +142,7 @@ verify-export <export-file>
 Import a logical export into a fresh data directory (server stopped):
 
 ```
-rhypedb-import <export-file> --data-dir <path> [--force] [--vectors raw|none]
+rhypedb-import <export-file> --data-dir <path> [--force] [--vectors raw|none|reembed]
 ```
 
 ## Binary TCP protocol

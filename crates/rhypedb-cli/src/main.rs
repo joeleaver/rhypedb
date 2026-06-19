@@ -73,7 +73,8 @@ enum Commands {
         /// Comma-separated type names to export (default: every type).
         #[arg(long)]
         types: Option<String>,
-        /// Vector handling: raw (default) | none.
+        /// Vector handling: raw (default) | none | reembed (omit @vectorize
+        /// vectors; the importer regenerates them from source text).
         #[arg(long)]
         vectors: Option<String>,
     },
@@ -805,7 +806,7 @@ fn download_export(
     vectors: &Option<String>,
 ) -> Result<(), String> {
     // Schema type idents are Unicode-alphanumeric (plus underscore) and vectors
-    // is raw|none — none carry a URL-significant character, so the query values
+    // is raw|none|reembed — none carry a URL-significant character, so the query values
     // go on the wire as-is; the comma is the list delimiter (an ident can't
     // contain one). A non-ASCII ident would ideally be percent-encoded, but it
     // poses no delimiter/injection risk here.

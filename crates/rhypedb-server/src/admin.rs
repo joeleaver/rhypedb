@@ -855,7 +855,12 @@ fn build_export_opts(
     let vectors = match vectors {
         None | Some("raw") => VectorMode::Raw,
         Some("none") => VectorMode::None,
-        Some(other) => return Err(format!("unknown vectors mode '{other}' (expected raw|none)")),
+        Some("reembed") => VectorMode::Reembed,
+        Some(other) => {
+            return Err(format!(
+                "unknown vectors mode '{other}' (expected raw|none|reembed)"
+            ));
+        }
     };
     Ok(LogicalExportOptions { types, vectors })
 }
@@ -864,6 +869,7 @@ fn export_vectors_tag(opts: &LogicalExportOptions) -> &'static str {
     match opts.vectors {
         VectorMode::Raw => "raw",
         VectorMode::None => "none",
+        VectorMode::Reembed => "reembed",
     }
 }
 

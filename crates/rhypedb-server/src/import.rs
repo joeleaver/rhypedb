@@ -45,6 +45,12 @@ pub enum VectorImportMode {
     Raw,
     /// Skip vector lines entirely.
     None,
+    /// Re-derive every `@vectorize` field's vectors by embedding its source
+    /// text — the counterpart of a `reembed` export, which omits them. BYO
+    /// vector fields still come from the dump's raw lines. Loads the embedding
+    /// model named in the schema and FAILS the whole import (before the swap)
+    /// if that model is unavailable. Lossy + non-deterministic vs. the originals.
+    Reembed,
 }
 
 pub struct ImportOptions {
@@ -84,11 +90,19 @@ pub fn run_import(
     let report = {
         let db = Database::open(schema, &staging)
             .map_err(|e| format!("open staging dir: {e}"))?;
-        let report = import_pass(src, &db, opts)?;
+        let mut report = import_pass(src, &db, opts)?;
         // The validation above checked the file's INTERNAL counts; re-check what
         // we actually imported against the trailer to catch a file that changed
-        // between the validate read and the import read (TOCTOU).
+        // between the validate read and the import read (TOCTOU). verify_counts
+        // checks vector totals only in Raw mode, so it runs BEFORE the reembed
+        // pass adds regenerated vectors.
         verify_counts(&report, &validated, opts)?;
+        // Reembed mode: regenerate every @vectorize field's vectors from source
+        // text (the dump omitted them). Done before the swap so an unavailable
+        // model fails the whole import with the target dir untouched.
+        if opts.vectors == VectorImportMode::Reembed {
+            reembed_pass(&db, &mut report)?;
+        }
         // Materialize the memtable to SSTs before handing the dir over.
         db.storage()
             .flush()
@@ -351,6 +365,102 @@ fn flush_vectors(
     {
         db.restore_vectors(t, f, &std::mem::take(buf))
             .map_err(|e| format!("restore vectors of {t}.{f}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Reembed mode: re-derive every `@vectorize` field's vectors by embedding its
+/// source text, then store them. Runs after objects are restored but before the
+/// staging dir is flushed + swapped, so a model that can't be loaded fails the
+/// whole import with the target dir untouched. Objects whose source field is
+/// absent or non-string are skipped (no text → no vector), mirroring the live
+/// `@vectorize` path.
+fn reembed_pass(db: &Database, report: &mut ImportReport) -> Result<(), String> {
+    use rhypedb_embed::{Embedder, FastEmbedder};
+    use rhypedb_engine::object::Value;
+    use rhypedb_schema::types::FieldType;
+    use std::collections::HashMap;
+
+    // (type, vector_field, source_field, model, dims) for every @vectorize field.
+    let mut targets: Vec<(String, String, String, String, usize)> = Vec::new();
+    for type_def in db.schema().types.values() {
+        for f in type_def.vector_fields() {
+            let Some(vz) = f.vectorize() else { continue };
+            let FieldType::Vector(vt) = &f.field_type else {
+                continue;
+            };
+            targets.push((
+                type_def.name.clone(),
+                f.name.clone(),
+                vz.source_field.clone(),
+                vz.model.clone(),
+                vt.dimensions as usize,
+            ));
+        }
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    // One embedder per distinct model; loaded lazily and FAILS the import
+    // cleanly if a model is unavailable.
+    let mut embedders: HashMap<String, FastEmbedder> = HashMap::new();
+    let snapshot = db.storage().read_snapshot();
+
+    for (type_name, vfield, source, model, dims) in &targets {
+        if !embedders.contains_key(model) {
+            let e = FastEmbedder::new(model).map_err(|e| {
+                format!("reembed: model '{model}' for {type_name}.{vfield} is unavailable: {e}")
+            })?;
+            if e.dimensions() != *dims {
+                return Err(format!(
+                    "reembed: model '{model}' emits {}-dim vectors but \
+                     {type_name}.{vfield} is Vector<{dims}>",
+                    e.dimensions()
+                ));
+            }
+            embedders.insert(model.clone(), e);
+        }
+        let embedder = embedders.get_mut(model).expect("just inserted");
+
+        let mut cursor = 0u64;
+        loop {
+            let chunk = db
+                .scan_chunk(type_name, snapshot, cursor, IMPORT_CHUNK)
+                .map_err(|e| format!("reembed: scan {type_name}: {e}"))?;
+            let mut ids: Vec<u64> = Vec::with_capacity(chunk.objects.len());
+            let mut texts: Vec<&str> = Vec::with_capacity(chunk.objects.len());
+            for obj in &chunk.objects {
+                if let Some(Value::String(s)) = obj.fields.get(source) {
+                    ids.push(obj.id);
+                    texts.push(s.as_str());
+                }
+            }
+            if !ids.is_empty() {
+                let vecs = embedder
+                    .embed(&texts)
+                    .map_err(|e| format!("reembed: embed {type_name}.{vfield}: {e}"))?;
+                let rows: Vec<(u64, Bytes)> = ids
+                    .iter()
+                    .zip(vecs.iter())
+                    .map(|(id, v)| {
+                        let mut b = bytes::BytesMut::with_capacity(v.len() * 4);
+                        for x in v {
+                            b.extend_from_slice(&x.to_be_bytes());
+                        }
+                        (*id, b.freeze())
+                    })
+                    .collect();
+                let n = rows.len() as u64;
+                db.restore_vectors(type_name, vfield, &rows)
+                    .map_err(|e| format!("reembed: store {type_name}.{vfield}: {e}"))?;
+                report.vectors += n;
+            }
+            match chunk.next_cursor {
+                Some(next) if chunk.more => cursor = next,
+                _ => break,
+            }
+        }
     }
     Ok(())
 }
@@ -697,5 +807,96 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".rhypedb-"))
             .count();
         assert_eq!(leaked, 0, "no staging dir leaked");
+    }
+
+    #[test]
+    fn reembed_export_omits_vectorize_keeps_byo() {
+        use rhypedb_engine::logical::VectorMode;
+        let dir = tempfile::tempdir().unwrap();
+        let sdl = r#"
+            type Doc {
+                body: String
+                auto: Vector<4> @vectorize(source: "body", model: "all-MiniLM-L6-v2")
+                byo: Vector<4>
+            }
+        "#;
+        let db = Database::open(parse_schema(sdl).unwrap(), dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("body".into(), Value::String("hello".into()));
+        let id = db.create("Doc", f).unwrap().id;
+        // Raw vectors into BOTH fields (no embedding needed for the test).
+        db.restore_vectors("Doc", "auto", &[(id, vec_bytes(1.0))]).unwrap();
+        db.restore_vectors("Doc", "byo", &[(id, vec_bytes(2.0))]).unwrap();
+
+        // Reembed export: the @vectorize field is omitted (regenerated on
+        // import), the BYO field still ships raw.
+        let mut out = Vec::new();
+        db.logical_export_stream(
+            &mut out,
+            &LogicalExportOptions { types: None, vectors: VectorMode::Reembed },
+        )
+        .unwrap();
+        let s = String::from_utf8(out).unwrap();
+        let vec_lines: Vec<&str> =
+            s.lines().filter(|l| l.contains(r#""kind":"vector""#)).collect();
+        assert_eq!(vec_lines.len(), 1, "only the BYO vector should be emitted");
+        assert!(vec_lines[0].contains(r#""field":"byo""#), "got {}", vec_lines[0]);
+        assert!(
+            !s.contains(r#""field":"auto""#),
+            "the @vectorize field must be omitted in reembed mode"
+        );
+
+        // Raw export (default) still includes BOTH fields.
+        let mut raw = Vec::new();
+        db.logical_export_stream(&mut raw, &LogicalExportOptions::default()).unwrap();
+        let raw = String::from_utf8(raw).unwrap();
+        assert_eq!(
+            raw.lines().filter(|l| l.contains(r#""kind":"vector""#)).count(),
+            2,
+            "raw export includes both vector fields"
+        );
+    }
+
+    #[test]
+    fn reembed_import_refuses_unavailable_model() {
+        // A @vectorize field whose model is unsupported fails a reembed import
+        // cleanly (before the swap), leaving the target untouched. No network:
+        // an unknown model name is rejected by the embedder immediately.
+        use rhypedb_engine::logical::VectorMode;
+        let dir = tempfile::tempdir().unwrap();
+        let sdl = r#"
+            type Doc {
+                body: String
+                auto: Vector<4> @vectorize(source: "body", model: "nope-not-a-real-model")
+            }
+        "#;
+        let db = Database::open(parse_schema(sdl).unwrap(), dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("body".into(), Value::String("hello".into()));
+        db.create("Doc", f).unwrap();
+        let mut out = Vec::new();
+        db.logical_export_stream(
+            &mut out,
+            &LogicalExportOptions { types: None, vectors: VectorMode::Reembed },
+        )
+        .unwrap();
+        let file = dir.path().join("dump.ndjson");
+        std::fs::write(&file, &out).unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let r = run_import(
+            &file,
+            target.path(),
+            &ImportOptions { force: false, vectors: VectorImportMode::Reembed },
+        );
+        let msg = r.expect_err("reembed must fail on an unavailable model");
+        assert!(
+            msg.contains("model") && msg.contains("unavailable"),
+            "got: {msg}"
+        );
+        assert!(
+            std::fs::read_dir(target.path()).unwrap().next().is_none(),
+            "target must be untouched on a failed reembed import"
+        );
     }
 }

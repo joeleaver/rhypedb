@@ -78,7 +78,7 @@ Options:
 | Flag | Meaning |
 | --- | --- |
 | `--types A,B` | Export only these types (relationships to excluded types are dropped and counted). |
-| `--vectors raw\|none` | `raw` (default) ships the f32 vectors; `none` omits them. |
+| `--vectors raw\|none\|reembed` | `raw` (default) ships the f32 vectors; `none` omits them; `reembed` omits `@vectorize` vectors so the importer regenerates them from source text. |
 
 The equivalent HTTP endpoints are `POST /admin/export` and `GET /admin/export/stream`. An export is refused while a field-type migration is in progress.
 
@@ -118,7 +118,7 @@ Flags:
 | --- | --- |
 | `--data-dir <path>` | Target directory (must be empty unless `--force`). |
 | `--force` | Overwrite a non-empty target. |
-| `--vectors raw\|none` | How to handle vector lines (`raw` = default). |
+| `--vectors raw\|none\|reembed` | How to handle vectors (`raw` = default). `reembed` re-derives `@vectorize` vectors from source text by loading the embedding model — it fails cleanly if the model is unavailable, and is lossy/non-deterministic vs. the originals. |
 
 ## Which should I use?
 

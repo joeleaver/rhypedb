@@ -6303,6 +6303,7 @@ impl Database {
         let vectors_tag = match opts.vectors {
             VectorMode::Raw => "raw",
             VectorMode::None => "none",
+            VectorMode::Reembed => "reembed",
         };
 
         // (1) HEADER.
@@ -6421,10 +6422,12 @@ impl Database {
             }
         }
 
-        // (5) VECTOR lines (raw mode only) — streamed over the v:<type_id>:
+        // (5) VECTOR lines (Raw or Reembed) — streamed over the v:<type_id>:
         // keyspace. The stored value is already big-endian f32, shipped
         // verbatim as base64; import decodes it and rebuilds the HNSW graph.
-        if opts.vectors == VectorMode::Raw {
+        // In Reembed mode the @vectorize fields are omitted (regenerated from
+        // source text on import); BYO vector fields still ship raw.
+        if opts.vectors != VectorMode::None {
             for type_name in type_names {
                 let type_def = self.schema.get_type(type_name).unwrap();
                 // field_id -> field name for this type's LIVE vector fields;
@@ -6432,6 +6435,11 @@ impl Database {
                 // import them into).
                 let mut vec_field_names: HashMap<u64, &str> = HashMap::new();
                 for f in type_def.vector_fields() {
+                    // Reembed: skip @vectorize fields (regenerated on import);
+                    // a BYO field has no source text and must still ship raw.
+                    if opts.vectors == VectorMode::Reembed && f.vectorize().is_some() {
+                        continue;
+                    }
                     if let Some(fid) = self.field_ids.get(&format!("{type_name}.{}", f.name)) {
                         vec_field_names.insert(*fid, f.name.as_str());
                     }

@@ -133,8 +133,14 @@ pub enum VectorMode {
     Raw,
     /// Drop embeddings entirely — schema, objects and edges only.
     None,
-    // A `Reembed` mode (re-derive vectors from their source text) is added in a
-    // later increment; it is lossy + model-dependent and never the default.
+    /// Re-derive `@vectorize` vectors from their source text on import instead
+    /// of shipping the stored f32. A bring-your-own vector field has no source
+    /// text, so its vectors still ship as `Raw`. Shrinks the dump and enables
+    /// cross-model moves, but is LOSSY + model-dependent + non-deterministic
+    /// (the regenerated vectors are not the originals), so it is never the
+    /// default. Import re-embeds the source text and the HNSW graph is built
+    /// from the result.
+    Reembed,
 }
 
 /// Options controlling a logical export.

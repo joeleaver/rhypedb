@@ -21,7 +21,8 @@ struct Cli {
     /// Overwrite even if the data dir is non-empty (clears stale LSM state first).
     #[arg(long)]
     force: bool,
-    /// Vector handling: raw (default — import raw f32, HNSW rebuilds on start) | none.
+    /// Vector handling: raw (default — import raw f32, HNSW rebuilds on start) |
+    /// none | reembed (re-embed @vectorize fields from source text; needs the model).
     #[arg(long, default_value = "raw")]
     vectors: String,
 }
@@ -31,8 +32,9 @@ fn main() {
     let vectors = match cli.vectors.as_str() {
         "raw" => VectorImportMode::Raw,
         "none" => VectorImportMode::None,
+        "reembed" => VectorImportMode::Reembed,
         other => {
-            eprintln!("ERROR: unknown --vectors '{other}' (expected raw|none)");
+            eprintln!("ERROR: unknown --vectors '{other}' (expected raw|none|reembed)");
             std::process::exit(1);
         }
     };
