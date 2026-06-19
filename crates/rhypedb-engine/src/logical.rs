@@ -119,6 +119,73 @@ pub fn fields_from_json(j: &Json) -> LResult<FieldMap> {
     Ok(out)
 }
 
+/// The `format` tag written in the header line and checked on import.
+pub const FORMAT_TAG: &str = "rhypedb-logical-export-v1";
+
+/// How a logical export handles vector embeddings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorMode {
+    /// Export raw f32 vectors verbatim; import rebuilds the HNSW graph from
+    /// them. The only fully-faithful mode, and the default — the at-rest f32 is
+    /// recoverable losslessly, whereas the graph holds only lossy TurboQuant
+    /// codes and re-embedding is non-deterministic.
+    #[default]
+    Raw,
+    /// Drop embeddings entirely — schema, objects and edges only.
+    None,
+    // A `Reembed` mode (re-derive vectors from their source text) is added in a
+    // later increment; it is lossy + model-dependent and never the default.
+}
+
+/// Options controlling a logical export.
+#[derive(Debug, Clone, Default)]
+pub struct LogicalExportOptions {
+    /// Restrict the export to these type names. `None` or empty = every type.
+    /// A selective export skips forward edges whose target type is excluded
+    /// (they would be unimportable); those are tallied as
+    /// [`TypeCounts::dangling_edges_skipped`].
+    pub types: Option<Vec<String>>,
+    /// Vector handling.
+    pub vectors: VectorMode,
+}
+
+/// Per-type tallies for a logical export. Embedded in the trailer line so
+/// `verify` and `import` can confirm the stream is complete.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypeCounts {
+    pub objects: u64,
+    pub edges: u64,
+    pub vectors: u64,
+    /// Forward edges skipped because their target type was excluded from a
+    /// selective (`types`-filtered) export.
+    pub dangling_edges_skipped: u64,
+}
+
+/// Summary returned by a completed logical export.
+#[derive(Debug, Clone, Default)]
+pub struct LogicalExportSummary {
+    /// Per-type counts, keyed by type name.
+    pub counts: std::collections::BTreeMap<String, TypeCounts>,
+}
+
+impl LogicalExportSummary {
+    /// Total forward edges skipped as dangling across all types.
+    pub fn total_dangling_skipped(&self) -> u64 {
+        self.counts.values().map(|c| c.dangling_edges_skipped).sum()
+    }
+}
+
+/// Base64-encode raw bytes (vector payloads) for an export line.
+pub fn encode_bytes(b: &[u8]) -> String {
+    B64.encode(b)
+}
+
+/// Decode a base64 string produced by [`encode_bytes`].
+pub fn decode_bytes(s: &str) -> LResult<Vec<u8>> {
+    B64.decode(s)
+        .map_err(|e| malformed(format!("invalid base64: {e}")))
+}
+
 fn env(tag: &str, v: Json) -> Json {
     let mut m = serde_json::Map::with_capacity(2);
     m.insert("t".to_owned(), Json::String(tag.to_owned()));

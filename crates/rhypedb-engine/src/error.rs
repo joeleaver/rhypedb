@@ -16,6 +16,12 @@ pub enum EngineError {
     #[error("logical export/import error: {0}")]
     Logical(#[from] crate::logical::LogicalError),
 
+    #[error(
+        "logical export refused: a field-type migration is in flight ({migrating_fields} field(s)) — \
+         stored values diverge from the declared schema mid-migration; retry once it completes"
+    )]
+    ExportWhileMigrating { migrating_fields: usize },
+
     #[error("type not found: {0}")]
     TypeNotFound(String),
 

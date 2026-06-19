@@ -37,6 +37,35 @@ pub struct ObjectChunk {
     pub more: bool,
 }
 
+/// Objects (and vector entries) materialized per chunk during a logical
+/// export. Bounds peak memory regardless of how large a type is.
+const LOGICAL_EXPORT_CHUNK_SIZE: usize = 1024;
+
+/// Serialize one NDJSON line (a `serde_json::Value`) and write it followed by a
+/// newline. `Value` serialization is infallible here — every map key is a
+/// string and every numeric field is encoded as a string or a plain integer
+/// (no NaN floats) — so only the write itself can fail.
+fn write_export_line(writer: &mut dyn std::io::Write, val: &serde_json::Value) -> EngineResult<()> {
+    let mut buf = serde_json::to_vec(val).expect("export line Value serialization is infallible");
+    buf.push(b'\n');
+    writer.write_all(&buf).map_err(export_io_err)
+}
+
+/// The byte string immediately after `k` in unsigned-byte order — `k` with a
+/// trailing `0x00`. Advances a raw chunked scan strictly past an inclusive
+/// high-water key whose tail is not a decodable object id (e.g. the `v:` vector
+/// keyspace, where the trailing 8 bytes are the field id).
+fn successor_key(k: &[u8]) -> Bytes {
+    let mut buf = bytes::BytesMut::with_capacity(k.len() + 1);
+    buf.extend_from_slice(k);
+    buf.extend_from_slice(&[0u8]);
+    buf.freeze()
+}
+
+fn export_io_err(e: std::io::Error) -> EngineError {
+    EngineError::Storage(rhypedb_storage::Error::Io(e))
+}
+
 /// One row of the precomputed reverse-relation index used by cascade delete.
 /// `is_many` distinguishes forward 1:1 incoming relations (where the source's
 /// rev_edge cover embeds the target's data) from many-relations (where the
@@ -6017,6 +6046,278 @@ impl Database {
         })
     }
 
+    /// Stream a portable, version-independent **logical** dump of this database
+    /// to `writer` as NDJSON. Unlike [`backup_to`](Self::backup_to) (which
+    /// hard-links the on-disk SSTs/WAL and is tied to the storage format), this
+    /// reads data out through the object layer into a self-describing stream
+    /// that survives format/version changes and can be inspected by hand.
+    ///
+    /// Line order is fixed and dependency-safe so a single forward pass can
+    /// import it: `header` → `schema` → every type's `object` lines → every
+    /// type's forward `edge` lines → every type's raw `vector` lines →
+    /// `trailer`. The trailer (with per-type counts and `complete:true`) is
+    /// written LAST and is the completeness sentinel — NDJSON has no
+    /// end-of-archive marker, so a truncated download is detected by its
+    /// absence.
+    ///
+    /// The whole dump is read at ONE pinned MVCC snapshot. It is refused while
+    /// a field-type migration is in flight (stored values diverge from the
+    /// declared schema mid-migration). Memory is bounded: objects, edges, and
+    /// vectors all stream in chunks; nothing materializes a whole type.
+    ///
+    /// The embedded schema is the LIVE [`schema`](Self::schema) rendered to SDL
+    /// — never the operator's on-disk file, which goes stale after a completed
+    /// rename/change-type migration.
+    pub fn logical_export_stream(
+        &self,
+        writer: &mut dyn std::io::Write,
+        opts: &crate::logical::LogicalExportOptions,
+    ) -> EngineResult<crate::logical::LogicalExportSummary> {
+        use crate::logical::{self, TypeCounts, VectorMode};
+
+        // Refuse mid field-type migration: stored values diverge from the
+        // declared schema until cutover completes, so the dump would be
+        // internally inconsistent. The server maps this to HTTP 409.
+        let migrating = self.migrating_field_count.load(Ordering::SeqCst);
+        if migrating > 0 {
+            return Err(EngineError::ExportWhileMigrating {
+                migrating_fields: migrating,
+            });
+        }
+
+        // Resolve + validate the type set, in a deterministic sorted order.
+        let mut type_names: Vec<String> = match &opts.types {
+            Some(list) if !list.is_empty() => {
+                for t in list {
+                    if self.schema.get_type(t).is_none() {
+                        return Err(EngineError::TypeNotFound(t.clone()));
+                    }
+                }
+                list.clone()
+            }
+            _ => self.schema.type_names().map(|s| s.to_owned()).collect(),
+        };
+        type_names.sort();
+        type_names.dedup();
+        let included: std::collections::HashSet<&str> =
+            type_names.iter().map(String::as_str).collect();
+
+        // One MVCC snapshot for the entire multi-section dump.
+        let snapshot = self.storage.read_snapshot();
+        let chunk_size = LOGICAL_EXPORT_CHUNK_SIZE;
+
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let vectors_tag = match opts.vectors {
+            VectorMode::Raw => "raw",
+            VectorMode::None => "none",
+        };
+
+        // (1) HEADER.
+        write_export_line(
+            writer,
+            &serde_json::json!({
+                "kind": "header",
+                "format": logical::FORMAT_TAG,
+                "created_at_ms": created_at_ms,
+                "export_version": snapshot,
+                "vectors": vectors_tag,
+                "types": type_names,
+            }),
+        )?;
+
+        // (2) SCHEMA — the LIVE schema rendered to SDL.
+        write_export_line(
+            writer,
+            &serde_json::json!({
+                "kind": "schema",
+                "sdl": rhypedb_schema::emit_schema(&self.schema),
+            }),
+        )?;
+
+        let mut counts: std::collections::BTreeMap<String, TypeCounts> =
+            std::collections::BTreeMap::new();
+        for t in &type_names {
+            counts.insert(t.clone(), TypeCounts::default());
+        }
+
+        // (3) OBJECT lines — every type, ascending object id, scalars only.
+        for type_name in &type_names {
+            let mut cursor = 0u64;
+            loop {
+                let chunk = self.scan_chunk(type_name, snapshot, cursor, chunk_size)?;
+                for obj in &chunk.objects {
+                    write_export_line(
+                        writer,
+                        &serde_json::json!({
+                            "kind": "object",
+                            "type": type_name,
+                            "id": obj.id.to_string(),
+                            "fields": logical::fields_to_json(&obj.fields),
+                        }),
+                    )?;
+                    counts.get_mut(type_name).unwrap().objects += 1;
+                }
+                match chunk.next_cursor {
+                    Some(next) if chunk.more => cursor = next,
+                    _ => break,
+                }
+            }
+        }
+
+        // (4) EDGE lines — forward (non-@inverse) relations only, after ALL
+        // objects so both endpoints exist on a single-pass import. @inverse
+        // fields are the reverse view of another type's forward edge and would
+        // duplicate them. Read at the pinned snapshot (not get_links, which
+        // takes its own).
+        for type_name in &type_names {
+            let type_def = self.schema.get_type(type_name).unwrap();
+            // (field name, rel_id, target-type-included?) for each forward rel.
+            let forward: Vec<(&str, u64, bool)> = type_def
+                .fields
+                .iter()
+                .filter(|f| {
+                    matches!(f.field_type, FieldType::Relation(_)) && f.inverse().is_none()
+                })
+                .filter_map(|f| {
+                    let rel_id = *self.rel_ids.get(&format!("{type_name}.{}", f.name))?;
+                    let FieldType::Relation(rel) = &f.field_type else {
+                        return None;
+                    };
+                    Some((f.name.as_str(), rel_id, included.contains(rel.target_type.as_str())))
+                })
+                .collect();
+            if forward.is_empty() {
+                continue;
+            }
+
+            let mut cursor = 0u64;
+            loop {
+                let chunk = self.scan_chunk(type_name, snapshot, cursor, chunk_size)?;
+                for obj in &chunk.objects {
+                    for (field_name, rel_id, target_included) in &forward {
+                        let prefix = KeyBuilder::edge_prefix(obj.id, *rel_id);
+                        let links = self.scan_prefix_at(snapshot, &prefix)?;
+                        if links.is_empty() {
+                            continue;
+                        }
+                        if !target_included {
+                            counts.get_mut(type_name).unwrap().dangling_edges_skipped +=
+                                links.len() as u64;
+                            continue;
+                        }
+                        for (dst, edge_fields) in links {
+                            write_export_line(
+                                writer,
+                                &serde_json::json!({
+                                    "kind": "edge",
+                                    "type": type_name,
+                                    "src": obj.id.to_string(),
+                                    "field": field_name,
+                                    "dst": dst.to_string(),
+                                    "edge_fields": logical::fields_to_json(&edge_fields),
+                                }),
+                            )?;
+                            counts.get_mut(type_name).unwrap().edges += 1;
+                        }
+                    }
+                }
+                match chunk.next_cursor {
+                    Some(next) if chunk.more => cursor = next,
+                    _ => break,
+                }
+            }
+        }
+
+        // (5) VECTOR lines (raw mode only) — streamed over the v:<type_id>:
+        // keyspace. The stored value is already big-endian f32, shipped
+        // verbatim as base64; import decodes it and rebuilds the HNSW graph.
+        if opts.vectors == VectorMode::Raw {
+            for type_name in &type_names {
+                let type_def = self.schema.get_type(type_name).unwrap();
+                // field_id -> field name for this type's LIVE vector fields;
+                // leftover vectors of a retired field are skipped (no field to
+                // import them into).
+                let mut vec_field_names: HashMap<u64, &str> = HashMap::new();
+                for f in type_def.vector_fields() {
+                    if let Some(fid) = self.field_ids.get(&format!("{type_name}.{}", f.name)) {
+                        vec_field_names.insert(*fid, f.name.as_str());
+                    }
+                }
+                if vec_field_names.is_empty() {
+                    continue;
+                }
+
+                let type_id = self.resolve_type_id(type_name)?;
+                let v_prefix = KeyBuilder::vector_prefix(type_id);
+                let mut start = v_prefix.clone();
+                loop {
+                    let chunk =
+                        self.storage
+                            .scan_chunk_raw(snapshot, &v_prefix, &start, chunk_size)?;
+                    for (key, value) in &chunk.live {
+                        // v:<type_id>:<object_id>:<field_id> — field_id is the
+                        // trailing 8 bytes; object_id the 8 before its separator.
+                        if key.len() < 17 {
+                            continue;
+                        }
+                        let field_id =
+                            u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                        let Some(field_name) = vec_field_names.get(&field_id) else {
+                            continue;
+                        };
+                        let object_id = u64::from_be_bytes(
+                            key[key.len() - 17..key.len() - 9].try_into().unwrap(),
+                        );
+                        write_export_line(
+                            writer,
+                            &serde_json::json!({
+                                "kind": "vector",
+                                "type": type_name,
+                                "id": object_id.to_string(),
+                                "field": field_name,
+                                "dims": value.len() / 4,
+                                "f32": logical::encode_bytes(value),
+                            }),
+                        )?;
+                        counts.get_mut(type_name).unwrap().vectors += 1;
+                    }
+                    match &chunk.high_water {
+                        Some(hw) if chunk.more => start = successor_key(hw),
+                        _ => break,
+                    }
+                }
+            }
+        }
+
+        // (6) TRAILER — last line, the completeness sentinel.
+        let mut counts_obj = serde_json::Map::new();
+        for (t, c) in &counts {
+            counts_obj.insert(
+                t.clone(),
+                serde_json::json!({
+                    "objects": c.objects,
+                    "edges": c.edges,
+                    "vectors": c.vectors,
+                    "dangling_edges_skipped": c.dangling_edges_skipped,
+                }),
+            );
+        }
+        write_export_line(
+            writer,
+            &serde_json::json!({
+                "kind": "trailer",
+                "complete": true,
+                "counts": serde_json::Value::Object(counts_obj),
+            }),
+        )?;
+        writer.flush().map_err(export_io_err)?;
+
+        Ok(crate::logical::LogicalExportSummary { counts })
+    }
+
     pub fn type_ids(&self) -> &HashMap<String, u64> {
         &self.type_ids
     }
@@ -8321,6 +8622,219 @@ mod tests {
             saw_empty_nonfinal_chunk,
             "a chunk should land entirely inside the tombstone run"
         );
+    }
+
+    /// Build a small DB with two types, a forward relation carrying an edge
+    /// field, an @inverse back-reference, and raw vectors. Returns the db plus
+    /// the created ids for assertions.
+    fn export_fixture() -> (tempfile::TempDir, Arc<Database>, u64, u64, u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String @unique
+                age: u32
+                posts: [Post] @inverse(Post.author)
+                embedding: Vector<4>
+            }
+            type Post {
+                title: String
+                rating: f64
+                author: User { weight: f32 }
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut u1f = FieldMap::new();
+        u1f.insert("name".into(), Value::String("Ada".into()));
+        u1f.insert("age".into(), Value::U32(36));
+        let u1 = db.create("User", u1f).unwrap().id;
+        let mut u2f = FieldMap::new();
+        u2f.insert("name".into(), Value::String("Alan".into()));
+        u2f.insert("age".into(), Value::U32(41));
+        let u2 = db.create("User", u2f).unwrap().id;
+
+        let mut p1f = FieldMap::new();
+        p1f.insert("title".into(), Value::String("On Computable Numbers".into()));
+        p1f.insert("rating".into(), Value::F64(4.5));
+        let p1 = db.create("Post", p1f).unwrap().id;
+        let mut ef = FieldMap::new();
+        ef.insert("weight".into(), Value::F32(0.5));
+        db.link("Post", p1, "author", u1, Some(ef)).unwrap();
+
+        let mut p2f = FieldMap::new();
+        p2f.insert("title".into(), Value::String("Mind".into()));
+        p2f.insert("rating".into(), Value::F64(3.0));
+        let p2 = db.create("Post", p2f).unwrap().id;
+        db.link("Post", p2, "author", u2, None).unwrap();
+
+        // Raw vectors straight to the v: keyspace (no embedder in-test).
+        let user_type_id = *db.type_ids().get("User").unwrap();
+        let emb_field_id = *db.field_ids().get("User.embedding").unwrap();
+        let mut txn = db.storage.begin_txn();
+        for (id, arr) in [(u1, [1.0f32, 2.0, 3.0, 4.0]), (u2, [5.0, 6.0, 7.0, 8.0])] {
+            let key = KeyBuilder::vector(user_type_id, id, emb_field_id);
+            let mut buf = bytes::BytesMut::new();
+            for v in arr {
+                buf.extend_from_slice(&v.to_be_bytes());
+            }
+            db.storage.put(&mut txn, &key, buf.freeze()).unwrap();
+        }
+        db.storage.commit(&mut txn).unwrap();
+
+        (dir, db, u1, u2, p1, p2)
+    }
+
+    fn parse_ndjson(out: &[u8]) -> Vec<serde_json::Value> {
+        std::str::from_utf8(out)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn logical_export_stream_emits_ordered_complete_dump() {
+        use crate::logical::LogicalExportOptions;
+        let (_dir, db, u1, _u2, p1, _p2) = export_fixture();
+
+        let mut out = Vec::new();
+        let summary = db
+            .logical_export_stream(&mut out, &LogicalExportOptions::default())
+            .unwrap();
+        let lines = parse_ndjson(&out);
+
+        // Header first; types sorted.
+        assert_eq!(lines[0]["kind"], "header");
+        assert_eq!(lines[0]["format"], crate::logical::FORMAT_TAG);
+        assert_eq!(lines[0]["vectors"], "raw");
+        assert_eq!(lines[0]["types"], serde_json::json!(["Post", "User"]));
+        // Schema second; re-parses.
+        assert_eq!(lines[1]["kind"], "schema");
+        assert!(parse_schema(lines[1]["sdl"].as_str().unwrap()).is_ok());
+
+        // Global section order: all objects, then all edges, then all vectors,
+        // then trailer LAST.
+        let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+        let last_object = kinds.iter().rposition(|k| *k == "object").unwrap();
+        let first_edge = kinds.iter().position(|k| *k == "edge").unwrap();
+        let last_edge = kinds.iter().rposition(|k| *k == "edge").unwrap();
+        let first_vector = kinds.iter().position(|k| *k == "vector").unwrap();
+        assert!(last_object < first_edge, "all objects precede any edge");
+        assert!(last_edge < first_vector, "all edges precede any vector");
+        assert_eq!(*kinds.last().unwrap(), "trailer");
+
+        let objects: Vec<_> = lines.iter().filter(|l| l["kind"] == "object").collect();
+        let edges: Vec<_> = lines.iter().filter(|l| l["kind"] == "edge").collect();
+        let vectors: Vec<_> = lines.iter().filter(|l| l["kind"] == "vector").collect();
+        assert_eq!(objects.len(), 4, "2 users + 2 posts");
+        assert_eq!(edges.len(), 2, "forward Post.author only, NOT the User.posts inverse");
+        assert_eq!(vectors.len(), 2);
+        assert!(
+            edges.iter().all(|e| e["type"] == "Post" && e["field"] == "author"),
+            "no inverse-edge duplication"
+        );
+
+        // Edge fields survive with type fidelity.
+        let e1 = edges.iter().find(|e| e["src"] == p1.to_string()).unwrap();
+        assert_eq!(e1["dst"], u1.to_string());
+        assert_eq!(e1["edge_fields"]["weight"]["t"], "f32");
+
+        // Scalar fidelity on an object line (u32 carried as a decimal string).
+        let ada = objects
+            .iter()
+            .find(|o| o["type"] == "User" && o["id"] == u1.to_string())
+            .unwrap();
+        assert_eq!(ada["fields"]["name"]["v"], "Ada");
+        assert_eq!(ada["fields"]["age"]["t"], "u32");
+        assert_eq!(ada["fields"]["age"]["v"], "36");
+
+        // Vector bytes are byte-equal to the stored v: value.
+        let v1 = vectors.iter().find(|v| v["id"] == u1.to_string()).unwrap();
+        assert_eq!(v1["dims"], 4);
+        assert_eq!(v1["field"], "embedding");
+        let decoded = crate::logical::decode_bytes(v1["f32"].as_str().unwrap()).unwrap();
+        let mut expect = Vec::new();
+        for v in [1.0f32, 2.0, 3.0, 4.0] {
+            expect.extend_from_slice(&v.to_be_bytes());
+        }
+        assert_eq!(decoded, expect);
+
+        // Trailer counts + summary agree.
+        let trailer = lines.last().unwrap();
+        assert_eq!(trailer["complete"], true);
+        assert_eq!(trailer["counts"]["User"]["objects"], 2);
+        assert_eq!(trailer["counts"]["Post"]["objects"], 2);
+        assert_eq!(trailer["counts"]["Post"]["edges"], 2);
+        assert_eq!(trailer["counts"]["User"]["vectors"], 2);
+        assert_eq!(summary.counts["Post"].edges, 2);
+        assert_eq!(summary.counts["User"].vectors, 2);
+        assert_eq!(summary.total_dangling_skipped(), 0);
+    }
+
+    #[test]
+    fn logical_export_refuses_while_field_migrating() {
+        use crate::logical::LogicalExportOptions;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type T { a: u32 }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        // Simulate an in-flight field-type migration (the gate the export reads).
+        db.migrating_field_count.store(1, Ordering::SeqCst);
+        let mut out = Vec::new();
+        let err = db
+            .logical_export_stream(&mut out, &LogicalExportOptions::default())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::ExportWhileMigrating { migrating_fields: 1 }
+        ));
+        assert!(out.is_empty(), "nothing written when refused");
+
+        // Clearing the gate lets it through.
+        db.migrating_field_count.store(0, Ordering::SeqCst);
+        let mut ok = Vec::new();
+        assert!(db
+            .logical_export_stream(&mut ok, &LogicalExportOptions::default())
+            .is_ok());
+    }
+
+    #[test]
+    fn logical_export_selective_types_skips_dangling_edges() {
+        use crate::logical::{LogicalExportOptions, VectorMode};
+        let (_dir, db, _u1, _u2, _p1, _p2) = export_fixture();
+
+        // Export only Post; its forward author -> User edges are now dangling
+        // (target type excluded) and must be skipped + counted, not emitted.
+        let opts = LogicalExportOptions {
+            types: Some(vec!["Post".into()]),
+            vectors: VectorMode::None,
+        };
+        let mut out = Vec::new();
+        let summary = db.logical_export_stream(&mut out, &opts).unwrap();
+        let lines = parse_ndjson(&out);
+
+        assert_eq!(lines[0]["types"], serde_json::json!(["Post"]));
+        assert!(
+            lines.iter().all(|l| l["kind"] != "edge"),
+            "dangling edges are not emitted"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|l| l["kind"] == "object")
+                .all(|o| o["type"] == "Post"),
+            "only the selected type's objects"
+        );
+        assert!(
+            lines.iter().all(|l| l["kind"] != "vector"),
+            "vectors=none drops embeddings"
+        );
+        assert_eq!(summary.total_dangling_skipped(), 2, "both posts' author edges");
+        assert_eq!(lines.last().unwrap()["complete"], true);
     }
 
     #[test]
