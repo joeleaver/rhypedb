@@ -6,21 +6,28 @@
 //! the write path. So it ships as the offline `rhypedb-import` binary (the
 //! server must be STOPPED), not the HTTP CLI — the CLI does not link the engine.
 //!
-//! Flow (single forward pass over the dependency-safe stream):
-//! 1. Validate the file up front (header format + trailer + per-type counts) and
-//!    refuse an incomplete/truncated dump BEFORE touching the data dir.
-//! 2. Guard the target + clear stale LSM state (a fresh dir).
-//! 3. `Database::open` from the EMBEDDED schema, write the schema out as
-//!    `schema.rhype` so the operator can start the server.
-//! 4. PASS over the stream: object lines → `restore_objects` (id-preserving,
-//!    chunked per type); edge lines → `Database::link` (both endpoints exist by
-//!    now — two-pass-by-stream-order handles cycles, no topo sort); vector lines
-//!    → `restore_vectors` (verbatim raw f32, chunked per field). The HNSW graph
-//!    rebuilds from those `v:` keys on the next server start.
+//! All-or-nothing at the dir level: the whole import is built in a sibling
+//! STAGING dir and atomically renamed into place only after it fully succeeds,
+//! so a failure (a bad line, an I/O error, an unparseable schema) leaves the
+//! target data dir completely untouched — never a wiped-and-partial dir.
+//!
+//! Flow:
+//! 1. Validate the file (header format + trailer + per-type counts) AND parse
+//!    the embedded schema — all non-destructive — and guard the target dir
+//!    (refuse a non-empty one without `--force`). Nothing is touched yet.
+//! 2. `Database::open` a fresh STAGING dir (a sibling of the target) and stream
+//!    the dependency-safe sections into it: object lines → `restore_objects`
+//!    (id-preserving, chunked per type); edge lines → `Database::link` (every
+//!    endpoint exists by then — two-pass-by-stream-order handles cycles, no topo
+//!    sort); vector lines → `restore_vectors` (verbatim raw f32, chunked per
+//!    field; the HNSW graph rebuilds from those `v:` keys on the next start).
+//!    Write `schema.rhype` so the operator can start the server.
+//! 3. Atomically swap the staging dir into the target; the staging dir is
+//!    removed on any earlier failure, leaving the target intact.
 
 use std::collections::BTreeMap;
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use rhypedb_engine::database::Database;
@@ -59,32 +66,166 @@ pub fn run_import(
     data_dir: &Path,
     opts: &ImportOptions,
 ) -> Result<ImportReport, String> {
-    // 1. Validate the whole file first — refuse a truncated/inconsistent dump
-    //    before we clear or write anything.
+    // 1. Validate the file + parse the embedded schema (both NON-destructive),
+    //    and guard the target — all BEFORE anything is touched, so a truncated
+    //    dump or an unparseable schema refuses with the target dir intact.
     let validated = validate_file(src)?;
-
-    // 2. Guard the target dir + clear stale LSM state so open() starts fresh.
-    prepare_data_dir(data_dir, opts.force)?;
-
-    // 3. Open a fresh Database from the EMBEDDED schema.
     let schema = parse_schema(&validated.sdl)
         .map_err(|e| format!("embedded schema is invalid: {e}"))?;
-    let db =
-        Database::open(schema, data_dir).map_err(|e| format!("open data dir: {e}"))?;
+    guard_target(data_dir, opts.force)?;
 
-    // 4. Stream the data sections into the engine.
-    let report = import_pass(src, &db, opts)?;
+    // 2. Build the ENTIRE import in a sibling staging dir (same filesystem, so
+    //    the final rename is atomic). The staging dir is removed on ANY failure
+    //    below, leaving the target untouched — the import is all-or-nothing.
+    let staging = staging_path(data_dir)?;
+    let mut guard = StagingGuard::new(staging.clone());
+    std::fs::create_dir_all(&staging).map_err(|e| format!("create staging dir: {e}"))?;
 
-    // Make the data dir self-contained + startable: write the schema out (the
-    // server needs a --schema file; the dump embeds it instead).
-    std::fs::write(data_dir.join("schema.rhype"), &validated.sdl)
+    let report = {
+        let db = Database::open(schema, &staging)
+            .map_err(|e| format!("open staging dir: {e}"))?;
+        let report = import_pass(src, &db, opts)?;
+        // The validation above checked the file's INTERNAL counts; re-check what
+        // we actually imported against the trailer to catch a file that changed
+        // between the validate read and the import read (TOCTOU).
+        verify_counts(&report, &validated, opts)?;
+        // Materialize the memtable to SSTs before handing the dir over.
+        db.storage()
+            .flush()
+            .map_err(|e| format!("flush staging dir: {e}"))?;
+        report
+        // `db` drops here, releasing the LSM on the staging dir.
+    };
+
+    // Make the dir self-contained + startable: the server needs a --schema file
+    // (the dump embeds the schema instead).
+    std::fs::write(staging.join("schema.rhype"), &validated.sdl)
         .map_err(|e| format!("write schema.rhype: {e}"))?;
 
+    // 3. Atomically swap the staging dir into place. Only NOW is the target
+    //    touched; on success the staging dir was moved, so disarm cleanup.
+    swap_into_place(&staging, data_dir)?;
+    guard.disarm();
     Ok(report)
 }
 
 struct Validated {
     sdl: String,
+    /// Total [objects, edges, vectors] across all types, from the trailer.
+    totals: [u64; 3],
+}
+
+/// Refuse a non-empty target dir without `--force`. The target is NOT modified
+/// here — the import stages into a sibling dir and only swaps in at the end.
+fn guard_target(dir: &Path, force: bool) -> Result<(), String> {
+    if dir.exists() {
+        let non_empty = std::fs::read_dir(dir)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(true);
+        if non_empty && !force {
+            return Err(format!(
+                "{} exists and is not empty (use --force to overwrite)",
+                dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_counts(
+    report: &ImportReport,
+    validated: &Validated,
+    opts: &ImportOptions,
+) -> Result<(), String> {
+    let [objects, edges, vectors] = validated.totals;
+    if report.objects != objects || report.edges != edges {
+        return Err(format!(
+            "imported counts diverge from the trailer (objects {}/{objects}, edges {}/{edges}) \
+             — did the source file change during import?",
+            report.objects, report.edges
+        ));
+    }
+    if opts.vectors == VectorImportMode::Raw && report.vectors != vectors {
+        return Err(format!(
+            "imported vectors {} != trailer {vectors} — did the source file change during import?",
+            report.vectors
+        ));
+    }
+    Ok(())
+}
+
+/// A staging dir under the target's parent (same filesystem → atomic rename).
+fn staging_path(data_dir: &Path) -> Result<PathBuf, String> {
+    let parent = parent_or_cwd(data_dir);
+    std::fs::create_dir_all(&parent)
+        .map_err(|e| format!("create parent of {}: {e}", data_dir.display()))?;
+    Ok(parent.join(format!(".rhypedb-import-{}", unique_suffix(data_dir))))
+}
+
+/// Atomically install the fully-built `staging` dir at `data_dir`. If the target
+/// already exists it is moved aside first (and restored on a mid-swap failure),
+/// so the operation never leaves a half-installed dir.
+fn swap_into_place(staging: &Path, data_dir: &Path) -> Result<(), String> {
+    if data_dir.exists() {
+        let backup = parent_or_cwd(data_dir).join(format!(".rhypedb-old-{}", unique_suffix(data_dir)));
+        std::fs::rename(data_dir, &backup)
+            .map_err(|e| format!("move {} aside: {e}", data_dir.display()))?;
+        match std::fs::rename(staging, data_dir) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&backup);
+                Ok(())
+            }
+            Err(e) => {
+                // Restore the original so a failed swap is not destructive.
+                let _ = std::fs::rename(&backup, data_dir);
+                Err(format!("install import at {}: {e}", data_dir.display()))
+            }
+        }
+    } else {
+        std::fs::rename(staging, data_dir)
+            .map_err(|e| format!("install import at {}: {e}", data_dir.display()))
+    }
+}
+
+fn parent_or_cwd(p: &Path) -> PathBuf {
+    p.parent()
+        .filter(|x| !x.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn unique_suffix(data_dir: &Path) -> String {
+    let name = data_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "data".into());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{name}-{}-{nanos}", std::process::id())
+}
+
+/// Removes the staging dir on drop unless disarmed — so any early return from
+/// `run_import` cleans up the partial staging dir and leaves the target intact.
+struct StagingGuard {
+    path: PathBuf,
+    armed: bool,
+}
+impl StagingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 /// Validate the export file's structure: a `header` first line with the
@@ -159,6 +300,7 @@ fn validate_file(path: &Path) -> Result<Validated, String> {
         .and_then(Json::as_object)
         .ok_or("trailer is missing per-type counts")?;
 
+    let mut totals = [0u64; 3];
     for (t, c) in counts_obj {
         let want = [
             c.get("objects").and_then(Json::as_u64).unwrap_or(0),
@@ -173,44 +315,17 @@ fn validate_file(path: &Path) -> Result<Validated, String> {
                 want[0], want[1], want[2], got[0], got[1], got[2]
             ));
         }
+        for i in 0..3 {
+            totals[i] += want[i];
+        }
     }
     if let Some((t, _)) = tally.iter().next() {
         return Err(format!("type {t} has data lines but is absent from the trailer counts"));
     }
 
-    Ok(Validated { sdl })
+    Ok(Validated { sdl, totals })
 }
 
-/// Guard the target dir + clear stale LSM state so `Database::open` starts
-/// fresh. `open()` loads EVERY `*.sst` (no manifest), so a leftover SST would
-/// mix a foreign database into the import — clear `sst/` + `wal.log` + the HNSW
-/// snapshots first (mirrors the physical restore).
-fn prepare_data_dir(dir: &Path, force: bool) -> Result<(), String> {
-    if dir.exists() {
-        let non_empty = std::fs::read_dir(dir)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(true);
-        if non_empty && !force {
-            return Err(format!(
-                "{} exists and is not empty (use --force to overwrite)",
-                dir.display()
-            ));
-        }
-    }
-    let _ = std::fs::remove_dir_all(dir.join("sst"));
-    let _ = std::fs::remove_file(dir.join("wal.log"));
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let n = entry.file_name();
-            let n = n.to_string_lossy();
-            if n.starts_with("hnsw_") && n.ends_with(".bin") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-    std::fs::create_dir_all(dir).map_err(|e| format!("create data dir: {e}"))?;
-    Ok(())
-}
 
 fn flush_objects(
     db: &Database,
@@ -520,12 +635,67 @@ mod tests {
             &ImportOptions { force: false, vectors: VectorImportMode::Raw },
         );
         assert!(r.is_err() && r.unwrap_err().contains("not empty"));
-        // With --force it succeeds.
+        // With --force it succeeds and FULLY REPLACES the target (the stray file
+        // is gone — the staging dir is swapped in, not merged).
         let r = run_import(
             &file,
             target.path(),
             &ImportOptions { force: true, vectors: VectorImportMode::Raw },
         );
         assert!(r.is_ok(), "got {r:?}");
+        assert!(
+            !target.path().join("stray.txt").exists(),
+            "--force replaces the dir wholesale; no stale files survive"
+        );
+    }
+
+    #[test]
+    fn import_bad_schema_leaves_target_untouched() {
+        // A dump that passes structural validation but whose embedded SDL is
+        // unparseable must be refused BEFORE the target dir is touched (the
+        // destructive swap happens only after a full successful import).
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema("type T { n: u32 }").unwrap(), dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("n".into(), Value::U32(1));
+        db.create("T", f).unwrap();
+        let full = export_to_string(&db);
+
+        // Corrupt the schema line's SDL but keep counts + trailer valid.
+        let bad: String = full
+            .lines()
+            .map(|l| {
+                if l.contains("\"kind\":\"schema\"") {
+                    r#"{"kind":"schema","sdl":"type type !!! not valid"}"#.to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let file = dir.path().join("bad.ndjson");
+        std::fs::write(&file, &bad).unwrap();
+
+        // Pre-populate the target (inside a controlled base so we can check for a
+        // leaked staging dir as a sibling).
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("data");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("marker.txt"), b"keep me").unwrap();
+
+        let r = run_import(
+            &file,
+            &target,
+            &ImportOptions { force: true, vectors: VectorImportMode::Raw },
+        );
+        assert!(r.is_err() && r.unwrap_err().contains("schema"), "bad SDL must be rejected");
+        assert!(target.join("marker.txt").is_file(), "target untouched on failure");
+        let leaked = std::fs::read_dir(base.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".rhypedb-"))
+            .count();
+        assert_eq!(leaked, 0, "no staging dir leaked");
     }
 }

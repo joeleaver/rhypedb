@@ -4024,11 +4024,15 @@ impl Database {
     /// the export shipped), so this is a lossless restore.
     ///
     /// It writes ONLY the `v:<type_id>:<object_id>:<field_id>` source-of-truth
-    /// keys — NOT the HNSW graph, which is rebuilt from these keys on the next
-    /// open (a server's `Vectorizer` rebuilds when the `.bin` snapshot is absent
-    /// or its config mismatches). So a logical import reconstructs vector search
-    /// with no vectorizer/embedder at import time; search comes back
-    /// recall-equivalent after the rebuild.
+    /// keys — NOT the HNSW graph. The graph is rebuilt from these keys on the
+    /// next open ONLY when the `.bin` snapshot is absent or its config mismatches
+    /// (a full `rebuild_index_from_lsm`); against a warm dir whose snapshot
+    /// already holds these ids the open takes the delta path and SKIPS ids
+    /// already in the graph, so an OVERWRITE would not reach the graph. Callers
+    /// overwriting vectors must therefore clear `hnsw_*.bin` first — the offline
+    /// import does (it stages into a fresh dir). So a logical import reconstructs
+    /// vector search with no vectorizer/embedder at import time; search comes
+    /// back recall-equivalent after the rebuild.
     ///
     /// Each payload's length must be `dims * 4` for the field's declared
     /// `Vector<dims>`. All-or-nothing per call (one txn / commit).
