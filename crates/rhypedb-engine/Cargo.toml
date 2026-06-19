@@ -18,6 +18,7 @@ rhypedb-schema = { workspace = true }
 rhypedb-vector = { workspace = true }
 rhypedb-embed = { workspace = true }
 rhypedb-subscribe = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }

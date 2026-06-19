@@ -2478,6 +2478,7 @@ name = "rhypedb-engine"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "base64 0.22.1",
  "bytes",
  "parking_lot",
  "rhypedb-embed",

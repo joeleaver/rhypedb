@@ -13,6 +13,9 @@ pub enum EngineError {
     #[error("catalog error: {0}")]
     Catalog(#[from] CatalogError),
 
+    #[error("logical export/import error: {0}")]
+    Logical(#[from] crate::logical::LogicalError),
+
     #[error("type not found: {0}")]
     TypeNotFound(String),
 

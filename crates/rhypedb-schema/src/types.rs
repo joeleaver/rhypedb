@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 /// A complete schema — all types and their relationships.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
     pub types: HashMap<String, TypeDef>,
 }
@@ -31,7 +31,7 @@ impl Schema {
 }
 
 /// Definition of a single object type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TypeDef {
     pub name: String,
     pub fields: Vec<FieldDef>,
@@ -56,7 +56,7 @@ impl TypeDef {
 }
 
 /// Definition of a single field within a type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FieldDef {
     pub name: String,
     pub field_type: FieldType,

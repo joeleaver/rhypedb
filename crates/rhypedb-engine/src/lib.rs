@@ -1,6 +1,7 @@
 pub(crate) mod catalog;
 pub mod database;
 pub mod error;
+pub mod logical;
 pub mod object;
 pub mod vectorizer;
 
