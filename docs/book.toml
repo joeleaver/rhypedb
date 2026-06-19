@@ -8,5 +8,7 @@ language = "en"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
+# Served as a GitHub Pages project site at https://joeleaver.github.io/rhypedb/
+site-url = "/rhypedb/"
 git-repository-url = "https://github.com/joeleaver/rhypedb"
 edit-url-template = "https://github.com/joeleaver/rhypedb/edit/master/docs/{path}"

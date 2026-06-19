@@ -57,7 +57,9 @@ See the [Query Language](docs/src/queries.md) reference for the full grammar.
 
 ## Documentation
 
-Full documentation lives in [`docs/`](docs/) and is built with [mdBook](https://rust-lang.github.io/mdBook/):
+📖 **[Read the docs → joeleaver.github.io/rhypedb](https://joeleaver.github.io/rhypedb/)**
+
+Built with [mdBook](https://rust-lang.github.io/mdBook/) (sources in [`docs/`](docs/); `mdbook serve docs` to preview locally):
 
 - [Getting Started](docs/src/getting-started.md) — define a schema, run the server, query it.
 - [Schema Reference](docs/src/schema.md) — types, relationships, directives.
@@ -78,10 +80,53 @@ cargo build --release -p rhypedb-server -p rhypedb-cli
 
 # run a server on the example schema
 target/release/rhypedb-server --schema examples/blog.rhype --data-dir ./data
-
-# query it (in another terminal)
-target/release/rhypedb-cli -e 'User.create({ name: "Alice", email: "alice@example.com", age: 30 })'
 ```
+
+In another terminal, talk to it with the CLI (`-e` runs one query; with no args it starts a REPL):
+
+```bash
+# create
+rhypedb-cli -e 'User.create({ name: "Alice", email: "alice@example.com", age: 30 })'
+rhypedb-cli -e 'Post.create({ title: "Hello", body: "first post", author: User.get(1) })'
+
+# read & traverse relationships
+rhypedb-cli -e 'User.filter(.age > 18).limit(10)'
+rhypedb-cli -e 'User.get(1).posts'
+
+# mutate
+rhypedb-cli -e 'User.get(1).update({ age: 31 })'
+```
+
+The same queries work over HTTP: `curl -s localhost:4200/query -d '{"query":"User.get(1)"}'`.
+
+### Evolving the schema
+
+**Additive changes need no migration.** Add a field and reapply the schema — existing objects just read the new field as null until it's set:
+
+```diff
+  type User {
+      name: String
+      email: String @unique
+      age: u32
++     bio: String
+  }
+```
+
+```bash
+# apply without a restart (or simply restart the server on the edited file)
+curl -X POST localhost:4200/admin/reload \
+  -H "Authorization: Bearer $RHYPEDB_ADMIN_TOKEN" --data-binary @examples/blog.rhype
+```
+
+**Type changes run as an online migration.** Changing a field's *type* can't be inferred from a schema diff — it rewrites every stored value behind a live double-write, backfilling in the background and cutting over with no downtime. You drive it with a named converter (e.g. widening an `i64` field to `f64`):
+
+```bash
+rhypedb-cli --admin-token "$RHYPEDB_ADMIN_TOKEN" \
+  migrate start --type User --field score --to f64 --converter widen_int_to_f64
+rhypedb-cli --admin-token "$RHYPEDB_ADMIN_TOKEN" migrate status   # watch it backfill, then cut over
+```
+
+Renames, removals, error policies, pause/resume/cancel, and dry-runs are covered in **[Schema Migrations](docs/src/migrations.md)**.
 
 See [Getting Started](docs/src/getting-started.md) for the full walkthrough.
 
