@@ -6330,6 +6330,15 @@ impl Database {
         &self.rel_ids
     }
 
+    /// Number of fields currently undergoing a field-type migration. Non-zero
+    /// means stored values may diverge from the declared schema, so a logical
+    /// export is refused (see [`logical_export_stream`](Self::logical_export_stream)).
+    /// A cheap lock-free read; lets the server pre-flight a clean 409 before
+    /// committing to a streamed 200 response.
+    pub fn migrating_fields(&self) -> usize {
+        self.migrating_field_count.load(Ordering::SeqCst)
+    }
+
     /// Check that a unique value doesn't already exist, and insert the index entry.
     ///
     /// `staged` records every unique key this transaction has already claimed.
@@ -8738,22 +8747,25 @@ mod tests {
             "no inverse-edge duplication"
         );
 
+        // ids are emitted as decimal strings; hoist them out of the closures.
+        let (u1s, p1s) = (u1.to_string(), p1.to_string());
+
         // Edge fields survive with type fidelity.
-        let e1 = edges.iter().find(|e| e["src"] == p1.to_string()).unwrap();
-        assert_eq!(e1["dst"], u1.to_string());
+        let e1 = edges.iter().find(|e| e["src"] == p1s).unwrap();
+        assert_eq!(e1["dst"], u1s);
         assert_eq!(e1["edge_fields"]["weight"]["t"], "f32");
 
         // Scalar fidelity on an object line (u32 carried as a decimal string).
         let ada = objects
             .iter()
-            .find(|o| o["type"] == "User" && o["id"] == u1.to_string())
+            .find(|o| o["type"] == "User" && o["id"] == u1s)
             .unwrap();
         assert_eq!(ada["fields"]["name"]["v"], "Ada");
         assert_eq!(ada["fields"]["age"]["t"], "u32");
         assert_eq!(ada["fields"]["age"]["v"], "36");
 
         // Vector bytes are byte-equal to the stored v: value.
-        let v1 = vectors.iter().find(|v| v["id"] == u1.to_string()).unwrap();
+        let v1 = vectors.iter().find(|v| v["id"] == u1s).unwrap();
         assert_eq!(v1["dims"], 4);
         assert_eq!(v1["field"], "embedding");
         let decoded = crate::logical::decode_bytes(v1["f32"].as_str().unwrap()).unwrap();

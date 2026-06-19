@@ -58,6 +58,30 @@ enum Commands {
         /// The snapshot directory to check.
         dir: PathBuf,
     },
+    /// Logical export — a portable, version-independent NDJSON dump
+    /// (talks to /admin/export).
+    Export {
+        /// Write the export to this path ON THE SERVER's filesystem.
+        #[arg(long, conflicts_with = "download")]
+        dest: Option<String>,
+        /// Stream the export into this LOCAL file (.ndjson).
+        #[arg(long, conflicts_with = "dest")]
+        download: Option<PathBuf>,
+        /// Optional label folded into the server-side export dir name (--dest).
+        #[arg(long, requires = "dest")]
+        label: Option<String>,
+        /// Comma-separated type names to export (default: every type).
+        #[arg(long)]
+        types: Option<String>,
+        /// Vector handling: raw (default) | none.
+        #[arg(long)]
+        vectors: Option<String>,
+    },
+    /// Verify a local logical export file (header + trailer + per-type counts).
+    VerifyExport {
+        /// The .ndjson export file to check.
+        file: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -681,6 +705,264 @@ fn run_verify(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Logical export / verify (Overboard cmqikqug4)
+// ---------------------------------------------------------------------------
+
+/// The logical-export format tag. MUST match
+/// `rhypedb_engine::logical::FORMAT_TAG` — the CLI is a pure HTTP client and
+/// does not link the engine, so the wire contract is duplicated here.
+const LOGICAL_EXPORT_FORMAT: &str = "rhypedb-logical-export-v1";
+
+/// Split a `--types a,b,c` value into trimmed, non-empty names.
+fn split_types(types: &Option<String>) -> Vec<String> {
+    types
+        .as_deref()
+        .map(|t| {
+            t.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn run_export(
+    cli: &Cli,
+    dest: &Option<String>,
+    download: &Option<PathBuf>,
+    label: &Option<String>,
+    types: &Option<String>,
+    vectors: &Option<String>,
+) -> Result<(), String> {
+    match (dest, download) {
+        (Some(d), _) => {
+            let mut body = serde_json::json!({ "dest": d });
+            if let Some(l) = label {
+                body["label"] = serde_json::Value::String(l.clone());
+            }
+            let list = split_types(types);
+            if !list.is_empty() {
+                body["types"] = serde_json::json!(list);
+            }
+            if let Some(v) = vectors {
+                body["vectors"] = serde_json::Value::String(v.clone());
+            }
+            let (status, resp) = admin_post(cli, "/admin/export", body)?;
+            if !(200..300).contains(&status) {
+                return Err(http_error(status, &resp));
+            }
+            let path = resp.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+            println!("export written on server: {path}");
+            if let Some(counts) = resp.get("manifest").and_then(|m| m.get("counts")) {
+                print_export_counts(counts);
+            }
+            Ok(())
+        }
+        (None, Some(file)) => {
+            download_export(cli, file, types, vectors)?;
+            // A streamed export commits to 200 then can only truncate; validate
+            // the trailer before trusting the file.
+            let report = verify_export_file(file)?;
+            println!(
+                "export downloaded + verified: {} ({} objects, {} edges, {} vectors)",
+                file.display(),
+                report.objects,
+                report.edges,
+                report.vectors,
+            );
+            Ok(())
+        }
+        (None, None) => Err("specify --dest <server-path> or --download <local-file>".into()),
+    }
+}
+
+/// Stream `GET /admin/export/stream` straight into the local file `into`.
+fn download_export(
+    cli: &Cli,
+    into: &Path,
+    types: &Option<String>,
+    vectors: &Option<String>,
+) -> Result<(), String> {
+    // Type names are schema idents ([A-Za-z0-9_]) and vectors is raw|none, so no
+    // URL-encoding is needed for the query values.
+    let mut query = Vec::new();
+    let list = split_types(types);
+    if !list.is_empty() {
+        query.push(format!("types={}", list.join(",")));
+    }
+    if let Some(v) = vectors {
+        query.push(format!("vectors={v}"));
+    }
+    let qs = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query.join("&"))
+    };
+    let url = format!("{}/admin/export/stream{qs}", cli.host);
+
+    let mut req = ureq::get(&url)
+        .config()
+        .http_status_as_error(false)
+        .build();
+    if let Some(t) = &cli.admin_token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let mut resp = req.call().map_err(|e| format!("connection error: {e}"))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err(format!("server returned {status}: {}", text.trim()));
+    }
+
+    let existed = into.exists();
+    let mut file =
+        std::fs::File::create(into).map_err(|e| format!("create {}: {e}", into.display()))?;
+    let mut reader = resp.body_mut().as_reader();
+    if let Err(e) = std::io::copy(&mut reader, &mut file) {
+        if !existed {
+            let _ = std::fs::remove_file(into);
+        }
+        return Err(format!("download (incomplete): {e}"));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ExportVerifyReport {
+    objects: u64,
+    edges: u64,
+    vectors: u64,
+    types: usize,
+}
+
+/// Validate a logical export file: a `header` first line with the expected
+/// format tag, a `trailer` LAST line marked `complete:true`, and per-type
+/// object/edge/vector counts that match the actual lines. Streams the file so
+/// a huge export does not load into memory. The analogue of
+/// `backup_missing_files` for the logical artifact.
+fn verify_export_file(path: &Path) -> Result<ExportVerifyReport, String> {
+    use std::io::BufRead;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut lines = std::io::BufReader::new(file).lines();
+
+    // First non-empty line must be the header.
+    let header_line = loop {
+        match lines.next() {
+            Some(Ok(l)) if l.trim().is_empty() => continue,
+            Some(Ok(l)) => break l,
+            Some(Err(e)) => return Err(format!("read error: {e}")),
+            None => return Err("empty export file".into()),
+        }
+    };
+    let header: serde_json::Value =
+        serde_json::from_str(&header_line).map_err(|e| format!("first line is not JSON: {e}"))?;
+    if header.get("kind").and_then(|k| k.as_str()) != Some("header") {
+        return Err("first line is not a header".into());
+    }
+    if header.get("format").and_then(|f| f.as_str()) != Some(LOGICAL_EXPORT_FORMAT) {
+        return Err(format!(
+            "unknown/incompatible format (expected {LOGICAL_EXPORT_FORMAT})"
+        ));
+    }
+
+    // Tally object/edge/vector lines per type; the trailer must be the LAST line.
+    let mut tally: std::collections::BTreeMap<String, [u64; 3]> = std::collections::BTreeMap::new();
+    let mut trailer: Option<serde_json::Value> = None;
+    for line in lines {
+        let line = line.map_err(|e| format!("read error: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if trailer.is_some() {
+            return Err("malformed export: lines present after the trailer".into());
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&line).map_err(|e| format!("invalid JSON line: {e}"))?;
+        match v.get("kind").and_then(|k| k.as_str()) {
+            Some(kind @ ("object" | "edge" | "vector")) => {
+                let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let slot = tally.entry(t).or_default();
+                match kind {
+                    "object" => slot[0] += 1,
+                    "edge" => slot[1] += 1,
+                    _ => slot[2] += 1,
+                }
+            }
+            Some("schema") => {}
+            Some("trailer") => trailer = Some(v),
+            Some("header") => return Err("unexpected second header line".into()),
+            other => return Err(format!("unknown line kind: {other:?}")),
+        }
+    }
+
+    let trailer = trailer.ok_or("export INCOMPLETE: no trailer line (truncated download)")?;
+    if trailer.get("complete").and_then(|c| c.as_bool()) != Some(true) {
+        return Err("export trailer is not marked complete".into());
+    }
+    let counts = trailer
+        .get("counts")
+        .and_then(|c| c.as_object())
+        .ok_or("trailer is missing per-type counts")?;
+
+    // Every trailer type must match the tallied lines exactly, and no tallied
+    // type may be absent from the trailer.
+    let mut total = [0u64; 3];
+    for (t, c) in counts {
+        let want = [
+            c.get("objects").and_then(|v| v.as_u64()).unwrap_or(0),
+            c.get("edges").and_then(|v| v.as_u64()).unwrap_or(0),
+            c.get("vectors").and_then(|v| v.as_u64()).unwrap_or(0),
+        ];
+        let got = tally.remove(t).unwrap_or([0, 0, 0]);
+        if got != want {
+            return Err(format!(
+                "count mismatch for type {t}: trailer says objects={} edges={} vectors={}, \
+                 file has objects={} edges={} vectors={}",
+                want[0], want[1], want[2], got[0], got[1], got[2]
+            ));
+        }
+        for i in 0..3 {
+            total[i] += want[i];
+        }
+    }
+    if let Some((t, _)) = tally.iter().next() {
+        return Err(format!(
+            "type {t} has data lines but is absent from the trailer counts"
+        ));
+    }
+
+    Ok(ExportVerifyReport {
+        objects: total[0],
+        edges: total[1],
+        vectors: total[2],
+        types: counts.len(),
+    })
+}
+
+fn run_verify_export(file: &Path) -> Result<(), String> {
+    let r = verify_export_file(file)?;
+    println!(
+        "export OK: {} type(s), {} objects, {} edges, {} vectors",
+        r.types, r.objects, r.edges, r.vectors
+    );
+    Ok(())
+}
+
+fn print_export_counts(counts: &serde_json::Value) {
+    if let Some(obj) = counts.as_object() {
+        let (mut o, mut e, mut v) = (0u64, 0u64, 0u64);
+        for c in obj.values() {
+            o += c.get("objects").and_then(|x| x.as_u64()).unwrap_or(0);
+            e += c.get("edges").and_then(|x| x.as_u64()).unwrap_or(0);
+            v += c.get("vectors").and_then(|x| x.as_u64()).unwrap_or(0);
+        }
+        println!("  {} type(s): {o} objects, {e} edges, {v} vectors", obj.len());
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -705,6 +987,14 @@ fn main() {
                 force,
             } => run_restore(src, data_dir, *force),
             Commands::Verify { dir } => run_verify(dir),
+            Commands::Export {
+                dest,
+                download,
+                label,
+                types,
+                vectors,
+            } => run_export(&cli, dest, download, label, types, vectors),
+            Commands::VerifyExport { file } => run_verify_export(file),
             Commands::Migrate { .. } => unreachable!("handled above"),
         };
         if let Err(e) = result {
@@ -794,6 +1084,89 @@ mod tests {
         std::fs::remove_file(dir.path().join("sst").join("00000001.sst")).unwrap();
         let err = run_verify(dir.path()).unwrap_err();
         assert!(err.contains("INCOMPLETE"), "got: {err}");
+    }
+
+    /// A minimal but complete logical-export stream: 2 objects (1 User, 1 Post),
+    /// 1 forward edge, no vectors. Used by the verify_export tests.
+    fn sample_export_ndjson() -> String {
+        [
+            r#"{"kind":"header","format":"rhypedb-logical-export-v1","created_at_ms":1,"export_version":1,"vectors":"raw","types":["Post","User"]}"#,
+            r#"{"kind":"schema","sdl":"type User { name: String }\ntype Post { author: User }\n"}"#,
+            r#"{"kind":"object","type":"User","id":"1","fields":{"name":{"t":"str","v":"Ada"}}}"#,
+            r#"{"kind":"object","type":"Post","id":"2","fields":{}}"#,
+            r#"{"kind":"edge","type":"Post","src":"2","field":"author","dst":"1","edge_fields":{}}"#,
+            r#"{"kind":"trailer","complete":true,"counts":{"User":{"objects":1,"edges":0,"vectors":0,"dangling_edges_skipped":0},"Post":{"objects":1,"edges":1,"vectors":0,"dangling_edges_skipped":0}}}"#,
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    fn write_export(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.ndjson");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn verify_export_accepts_complete_stream() {
+        let (_d, path) = write_export(&sample_export_ndjson());
+        let r = verify_export_file(&path).unwrap();
+        assert_eq!(r.objects, 2);
+        assert_eq!(r.edges, 1);
+        assert_eq!(r.vectors, 0);
+        assert_eq!(r.types, 2);
+    }
+
+    #[test]
+    fn verify_export_rejects_truncated_no_trailer() {
+        // Drop the trailer line — a truncated download.
+        let truncated: String = sample_export_ndjson()
+            .lines()
+            .filter(|l| !l.contains("\"trailer\""))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let (_d, path) = write_export(&truncated);
+        let err = verify_export_file(&path).unwrap_err();
+        assert!(
+            err.contains("INCOMPLETE") && err.contains("trailer"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_export_rejects_count_mismatch() {
+        // Trailer claims 2 User objects but the file has 1.
+        let tampered =
+            sample_export_ndjson().replace(r#""User":{"objects":1"#, r#""User":{"objects":2"#);
+        let (_d, path) = write_export(&tampered);
+        let err = verify_export_file(&path).unwrap_err();
+        assert!(err.contains("count mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_export_rejects_wrong_format_tag() {
+        let tampered =
+            sample_export_ndjson().replace("rhypedb-logical-export-v1", "some-other-format-v9");
+        let (_d, path) = write_export(&tampered);
+        let err = verify_export_file(&path).unwrap_err();
+        assert!(err.contains("format"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_export_rejects_lines_after_trailer() {
+        let mut s = sample_export_ndjson();
+        s.push_str("{\"kind\":\"object\",\"type\":\"User\",\"id\":\"99\",\"fields\":{}}\n");
+        let (_d, path) = write_export(&s);
+        let err = verify_export_file(&path).unwrap_err();
+        assert!(err.contains("after the trailer"), "got: {err}");
+    }
+
+    #[test]
+    fn verify_export_rejects_empty_file() {
+        let (_d, path) = write_export("");
+        let err = verify_export_file(&path).unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
     }
 
     #[test]

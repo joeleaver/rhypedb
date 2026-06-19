@@ -27,6 +27,7 @@ use rhypedb_engine::database::{
     Database, MigrationEvent, MigrationFilter, MigrationPlanSpec, MigrationProgress,
     MigrationSummary, QuarantineEntry,
 };
+use rhypedb_engine::logical::{LogicalExportOptions, VectorMode};
 use rhypedb_engine::{EngineError, ErrorPolicy, MigrationPhase, MigrationStatus};
 use rhypedb_schema::parser::parse_schema;
 use rhypedb_schema::{FieldType, ScalarType, Schema};
@@ -55,6 +56,11 @@ pub(crate) fn admin_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // streams the snapshot back as a tar.
         .route("/admin/backup", post(backup))
         .route("/admin/backup/stream", get(backup_stream))
+        // Logical export: portable, version-independent NDJSON dump.
+        // `POST /admin/export` writes it to a server path; `GET
+        // /admin/export/stream` streams it back.
+        .route("/admin/export", post(export))
+        .route("/admin/export/stream", get(export_stream))
         // Auth applies to these routes only (NOT /query, /status, /health).
         .route_layer(middleware::from_fn_with_state(state, admin_auth))
 }
@@ -807,6 +813,212 @@ async fn backup_stream(State(state): State<Arc<AppState>>) -> Response {
         .expect("valid backup-stream response")
 }
 
+// ===================================================================
+// Logical export (Overboard cmqikqug4).
+// ===================================================================
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    /// Comma-separated type names; empty/absent = every type.
+    types: Option<String>,
+    /// Vector handling: "raw" (default) | "none".
+    vectors: Option<String>,
+}
+
+/// Build [`LogicalExportOptions`] from query/body inputs. Errors on an unknown
+/// vectors mode; the type set itself is validated by the engine (unknown type
+/// → 404).
+fn build_export_opts(
+    types_csv: Option<&str>,
+    types_list: Option<Vec<String>>,
+    vectors: Option<&str>,
+) -> Result<LogicalExportOptions, String> {
+    let types = match (types_csv, types_list) {
+        (_, Some(list)) => {
+            let v: Vec<String> = list
+                .into_iter()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            (!v.is_empty()).then_some(v)
+        }
+        (Some(csv), None) => {
+            let v: Vec<String> = csv
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            (!v.is_empty()).then_some(v)
+        }
+        (None, None) => None,
+    };
+    let vectors = match vectors {
+        None | Some("raw") => VectorMode::Raw,
+        Some("none") => VectorMode::None,
+        Some(other) => return Err(format!("unknown vectors mode '{other}' (expected raw|none)")),
+    };
+    Ok(LogicalExportOptions { types, vectors })
+}
+
+fn export_vectors_tag(opts: &LogicalExportOptions) -> &'static str {
+    match opts.vectors {
+        VectorMode::Raw => "raw",
+        VectorMode::None => "none",
+    }
+}
+
+/// `GET /admin/export/stream` — stream a logical NDJSON dump (chunked, never
+/// buffered — OOM-safe). A pre-flight refuses mid field-type migration with a
+/// clean 409. A failure AFTER the 200 begins can only truncate the body, so
+/// clients MUST validate the trailer line before trusting the download (the
+/// CLI's `verify-export` / post-download check does).
+async fn export_stream(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ExportQuery>,
+) -> Response {
+    let opts = match build_export_opts(q.types.as_deref(), None, q.vectors.as_deref()) {
+        Ok(o) => o,
+        Err(m) => return bad_request(&m),
+    };
+    let db = state.db();
+    // Pre-flight before committing to a 200 stream: an unknown type is a clean
+    // 404 and an in-flight field-type migration a clean 409, rather than a
+    // truncated body the client only discovers via the missing trailer.
+    if let Some(types) = &opts.types {
+        let schema = db.schema();
+        for t in types {
+            if schema.get_type(t).is_none() {
+                return err_response(EngineError::TypeNotFound(t.clone()));
+            }
+        }
+    }
+    let migrating = db.migrating_fields();
+    if migrating > 0 {
+        return err_response(EngineError::ExportWhileMigrating {
+            migrating_fields: migrating,
+        });
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
+    tokio::task::spawn_blocking(move || {
+        let mut writer = ChannelWriter { tx: tx.clone() };
+        if let Err(e) = db.logical_export_stream(&mut writer, &opts) {
+            let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+        }
+    });
+
+    let body = axum::body::Body::from_stream(ReceiverStream::new(rx));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"rhypedb-export.ndjson\"",
+        )
+        .body(body)
+        .expect("valid export-stream response")
+}
+
+#[derive(Deserialize)]
+struct ExportReq {
+    /// Directory on the SERVER's filesystem to place the export under. A
+    /// timestamped `rhypedb-export-<ms>[-<label>]/` subdir is created in it.
+    dest: String,
+    label: Option<String>,
+    types: Option<Vec<String>>,
+    vectors: Option<String>,
+}
+
+/// `POST /admin/export` — write a logical export to a path on the server.
+async fn export(State(state): State<Arc<AppState>>, Json(req): Json<ExportReq>) -> Response {
+    let opts = match build_export_opts(None, req.types, req.vectors.as_deref()) {
+        Ok(o) => o,
+        Err(m) => return bad_request(&m),
+    };
+    let db = state.db();
+    let dest = std::path::PathBuf::from(req.dest);
+    let label = req.label;
+    match spawn_blocking_engine(move || {
+        let dir = dest.join(export_dir_name(label.as_deref()));
+        std::fs::create_dir_all(&dir).map_err(io_err)?;
+        match export_into_dir(&db, &dir, &opts) {
+            Ok(manifest_json) => Ok(json!({
+                "ok": true,
+                "path": dir.to_string_lossy(),
+                "manifest": manifest_json,
+            })),
+            Err(e) => {
+                // Don't leave a partial (manifest-less) dir behind on failure.
+                let _ = std::fs::remove_dir_all(&dir);
+                Err(e)
+            }
+        }
+    })
+    .await
+    {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+/// Write a logical export into `dir` (fresh): `export.ndjson` (whose own
+/// trailer is its completeness sentinel) plus a `MANIFEST.json` written LAST.
+/// Crash-durability: fsync the data file, then write + fsync the manifest, then
+/// fsync the dir — so a durable MANIFEST.json implies a durable, complete data
+/// file.
+fn export_into_dir(
+    db: &Database,
+    dir: &std::path::Path,
+    opts: &LogicalExportOptions,
+) -> Result<JsonValue, EngineError> {
+    let data_path = dir.join("export.ndjson");
+    let mut file = std::fs::File::create(&data_path).map_err(io_err)?;
+    let summary = db.logical_export_stream(&mut file, opts)?;
+    file.sync_all().map_err(io_err)?;
+
+    let mut counts = serde_json::Map::new();
+    for (t, c) in &summary.counts {
+        counts.insert(
+            t.clone(),
+            json!({
+                "objects": c.objects,
+                "edges": c.edges,
+                "vectors": c.vectors,
+                "dangling_edges_skipped": c.dangling_edges_skipped,
+            }),
+        );
+    }
+    let created_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let manifest_json = json!({
+        "format": "rhypedb-logical-export-v1",
+        "created_at_ms": created_at_ms,
+        "data_file": "export.ndjson",
+        "vectors": export_vectors_tag(opts),
+        "counts": JsonValue::Object(counts),
+        "complete": true,
+    });
+    let bytes = serde_json::to_vec_pretty(&manifest_json)
+        .map_err(|e| io_err(std::io::Error::other(e.to_string())))?;
+    std::fs::write(dir.join("MANIFEST.json"), bytes).map_err(io_err)?;
+    fsync_path(&dir.join("MANIFEST.json")).map_err(io_err)?;
+    fsync_path(dir).map_err(io_err)?;
+    Ok(manifest_json)
+}
+
+fn export_dir_name(label: Option<&str>) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    match label {
+        Some(l) if !l.is_empty() => format!("rhypedb-export-{ts}-{}", sanitize_label(l)),
+        _ => format!("rhypedb-export-{ts}"),
+    }
+}
+
 fn err_response(e: EngineError) -> Response {
     let code = match &e {
         EngineError::MigrationPlanNotFound { .. } | EngineError::TypeNotFound(_) => {
@@ -817,6 +1029,7 @@ fn err_response(e: EngineError) -> Response {
         | EngineError::MigrationCannotCancelSettled { .. }
         | EngineError::MigrationAlreadyRunning { .. }
         | EngineError::ReloadBlockedByActiveMigration { .. }
+        | EngineError::ExportWhileMigrating { .. }
         | EngineError::MigrationCutoverHasErrors { .. } => StatusCode::CONFLICT,
         EngineError::ConverterNotRegistered { .. }
         | EngineError::MigrationResumeSchemaMismatch { .. }
@@ -1327,6 +1540,149 @@ mod tests {
             db.get("User", 1).unwrap().fields.get("score"),
             Some(&Value::I64(0))
         );
+    }
+
+    /// `GET /admin/export/stream` returns a complete, well-ordered NDJSON dump.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_stream_returns_complete_ndjson() {
+        let (base, _state) = spawn_app(Some("tok"), 3).await;
+        let b2 = base.clone();
+        let text: String = tokio::task::spawn_blocking(move || {
+            ureq::get(&format!("{b2}/admin/export/stream"))
+                .header("Authorization", "Bearer tok")
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_to_string()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["kind"], "header");
+        assert_eq!(lines[0]["format"], "rhypedb-logical-export-v1");
+        assert_eq!(lines[0]["vectors"], "raw");
+        assert_eq!(lines[1]["kind"], "schema");
+        assert!(parse_schema(lines[1]["sdl"].as_str().unwrap()).is_ok());
+        let objects = lines.iter().filter(|l| l["kind"] == "object").count();
+        assert_eq!(objects, 3, "3 User rows exported");
+        let trailer = lines.last().unwrap();
+        assert_eq!(trailer["kind"], "trailer");
+        assert_eq!(trailer["complete"], true);
+        assert_eq!(trailer["counts"]["User"]["objects"], 3);
+    }
+
+    /// Both export endpoints are behind the admin-token gate (GET + POST).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_endpoints_are_auth_gated() {
+        let status_of = |url: String, header: Option<&'static str>| async move {
+            tokio::task::spawn_blocking(move || {
+                let mut req = ureq::get(&url);
+                if let Some(h) = header {
+                    req = req.header("Authorization", h);
+                }
+                req.call().err().and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+            })
+            .await
+            .unwrap()
+        };
+
+        let base_403 = spawn(None, 0).await;
+        assert_eq!(
+            status_of(format!("{base_403}/admin/export/stream"), None).await,
+            Some(403),
+            "GET stream with no server token must be 403"
+        );
+        let base_401 = spawn(Some("s3cret"), 0).await;
+        assert_eq!(
+            status_of(format!("{base_401}/admin/export/stream"), Some("Bearer wrong")).await,
+            Some(401),
+            "GET stream with wrong token must be 401"
+        );
+
+        let base_403p = spawn(None, 0).await;
+        let code = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{base_403p}/admin/export"))
+                .send_json(serde_json::json!({ "dest": "/tmp/nope" }))
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(code, Some(403), "POST export with no server token must be 403");
+    }
+
+    /// `POST /admin/export` writes a complete, verifiable export file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_path_writes_verifiable_file() {
+        let (base, _state) = spawn_app(Some("tok"), 2).await;
+        let dest = tempfile::tempdir().unwrap();
+        let dest_str = dest.path().to_string_lossy().to_string();
+        let b2 = base.clone();
+        let resp: serde_json::Value = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{b2}/admin/export"))
+                .header("Authorization", "Bearer tok")
+                .send_json(serde_json::json!({ "dest": dest_str, "label": "nightly" }))
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["manifest"]["complete"], true);
+        assert_eq!(resp["manifest"]["counts"]["User"]["objects"], 2);
+        let path = std::path::PathBuf::from(resp["path"].as_str().unwrap());
+        assert!(path.join("MANIFEST.json").is_file());
+        assert!(path.join("export.ndjson").is_file());
+        std::mem::forget(dest);
+    }
+
+    /// An unknown vectors mode is a clean 400; an unknown type a clean 404 —
+    /// both BEFORE the streaming 200 commits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn export_stream_rejects_bad_params_before_streaming() {
+        let base = spawn(Some("tok"), 0).await;
+        let b2 = base.clone();
+        let bad_vectors = tokio::task::spawn_blocking(move || {
+            ureq::get(&format!("{b2}/admin/export/stream?vectors=bogus"))
+                .header("Authorization", "Bearer tok")
+                .call()
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(bad_vectors, Some(400), "unknown vectors mode → 400");
+
+        let unknown_type = tokio::task::spawn_blocking(move || {
+            ureq::get(&format!("{base}/admin/export/stream?types=Nope"))
+                .header("Authorization", "Bearer tok")
+                .call()
+                .err()
+                .and_then(|e| match e {
+                    ureq::Error::StatusCode(c) => Some(c),
+                    _ => None,
+                })
+        })
+        .await
+        .unwrap();
+        assert_eq!(unknown_type, Some(404), "unknown type → 404");
     }
 
     /// HTTP round-trip: start a migration, then read its detail — exercises the
