@@ -69,9 +69,14 @@ Execute a single query with `-e`:
 target/release/rhypedb-cli -e 'User.create({ name: "Alice", email: "alice@example.com", age: 30 })'
 ```
 
-```json
-{ "object": { "id": 1, "name": "Alice", "email": "alice@example.com", "age": 30 } }
 ```
+User:1
+  age: 30
+  email: "alice@example.com"
+  name: "Alice"
+```
+
+Every object gets a database-assigned `id` (here `1`) — see [Object identity](schema.md#object-identity).
 
 Create another user and a post, then link them:
 
@@ -92,7 +97,10 @@ Run the CLI with no arguments to drop into an interactive REPL:
 ```
 $ rhypedb-cli
 rhypedb> User.get(1)
-{ "object": { "id": 1, "name": "Alice", ... } }
+User:1
+  age: 30
+  email: "alice@example.com"
+  name: "Alice"
 rhypedb> quit
 ```
 
@@ -107,7 +115,7 @@ curl -s http://127.0.0.1:4200/query \
 ```
 
 ```json
-{ "object": { "id": 1, "name": "Alice", "email": "alice@example.com", "age": 30 } }
+{ "object": { "type": "User", "id": 1, "fields": { "name": "Alice", "email": "alice@example.com", "age": 30 } } }
 ```
 
 This is all you need to build a client in any language: send a query string, get JSON back. See the **[API Reference](api-reference.md)** for the full response shapes and the faster binary TCP protocol.

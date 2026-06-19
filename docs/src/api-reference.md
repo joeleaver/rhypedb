@@ -22,9 +22,17 @@ Execute a query or mutation.
 
 | Query kind | Body |
 | --- | --- |
-| Returns many objects | `{ "objects": [ { ... }, ... ] }` |
-| Returns one object | `{ "object": { ... } }` |
+| Returns many objects | `{ "objects": [ <object>, ... ] }` |
+| Returns one object | `{ "object": <object> }` |
 | Mutation with no return (update/delete) | `{ "ok": true }` |
+
+Each `<object>` is `{ "type": …, "id": …, "fields": { … } }`:
+
+```json
+{ "object": { "type": "User", "id": 1, "fields": { "name": "Alice", "age": 30 } } }
+```
+
+`id` is a JSON number (an unsigned 64-bit id). Treat it as opaque — ids above 2⁵³ can lose precision in clients that parse JSON numbers as doubles. See [Object identity](schema.md#object-identity).
 
 **Errors:** `400`/`500` with `{ "error": "message" }`.
 

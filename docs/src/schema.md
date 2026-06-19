@@ -26,6 +26,33 @@ type TypeName {
 
 Fields are separated by newlines (commas are also accepted). Field names may **not** contain a double underscore (`__`) — that sequence is reserved for the engine's internal sidecar keys.
 
+## Object identity
+
+Every object has an `id` — a database-assigned **unsigned 64-bit integer** that is its primary key. You don't declare it; every type has one implicitly.
+
+- **Assigned on `create`.** ids come from a counter and increase monotonically. You can't set or override an object's id when creating it.
+- **Globally unique, not per-type.** The counter is shared across all types, so a `User` and a `Post` created in sequence get different ids (e.g. `1` and `2`) — ids are unique across the whole database, not `1..N` within each type.
+- **Never reused.** Deleting an object does not recycle its id; the counter only moves forward (it is re-seeded past the highest existing id when the database reopens).
+
+You reference objects by id in queries:
+
+```
+User.get(1)
+Post.create({ title: "Hello", author: User.get(1) })
+```
+
+### ids on the wire
+
+In a `POST /query` response an object is shaped as `{ "type": …, "id": …, "fields": { … } }`, with `id` as a JSON **number**:
+
+```json
+{ "object": { "type": "User", "id": 1, "fields": { "name": "Alice" } } }
+```
+
+Because JSON numbers are IEEE-754 doubles in most clients, an id above 2⁵³ can lose precision if parsed as a number — treat ids as opaque identifiers, and in languages where it matters read them as 64-bit integers. (The [logical export](backup-recovery.md) format encodes ids as strings precisely so a dump round-trips exactly.)
+
+> There is no user-defined auto-increment, default, or sequence for your own scalar fields — the object `id` is the only auto-assigned value. `@unique` enforces uniqueness on values *you* supply (e.g. `email`); it does not generate them.
+
 ## Field types
 
 ### Scalars
