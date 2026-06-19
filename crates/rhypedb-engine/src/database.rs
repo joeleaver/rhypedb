@@ -3926,6 +3926,99 @@ impl Database {
         Ok(out)
     }
 
+    /// Bulk-insert objects with CALLER-SUPPLIED ids, preserving them exactly —
+    /// the import counterpart of [`create_batch`](Self::create_batch), which
+    /// instead assigns ids from `next_object_id`. Reuses `stage_create_writes`,
+    /// so @unique / @indexed covering entries (and any inline-relation edges)
+    /// are rebuilt identically, then advances `next_object_id` PAST the highest
+    /// restored id via `fetch_max` — the same monotonic invariant `open()`
+    /// reconstructs from the `o:*` scan — so a later `create` can never reuse a
+    /// restored id. Because ids are preserved, edges and vectors import verbatim
+    /// with no remap table.
+    ///
+    /// All-or-nothing per call (one txn, one commit), like `create_batch`: any
+    /// row that fails validation / @unique rolls the whole call back. Each
+    /// `FieldMap` is the object's SCALAR fields (a logical import recreates
+    /// relations separately as edges, after every object exists); a relation
+    /// field present here is staged inline and so requires its target to exist.
+    pub fn restore_objects(
+        &self,
+        type_name: &str,
+        rows: Vec<(u64, FieldMap)>,
+    ) -> EngineResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let _migration_guard = self.migration_lock.read();
+        let type_id = self.resolve_type_id(type_name)?;
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+
+        let mut txn = self.storage.begin_txn();
+        let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(rows.len() * 2);
+        let mut staged_unique: HashMap<Bytes, u64> = HashMap::new();
+        let mut staged: Vec<(u64, FieldMap)> = Vec::with_capacity(rows.len());
+        let mut max_id = 0u64;
+
+        for (object_id, fields) in &rows {
+            match self.stage_create_writes(
+                &mut txn, type_name, type_def, type_id, *object_id, fields, &mut puts,
+                &mut staged_unique,
+            ) {
+                Ok(scalar_fields) => {
+                    max_id = max_id.max(*object_id);
+                    staged.push((*object_id, scalar_fields));
+                }
+                Err(e) => {
+                    // This row never bumped (bump is the last step); undo the
+                    // earlier rows' in-memory generation bumps.
+                    for (id, _) in &staged {
+                        self.rollback_version(type_id, *id);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        let rollback_all = |db: &Self| {
+            for (id, _) in &staged {
+                db.rollback_version(type_id, *id);
+            }
+        };
+        if let Err(e) = self.storage.put_batch(&mut txn, &puts) {
+            rollback_all(self);
+            return Err(EngineError::Storage(e));
+        }
+        let version = match self.storage.commit(&mut txn) {
+            Ok(v) => v,
+            Err(e) => {
+                rollback_all(self);
+                return Err(match e {
+                    rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                    other => EngineError::Storage(other),
+                });
+            }
+        };
+
+        // Advance the id counter past every restored id so a future create
+        // cannot collide. fetch_max is monotonic, so chunked calls compose.
+        self.next_object_id.fetch_max(max_id + 1, Ordering::SeqCst);
+
+        // Publish create events (one per object), mirroring create_batch.
+        for (object_id, scalar_fields) in &staged {
+            self.subscriptions.publish(ChangeEvent {
+                version,
+                kind: ChangeKind::Create,
+                type_name: type_name.into(),
+                object_id: *object_id,
+                fields: Some(fields_to_json(scalar_fields)),
+            });
+        }
+        Ok(())
+    }
+
     /// Get an object by type and ID.
     pub fn get(&self, type_name: &str, object_id: u64) -> EngineResult<Object> {
         let type_id = self.resolve_type_id(type_name)?;
@@ -8946,6 +9039,132 @@ mod tests {
             "export reads the pinned-snapshot value, not the concurrent update"
         );
         assert_eq!(summary.counts["Item"].objects, 20);
+    }
+
+    #[test]
+    fn restore_objects_preserves_ids_and_rebuilds_indexes() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String @unique  score: i64 @indexed }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        // Restore with non-contiguous, caller-supplied ids (as a logical import
+        // would, preserving the source ids).
+        let rows = vec![
+            (5u64, {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String("Ada".into()));
+                f.insert("score".into(), Value::I64(10));
+                f
+            }),
+            (9u64, {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String("Alan".into()));
+                f.insert("score".into(), Value::I64(20));
+                f
+            }),
+        ];
+        db.restore_objects("User", rows).unwrap();
+
+        // Ids preserved exactly.
+        assert_eq!(
+            db.get("User", 5).unwrap().fields.get("name"),
+            Some(&Value::String("Ada".into()))
+        );
+        assert_eq!(
+            db.get("User", 9).unwrap().fields.get("score"),
+            Some(&Value::I64(20))
+        );
+
+        // A later create does NOT collide with a restored id (fetch_max moved
+        // next_object_id past 9).
+        let bob = {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("Bob".into()));
+            f.insert("score".into(), Value::I64(30));
+            db.create("User", f).unwrap()
+        };
+        assert!(bob.id > 9, "new id {} must exceed the max restored id 9", bob.id);
+
+        // @unique is enforced post-restore: re-inserting "Ada" is rejected.
+        let dup = {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("Ada".into()));
+            f.insert("score".into(), Value::I64(99));
+            db.create("User", f)
+        };
+        assert!(matches!(dup, Err(EngineError::UniqueViolation { .. })), "got {dup:?}");
+
+        // @indexed covering entries were rebuilt: the index scan finds the
+        // restored row by its id.
+        let hits = db
+            .filter_scan("User", "score", CompareOp::Eq, 10, None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 5);
+    }
+
+    #[test]
+    fn restore_objects_is_all_or_nothing_on_unique_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String @unique }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        // Two rows in one call sharing a @unique value — the whole call must
+        // roll back (a buffered unique put is invisible to a later row's read,
+        // so staged-dedup is what catches it).
+        let rows = vec![
+            (1u64, {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String("dup".into()));
+                f
+            }),
+            (2u64, {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String("dup".into()));
+                f
+            }),
+        ];
+        let r = db.restore_objects("User", rows);
+        assert!(matches!(r, Err(EngineError::UniqueViolation { .. })), "got {r:?}");
+        // Nothing landed.
+        assert!(db.get("User", 1).is_err());
+        assert!(db.get("User", 2).is_err());
+        // And next_object_id was NOT advanced (commit never happened), so a
+        // fresh create still starts low.
+        let o = {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("ok".into()));
+            db.create("User", f).unwrap()
+        };
+        assert_eq!(o.id, 1, "no id burned by the rolled-back restore");
+    }
+
+    #[test]
+    fn restore_objects_survives_reopen() {
+        // Restored ids + values persist across a close/reopen, and the reopened
+        // handle's next_object_id is seeded past them (no collision).
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type Item { n: u32 }"#).unwrap();
+        {
+            let db = Database::open(schema.clone(), dir.path()).unwrap();
+            let rows: Vec<(u64, FieldMap)> = [3u64, 7, 42]
+                .into_iter()
+                .map(|id| {
+                    let mut f = FieldMap::new();
+                    f.insert("n".into(), Value::U32(id as u32));
+                    (id, f)
+                })
+                .collect();
+            db.restore_objects("Item", rows).unwrap();
+        }
+        let db = Database::open(schema, dir.path()).unwrap();
+        assert_eq!(db.get("Item", 42).unwrap().fields.get("n"), Some(&Value::U32(42)));
+        let next = {
+            let mut f = FieldMap::new();
+            f.insert("n".into(), Value::U32(0));
+            db.create("Item", f).unwrap()
+        };
+        assert!(next.id > 42, "reopened next_object_id must clear the restored max");
     }
 
     #[test]
