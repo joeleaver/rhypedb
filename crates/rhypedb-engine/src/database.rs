@@ -4019,6 +4019,74 @@ impl Database {
         Ok(())
     }
 
+    /// Bulk-write raw vector values for a `Vector` field, preserving object ids.
+    /// Each `bytes` is the verbatim `v:` payload (big-endian f32, exactly what
+    /// the export shipped), so this is a lossless restore.
+    ///
+    /// It writes ONLY the `v:<type_id>:<object_id>:<field_id>` source-of-truth
+    /// keys — NOT the HNSW graph, which is rebuilt from these keys on the next
+    /// open (a server's `Vectorizer` rebuilds when the `.bin` snapshot is absent
+    /// or its config mismatches). So a logical import reconstructs vector search
+    /// with no vectorizer/embedder at import time; search comes back
+    /// recall-equivalent after the rebuild.
+    ///
+    /// Each payload's length must be `dims * 4` for the field's declared
+    /// `Vector<dims>`. All-or-nothing per call (one txn / commit).
+    pub fn restore_vectors(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        rows: &[(u64, Bytes)],
+    ) -> EngineResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let _migration_guard = self.migration_lock.read();
+        let (type_id, field_id) = self.resolve_field_id(type_name, field_name)?;
+
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let field_def = type_def
+            .get_field(field_name)
+            .ok_or_else(|| EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: field_name.into(),
+            })?;
+        let expected_len = match &field_def.field_type {
+            FieldType::Vector(v) => v.dimensions as usize * 4,
+            _ => {
+                return Err(EngineError::TypeMismatch {
+                    field: field_name.into(),
+                    expected: "Vector field".into(),
+                    got: "non-vector field".into(),
+                });
+            }
+        };
+
+        let mut txn = self.storage.begin_txn();
+        let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(rows.len());
+        for (object_id, bytes) in rows {
+            if bytes.len() != expected_len {
+                return Err(EngineError::TypeMismatch {
+                    field: field_name.into(),
+                    expected: format!("{expected_len} bytes (dims*4)"),
+                    got: format!("{} bytes", bytes.len()),
+                });
+            }
+            puts.push((KeyBuilder::vector(type_id, *object_id, field_id), bytes.clone()));
+        }
+        self.storage
+            .put_batch(&mut txn, &puts)
+            .map_err(EngineError::Storage)?;
+        self.storage.commit(&mut txn).map_err(|e| match e {
+            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+            other => EngineError::Storage(other),
+        })?;
+        Ok(())
+    }
+
     /// Get an object by type and ID.
     pub fn get(&self, type_name: &str, object_id: u64) -> EngineResult<Object> {
         let type_id = self.resolve_type_id(type_name)?;
@@ -9165,6 +9233,36 @@ mod tests {
             db.create("Item", f).unwrap()
         };
         assert!(next.id > 42, "reopened next_object_id must clear the restored max");
+    }
+
+    #[test]
+    fn restore_vectors_writes_exact_v_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type Doc { embedding: Vector<3> }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        db.restore_objects("Doc", vec![(7, FieldMap::new())]).unwrap();
+
+        let mut buf = bytes::BytesMut::new();
+        for f in [1.0f32, 2.0, 3.0] {
+            buf.extend_from_slice(&f.to_be_bytes());
+        }
+        let payload = buf.freeze();
+        db.restore_vectors("Doc", "embedding", &[(7, payload.clone())]).unwrap();
+
+        // The v: key holds the verbatim payload.
+        let type_id = *db.type_ids().get("Doc").unwrap();
+        let field_id = *db.field_ids().get("Doc.embedding").unwrap();
+        let key = KeyBuilder::vector(type_id, 7, field_id);
+        let got = db.storage.get_at(db.storage.read_snapshot(), &key).unwrap();
+        assert_eq!(got.as_deref(), Some(&payload[..]));
+
+        // A wrong-length payload is rejected (dims*4 enforced).
+        let bad = db.restore_vectors(
+            "Doc",
+            "embedding",
+            &[(7, bytes::Bytes::from_static(&[0, 1, 2, 3]))],
+        );
+        assert!(matches!(bad, Err(EngineError::TypeMismatch { .. })), "got {bad:?}");
     }
 
     #[test]

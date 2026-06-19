@@ -25,6 +25,7 @@ use rhypedb_schema::Schema;
 
 mod admin;
 mod converters;
+pub mod import;
 mod protocol;
 mod query_cache;
 

@@ -2517,6 +2517,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "bytes",
  "clap",
  "libmimalloc-sys",
  "mimalloc",
