@@ -120,9 +120,28 @@ Flags:
 | `--force` | Overwrite a non-empty target. |
 | `--vectors raw\|none\|reembed` | How to handle vectors (`raw` = default). `reembed` re-derives `@vectorize` vectors from source text by loading the embedding model — it fails cleanly if the model is unavailable, and is lossy/non-deterministic vs. the originals. |
 
+### Online import (into a running server)
+
+`POST /admin/import/stream` applies a dump to a **live** server without stopping it — stream the NDJSON as the request body:
+
+```bash
+curl -X POST "http://127.0.0.1:4200/admin/import/stream?vectors=raw" \
+  -H "Authorization: Bearer $RHYPEDB_ADMIN_TOKEN" \
+  --data-binary @dump.ndjson
+```
+
+Unlike the offline path it can't stage-and-swap (the server holds the data dir open), so it writes directly to the live database. That means:
+
+- **Additive and non-atomic** — a mid-stream failure can leave partially-imported data (there is no all-or-nothing swap).
+- **Upsert-by-id** — because ids are preserved verbatim, importing an object whose id already exists *overwrites* it. That is what you want for re-importing, a replica, or disjoint id spaces, but it will clobber unrelated objects if you merge two databases that both assigned the same ids. (True cross-database merge would need id remapping, which the format deliberately avoids.)
+- **Refused during a migration** — returns `409` while a field-type migration is in flight.
+- `vectors=reembed` enqueues re-embedding jobs for the live worker (so `@vectorize` vectors fill in asynchronously); `raw`/`none` behave as offline.
+
+Use the offline `rhypedb-import` for the safe, all-or-nothing path; use online import when you need to load into a running server and accept the upsert/non-atomic semantics.
+
 ## Which should I use?
 
 - **Fast local snapshot, same version, point-in-time recovery, or VM snapshotting** → physical backup/restore.
 - **Moving data between rhypedb versions, archiving, or inspecting the contents** → logical export/import.
 
-> All restore and import operations are offline by design and protected by the [single-writer data-dir lock](operations.md#one-writer-per-data-directory): they refuse to run against a directory a live server still holds.
+> Physical restore and the offline `rhypedb-import` are offline by design and protected by the [single-writer data-dir lock](operations.md#one-writer-per-data-directory): they refuse to run against a directory a live server still holds. Online import (above) is the exception — it runs *through* the live server, not against its files directly.

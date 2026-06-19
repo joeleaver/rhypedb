@@ -61,6 +61,10 @@ pub(crate) fn admin_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // /admin/export/stream` streams it back.
         .route("/admin/export", post(export))
         .route("/admin/export/stream", get(export_stream))
+        // Logical import: apply a portable NDJSON dump to the LIVE database
+        // (additive, non-atomic, upsert-by-id). Streamed body; refused with 409
+        // while a field-type migration is in flight.
+        .route("/admin/import/stream", post(import_stream))
         // Auth applies to these routes only (NOT /query, /status, /health).
         .route_layer(middleware::from_fn_with_state(state, admin_auth))
 }
@@ -1025,6 +1029,118 @@ fn export_dir_name(label: Option<&str>) -> String {
     }
 }
 
+#[derive(Deserialize)]
+struct ImportQuery {
+    vectors: Option<String>,
+}
+
+/// `POST /admin/import/stream` — apply a logical NDJSON dump to the LIVE
+/// database (additive, non-atomic, upsert-by-id; see `run_online_import`). The
+/// body is streamed to a temp file (OOM-safe) before being applied on the
+/// blocking pool. Refused with 409 while a field-type migration is in flight; a
+/// concurrent hot-reload is fenced for the apply.
+async fn import_stream(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ImportQuery>,
+    body: axum::body::Body,
+) -> Response {
+    let vectors = match q.vectors.as_deref() {
+        None | Some("raw") => crate::import::VectorImportMode::Raw,
+        Some("none") => crate::import::VectorImportMode::None,
+        Some("reembed") => crate::import::VectorImportMode::Reembed,
+        Some(other) => {
+            return bad_request(&format!(
+                "unknown vectors mode '{other}' (expected raw|none|reembed)"
+            ));
+        }
+    };
+
+    // Stream the body to a temp file under the data dir FIRST — no locks held
+    // during the (potentially large) upload.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = state.data_dir.join(format!(
+        ".rhypedb-online-import-{}-{nanos}.ndjson",
+        std::process::id()
+    ));
+    if let Err(m) = stream_body_to_file(body, &tmp).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return bad_request(&m);
+    }
+
+    // Fence a concurrent hot-reload (like /query) and refuse a migration in
+    // flight, then apply on the blocking pool.
+    let _epoch = state.reload_lock.read().await;
+    let db = state.db();
+    let migrating = db.migrating_fields();
+    if migrating > 0 {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "cannot import while a field-type migration is in progress ({migrating} field(s))"
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    let vectorizer = state.vectorizer.clone();
+    let apply_path = tmp.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::import::run_online_import(&apply_path, &db, vectors, vectorizer.as_deref())
+    })
+    .await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+
+    match result {
+        Ok(Ok(report)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "types": report.types,
+                "objects": report.objects,
+                "edges": report.edges,
+                "vectors": report.vectors,
+                "reembed_enqueued": report.reembed_enqueued,
+            })),
+        )
+            .into_response(),
+        Ok(Err(msg)) => bad_request(&msg),
+        Err(join) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("import task failed: {join}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Stream a request body to `path`, bounded memory (one chunk at a time).
+async fn stream_body_to_file(
+    body: axum::body::Body,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    use tokio_stream::StreamExt;
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| format!("create temp import file: {e}"))?;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("read request body: {e}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("write temp import file: {e}"))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("flush temp import file: {e}"))?;
+    Ok(())
+}
+
 fn err_response(e: EngineError) -> Response {
     let code = match &e {
         EngineError::MigrationPlanNotFound { .. } | EngineError::TypeNotFound(_) => {
@@ -1546,6 +1662,54 @@ mod tests {
             db.get("User", 1).unwrap().fields.get("score"),
             Some(&Value::I64(0))
         );
+    }
+
+    /// `POST /admin/import/stream` applies a streamed dump to the LIVE database.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn online_import_via_http_lands_data() {
+        let (base, state) = spawn_app(Some("tok"), 0).await; // empty live server
+        // Build an export of 3 User rows from a source DB (same schema).
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Database::open(
+            parse_schema(r#"type User { score: i64 }"#).unwrap(),
+            src_dir.path(),
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..3i64 {
+            let mut f = FieldMap::new();
+            f.insert("score".into(), Value::I64(100 + i));
+            ids.push(src.create("User", f).unwrap().id);
+        }
+        let mut buf = Vec::new();
+        src.logical_export_stream(
+            &mut buf,
+            &rhypedb_engine::logical::LogicalExportOptions::default(),
+        )
+        .unwrap();
+        drop(src);
+
+        let url = format!("{base}/admin/import/stream");
+        let resp: serde_json::Value = tokio::task::spawn_blocking(move || {
+            ureq::post(&url)
+                .header("Authorization", "Bearer tok")
+                .header("Content-Type", "application/x-ndjson")
+                .send(&buf[..])
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["objects"].as_u64(), Some(3));
+
+        // The 3 imported users are now in the LIVE database.
+        for id in ids {
+            let obj = state.db().get("User", id).unwrap();
+            assert!(matches!(obj.fields.get("score"), Some(Value::I64(_))));
+        }
     }
 
     /// `GET /admin/export/stream` returns a complete, well-ordered NDJSON dump.

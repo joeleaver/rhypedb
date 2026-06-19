@@ -24,7 +24,7 @@ type TypeName {
 }
 ```
 
-Fields are separated by newlines (commas are also accepted). Field names may **not** contain a double underscore (`__`) — that sequence is reserved for the engine's internal sidecar keys.
+Fields are separated by whitespace — write one per line. (Commas are not used between top-level fields, though an edge-field block accepts them.) Field names may **not** contain a double underscore (`__`) — that sequence is reserved for the engine's internal sidecar keys.
 
 ## Object identity
 

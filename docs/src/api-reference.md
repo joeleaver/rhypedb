@@ -77,6 +77,7 @@ All routes below require `Authorization: Bearer <RHYPEDB_ADMIN_TOKEN>`. With the
 | `GET /admin/backup/stream` | Download a physical snapshot as a tar. |
 | `POST /admin/export` | Write a logical NDJSON export on the server. |
 | `GET /admin/export/stream` | Download a logical export (`?types=&vectors=`). |
+| `POST /admin/import/stream` | Apply a streamed logical dump to the live DB (`?vectors=`). |
 | `POST /admin/compact` | Force flush + full compaction. |
 | `POST /admin/reload` | Hot-reload the schema (SDL in the request body). |
 

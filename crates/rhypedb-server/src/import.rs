@@ -33,6 +33,7 @@ use bytes::Bytes;
 use rhypedb_engine::database::Database;
 use rhypedb_engine::logical::{self, FORMAT_TAG};
 use rhypedb_engine::object::FieldMap;
+use rhypedb_engine::vectorizer::Vectorizer;
 use rhypedb_schema::parser::parse_schema;
 use serde_json::Value as Json;
 
@@ -64,6 +65,10 @@ pub struct ImportReport {
     pub objects: u64,
     pub edges: u64,
     pub vectors: u64,
+    /// Online reembed only: how many `@vectorize` embedding jobs were enqueued
+    /// for the live worker to process asynchronously (the offline reembed path
+    /// embeds synchronously and counts those under `vectors` instead).
+    pub reembed_enqueued: u64,
 }
 
 /// Run an offline logical import of `src` into `data_dir`.
@@ -463,6 +468,99 @@ fn reembed_pass(db: &Database, report: &mut ImportReport) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+/// Apply a logical export to a LIVE, already-open database — the online
+/// counterpart of [`run_import`]. The live server holds the data dir open, so
+/// there is NO staging + atomic swap: this writes directly, which makes it
+/// **additive, non-atomic** (a mid-stream failure can leave partial data) with
+/// **upsert-by-id** semantics — an imported id overwrites any existing object at
+/// that id. That is correct for re-importing / a replica / disjoint id spaces,
+/// but HAZARDOUS for merging two unrelated databases, because the format
+/// preserves ids verbatim with no remap. Objects are applied against the LIVE
+/// schema (the dump's schema line is ignored); a field the schema lacks surfaces
+/// as an error. The caller MUST refuse a concurrent field-type migration first.
+///
+/// In `Reembed` mode the dump omits `@vectorize` vectors; this enqueues an
+/// embedding job per imported `@vectorize` object so the live worker re-derives
+/// them from source text asynchronously.
+pub fn run_online_import(
+    src: &Path,
+    db: &Database,
+    vectors: VectorImportMode,
+    vectorizer: Option<&Vectorizer>,
+) -> Result<ImportReport, String> {
+    let validated = validate_file(src)?;
+    let opts = ImportOptions { force: false, vectors };
+    let mut report = import_pass(src, db, &opts)?;
+    verify_counts(&report, &validated, &opts)?;
+    if vectors == VectorImportMode::Reembed {
+        report.reembed_enqueued = enqueue_reembed(src, db, vectorizer)?;
+    }
+    Ok(report)
+}
+
+/// Enqueue an embedding job per imported `@vectorize` object so the live
+/// vectorizer worker re-derives the vectors from source text. Runs AFTER the
+/// objects are committed (so the worker always finds them). Returns the number
+/// of jobs enqueued.
+fn enqueue_reembed(
+    src: &Path,
+    db: &Database,
+    vectorizer: Option<&Vectorizer>,
+) -> Result<u64, String> {
+    use rhypedb_engine::vectorizer::VectorizeJob;
+    // Live @vectorize defs: type -> [(source_field, vector_field, model)].
+    let mut defs: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+    for type_def in db.schema().types.values() {
+        for f in type_def.vector_fields() {
+            if let Some(vzdef) = f.vectorize() {
+                defs.entry(type_def.name.clone()).or_default().push((
+                    vzdef.source_field.clone(),
+                    f.name.clone(),
+                    vzdef.model.clone(),
+                ));
+            }
+        }
+    }
+    // No @vectorize fields → reembed is a no-op (the dump's BYO vectors, if any,
+    // were already restored). Only @vectorize fields need the worker.
+    if defs.is_empty() {
+        return Ok(0);
+    }
+    let vz = vectorizer.ok_or(
+        "reembed import needs the live embedding worker, but this server started \
+         without a vectorizer",
+    )?;
+    // Re-read the object lines and enqueue a job per (object, @vectorize field).
+    let file = std::fs::File::open(src).map_err(|e| format!("open {}: {e}", src.display()))?;
+    let mut count = 0u64;
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("read error: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Json =
+            serde_json::from_str(&line).map_err(|e| format!("invalid JSON line: {e}"))?;
+        if v.get("kind").and_then(Json::as_str) != Some("object") {
+            continue;
+        }
+        let t = str_field(&v, "type")?;
+        let Some(fields) = defs.get(t) else { continue };
+        let id = u64_field(&v, "id")?;
+        for (source, vfield, model) in fields {
+            vz.enqueue(VectorizeJob {
+                type_name: t.to_string(),
+                object_id: id,
+                source_field: source.clone(),
+                vector_field: vfield.clone(),
+                model: model.clone(),
+            })
+            .map_err(|e| format!("enqueue reembed {t}:{id}.{vfield}: {e}"))?;
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn import_pass(
@@ -898,5 +996,82 @@ mod tests {
             std::fs::read_dir(target.path()).unwrap().next().is_none(),
             "target must be untouched on a failed reembed import"
         );
+    }
+
+    #[test]
+    fn online_import_additive_upsert() {
+        // A LIVE target DB already holding User id 1.
+        let sdl = r#"type User { score: i64
+            note: String }"#;
+        let tgt_dir = tempfile::tempdir().unwrap();
+        let target = Database::open(parse_schema(sdl).unwrap(), tgt_dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("score".into(), Value::I64(1));
+        f.insert("note".into(), Value::String("original".into()));
+        let id1 = target.create("User", f).unwrap().id;
+
+        // Source DB (same schema): id 1 (collides) + id 2 (new).
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Database::open(parse_schema(sdl).unwrap(), src_dir.path()).unwrap();
+        let mut a = FieldMap::new();
+        a.insert("score".into(), Value::I64(11));
+        a.insert("note".into(), Value::String("from-import".into()));
+        let s1 = src.create("User", a).unwrap().id;
+        let mut b = FieldMap::new();
+        b.insert("score".into(), Value::I64(22));
+        b.insert("note".into(), Value::String("new".into()));
+        let s2 = src.create("User", b).unwrap().id;
+        assert_eq!(s1, id1, "both DBs start fresh so the first id collides");
+        let dump = src_dir.path().join("d.ndjson");
+        let mut buf = Vec::new();
+        src.logical_export_stream(&mut buf, &LogicalExportOptions::default()).unwrap();
+        std::fs::write(&dump, &buf).unwrap();
+        drop(src);
+
+        // Online import into the live target (raw vectors, no vectorizer).
+        let report = run_online_import(&dump, &target, VectorImportMode::Raw, None).unwrap();
+        assert_eq!(report.objects, 2);
+
+        // Upsert-by-id: id 1 OVERWRITTEN by the imported row; id 2 ADDED.
+        assert_eq!(
+            target.get("User", s1).unwrap().fields.get("note"),
+            Some(&Value::String("from-import".into())),
+            "existing id is overwritten (upsert-by-id)"
+        );
+        assert_eq!(
+            target.get("User", s2).unwrap().fields.get("score"),
+            Some(&Value::I64(22)),
+            "new id is added"
+        );
+    }
+
+    #[test]
+    fn online_reembed_without_vectorizer_refuses() {
+        // Reembed online needs the live embedding worker; with no vectorizer it
+        // must refuse cleanly rather than silently leave @vectorize fields empty.
+        use rhypedb_engine::logical::VectorMode;
+        let sdl = r#"type Doc {
+            body: String
+            auto: Vector<4> @vectorize(source: "body", model: "all-MiniLM-L6-v2")
+        }"#;
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Database::open(parse_schema(sdl).unwrap(), src_dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("body".into(), Value::String("hello".into()));
+        src.create("Doc", f).unwrap();
+        let mut buf = Vec::new();
+        src.logical_export_stream(
+            &mut buf,
+            &LogicalExportOptions { types: None, vectors: VectorMode::Reembed },
+        )
+        .unwrap();
+        let dump = src_dir.path().join("d.ndjson");
+        std::fs::write(&dump, &buf).unwrap();
+
+        let tgt_dir = tempfile::tempdir().unwrap();
+        let target = Database::open(parse_schema(sdl).unwrap(), tgt_dir.path()).unwrap();
+        let err = run_online_import(&dump, &target, VectorImportMode::Reembed, None)
+            .expect_err("reembed online without a vectorizer must fail");
+        assert!(err.contains("reembed") && err.contains("vectorizer"), "got: {err}");
     }
 }
