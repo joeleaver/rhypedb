@@ -761,10 +761,29 @@ fn run_export(
             Ok(())
         }
         (None, Some(file)) => {
-            download_export(cli, file, types, vectors)?;
-            // A streamed export commits to 200 then can only truncate; validate
-            // the trailer before trusting the file.
-            let report = verify_export_file(file)?;
+            // Download to a sibling temp file, validate it, and only then rename
+            // it over the destination — so a mid-stream failure can never clobber
+            // a pre-existing export at `file` with a truncated partial.
+            let mut tmp_os = file.as_os_str().to_owned();
+            tmp_os.push(".partial");
+            let tmp = PathBuf::from(tmp_os);
+
+            let result = download_export(cli, &tmp, types, vectors).and_then(|()| {
+                // A streamed export commits to 200 then can only truncate; the
+                // trailer check rejects an incomplete download.
+                verify_export_file(&tmp)
+            });
+            let report = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            };
+            std::fs::rename(&tmp, file).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("finalize {}: {e}", file.display())
+            })?;
             println!(
                 "export downloaded + verified: {} ({} objects, {} edges, {} vectors)",
                 file.display(),
@@ -785,8 +804,11 @@ fn download_export(
     types: &Option<String>,
     vectors: &Option<String>,
 ) -> Result<(), String> {
-    // Type names are schema idents ([A-Za-z0-9_]) and vectors is raw|none, so no
-    // URL-encoding is needed for the query values.
+    // Schema type idents are Unicode-alphanumeric (plus underscore) and vectors
+    // is raw|none — none carry a URL-significant character, so the query values
+    // go on the wire as-is; the comma is the list delimiter (an ident can't
+    // contain one). A non-ASCII ident would ideally be percent-encoded, but it
+    // poses no delimiter/injection risk here.
     let mut query = Vec::new();
     let list = split_types(types);
     if !list.is_empty() {
