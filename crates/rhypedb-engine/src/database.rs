@@ -18,6 +18,25 @@ use crate::object::{
     serialize_fields,
 };
 
+/// One bounded, OOM-safe step of an ascending object scan
+/// ([`Database::scan_chunk`]). Mirrors storage's [`rhypedb_storage::lsm::ChunkScan`]
+/// but yields decoded [`Object`]s instead of raw key/value pairs.
+#[derive(Debug, Clone)]
+pub struct ObjectChunk {
+    /// Live objects in this chunk, ascending by object id. May be shorter than
+    /// the requested `max_distinct` (or empty) when the chunk straddles a run
+    /// of tombstoned ids — do NOT treat a short vec as end-of-range.
+    pub objects: Vec<Object>,
+    /// Highest object id visited this chunk, tombstones included. `None` iff
+    /// the range is exhausted (no key at/after the cursor). Pass it back as the
+    /// next `cursor` to resume.
+    pub next_cursor: Option<u64>,
+    /// `true` when more objects may exist strictly past `next_cursor`. `false`
+    /// PROVES the scan is complete. Only `!more` (or `next_cursor == None`) is
+    /// a sound stop condition.
+    pub more: bool,
+}
+
 /// One row of the precomputed reverse-relation index used by cascade delete.
 /// `is_many` distinguishes forward 1:1 incoming relations (where the source's
 /// rev_edge cover embeds the target's data) from many-relations (where the
@@ -4106,6 +4125,85 @@ impl Database {
         Ok(objects)
     }
 
+    /// One bounded, OOM-safe step of an ascending scan over every live object
+    /// of `type_name`, visible at the caller-pinned `snapshot`.
+    ///
+    /// Unlike [`scan_type`](Self::scan_type) — which materializes the whole
+    /// type in memory — this walks the `o:<type_id>:` keyspace in chunks of at
+    /// most `max_distinct` distinct keys, so a caller (logical export, bulk
+    /// re-index) can stream an arbitrarily large type with bounded peak memory.
+    ///
+    /// Resume protocol: start with `cursor == 0`; each call returns
+    /// [`ObjectChunk::next_cursor`] (the highest object id visited this chunk,
+    /// tombstones included) — pass it back verbatim as the next `cursor`. Stop
+    /// when [`ObjectChunk::more`] is `false` (or `next_cursor` is `None`).
+    /// NEVER infer end-of-range from a short `objects` vec: a chunk may straddle
+    /// a run of tombstoned object ids, returning few (or zero) live objects
+    /// while more live objects remain past `next_cursor`.
+    ///
+    /// Pin `snapshot` once via [`read_snapshot`](rhypedb_storage::lsm::LsmTree::read_snapshot)
+    /// across the whole walk so every chunk sees one MVCC point-in-time view.
+    pub fn scan_chunk(
+        &self,
+        type_name: &str,
+        snapshot: u64,
+        cursor: u64,
+        max_distinct: usize,
+    ) -> EngineResult<ObjectChunk> {
+        let type_id = self.resolve_type_id(type_name)?;
+        let prefix = KeyBuilder::object_prefix(type_id);
+
+        // `cursor == 0` starts at the prefix; otherwise seek strictly after the
+        // last visited object id. A cursor at u64::MAX has no successor key, so
+        // the range is already exhausted (matches the migration driver).
+        let start = if cursor == 0 {
+            prefix.clone()
+        } else {
+            match cursor.checked_add(1) {
+                Some(next) => KeyBuilder::object(type_id, next),
+                None => {
+                    return Ok(ObjectChunk {
+                        objects: Vec::new(),
+                        next_cursor: None,
+                        more: false,
+                    });
+                }
+            }
+        };
+
+        let chunk = self.storage.scan_chunk_raw(snapshot, &prefix, &start, max_distinct)?;
+
+        // Object key is o:<type_id>:<object_id>; the object id is the trailing
+        // 8 bytes. high_water lives in the same keyspace, so its tail decodes
+        // to the highest id visited (live or tombstoned).
+        let next_cursor = chunk
+            .high_water
+            .as_ref()
+            .map(|hw| u64::from_be_bytes(hw[hw.len() - 8..].try_into().unwrap()));
+
+        let mut objects = Vec::with_capacity(chunk.live.len());
+        for (key, data) in &chunk.live {
+            if key.len() < 8 {
+                continue;
+            }
+            let object_id = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+            let mut fields = deserialize_fields(data);
+            self.strip_tombstoned_fields(type_name, &mut fields);
+            objects.push(Object {
+                type_name: type_name.into(),
+                id: object_id,
+                fields,
+                raw_fields: None,
+            });
+        }
+
+        Ok(ObjectChunk {
+            objects,
+            next_cursor,
+            more: chunk.more,
+        })
+    }
+
     /// Filtered scan: pushes a single-field integer comparison down to storage.
     ///
     /// Two fast paths are layered:
@@ -8105,6 +8203,123 @@ mod tests {
         assert_eq!(
             restored.get("Movie", ids[1]).unwrap().fields.get("year"),
             Some(&Value::U32(1995))
+        );
+    }
+
+    #[test]
+    fn scan_chunk_visits_every_object_ascending_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type Item { n: u32 }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        // Far more objects than the chunk cap, so the walk spans many chunks.
+        let count = 250u32;
+        for n in 0..count {
+            let mut f = FieldMap::new();
+            f.insert("n".into(), Value::U32(n));
+            db.create("Item", f).unwrap();
+        }
+
+        let snapshot = db.storage.read_snapshot();
+        let max_distinct = 16usize;
+        let mut cursor = 0u64;
+        let mut collected: Vec<(u64, u32)> = Vec::new();
+        let mut chunks = 0;
+        loop {
+            let chunk = db.scan_chunk("Item", snapshot, cursor, max_distinct).unwrap();
+            assert!(chunk.objects.len() <= max_distinct, "chunk respects the cap");
+            for obj in &chunk.objects {
+                let Some(Value::U32(n)) = obj.fields.get("n") else {
+                    panic!("missing/bad field on {}", obj.id)
+                };
+                collected.push((obj.id, *n));
+            }
+            chunks += 1;
+            match chunk.next_cursor {
+                Some(next) if chunk.more => cursor = next,
+                _ => break,
+            }
+        }
+
+        assert!(chunks > 1, "walk should span multiple chunks, got {chunks}");
+        assert!(
+            collected.windows(2).all(|w| w[0].0 < w[1].0),
+            "ascending, de-duplicated ids"
+        );
+        assert_eq!(collected.len() as u32, count);
+
+        // Identical set to the materializing scan_type.
+        let mut want: Vec<(u64, u32)> = db
+            .scan_type("Item")
+            .unwrap()
+            .into_iter()
+            .map(|o| match o.fields.get("n") {
+                Some(Value::U32(n)) => (o.id, *n),
+                _ => panic!("bad object"),
+            })
+            .collect();
+        want.sort_by_key(|(id, _)| *id);
+        assert_eq!(collected, want, "chunked scan == scan_type set");
+    }
+
+    #[test]
+    fn scan_chunk_empty_type_terminates_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type Item { n: u32 }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let snapshot = db.storage.read_snapshot();
+        let chunk = db.scan_chunk("Item", snapshot, 0, 16).unwrap();
+        assert!(chunk.objects.is_empty());
+        assert_eq!(chunk.next_cursor, None);
+        assert!(!chunk.more, "exhausted range must report more=false");
+    }
+
+    #[test]
+    fn scan_chunk_advances_past_long_tombstone_run() {
+        // A contiguous deleted run longer than the chunk cap must NOT strand the
+        // live objects beyond it — the sound stop condition is `!more`, not a
+        // short/empty chunk. This is the invariant scan_chunk_raw was built for.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type Item { n: u32 }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let count = 100u32;
+        let mut ids = Vec::new();
+        for n in 0..count {
+            let mut f = FieldMap::new();
+            f.insert("n".into(), Value::U32(n));
+            ids.push(db.create("Item", f).unwrap().id);
+        }
+        // Delete a 40-wide contiguous run in the middle; chunk cap is 8, so some
+        // chunk lands entirely inside the run (zero live, more=true).
+        let max_distinct = 8usize;
+        for id in &ids[20..60] {
+            db.delete("Item", *id).unwrap();
+        }
+
+        let snapshot = db.storage.read_snapshot();
+        let mut cursor = 0u64;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut saw_empty_nonfinal_chunk = false;
+        loop {
+            let chunk = db.scan_chunk("Item", snapshot, cursor, max_distinct).unwrap();
+            if chunk.objects.is_empty() && chunk.more {
+                saw_empty_nonfinal_chunk = true;
+            }
+            for o in &chunk.objects {
+                seen.insert(o.id);
+            }
+            match chunk.next_cursor {
+                Some(next) if chunk.more => cursor = next,
+                _ => break,
+            }
+        }
+
+        let expect: std::collections::BTreeSet<u64> =
+            ids[..20].iter().chain(ids[60..].iter()).copied().collect();
+        assert_eq!(seen, expect, "no live object stranded behind the tombstone run");
+        assert!(
+            saw_empty_nonfinal_chunk,
+            "a chunk should land entirely inside the tombstone run"
         );
     }
 
