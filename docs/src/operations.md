@@ -12,8 +12,10 @@ rhypedb-server --schema schema.rhype --data-dir /var/lib/rhypedb
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-s`, `--schema <path>` | *(required)* | Path to the SDL schema file. |
+| `-s`, `--schema <path>` | *(required, except with `--restore-from`)* | Path to the SDL schema file. Optional when restoring (the snapshot carries its own authoritative schema). |
 | `-d`, `--data-dir <path>` | `./rhypedb-data` | Storage directory (created if absent). |
+| `--restore-from <dir>` | off | Restore a physical backup snapshot into `--data-dir` **before** serving (see [Restore on boot](#restore-on-boot)). Idempotent. |
+| `--restore-force` | off | Allow `--restore-from` to overwrite an existing, *different* database in `--data-dir`. |
 | `--listen <addr>` | `127.0.0.1:4200` | HTTP listen address. |
 | `--tcp-listen <addr>` | `127.0.0.1:4201` | Binary TCP listen address. |
 | `--no-sync` | off | Skip the WAL `fsync` at commit. Faster, but a power loss can drop the last few writes. Equivalent to Postgres `fsync=off`. **Don't use in production.** |
@@ -25,6 +27,50 @@ rhypedb-server --schema schema.rhype --data-dir /var/lib/rhypedb
 | `RHYPEDB_ADMIN_TOKEN` | Bearer token that gates all `/admin/*` endpoints. If unset, admin routes return `403`. |
 | `RHYPEDB_EF` | Default HNSW search width (`ef`) for `.similar` queries that omit `ef:` (must be `≥ 1`; overridable per query). An invalid value is ignored with a warning. |
 | `RHYPEDB_RERANK` | Default rerank pool size for `.similar` queries that omit `rerank:` (`0` = off; overridable per query). An invalid value is ignored with a warning. |
+| `RHYPEDB_RESTORE_FROM` | Snapshot directory to restore on boot (same as `--restore-from`; the flag wins if both are set). |
+| `RHYPEDB_RESTORE_FROM_FORCE` | `1`/`true`/`yes`/`on` ⇒ same as `--restore-force`. |
+
+## Restore on boot
+
+For a managed deployment (where the platform controls the instance lifecycle and
+fetches backups from object storage), the server can restore a [physical
+backup](backup-recovery.md) snapshot into its `--data-dir` **at startup, before it
+opens the database or binds a listener**, then serve normally:
+
+```sh
+rhypedb-server --restore-from /restore/snapshot --data-dir /var/lib/rhypedb
+```
+
+The typical scale-to-zero wake flow is: the platform stops the instance (a clean
+`SIGTERM` flushes the memtable and saves the HNSW snapshots), fetches a backup from
+object storage to a local path, and starts the server pointed at it.
+
+What it does, in order: validate the snapshot's `MANIFEST.json` (a typo'd or
+incomplete source is refused **before** anything is cleared) → take the
+single-writer data-dir lock → clear stale LSM data → copy the SSTs, WAL,
+`schema.rhype`, and the `hnsw_*.bin` index snapshots → open and serve.
+
+Key points:
+
+- **The snapshot's schema wins.** A restored data dir carries its own
+  `schema.rhype`, which is authoritative (the SSTs were written for it). `--schema`
+  is therefore optional under `--restore-from`; if you pass it, it must match the
+  snapshot's schema exactly or startup fails.
+- **The HNSW snapshots travel with the backup.** Restoring the `hnsw_*.bin` files
+  lets a vector index wake in ~hundreds of ms instead of rebuilding from the LSM
+  (which is multi-second per 100k vectors — see the cold-start benchmark). A
+  missing index snapshot is a warning, not an error (it rebuilds on open).
+- **Idempotent.** `--restore-from` records the snapshot identity, so a restart with
+  the same snapshot already in place is a no-op — you can leave
+  `RHYPEDB_RESTORE_FROM` set across restarts without re-clobbering live data.
+- **Overwrite protection.** Restoring over an existing, *different* database
+  requires `--restore-force` (or `RHYPEDB_RESTORE_FROM_FORCE=1`). A stale `LOCK`
+  file from a crashed instance does **not** count as existing data.
+- **Same host only.** Like all of rhypedb, the single-writer lock is same-host; the
+  managed platform must guarantee the previous instance is stopped first.
+
+This is the in-server counterpart to the offline `rhypedb-cli restore`, which
+remains available for manual use.
 
 ## The data directory
 

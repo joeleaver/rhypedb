@@ -57,6 +57,22 @@ rhypedb-cli restore ./snap-2026-06-19 /var/lib/rhypedb --force
 
 `--force` is required to overwrite a non-empty target directory.
 
+### Restore on boot (managed deployments)
+
+The server can also restore a snapshot itself, at startup, before it opens the
+database — no CLI needed. This is the path a managed platform uses to wake an
+instance from object storage:
+
+```bash
+rhypedb-server --restore-from ./snap-2026-06-19 --data-dir /var/lib/rhypedb
+```
+
+It applies the same validation and clear-then-copy as the CLI restore, but holds
+the single-writer lock across the operation, takes the schema from the snapshot
+(so `--schema` is optional), restores the `hnsw_*.bin` index snapshots for a fast
+wake, and is **idempotent** (a restart with the same snapshot already in place is a
+no-op). See [Restore on boot](operations.md#restore-on-boot) for the full contract.
+
 ## Logical export
 
 A logical export is a single self-describing NDJSON stream — header, schema, objects, relationships, vectors, trailer — read at one consistent snapshot. The trailer (with per-type counts and a `complete` marker) is written last, so a truncated dump is detectable. Because it carries the schema and typed values rather than raw storage bytes, it imports into any version of rhypedb.

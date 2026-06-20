@@ -31,19 +31,35 @@ mod converters;
 pub mod import;
 mod protocol;
 mod query_cache;
+mod restore;
 
 use query_cache::QueryCache;
 
 #[derive(Parser)]
 #[command(name = "rhypedb", about = "rhypedb database server")]
 struct Cli {
-    /// Path to the SDL schema file.
+    /// Path to the SDL schema file. Required, EXCEPT with `--restore-from`: a
+    /// restored data dir carries its own authoritative `schema.rhype`, so the
+    /// flag is optional there (and, if given, must match the snapshot's schema).
     #[arg(short, long)]
-    schema: PathBuf,
+    schema: Option<PathBuf>,
 
     /// Data directory for storage.
     #[arg(short, long, default_value = "./rhypedb-data")]
     data_dir: PathBuf,
+
+    /// Restore a physical backup snapshot into `--data-dir` BEFORE serving, then
+    /// open it. The snapshot's `schema.rhype` becomes authoritative. Idempotent:
+    /// a restart with the same snapshot already in place is a no-op (so this can
+    /// stay set across restarts). Also settable via `RHYPEDB_RESTORE_FROM`.
+    #[arg(long)]
+    restore_from: Option<PathBuf>,
+
+    /// Allow `--restore-from` to overwrite an existing, different database in
+    /// `--data-dir`. Not needed to re-apply the same snapshot (that's a no-op) or
+    /// to clear a stale LOCK. Also settable via `RHYPEDB_RESTORE_FROM_FORCE=1`.
+    #[arg(long)]
+    restore_force: bool,
 
     /// HTTP listen address.
     #[arg(long, default_value = "127.0.0.1:4200")]
@@ -532,20 +548,96 @@ fn quantization_name(q: &QuantizationType) -> &'static str {
     }
 }
 
+/// An env var set to a truthy value (`1`/`true`/`yes`/`on`, case-insensitive).
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Read + parse an SDL schema file, exiting the process with a legible message on
+/// any error (the only sensible behaviour at startup).
+fn read_and_parse_schema(path: &std::path::Path) -> Schema {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("failed to read schema file {path:?}: {e}");
+        std::process::exit(1);
+    });
+    parse_schema(&text).unwrap_or_else(|e| {
+        eprintln!("schema error: {e}");
+        std::process::exit(1);
+    })
+}
+
 /// Parse the CLI, open the database, and serve until shutdown. Callers provide
 /// the async runtime (this crate's `main` uses `#[tokio::main]`).
 pub async fn run() {
     let cli = Cli::parse();
 
-    let schema_text = std::fs::read_to_string(&cli.schema).unwrap_or_else(|e| {
-        eprintln!("failed to read schema file {:?}: {e}", cli.schema);
-        std::process::exit(1);
-    });
+    // Restore-on-boot config. CLI flag wins over env (clap has no `env` feature
+    // here, matching the RHYPEDB_ADMIN_TOKEN / EF / RERANK pattern).
+    let restore_from = cli
+        .restore_from
+        .clone()
+        .or_else(|| std::env::var_os("RHYPEDB_RESTORE_FROM").map(PathBuf::from));
+    let restore_force = cli.restore_force || env_truthy("RHYPEDB_RESTORE_FROM_FORCE");
 
-    let schema = parse_schema(&schema_text).unwrap_or_else(|e| {
-        eprintln!("schema error: {e}");
-        std::process::exit(1);
-    });
+    // If asked, restore a snapshot into the data dir BEFORE opening it, and take
+    // the schema from the restored dir (the snapshot's schema.rhype is
+    // authoritative — opening restored SSTs under a different schema would
+    // reconcile/mutate the on-disk catalog).
+    let schema_path: PathBuf = if let Some(snapshot) = &restore_from {
+        match restore::restore_from_snapshot(snapshot, &cli.data_dir, restore_force) {
+            Ok(report) => {
+                if report.skipped {
+                    println!(
+                        "restore: {} already holds this snapshot ({}) — serving existing data",
+                        cli.data_dir.display(),
+                        snapshot.display()
+                    );
+                } else {
+                    println!(
+                        "restored {} SSTs + WAL + {} HNSW snapshot(s) from {} into {}",
+                        report.sst_count,
+                        report.hnsw_count,
+                        snapshot.display(),
+                        cli.data_dir.display()
+                    );
+                }
+                for (plan_id, converter) in &report.in_flight {
+                    eprintln!(
+                        "WARNING: restored backup was MID-MIGRATION (plan {plan_id}, converter \
+                         {converter}); register that converter before serving."
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("restore failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        let restored_schema = cli.data_dir.join("schema.rhype");
+        // If --schema was ALSO given, it must match the snapshot's exactly. The
+        // snapshot still wins; this is a cheap guard against an operator pointing
+        // at the wrong schema.
+        if let Some(explicit) = &cli.schema
+            && read_and_parse_schema(&restored_schema) != read_and_parse_schema(explicit)
+        {
+            eprintln!(
+                "--schema {explicit:?} does not match the restored snapshot's schema \
+                 ({restored_schema:?}); the snapshot's schema is authoritative — omit \
+                 --schema or pass the matching file."
+            );
+            std::process::exit(1);
+        }
+        restored_schema
+    } else {
+        cli.schema.clone().unwrap_or_else(|| {
+            eprintln!("--schema <path> is required (unless --restore-from is given)");
+            std::process::exit(1);
+        })
+    };
+
+    let schema = read_and_parse_schema(&schema_path);
 
     let db = Database::open_with_options(
         schema.clone(),
@@ -629,7 +721,7 @@ pub async fn run() {
         reload_lock: tokio::sync::RwLock::new(()),
         pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
         data_dir: cli.data_dir.clone(),
-        schema_path: cli.schema.clone(),
+        schema_path: schema_path.clone(),
         default_ef,
         default_rerank,
     });

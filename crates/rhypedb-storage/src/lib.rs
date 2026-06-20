@@ -1,6 +1,6 @@
 pub mod bloom;
 pub mod key;
-mod lock;
+pub mod lock;
 pub mod wal;
 pub mod memtable;
 pub mod sst;
