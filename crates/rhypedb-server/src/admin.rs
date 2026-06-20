@@ -1401,6 +1401,8 @@ mod tests {
             pending_reload_schemas: std::sync::Mutex::new(std::collections::HashMap::new()),
             data_dir,
             schema_path,
+            default_ef: None,
+            default_rerank: None,
         });
         let app = Router::new()
             .merge(admin_router(state.clone()))

@@ -92,6 +92,14 @@ pub(crate) struct AppState {
     /// The `--schema` SDL file. There is no `Schema → SDL` serializer, so a backup
     /// copies this file in so the restored data dir is openable.
     pub(crate) schema_path: std::path::PathBuf,
+    /// Server-wide default HNSW search width (`ef`) for `.similar` queries that
+    /// omit `ef:`, read ONCE from `RHYPEDB_EF` at startup. `None` = use the
+    /// engine's per-shape heuristic. Threaded into every query's `ExecContext`.
+    pub(crate) default_ef: Option<usize>,
+    /// Server-wide default rerank pool size for `.similar` queries that omit
+    /// `rerank:`, read ONCE from `RHYPEDB_RERANK`. `None` = no full-precision
+    /// rerank by default. A per-query `ef:`/`rerank:` always overrides these.
+    pub(crate) default_rerank: Option<usize>,
 }
 
 impl AppState {
@@ -161,6 +169,42 @@ fn value_to_json(v: Value) -> serde_json::Value {
     }
 }
 
+/// Parse the `RHYPEDB_EF` / `RHYPEDB_RERANK` env values into server-wide
+/// `.similar` defaults. Both are optional tuning knobs: an absent, empty,
+/// non-integer, or out-of-range value is IGNORED with a warning (the server
+/// must not refuse to start over a fat-fingered tuning hint). `ef` must be
+/// `>= 1` (matching the per-query parser); `rerank: 0` means "off" and is
+/// normalised to `None` (no default rerank). Takes the raw strings so it is
+/// unit-testable without mutating the process environment.
+fn parse_vector_search_defaults(
+    ef: Option<&str>,
+    rerank: Option<&str>,
+) -> (Option<usize>, Option<usize>) {
+    fn parse_knob(name: &str, raw: Option<&str>, min: usize) -> Option<usize> {
+        let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+        match raw.parse::<usize>() {
+            Ok(n) if n >= min => Some(n),
+            Ok(n) => {
+                eprintln!(
+                    "WARNING: {name}={n} is below the minimum of {min}; ignoring it."
+                );
+                None
+            }
+            Err(_) => {
+                eprintln!(
+                    "WARNING: {name}=\"{raw}\" is not a non-negative integer; ignoring it."
+                );
+                None
+            }
+        }
+    }
+    // ef must be >= 1 (a width of 0 explores nothing). rerank accepts 0 = off,
+    // which collapses to "no default rerank".
+    let default_ef = parse_knob("RHYPEDB_EF", ef, 1);
+    let default_rerank = parse_knob("RHYPEDB_RERANK", rerank, 0).filter(|&n| n > 0);
+    (default_ef, default_rerank)
+}
+
 async fn handle_query(
     State(state): State<Arc<AppState>>,
     Json(req): Json<QueryRequest>,
@@ -190,6 +234,8 @@ async fn handle_query(
         let ctx = ExecContext {
             db: &db,
             vectorizer: state.vectorizer.as_deref(),
+            default_ef: state.default_ef,
+            default_rerank: state.default_rerank,
         };
         rhypedb_query::executor::execute(&ctx, &query)
     };
@@ -568,6 +614,13 @@ pub async fn run() {
     let admin_token = std::env::var("RHYPEDB_ADMIN_TOKEN").ok().filter(|t| !t.is_empty());
     let admin_enabled = admin_token.is_some();
 
+    // Server-wide `.similar` defaults, read ONCE. A per-query `ef:`/`rerank:`
+    // overrides these; an invalid value is warned-about and ignored (above).
+    let (default_ef, default_rerank) = parse_vector_search_defaults(
+        std::env::var("RHYPEDB_EF").ok().as_deref(),
+        std::env::var("RHYPEDB_RERANK").ok().as_deref(),
+    );
+
     let state = Arc::new(AppState {
         db: ArcSwap::from(db),
         vectorizer,
@@ -577,6 +630,8 @@ pub async fn run() {
         pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
         data_dir: cli.data_dir.clone(),
         schema_path: cli.schema.clone(),
+        default_ef,
+        default_rerank,
     });
 
     // Re-register completion watchers for any migration left in flight by a prior
@@ -618,6 +673,13 @@ pub async fn run() {
     println!("  POST /query     — execute queries");
     println!("  GET  /health    — health check");
     println!("  GET  /schema    — schema introspection (JSON + SDL)");
+    if default_ef.is_some() || default_rerank.is_some() {
+        println!(
+            "  vector .similar defaults: ef={} rerank={} (per-query args override)",
+            default_ef.map_or_else(|| "heuristic".to_string(), |n| n.to_string()),
+            default_rerank.map_or_else(|| "off".to_string(), |n| n.to_string()),
+        );
+    }
     if admin_enabled {
         println!("  *    /admin/* (compact, reload, migrations*) — admin (RHYPEDB_ADMIN_TOKEN set)");
         println!(
@@ -1002,6 +1064,8 @@ fn execute_query(state: &AppState, query_text: &str) -> Result<QueryOutput, Stri
     let ctx = ExecContext {
         db: &db,
         vectorizer: state.vectorizer.as_deref(),
+        default_ef: state.default_ef,
+        default_rerank: state.default_rerank,
     };
     rhypedb_query::executor::execute(&ctx, &query).map_err(|e| format!("{e}"))
 }
@@ -1036,7 +1100,35 @@ mod tcp_tests {
             pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
             data_dir,
             schema_path,
+            default_ef: None,
+            default_rerank: None,
         })
+    }
+
+    #[test]
+    fn parse_vector_search_defaults_normalises() {
+        // Valid values pass through.
+        assert_eq!(
+            parse_vector_search_defaults(Some("128"), Some("40")),
+            (Some(128), Some(40))
+        );
+        // Unset -> no defaults.
+        assert_eq!(parse_vector_search_defaults(None, None), (None, None));
+        // Empty / whitespace-only -> ignored; surrounding whitespace trimmed.
+        assert_eq!(
+            parse_vector_search_defaults(Some("   "), Some(" 50 ")),
+            (None, Some(50))
+        );
+        // ef must be >= 1; ef=0 is ignored. rerank=0 means "off" -> None.
+        assert_eq!(
+            parse_vector_search_defaults(Some("0"), Some("0")),
+            (None, None)
+        );
+        // Garbage / negative -> ignored (server still starts).
+        assert_eq!(
+            parse_vector_search_defaults(Some("abc"), Some("-5")),
+            (None, None)
+        );
     }
 
     #[tokio::test]

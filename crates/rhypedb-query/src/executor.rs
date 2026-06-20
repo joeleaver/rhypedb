@@ -59,6 +59,30 @@ pub enum QueryOutput {
 pub struct ExecContext<'a> {
     pub db: &'a Database,
     pub vectorizer: Option<&'a Vectorizer>,
+    /// Server-wide default HNSW search width (`ef`) for `.similar` queries that
+    /// omit an explicit `ef:`. `None` = use the engine's per-shape heuristic. An
+    /// explicit per-query `ef:` always wins. The server sets this from
+    /// `RHYPEDB_EF`; embedded/library callers leave it `None`.
+    pub default_ef: Option<usize>,
+    /// Server-wide default rerank pool size for `.similar` queries that omit an
+    /// explicit `rerank:`. `None` (or `Some(0)`) = no full-precision rerank by
+    /// default. An explicit per-query `rerank:` — including `rerank: 0` (off) —
+    /// always wins. The server sets this from `RHYPEDB_RERANK`.
+    pub default_rerank: Option<usize>,
+}
+
+impl<'a> ExecContext<'a> {
+    /// A context with no server-wide vector-search defaults: `.similar` queries
+    /// fall back to the engine's per-shape `ef`/`rerank` heuristics. Server
+    /// callers construct this then set `default_ef`/`default_rerank` from config.
+    pub fn new(db: &'a Database, vectorizer: Option<&'a Vectorizer>) -> Self {
+        Self {
+            db,
+            vectorizer,
+            default_ef: None,
+            default_rerank: None,
+        }
+    }
 }
 
 /// Execute a parsed query against the database.
@@ -549,6 +573,92 @@ fn execute_step(
 /// `ef:`/`rerank:` so one query can't exhaust a small (1–4 core) deployment VM.
 const MAX_VECTOR_SEARCH_POOL: usize = 10_000;
 
+/// Fill in the server-wide `ef`/`rerank` defaults for a `.similar` step, but
+/// only where the query OMITTED the parameter. An explicit per-query value —
+/// including `rerank: 0` (rerank off) — always takes priority over the default,
+/// matching the "overridable per query" contract documented for `RHYPEDB_EF` /
+/// `RHYPEDB_RERANK`.
+fn resolve_similar_defaults(
+    ef: Option<usize>,
+    rerank: Option<usize>,
+    default_ef: Option<usize>,
+    default_rerank: Option<usize>,
+) -> (Option<usize>, Option<usize>) {
+    (ef.or(default_ef), rerank.or(default_rerank))
+}
+
+/// The HNSW search parameters resolved for one `.similar` step: the candidate
+/// pool to retrieve (`search_k`), the HNSW search width (`ef`), and whether to
+/// run a full-precision rerank.
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedSearch {
+    search_k: usize,
+    ef: usize,
+    rerank: bool,
+}
+
+/// Resolve the effective HNSW search parameters from a `.similar` step plus the
+/// server-wide defaults. First fills in the `RHYPEDB_EF`/`RHYPEDB_RERANK`
+/// defaults where the query OMITTED the parameter (an explicit per-query value —
+/// including `rerank: 0` = off — always wins), then applies the same over-fetch
+/// heuristic and safety clamps regardless of whether the value came from the
+/// query or a default. So a configured default behaves exactly as if the caller
+/// had written it into the query. `restricted` = an upstream filter narrowed the
+/// candidate set (changes the over-fetch and the `ef` heuristic).
+///
+/// Pure and side-effect-free so the default-flow + clamp behaviour is unit-tested
+/// deterministically, without the (non-deterministic) HNSW/quantizer path.
+fn resolve_search(
+    ef: Option<usize>,
+    rerank: Option<usize>,
+    default_ef: Option<usize>,
+    default_rerank: Option<usize>,
+    k: usize,
+    restricted: bool,
+) -> ResolvedSearch {
+    // Server-wide defaults fill in only where the query omitted ef/rerank.
+    let (ef, rerank) = resolve_similar_defaults(ef, rerank, default_ef, default_rerank);
+
+    // `rerank: 0` (and the absent case) means "no full-precision rerank".
+    let rerank = rerank.filter(|&r| r > 0);
+
+    // Over-fetch only when restricting (post-filtering discards some hits); a
+    // global search needs just k. For a SELECTIVE filter (a small restrict set)
+    // the vectorizer takes an exact brute-force path that ignores this over-fetch
+    // and `ef` entirely (it scores the whole set, so it never under-fills); the
+    // over-fetch below only matters for the HNSW post-filter path used when the
+    // restrict set is large (> EXACT_FILTER_MAX), where heavy filtering can still
+    // yield < k (a documented residual). `rerank: N` raises the retrieved pool to
+    // at least N so the full-precision re-score has N candidates to work over.
+    let base_k = if restricted {
+        k.saturating_mul(4).max(k)
+    } else {
+        k
+    };
+    let search_k = rerank
+        .map_or(base_k, |r| r.max(base_k))
+        .min(MAX_VECTOR_SEARCH_POOL);
+
+    // User-supplied (or defaulted) `ef` overrides the heuristic. Floor it to
+    // `search_k` (HNSW can't surface more than `ef` candidates) and cap it for
+    // safety so a hostile/fat-fingered value can't exhaust a small VM.
+    let heuristic_ef = if restricted {
+        search_k.saturating_mul(2).max(64)
+    } else {
+        k.max(50)
+    };
+    let ef = ef
+        .unwrap_or(heuristic_ef)
+        .max(search_k)
+        .min(MAX_VECTOR_SEARCH_POOL);
+
+    ResolvedSearch {
+        search_k,
+        ef,
+        rerank: rerank.is_some(),
+    }
+}
+
 /// Run a vector similarity search over `type_name.field_name`.
 ///
 /// `restrict = None` searches the whole type (a bare `Type.similar(...)`), so
@@ -580,35 +690,21 @@ fn run_similar(
         QueryError::Type("vector similarity search requires a vectorizer".into())
     })?;
 
-    // `rerank: 0` (and the absent case) means "no full-precision rerank".
-    let rerank = rerank.filter(|&r| r > 0);
-
-    // Over-fetch only when restricting (post-filtering discards some hits); a
-    // global search needs just k. For a SELECTIVE filter (a small restrict set)
-    // the vectorizer takes an exact brute-force path that ignores this over-fetch
-    // and `ef` entirely (it scores the whole set, so it never under-fills); the
-    // over-fetch below only matters for the HNSW post-filter path used when the
-    // restrict set is large (> EXACT_FILTER_MAX), where heavy filtering can still
-    // yield < k (a documented residual). `rerank: N` raises the retrieved pool to
-    // at least N so the full-precision re-score has N candidates to work over.
-    let base_k = match restrict {
-        Some(_) => k.saturating_mul(4).max(k),
-        None => k,
-    };
-    let search_k = rerank
-        .map_or(base_k, |r| r.max(base_k))
-        .min(MAX_VECTOR_SEARCH_POOL);
-
-    // User-supplied `ef` overrides the heuristic. Floor it to `search_k` (HNSW
-    // can't surface more than `ef` candidates) and cap it for safety.
-    let heuristic_ef = match restrict {
-        Some(_) => search_k.saturating_mul(2).max(64),
-        None => k.max(50),
-    };
-    let ef = ef
-        .unwrap_or(heuristic_ef)
-        .max(search_k)
-        .min(MAX_VECTOR_SEARCH_POOL);
+    // Resolve the effective search width / pool / rerank from the query's
+    // ef:/rerank: PLUS the server-wide RHYPEDB_EF / RHYPEDB_RERANK defaults (an
+    // explicit per-query value always wins). See `resolve_search`.
+    let ResolvedSearch {
+        search_k,
+        ef,
+        rerank,
+    } = resolve_search(
+        ef,
+        rerank,
+        ctx.default_ef,
+        ctx.default_rerank,
+        k,
+        restrict.is_some(),
+    );
 
     let results = match query {
         SimilarQuery::Text(text) => vectorizer.search_text(
@@ -617,7 +713,7 @@ fn run_similar(
             text,
             search_k,
             ef,
-            rerank.is_some(),
+            rerank,
             restrict,
         )?,
         SimilarQuery::Vector(vec) => vectorizer.search_vector(
@@ -626,7 +722,7 @@ fn run_similar(
             vec,
             search_k,
             ef,
-            rerank.is_some(),
+            rerank,
             restrict,
         )?,
     };
@@ -1047,13 +1143,157 @@ mod tests {
     }
 
     #[test]
+    fn resolve_similar_defaults_precedence() {
+        // Omitted in the query -> the server-wide default fills in.
+        assert_eq!(
+            resolve_similar_defaults(None, None, Some(128), Some(40)),
+            (Some(128), Some(40))
+        );
+        // An explicit per-query value always wins over the default.
+        assert_eq!(
+            resolve_similar_defaults(Some(256), Some(64), Some(128), Some(40)),
+            (Some(256), Some(64))
+        );
+        // `rerank: 0` is an EXPLICIT "off" and must NOT be replaced by a default.
+        assert_eq!(
+            resolve_similar_defaults(None, Some(0), Some(128), Some(40)),
+            (Some(128), Some(0))
+        );
+        // No default configured -> the query is unchanged (engine heuristics apply).
+        assert_eq!(
+            resolve_similar_defaults(None, None, None, None),
+            (None, None)
+        );
+        // Mixed: ef explicit, rerank defaulted.
+        assert_eq!(
+            resolve_similar_defaults(Some(300), None, Some(128), Some(40)),
+            (Some(300), Some(40))
+        );
+    }
+
+    /// Deterministic proof that the server-wide defaults actually FLOW INTO the
+    /// resolved HNSW parameters (the part a recall-based test can't show, because
+    /// HNSW construction and the quantizer rotation are both non-deterministic).
+    #[test]
+    fn resolve_search_applies_defaults_and_clamps() {
+        // Global (unrestricted), no query params, no defaults: the engine's own
+        // heuristic ef (k.max(50) = 50), pool = k, no rerank.
+        assert_eq!(
+            resolve_search(None, None, None, None, 1, false),
+            ResolvedSearch { search_k: 1, ef: 50, rerank: false }
+        );
+        // A server `RHYPEDB_EF` default REACHES the resolved ef — 200, not the
+        // heuristic 50. This is exactly what would NOT happen if run_similar
+        // failed to thread the default through.
+        assert_eq!(
+            resolve_search(None, None, Some(200), None, 1, false),
+            ResolvedSearch { search_k: 1, ef: 200, rerank: false }
+        );
+        // A server `RHYPEDB_RERANK` default turns rerank ON and grows the pool to
+        // at least the rerank size (ef stays at the heuristic, floored to search_k).
+        assert_eq!(
+            resolve_search(None, None, None, Some(10), 1, false),
+            ResolvedSearch { search_k: 10, ef: 50, rerank: true }
+        );
+        // An explicit per-query value wins over BOTH defaults; `rerank: 0` is an
+        // explicit "off" that the default must not resurrect.
+        assert_eq!(
+            resolve_search(Some(7), Some(0), Some(200), Some(10), 5, false),
+            ResolvedSearch { search_k: 5, ef: 7, rerank: false }
+        );
+        // Restricted (post-filter) path: over-fetch base_k = 4*k, heuristic ef =
+        // max(2*search_k, 64); the default ef still flows in and floors to search_k.
+        assert_eq!(
+            resolve_search(None, None, Some(200), None, 2, true),
+            ResolvedSearch { search_k: 8, ef: 200, rerank: false }
+        );
+        // Safety cap: a default far above MAX_VECTOR_SEARCH_POOL is clamped (so a
+        // server-wide default can't exhaust a small VM any more than a per-query
+        // value could).
+        assert_eq!(
+            resolve_search(None, None, Some(1_000_000), Some(1_000_000), 1, false),
+            ResolvedSearch {
+                search_k: MAX_VECTOR_SEARCH_POOL,
+                ef: MAX_VECTOR_SEARCH_POOL,
+                rerank: true
+            }
+        );
+    }
+
+    /// End-to-end smoke that the full defaults path — `ExecContext` defaults →
+    /// `execute()` → `run_similar` → `search_vector` → materialize — runs and
+    /// returns the correct exact match with the defaults set. The deterministic
+    /// proof that the defaults change the *resolved parameters* lives in
+    /// `resolve_search_applies_defaults_and_clamps`; this test guards the wiring
+    /// end-to-end (no panic / type error) over a real index. Uses a
+    /// bring-your-own `Vector` field so no embed model is needed.
+    #[test]
+    fn similar_query_executes_with_server_defaults_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Doc {
+                title: String
+                v: Vector<4>
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema.clone(), dir.path()).unwrap();
+
+        let vectorizer = Vectorizer::new(
+            std::sync::Arc::clone(db.storage()),
+            schema,
+            db.type_ids().clone(),
+            db.field_ids().clone(),
+        )
+        .unwrap();
+
+        // Four orthonormal vectors, one per Doc.
+        let basis = [
+            [1.0f32, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut ids = Vec::new();
+        for (i, vec) in basis.iter().enumerate() {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(format!("doc-{i}")));
+            let obj = db.create("Doc", f).unwrap();
+            vectorizer.ingest_vector("Doc", obj.id, "v", vec).unwrap();
+            ids.push(obj.id);
+        }
+
+        // Query equals the second basis vector -> Doc #1 is the unique nearest.
+        let q = parse_query("Doc.similar(.v, [0.0, 1.0, 0.0, 0.0], k: 1)").unwrap();
+        let top_id = |ctx: &ExecContext<'_>| match execute(ctx, &q).unwrap() {
+            QueryOutput::Objects(objs) => {
+                assert_eq!(objs.len(), 1);
+                objs[0].id
+            }
+            other => panic!("expected Objects, got {other:?}"),
+        };
+
+        // No defaults: engine heuristics; explicit defaults via the context.
+        let mut ctx = ExecContext::new(&db, Some(&vectorizer));
+        let baseline = top_id(&ctx);
+        ctx.default_ef = Some(200);
+        ctx.default_rerank = Some(10);
+        let with_defaults = top_id(&ctx);
+
+        assert_eq!(baseline, ids[1]);
+        assert_eq!(with_defaults, ids[1]);
+    }
+
+    #[test]
     fn create_coerces_literals_to_declared_scalar_types() {
         // Before the fix every Float -> F32 and every small Int -> U32, so
         // f64/u64/i32/i64 fields rejected the value with TypeMismatch. Now the
         // literal is coerced to the field's declared scalar type.
         let dir = tempfile::tempdir().unwrap();
         let db = product_db(dir.path());
-        let ctx = ExecContext { db: &db, vectorizer: None };
+        let ctx = ExecContext::new(&db, None);
 
         let q = parse_query(
             r#"Product.create({ name: "a", price: 3.5, big: 5, rating: -7, delta: 9 })"#,
@@ -1076,7 +1316,7 @@ mod tests {
         // correctly via the per-row numeric fallback.
         let dir = tempfile::tempdir().unwrap();
         let db = product_db(dir.path());
-        let ctx = ExecContext { db: &db, vectorizer: None };
+        let ctx = ExecContext::new(&db, None);
         for (n, r) in [("a", 1), ("b", 5), ("c", 10)] {
             let q = parse_query(&format!(
                 r#"Product.create({{ name: "{n}", price: 1.0, big: 1, rating: {r}, delta: 0 }})"#
@@ -1107,7 +1347,7 @@ mod tests {
         // (so `.rating >= 5.0` silently matched nothing).
         let dir = tempfile::tempdir().unwrap();
         let db = product_db(dir.path());
-        let ctx = ExecContext { db: &db, vectorizer: None };
+        let ctx = ExecContext::new(&db, None);
         for (n, r, p) in [("a", 1, 10.0), ("b", 5, 20.0), ("c", 8, 200.0)] {
             let q = parse_query(&format!(
                 r#"Product.create({{ name: "{n}", price: {p}, big: 1, rating: {r}, delta: 0 }})"#
@@ -1137,7 +1377,7 @@ mod tests {
         // index lookup (the empty candidate set short-circuits first).
         let dir = tempfile::tempdir().unwrap();
         let db = product_db(dir.path());
-        let ctx = ExecContext { db: &db, vectorizer: None };
+        let ctx = ExecContext::new(&db, None);
         execute(
             &ctx,
             &parse_query(
@@ -1160,7 +1400,7 @@ mod tests {
         let db = test_db(dir.path());
 
         let q = parse_query(r#"User.create({ name: "Alice", age: 30 })"#).unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         let obj = match result {
             QueryOutput::Single(o) => o,
             _ => panic!("expected Single"),
@@ -1168,7 +1408,7 @@ mod tests {
         assert_eq!(obj.fields.get("name"), Some(&Value::String("Alice".into())));
 
         let q = parse_query(&format!("User.get({})", obj.id)).unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         match result {
             QueryOutput::Objects(objs) => {
                 assert_eq!(objs.len(), 1);
@@ -1194,7 +1434,7 @@ mod tests {
             ])"#,
         )
         .unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         let objs = match result {
             QueryOutput::Objects(objs) => objs,
             other => panic!("expected Objects, got {other:?}"),
@@ -1211,7 +1451,7 @@ mod tests {
         // Round-trip: confirm we can read each back.
         for o in &objs {
             let q = parse_query(&format!("User.get({})", o.id)).unwrap();
-            let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+            let result = execute(&ExecContext::new(&db, None), &q).unwrap();
             match result {
                 QueryOutput::Objects(o2) => assert_eq!(o2.len(), 1),
                 _ => panic!("expected Objects"),
@@ -1229,7 +1469,7 @@ mod tests {
         create_user(&db, "Carol", 20);
 
         let q = parse_query("User.filter(.age > 22)").unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         match result {
             QueryOutput::Objects(objs) => {
                 assert_eq!(objs.len(), 2);
@@ -1256,7 +1496,7 @@ mod tests {
             alice.id
         ))
         .unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
 
         match result {
             QueryOutput::Single(obj) => {
@@ -1274,7 +1514,7 @@ mod tests {
         let alice = create_user(&db, "Alice", 25);
 
         let q = parse_query(&format!("User.get({}).delete()", alice.id)).unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         assert!(matches!(result, QueryOutput::Done));
 
         assert!(db.get("User", alice.id).is_err());
@@ -1291,7 +1531,7 @@ mod tests {
             .unwrap();
 
         let q = parse_query(&format!("User.get({}).friends", alice.id)).unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
 
         match result {
             QueryOutput::Objects(mut objs) => {
@@ -1323,7 +1563,7 @@ mod tests {
             alice.id, bob.id
         ))
         .unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         assert!(matches!(result, QueryOutput::Done));
 
         // Verify the link landed via direct db query.
@@ -1373,7 +1613,7 @@ mod tests {
              {{ score: 3.5, count: 5, rank: -7, big: 9000000000, weight: 1.25 }})"
         ))
         .unwrap();
-        let res = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let res = execute(&ExecContext::new(&db, None), &q).unwrap();
         assert!(matches!(res, QueryOutput::Done));
 
         let links = db.get_links("Item", item, "tags").unwrap();
@@ -1399,7 +1639,7 @@ mod tests {
             "Item.get({item}).link(Tag.get({tag}), {{ score: 5 }})"
         ))
         .unwrap();
-        execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        execute(&ExecContext::new(&db, None), &q).unwrap();
 
         let links = db.get_links("Item", item, "tags").unwrap();
         assert_eq!(links[0].1.get("score"), Some(&Value::F64(5.0)));
@@ -1416,7 +1656,7 @@ mod tests {
             "Item.get({item}).link(Tag.get({tag}), {{ score: null }})"
         ))
         .unwrap();
-        execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        execute(&ExecContext::new(&db, None), &q).unwrap();
         assert_eq!(db.get_links("Item", item, "tags").unwrap()[0].1.get("score"), Some(&Value::Null));
     }
 
@@ -1430,7 +1670,7 @@ mod tests {
             "Item.get({item}).link(Tag.get({tag}), {{ nope: 1 }})"
         ))
         .unwrap();
-        let res = execute(&ExecContext { db: &db, vectorizer: None }, &q);
+        let res = execute(&ExecContext::new(&db, None), &q);
         assert!(res.is_err(), "an undeclared edge field must be rejected");
     }
 
@@ -1444,7 +1684,7 @@ mod tests {
         }
 
         let q = parse_query("User.filter(.age >= 0).limit(2)").unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         match result {
             QueryOutput::Objects(objs) => {
                 assert_eq!(objs.len(), 2);
@@ -1508,7 +1748,7 @@ mod tests {
             movie.id
         ))
         .unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         let objs = match result {
             QueryOutput::Objects(objs) => objs,
             other => panic!("expected Objects, got {other:?}"),
@@ -1535,7 +1775,7 @@ mod tests {
             movie.id
         ))
         .unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         let objs = match result {
             QueryOutput::Objects(objs) => objs,
             other => panic!("expected Objects, got {other:?}"),
@@ -1608,7 +1848,7 @@ mod tests {
 
         // Baseline fusion returns Alice from the fresh cover.
         let q = parse_query(&format!("Movie.get({}).ratings.user", movie.id)).unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         assert!(
             matches!(&result, QueryOutput::Objects(o) if o.len() == 1),
             "baseline: expected 1 user, got {result:?}"
@@ -1624,7 +1864,7 @@ mod tests {
 
         // Re-run the fusion. A deleted object must never surface.
         let q = parse_query(&format!("Movie.get({}).ratings.user", movie.id)).unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         let objs = match result {
             QueryOutput::Objects(objs) => objs,
             other => panic!("expected Objects, got {other:?}"),
@@ -1693,7 +1933,7 @@ mod tests {
         );
 
         let q = parse_query(&format!("Movie.get({movie_id}).ratings.user")).unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         let objs = match result {
             QueryOutput::Objects(objs) => objs,
             other => panic!("expected Objects, got {other:?}"),
@@ -1761,7 +2001,7 @@ mod tests {
 
         // Baseline: the 3-hop fusion resolves the director.
         let q = parse_query(&format!("User.get({}).ratings.movie.director", user.id)).unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         assert!(
             matches!(&result, QueryOutput::Objects(o) if o.len() == 1),
             "baseline: expected 1 director, got {result:?}"
@@ -1772,7 +2012,7 @@ mod tests {
         db.delete("Director", director.id).unwrap();
 
         let q = parse_query(&format!("User.get({}).ratings.movie.director", user.id)).unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         let objs = match result {
             QueryOutput::Objects(objs) => objs,
             other => panic!("expected Objects, got {other:?}"),
@@ -1853,7 +2093,7 @@ mod tests {
         ))
         .unwrap();
         let result =
-            execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+            execute(&ExecContext::new(&db, None), &q).unwrap();
 
         match result {
             QueryOutput::Objects(mut objs) => {
@@ -1910,7 +2150,7 @@ mod tests {
         ))
         .unwrap();
         let result =
-            execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+            execute(&ExecContext::new(&db, None), &q).unwrap();
 
         match result {
             QueryOutput::Objects(mut objs) => {
@@ -1942,7 +2182,7 @@ mod tests {
         db.create("User", f).unwrap();
 
         let q = parse_query("User.filter(.active == true)").unwrap();
-        let result = execute(&ExecContext { db: &db, vectorizer: None }, &q).unwrap();
+        let result = execute(&ExecContext::new(&db, None), &q).unwrap();
         match result {
             QueryOutput::Objects(objs) => {
                 assert_eq!(objs.len(), 1);

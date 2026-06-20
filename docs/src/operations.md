@@ -23,8 +23,8 @@ rhypedb-server --schema schema.rhype --data-dir /var/lib/rhypedb
 | Variable | Meaning |
 | --- | --- |
 | `RHYPEDB_ADMIN_TOKEN` | Bearer token that gates all `/admin/*` endpoints. If unset, admin routes return `403`. |
-| `RHYPEDB_EF` | Default HNSW search width for `.similar` queries (overridable per query). |
-| `RHYPEDB_RERANK` | Default rerank pool size for `.similar` queries (overridable per query). |
+| `RHYPEDB_EF` | Default HNSW search width (`ef`) for `.similar` queries that omit `ef:` (must be `≥ 1`; overridable per query). An invalid value is ignored with a warning. |
+| `RHYPEDB_RERANK` | Default rerank pool size for `.similar` queries that omit `rerank:` (`0` = off; overridable per query). An invalid value is ignored with a warning. |
 
 ## The data directory
 

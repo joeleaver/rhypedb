@@ -116,7 +116,7 @@ A common high-recall pattern is a moderate `ef` with `rerank` set to a few × `k
 Post.similar(.embedding, "query text", k: 10, ef: 200, rerank: 50)
 ```
 
-Server-wide defaults for `ef` and `rerank` can also be set via the `RHYPEDB_EF` and `RHYPEDB_RERANK` environment variables (see [Running rhypedb](operations.md)); per-query arguments override them.
+Server-wide defaults for `ef` and `rerank` can also be set via the `RHYPEDB_EF` and `RHYPEDB_RERANK` environment variables (see [Running rhypedb](operations.md)); they apply only to queries that omit the corresponding argument, and an explicit per-query `ef:`/`rerank:` (including `rerank: 0` to force rerank off) always overrides them.
 
 ## What's preserved across backups
 
