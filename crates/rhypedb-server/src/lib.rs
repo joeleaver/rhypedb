@@ -21,7 +21,10 @@ use rhypedb_engine::object::{Object, Value};
 use rhypedb_engine::vectorizer::Vectorizer;
 use rhypedb_query::executor::{ExecContext, QueryOutput};
 use rhypedb_schema::parser::parse_schema;
-use rhypedb_schema::Schema;
+use rhypedb_schema::{
+    DistanceMetric, FieldDef, FieldType, IndexDef, OnDeletePolicy, QuantizationType, ScalarType,
+    Schema,
+};
 
 mod admin;
 mod converters;
@@ -341,6 +344,148 @@ async fn handle_status(
     Json(result)
 }
 
+/// `GET /schema` — a structured JSON introspection of the LIVE schema (types,
+/// fields, directives) plus the canonical SDL. Open + read-only like `/status`:
+/// the data plane (`/query`) is already open and you need the schema to use it,
+/// and SDK-codegen consumers shouldn't need the operator admin token. Trivially
+/// moved behind `admin_router` later if a deployment wants it gated.
+async fn handle_schema(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(schema_introspection(state.db().schema()))
+}
+
+/// Build the codegen-friendly introspection payload: format-tagged, types sorted
+/// by name (HashMap order is nondeterministic), fields in declaration order, plus
+/// the canonical SDL (`emit_schema`) so a consumer can parse or round-trip it.
+fn schema_introspection(schema: &Schema) -> serde_json::Value {
+    let mut names: Vec<&String> = schema.types.keys().collect();
+    names.sort();
+    let types: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            let td = &schema.types[*name];
+            let fields: Vec<serde_json::Value> =
+                td.fields.iter().map(field_introspection).collect();
+            serde_json::json!({ "name": name, "fields": fields })
+        })
+        .collect();
+    serde_json::json!({
+        "format": "rhypedb-schema-introspection-v1",
+        "types": types,
+        "sdl": rhypedb_schema::emit_schema(schema),
+    })
+}
+
+/// One field → its introspection object. `kind` discriminates the shape: a
+/// `scalar` carries `scalar`/`unique`/`indexed`; a `vector` carries `dimensions`
+/// plus optional `vectorize`/`index`; a `relation` carries `target`/`many` plus
+/// optional `onDelete`/`inverse`/`edgeFields`.
+fn field_introspection(f: &FieldDef) -> serde_json::Value {
+    let mut field = serde_json::json!({ "name": f.name });
+    match &f.field_type {
+        FieldType::Scalar(s) => {
+            field["kind"] = "scalar".into();
+            field["scalar"] = scalar_name(s).into();
+            field["unique"] = f.is_unique().into();
+            field["indexed"] = f.is_indexed().into();
+        }
+        FieldType::Vector(v) => {
+            field["kind"] = "vector".into();
+            field["dimensions"] = v.dimensions.into();
+            if let Some(vz) = f.vectorize() {
+                field["vectorize"] =
+                    serde_json::json!({ "source": vz.source_field, "model": vz.model });
+            }
+            if let Some(ix) = f.index() {
+                field["index"] = index_introspection(ix);
+            }
+        }
+        FieldType::Relation(rel) => {
+            field["kind"] = "relation".into();
+            field["target"] = rel.target_type.as_str().into();
+            field["many"] = rel.is_many.into();
+            if let Some(p) = f.on_delete() {
+                field["onDelete"] = on_delete_name(p).into();
+            }
+            if let Some(inv) = f.inverse() {
+                field["inverse"] =
+                    serde_json::json!({ "type": inv.type_name, "field": inv.field_name });
+            }
+            if !rel.edge_fields.is_empty() {
+                let efs: Vec<serde_json::Value> = rel
+                    .edge_fields
+                    .iter()
+                    .map(|ef| {
+                        serde_json::json!({ "name": ef.name, "scalar": scalar_name(&ef.scalar_type) })
+                    })
+                    .collect();
+                field["edgeFields"] = efs.into();
+            }
+        }
+    }
+    field
+}
+
+fn index_introspection(ix: &IndexDef) -> serde_json::Value {
+    // IndexType::Hnsw is the only variant today.
+    let mut out = serde_json::json!({ "type": "hnsw" });
+    if let Some(m) = &ix.metric {
+        out["metric"] = metric_name(m).into();
+    }
+    if let Some(q) = &ix.quantization {
+        out["quantization"] = quantization_name(q).into();
+    }
+    if let Some(m) = ix.m {
+        out["m"] = m.into();
+    }
+    if let Some(ef) = ix.ef_construction {
+        out["efConstruction"] = ef.into();
+    }
+    out
+}
+
+/// Canonical SDL spellings — mirror rhypedb-schema's emitter so the introspection
+/// and the embedded SDL agree.
+fn scalar_name(s: &ScalarType) -> &'static str {
+    match s {
+        ScalarType::String => "String",
+        ScalarType::U32 => "u32",
+        ScalarType::U64 => "u64",
+        ScalarType::I32 => "i32",
+        ScalarType::I64 => "i64",
+        ScalarType::F32 => "f32",
+        ScalarType::F64 => "f64",
+        ScalarType::Bool => "Bool",
+        ScalarType::DateTime => "DateTime",
+        ScalarType::Bytes => "Bytes",
+        ScalarType::Json => "Json",
+    }
+}
+
+fn on_delete_name(p: &OnDeletePolicy) -> &'static str {
+    match p {
+        OnDeletePolicy::Remove => "remove",
+        OnDeletePolicy::Cascade => "cascade",
+        OnDeletePolicy::Deny => "deny",
+    }
+}
+
+fn metric_name(m: &DistanceMetric) -> &'static str {
+    match m {
+        DistanceMetric::Cosine => "cosine",
+        DistanceMetric::L2 => "l2",
+        DistanceMetric::DotProduct => "dot_product",
+    }
+}
+
+fn quantization_name(q: &QuantizationType) -> &'static str {
+    match q {
+        QuantizationType::TurboQuant2Bit => "turboquant_2bit",
+        QuantizationType::TurboQuant3Bit => "turboquant_3bit",
+        QuantizationType::TurboQuant4Bit => "turboquant_4bit",
+        QuantizationType::None => "none",
+    }
+}
+
 /// Parse the CLI, open the database, and serve until shutdown. Callers provide
 /// the async runtime (this crate's `main` uses `#[tokio::main]`).
 pub async fn run() {
@@ -448,6 +593,7 @@ pub async fn run() {
         .route("/query", post(handle_query))
         .route("/status", get(handle_status))
         .route("/health", get(handle_health))
+        .route("/schema", get(handle_schema))
         // All admin/operational routes (/admin/compact, /admin/reload,
         // /admin/migrations*) are gated by RHYPEDB_ADMIN_TOKEN inside admin_router.
         .merge(admin::admin_router(state.clone()))
@@ -471,6 +617,7 @@ pub async fn run() {
     println!("rhypedb binary TCP listening on {}", cli.tcp_listen);
     println!("  POST /query     — execute queries");
     println!("  GET  /health    — health check");
+    println!("  GET  /schema    — schema introspection (JSON + SDL)");
     if admin_enabled {
         println!("  *    /admin/* (compact, reload, migrations*) — admin (RHYPEDB_ADMIN_TOKEN set)");
         println!(
@@ -1112,5 +1259,116 @@ mod tcp_tests {
             .expect("connection handler panicked");
 
         drop(client);
+    }
+
+    #[test]
+    fn schema_introspection_covers_scalar_relation_vector() {
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String @unique
+                age: i64 @indexed
+                posts: [Post] @inverse(Post.author) @on_delete(remove)
+                favorites: [Post] {
+                    rating: f32,
+                    added_at: DateTime
+                } @on_delete(cascade)
+                embedding: Vector<384> @vectorize(source: "name", model: "all-MiniLM-L6-v2") @index(hnsw, metric: cosine, quantization: turboquant_3bit, m: 16, ef_construction: 200)
+            }
+            type Post {
+                title: String @indexed
+                author: User @on_delete(deny)
+            }
+            "#,
+        )
+        .unwrap();
+
+        let v = schema_introspection(&schema);
+        assert_eq!(v["format"], "rhypedb-schema-introspection-v1");
+        // Types sorted by name: Post before User.
+        let types = v["types"].as_array().unwrap();
+        assert_eq!(types[0]["name"], "Post");
+        assert_eq!(types[1]["name"], "User");
+
+        let field = |ty: &str, name: &str| -> serde_json::Value {
+            types
+                .iter()
+                .find(|t| t["name"] == ty)
+                .unwrap()["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["name"] == name)
+                .unwrap()
+                .clone()
+        };
+
+        let name = field("User", "name");
+        assert_eq!(name["kind"], "scalar");
+        assert_eq!(name["scalar"], "String");
+        assert_eq!(name["unique"], true);
+        assert_eq!(name["indexed"], false);
+
+        let age = field("User", "age");
+        assert_eq!(age["scalar"], "i64");
+        assert_eq!(age["indexed"], true);
+
+        let posts = field("User", "posts");
+        assert_eq!(posts["kind"], "relation");
+        assert_eq!(posts["target"], "Post");
+        assert_eq!(posts["many"], true);
+        assert_eq!(posts["onDelete"], "remove");
+        assert_eq!(posts["inverse"]["type"], "Post");
+        assert_eq!(posts["inverse"]["field"], "author");
+
+        let favorites = field("User", "favorites");
+        assert_eq!(favorites["onDelete"], "cascade");
+        let efs = favorites["edgeFields"].as_array().unwrap();
+        assert!(efs.iter().any(|e| e["name"] == "rating" && e["scalar"] == "f32"));
+        assert!(efs.iter().any(|e| e["name"] == "added_at" && e["scalar"] == "DateTime"));
+
+        let emb = field("User", "embedding");
+        assert_eq!(emb["kind"], "vector");
+        assert_eq!(emb["dimensions"], 384);
+        assert_eq!(emb["vectorize"]["source"], "name");
+        assert_eq!(emb["vectorize"]["model"], "all-MiniLM-L6-v2");
+        assert_eq!(emb["index"]["type"], "hnsw");
+        assert_eq!(emb["index"]["metric"], "cosine");
+        assert_eq!(emb["index"]["quantization"], "turboquant_3bit");
+        assert_eq!(emb["index"]["m"], 16);
+        assert_eq!(emb["index"]["efConstruction"], 200);
+
+        // The canonical SDL is embedded and reparsable.
+        assert!(v["sdl"].as_str().unwrap().contains("type User"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schema_endpoint_serves_introspection() {
+        let state = test_state();
+        let app = Router::new()
+            .route("/schema", get(handle_schema))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let text = tokio::task::spawn_blocking(move || {
+            ureq::get(&format!("http://{addr}/schema"))
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_to_string()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["format"], "rhypedb-schema-introspection-v1");
+        assert!(body["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "User"));
+        assert!(body["sdl"].as_str().unwrap().contains("type User"));
     }
 }

@@ -57,6 +57,31 @@ Operational snapshot.
 }
 ```
 
+#### `GET /schema`
+
+A structured introspection of the **live** schema (the post-migration schema, not the on-disk file) plus its canonical SDL — intended for tooling and typed-client codegen. Each field's `kind` is `scalar`, `relation`, or `vector`:
+
+```json
+{
+  "format": "rhypedb-schema-introspection-v1",
+  "types": [
+    {
+      "name": "Post",
+      "fields": [
+        { "name": "title", "kind": "scalar", "scalar": "String", "unique": false, "indexed": true },
+        { "name": "author", "kind": "relation", "target": "Author", "many": false, "onDelete": "cascade" },
+        { "name": "embedding", "kind": "vector", "dimensions": 384,
+          "vectorize": { "source": "title", "model": "all-MiniLM-L6-v2" },
+          "index": { "type": "hnsw", "metric": "cosine", "quantization": "turboquant_4bit", "m": 16, "efConstruction": 100 } }
+      ]
+    }
+  ],
+  "sdl": "type Author { ... }\n\ntype Post { ... }\n"
+}
+```
+
+Types are sorted by name; fields are in declaration order. Like the other data-plane endpoints it is **open** (no admin token) — the schema is no more sensitive than the queries it enables. Put it behind your own network boundary if you need to restrict it.
+
 ### Admin plane (gated by `RHYPEDB_ADMIN_TOKEN`)
 
 All routes below require `Authorization: Bearer <RHYPEDB_ADMIN_TOKEN>`. With the token unset they return `403`; with a wrong token, `401`. See [Running rhypedb](operations.md#authentication).

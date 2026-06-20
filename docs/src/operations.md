@@ -52,7 +52,7 @@ This is a same-host guard. It does **not** make it safe to point two machines at
 
 ## Authentication
 
-The data-plane endpoints (`POST /query`, `GET /status`, `GET /health`) are **open** — put them behind your own network boundary or proxy as needed.
+The data-plane endpoints (`POST /query`, `GET /status`, `GET /health`, `GET /schema`) are **open** — put them behind your own network boundary or proxy as needed.
 
 The administrative endpoints (`/admin/*` — migrations, backup, export, compaction, reload) are gated by `RHYPEDB_ADMIN_TOKEN`:
 
@@ -96,6 +96,7 @@ curl -s -X POST http://127.0.0.1:4200/admin/compact \
 
 - **`GET /health`** — liveness. Returns `200 OK` with a short status string.
 - **`GET /status`** — operational snapshot: active subscriptions, pending embeddings, and per-index vector counts.
+- **`GET /schema`** — live schema introspection (JSON + canonical SDL) for tooling and typed-client codegen. See the [API reference](api-reference.md#get-schema).
 
 ```bash
 curl -s http://127.0.0.1:4200/status
