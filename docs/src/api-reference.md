@@ -276,3 +276,7 @@ the latest writes. Statement ids are per-connection (like a Postgres session) an
 are dropped when the connection closes; executing an unknown id is an `Error`. This
 is purely a transport optimization for hot, repeated queries — there are no bind
 parameters yet (the query is fixed at `Prepare` time).
+
+Pins are bounded per connection by both a count (1024 statements) and aggregate
+query-text size (1 MiB); exceeding either returns an `Error`. There is no
+per-statement deallocate message yet — reclaim slots by closing the connection.

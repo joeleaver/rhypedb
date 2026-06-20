@@ -989,6 +989,7 @@ async fn handle_connection_stream<R, W>(
     // query pinned by id for this connection, freed when it closes. Lock-free —
     // this task owns the map.
     let mut prepared: HashMap<u64, Arc<rhypedb_query::ast::Query>> = HashMap::new();
+    let mut prepared_bytes: usize = 0;
     let mut next_stmt_id: u64 = 1;
 
     loop {
@@ -1073,12 +1074,22 @@ async fn handle_connection_stream<R, W>(
                     }
                 };
                 // Parse + cache (reuses the global parsed-query cache), pin under a
-                // per-connection id. Bound the registry so a client can't prepare
-                // without limit.
-                let write_result = if prepared.len() >= MAX_PREPARED_PER_CONN {
-                    let msg = format!(
+                // per-connection id. Bound the registry BOTH by count (map entries)
+                // AND by aggregate pinned query-text bytes — the pins are
+                // eviction-proof and live until the connection closes, so a count
+                // alone (with a 16 MiB max frame) would let a client pin many GiB.
+                let cap_error = if prepared.len() >= MAX_PREPARED_PER_CONN {
+                    Some(format!(
                         "too many prepared statements on this connection (max {MAX_PREPARED_PER_CONN})"
-                    );
+                    ))
+                } else if prepared_bytes.saturating_add(query_text.len()) > MAX_PREPARED_BYTES {
+                    Some(format!(
+                        "prepared-statement memory limit reached on this connection (max {MAX_PREPARED_BYTES} bytes)"
+                    ))
+                } else {
+                    None
+                };
+                let write_result = if let Some(msg) = cap_error {
                     protocol::write_frame_buffered(
                         writer,
                         &mut response_buf,
@@ -1092,6 +1103,7 @@ async fn handle_connection_stream<R, W>(
                         Ok(query) => {
                             let id = next_stmt_id;
                             next_stmt_id += 1;
+                            prepared_bytes += query_text.len();
                             prepared.insert(id, query);
                             protocol::write_frame_buffered(
                                 writer,
@@ -1233,9 +1245,16 @@ fn execute_parsed(
     rhypedb_query::executor::execute(&ctx, query).map_err(|e| format!("{e}"))
 }
 
-/// Max prepared statements per connection — bounds a client that prepares without
-/// bound. Far above any realistic working set; a connection close frees them all.
-const MAX_PREPARED_PER_CONN: usize = 4096;
+/// Max prepared statements per connection (map-entry count) — generous for the
+/// "hot, repeated queries" workload; a connection close frees them all.
+const MAX_PREPARED_PER_CONN: usize = 1024;
+
+/// Max aggregate pinned query-TEXT bytes per connection. The honest memory bound:
+/// prepared ASTs are eviction-proof and live for the connection, and a single
+/// frame can be up to `MAX_FRAME_PAYLOAD` (16 MiB), so the count cap alone would
+/// let a client pin many GiB. 1 MiB of query text is far beyond any real working
+/// set of hot statements.
+const MAX_PREPARED_BYTES: usize = 1024 * 1024;
 
 /// Write a `QueryOutput`/error as the appropriate response frame. Shared by the
 /// `Query` and prepared-`Execute` paths so they stay byte-identical.
@@ -1476,6 +1495,40 @@ mod tcp_tests {
         protocol::write_frame(&mut client, 7, protocol::REQ_PREPARE, &badprep).await.unwrap();
         let resp = protocol::read_frame(&mut client).await.unwrap();
         assert_eq!(resp.kind, protocol::RESP_ERROR);
+
+        drop(client);
+        let _ = handler.await;
+    }
+
+    #[tokio::test]
+    async fn prepare_refuses_past_the_byte_cap() {
+        let state = test_state();
+        let (mut client, server) = duplex(64 * 1024);
+
+        let handler = tokio::spawn(async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let (read, write) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut writer = tokio::io::BufWriter::new(write);
+            handle_connection_stream(&mut reader, &mut writer, state, shutdown_rx).await;
+        });
+
+        // Each statement pins ~600 KiB of query text; the second pushes the
+        // aggregate over the 1 MiB per-connection cap and must be refused.
+        let big = "x".repeat(600 * 1024);
+        let payload =
+            protocol::encode_prepare_payload(&format!(r#"User.create({{ name: "{big}", age: 1 }})"#));
+
+        protocol::write_frame(&mut client, 1, protocol::REQ_PREPARE, &payload).await.unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.kind, protocol::RESP_PREPARED, "first big statement fits");
+
+        protocol::write_frame(&mut client, 2, protocol::REQ_PREPARE, &payload).await.unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.kind, protocol::RESP_ERROR, "second exceeds the byte cap");
+        assert!(protocol::decode_error_payload(&resp.payload)
+            .unwrap()
+            .contains("memory limit"));
 
         drop(client);
         let _ = handler.await;
