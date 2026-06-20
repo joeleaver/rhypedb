@@ -2465,6 +2465,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhypedb-codegen"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rhypedb-schema",
+ "syn",
+]
+
+[[package]]
 name = "rhypedb-embed"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,21 @@
+[package]
+name = "rhypedb-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rhypedb_codegen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rhypedb-codegen"
+path = "src/main.rs"
+
+[dependencies]
+rhypedb-schema = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+# Parse generated output to assert it is syntactically valid Rust.
+syn = { version = "2", features = ["full"] }

@@ -82,6 +82,24 @@ A structured introspection of the **live** schema (the post-migration schema, no
 
 Types are sorted by name; fields are in declaration order. Like the other data-plane endpoints it is **open** (no admin token) — the schema is no more sensitive than the queries it enables. Put it behind your own network boundary if you need to restrict it.
 
+### Generated clients
+
+`rhypedb-codegen` turns a schema into a typed client. Today it emits a Rust module of `serde`-deriving row structs — one per object type, carrying that type's scalar fields (each `Option<T>`, so a column-projected response still deserializes) plus `TYPE_NAME` / `FIELDS` constants:
+
+```bash
+rhypedb-codegen --schema schema.rhype --out client.rs   # omit --out to write stdout
+```
+
+```rust
+mod client;            // the generated module
+use client::User;
+
+let obj = &response["object"];                          // POST /query envelope
+let user: User = serde_json::from_value(obj["fields"].clone())?;   // the id is obj["id"]
+```
+
+Relations and vector fields are listed in each struct's doc comment but are not scalar columns. A typed query builder and a JS/TS target are planned.
+
 ### Admin plane (gated by `RHYPEDB_ADMIN_TOKEN`)
 
 All routes below require `Authorization: Bearer <RHYPEDB_ADMIN_TOKEN>`. With the token unset they return `403`; with a wrong token, `401`. See [Running rhypedb](operations.md#authentication).
