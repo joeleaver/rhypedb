@@ -84,21 +84,31 @@ Types are sorted by name; fields are in declaration order. Like the other data-p
 
 ### Generated clients
 
-`rhypedb-codegen` turns a schema into a typed client. Today it emits a Rust module of `serde`-deriving row structs — one per object type, carrying that type's scalar fields (each `Option<T>`, so a column-projected response still deserializes) plus `TYPE_NAME` / `FIELDS` constants:
+`rhypedb-codegen` turns a schema into a typed Rust client module:
 
 ```bash
 rhypedb-codegen --schema schema.rhype --out client.rs   # omit --out to write stdout
 ```
 
-```rust
-mod client;            // the generated module
-use client::User;
+It emits, per object type, a `serde`-deriving row struct (scalar fields, each `Option<T>` so a column-projected response still deserializes) plus typed query constructors and a `Row<T>` response parser:
 
-let obj = &response["object"];                          // POST /query envelope
-let user: User = serde_json::from_value(obj["fields"].clone())?;   // the id is obj["id"]
+```rust
+mod client;                                   // the generated module
+use client::{User, Row};
+
+// Build a query string — send `.build()` as the `query` of a `POST /query` body.
+let query = User::all().filter(".age > 18").limit(10).build();
+// -> "User.filter(.age > 18).limit(10)"
+
+// Parse the response into typed rows: the object `id` from the envelope plus the
+// typed `fields`, for both `{ "object": .. }` and `{ "objects": [..] }` shapes.
+let rows: Vec<Row<User>> = Row::from_response(&response_json)?;
+for row in &rows {
+    println!("{}: {:?}", row.id, row.data.name);
+}
 ```
 
-Relations and vector fields are listed in each struct's doc comment but are not scalar columns. A typed query builder and a JS/TS target are planned.
+The builder is transport-agnostic — bring your own HTTP client. Relations and vector fields are documented in each struct but are not scalar columns; typed `create`/write queries and a JS/TS target are planned.
 
 ### Admin plane (gated by `RHYPEDB_ADMIN_TOKEN`)
 

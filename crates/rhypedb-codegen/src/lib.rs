@@ -23,15 +23,96 @@ const HEADER: &str = "\
 // projected/partial response still deserializes. Relations and vector fields are
 // documented per struct but are not scalar columns.
 //
-// Use as a module, e.g. `mod client;`. Requires `serde` (with `derive`); a
-// `Json` field also needs `serde_json`. `DateTime` is represented as a `String`;
-// `Bytes` is currently returned by `/query` only as a placeholder and does not
-// round-trip.
+// Use as a module, e.g. `mod client;`. Requires `serde` (with `derive`) and
+// `serde_json`. `DateTime` is represented as a `String`; `Bytes` is currently
+// returned by `/query` only as a placeholder and does not round-trip.
+//
+// Read queries: build a typed `Query` from a constructor (e.g. `User::all()`),
+// chain `.filter(..)` / `.limit(..)`, send `.build()` as the `query` of a
+// `POST /query` body, then parse the response with `Row::<User>::from_response`.
 
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 ";
+
+const RUNTIME: &str = r#"
+/// A typed query string targeting one object type. Build it from a typed
+/// constructor (e.g. `User::all()`), optionally chain `.filter(..)` / `.limit(..)`,
+/// then send `.build()` as the `query` field of a `POST /query` body and parse
+/// the response with `Row`. This is a thin string builder; the server validates
+/// query composition.
+#[derive(Debug, Clone)]
+pub struct Query<T> {
+    text: String,
+    _row: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Query<T> {
+    fn raw(text: String) -> Self {
+        Query { text, _row: std::marker::PhantomData }
+    }
+    /// Append `.filter(<predicate>)`, e.g. `.filter(".age > 18")`.
+    pub fn filter(mut self, predicate: &str) -> Self {
+        self.text.push_str(".filter(");
+        self.text.push_str(predicate);
+        self.text.push(')');
+        self
+    }
+    /// Append `.limit(<n>)`.
+    pub fn limit(mut self, n: u64) -> Self {
+        self.text.push_str(&format!(".limit({n})"));
+        self
+    }
+    /// Consume the builder, returning the query string.
+    pub fn build(self) -> String {
+        self.text
+    }
+    /// Borrow the query string.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl<T> std::fmt::Display for Query<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// A query-result row: the object `id` from the `POST /query` envelope plus its
+/// typed scalar fields.
+#[derive(Debug, Clone)]
+pub struct Row<T> {
+    pub id: u64,
+    pub data: T,
+}
+
+impl<T: serde::de::DeserializeOwned> Row<T> {
+    /// Parse one `{ "type", "id", "fields": { .. } }` object value.
+    pub fn from_object(v: &serde_json::Value) -> Result<Self, String> {
+        let id = v
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| String::from("object missing numeric `id`"))?;
+        let fields = v.get("fields").cloned().unwrap_or(serde_json::Value::Null);
+        let data = serde_json::from_value(fields).map_err(|e| e.to_string())?;
+        Ok(Row { id, data })
+    }
+
+    /// Parse a `POST /query` response — either `{ "object": { .. } }` (single) or
+    /// `{ "objects": [ .. ] }` (list) — into typed rows.
+    pub fn from_response(resp: &serde_json::Value) -> Result<Vec<Self>, String> {
+        if let Some(one) = resp.get("object") {
+            return Ok(vec![Self::from_object(one)?]);
+        }
+        if let Some(arr) = resp.get("objects").and_then(serde_json::Value::as_array) {
+            return arr.iter().map(Self::from_object).collect();
+        }
+        Err(String::from("response had neither `object` nor `objects`"))
+    }
+}
+"#;
 
 /// Generate a Rust module (source text) of typed row structs for `schema`.
 ///
@@ -40,6 +121,7 @@ use serde::{Deserialize, Serialize};
 /// order. The output is deterministic for a given schema.
 pub fn generate_rust(schema: &Schema) -> String {
     let mut out = String::from(HEADER);
+    out.push_str(RUNTIME);
 
     let mut names: Vec<&String> = schema.types.keys().collect();
     names.sort();
@@ -102,6 +184,19 @@ fn emit_struct(out: &mut String, td: &TypeDef) {
         "    pub const FIELDS: &'static [&'static str] = &[{}];\n",
         scalar_fields.join(", ")
     ));
+
+    // Typed read-query constructors → `Query<Self>`.
+    let t = &td.name;
+    out.push_str(&format!(
+        "\n    /// `{t}` — all objects of this type.\n    pub fn all() -> Query<{t}> {{ Query::raw(String::from(\"{t}\")) }}\n"
+    ));
+    out.push_str(&format!(
+        "    /// `{t}.get(id)` — one object by id.\n    pub fn get(id: u64) -> Query<{t}> {{ Query::raw(format!(\"{t}.get({{id}})\")) }}\n"
+    ));
+    out.push_str(&format!(
+        "    /// `{t}.filter(predicate)` — e.g. `{t}::filter(\".age > 18\")`.\n    pub fn filter(predicate: &str) -> Query<{t}> {{ Query::raw(format!(\"{t}.filter({{predicate}})\")) }}\n"
+    ));
+
     out.push_str("}\n");
 }
 
@@ -238,6 +333,21 @@ mod tests {
         let mango = code.find("struct Mango").unwrap();
         let zebra = code.find("struct Zebra").unwrap();
         assert!(apple < mango && mango < zebra, "types must be name-sorted");
+    }
+
+    #[test]
+    fn emits_query_runtime_and_typed_constructors() {
+        let code = gen_rs(r#"type User { name: String  age: i64 }"#);
+        // Generic runtime types emitted once.
+        assert!(code.contains("pub struct Query<T>"));
+        assert!(code.contains("pub struct Row<T>"));
+        assert!(code.contains("pub fn from_response(resp: &serde_json::Value)"));
+        assert!(code.contains("pub fn filter(mut self, predicate: &str) -> Self"));
+        assert!(code.contains("pub fn limit(mut self, n: u64) -> Self"));
+        // Per-type typed constructors.
+        assert!(code.contains("pub fn all() -> Query<User> { Query::raw(String::from(\"User\")) }"));
+        assert!(code.contains("pub fn get(id: u64) -> Query<User> { Query::raw(format!(\"User.get({id})\")) }"));
+        assert!(code.contains("pub fn filter(predicate: &str) -> Query<User> { Query::raw(format!(\"User.filter({predicate})\")) }"));
     }
 
     #[test]
