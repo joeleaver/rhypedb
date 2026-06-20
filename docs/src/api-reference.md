@@ -108,7 +108,20 @@ for row in &rows {
 }
 ```
 
-The builder is transport-agnostic — bring your own HTTP client. Relations and vector fields are documented in each struct but are not scalar columns; typed `create`/write queries and a JS/TS target are planned.
+A **TypeScript** client (`--lang ts`) mirrors the same shape — an `interface` per type plus a value namespace of query constructors, a `Query` builder, and a `parseResponse` helper:
+
+```bash
+rhypedb-codegen --schema schema.rhype --lang ts --out client.ts
+```
+
+```typescript
+import { User, parseResponse, type Row } from "./client.ts";
+
+const query = User.all().filter(".age > 18").limit(10).build();
+const rows: Array<Row<User>> = parseResponse<User>(responseJson);   // { id, data }
+```
+
+The builder is transport-agnostic — bring your own HTTP client. Relations and vector fields are documented per type but are not scalar columns; typed `create`/write queries are planned.
 
 ### Admin plane (gated by `RHYPEDB_ADMIN_TOKEN`)
 

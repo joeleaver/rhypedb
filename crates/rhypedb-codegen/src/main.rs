@@ -20,18 +20,13 @@ struct Cli {
     #[arg(short, long)]
     out: Option<PathBuf>,
 
-    /// Target language. Only `rust` is supported today.
+    /// Target language: `rust` or `ts` (`typescript`).
     #[arg(short, long, default_value = "rust")]
     lang: String,
 }
 
 fn main() {
     let cli = Cli::parse();
-
-    if cli.lang != "rust" {
-        eprintln!("unsupported --lang '{}': only 'rust' is supported", cli.lang);
-        std::process::exit(2);
-    }
 
     let sdl = std::fs::read_to_string(&cli.schema).unwrap_or_else(|e| {
         eprintln!("failed to read schema {:?}: {e}", cli.schema);
@@ -43,7 +38,14 @@ fn main() {
         std::process::exit(1);
     });
 
-    let code = rhypedb_codegen::generate_rust(&schema);
+    let code = match cli.lang.as_str() {
+        "rust" => rhypedb_codegen::generate_rust(&schema),
+        "ts" | "typescript" => rhypedb_codegen::generate_typescript(&schema),
+        other => {
+            eprintln!("unsupported --lang '{other}': expected 'rust' or 'ts'");
+            std::process::exit(2);
+        }
+    };
 
     match &cli.out {
         Some(path) => {
