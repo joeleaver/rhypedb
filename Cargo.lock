@@ -2456,6 +2456,8 @@ name = "rhypedb-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rhypedb-codegen",
+ "rhypedb-schema",
  "rustyline",
  "serde",
  "serde_json",

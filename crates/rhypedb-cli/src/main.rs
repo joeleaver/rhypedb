@@ -58,6 +58,19 @@ enum Commands {
         /// The snapshot directory to check.
         dir: PathBuf,
     },
+    /// Generate a typed client from the server's LIVE schema (`GET <host>/schema`)
+    /// or a local SDL file — Rust structs + query builder, or TypeScript.
+    Codegen {
+        /// Target language: `rust` (default) or `ts` (`typescript`).
+        #[arg(short, long, default_value = "rust")]
+        lang: String,
+        /// Output file. Defaults to stdout.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Generate from a local SDL file instead of the live server.
+        #[arg(long)]
+        schema: Option<PathBuf>,
+    },
     /// Logical export — a portable, version-independent NDJSON dump
     /// (talks to /admin/export).
     Export {
@@ -707,6 +720,57 @@ fn run_verify(dir: &Path) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Codegen — typed client from the live schema or a local SDL file
+// ---------------------------------------------------------------------------
+
+/// Fetch the canonical SDL from a running server's open `GET /schema` endpoint.
+fn fetch_sdl(host: &str) -> Result<String, String> {
+    let url = format!("{}/schema", host.trim_end_matches('/'));
+    let mut resp = ureq::get(&url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let text = resp
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("read {url}: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse {url} response: {e}"))?;
+    json.get("sdl")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{url}: response has no 'sdl' field — is this a rhypedb server?"))
+}
+
+fn run_codegen(
+    cli: &Cli,
+    lang: &str,
+    out: &Option<PathBuf>,
+    schema_file: &Option<PathBuf>,
+) -> Result<(), String> {
+    // SDL source: a local file (offline), else the live server's `GET /schema`.
+    let sdl = match schema_file {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| format!("read schema {path:?}: {e}"))?,
+        None => fetch_sdl(&cli.host)?,
+    };
+    let schema =
+        rhypedb_schema::parser::parse_schema(&sdl).map_err(|e| format!("schema error: {e}"))?;
+    let code = match lang {
+        "rust" => rhypedb_codegen::generate_rust(&schema),
+        "ts" | "typescript" => rhypedb_codegen::generate_typescript(&schema),
+        other => return Err(format!("unsupported --lang '{other}': expected 'rust' or 'ts'")),
+    };
+    match out {
+        Some(path) => {
+            std::fs::write(path, &code).map_err(|e| format!("write {path:?}: {e}"))?;
+            eprintln!("wrote {} type(s) to {path:?}", schema.types.len());
+        }
+        None => print!("{code}"),
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Logical export / verify (Overboard cmqikqug4)
 // ---------------------------------------------------------------------------
 
@@ -1018,6 +1082,7 @@ fn main() {
                 vectors,
             } => run_export(&cli, dest, download, label, types, vectors),
             Commands::VerifyExport { file } => run_verify_export(file),
+            Commands::Codegen { lang, out, schema } => run_codegen(&cli, lang, out, schema),
             Commands::Migrate { .. } => unreachable!("handled above"),
         };
         if let Err(e) = result {
@@ -1077,6 +1142,51 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cli() -> Cli {
+        Cli {
+            host: "http://127.0.0.1:0".into(),
+            execute: None,
+            admin_token: None,
+            command: None,
+        }
+    }
+
+    #[test]
+    fn codegen_file_mode_generates_rust_and_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = dir.path().join("s.rhype");
+        std::fs::write(&schema, "type User {\n  name: String\n  age: u32\n}\n").unwrap();
+
+        let rs = dir.path().join("client.rs");
+        run_codegen(&test_cli(), "rust", &Some(rs.clone()), &Some(schema.clone())).unwrap();
+        assert!(std::fs::read_to_string(&rs).unwrap().contains("pub struct User"));
+
+        let ts = dir.path().join("client.ts");
+        run_codegen(&test_cli(), "ts", &Some(ts.clone()), &Some(schema)).unwrap();
+        assert!(std::fs::read_to_string(&ts).unwrap().contains("interface User"));
+    }
+
+    #[test]
+    fn codegen_rejects_unknown_lang() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = dir.path().join("s.rhype");
+        std::fs::write(&schema, "type User { name: String }\n").unwrap();
+        let err = run_codegen(&test_cli(), "cobol", &None, &Some(schema)).unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
+    }
+
+    #[test]
+    fn codegen_reports_a_bad_schema_file() {
+        let err = run_codegen(
+            &test_cli(),
+            "rust",
+            &None,
+            &Some(PathBuf::from("/no/such/schema.rhype")),
+        )
+        .unwrap_err();
+        assert!(err.contains("read schema"), "{err}");
+    }
 
     fn write_fake_backup(dir: &Path) {
         std::fs::create_dir_all(dir.join("sst")).unwrap();

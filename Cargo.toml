@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 rhypedb-storage = { path = "crates/rhypedb-storage" }
 rhypedb-schema = { path = "crates/rhypedb-schema" }
+rhypedb-codegen = { path = "crates/rhypedb-codegen" }
 # default-features off on the crates that sit on a path to rhypedb-embed, so the
 # ONNX linking choice (onnx-download / onnx-dynamic) flows from the top binary and
 # no path silently re-enables the build-time download via feature unification.

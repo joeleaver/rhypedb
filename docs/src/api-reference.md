@@ -90,6 +90,19 @@ Types are sorted by name; fields are in declaration order. Like the other data-p
 rhypedb-codegen --schema schema.rhype --out client.rs   # omit --out to write stdout
 ```
 
+Or generate against a **running server's live schema** (no schema file needed) with
+the `rhypedb-cli codegen` subcommand, which fetches [`GET /schema`](#get-schema):
+
+```bash
+rhypedb-cli --host http://127.0.0.1:4200 codegen --lang rust --out client.rs
+rhypedb-cli --host http://127.0.0.1:4200 codegen --lang ts   --out client.ts
+rhypedb-cli codegen --schema schema.rhype                    # offline file mode, to stdout
+```
+
+Both produce byte-identical output for the same schema; the live form just sources
+the SDL from the server instead of a file (handy after a migration, since the live
+schema reflects the post-migration shape).
+
 It emits, per object type, a `serde`-deriving row struct (scalar fields, each `Option<T>` so a column-projected response still deserializes) plus typed query constructors and a `Row<T>` response parser:
 
 ```rust

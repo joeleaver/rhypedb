@@ -9,6 +9,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rustyline = { workspace = true }
 ureq = { workspace = true }
+# Typed-client codegen (`codegen` subcommand). These are lightweight pure-Rust
+# crates (schema parser + code emitter) — NOT the engine, so the CLI stays
+# engine-free.
+rhypedb-schema = { workspace = true }
+rhypedb-codegen = { workspace = true }
 # Unpack a streamed `/admin/backup/stream` tar (download/restore/verify).
 tar = "0.4"
 
