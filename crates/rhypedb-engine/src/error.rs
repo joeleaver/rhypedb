@@ -28,6 +28,12 @@ pub enum EngineError {
     #[error("object not found: {type_name}:{object_id}")]
     ObjectNotFound { type_name: String, object_id: u64 },
 
+    #[error(
+        "object {type_name}:{object_id} already exists; an additive restore will not \
+         overwrite it (import into a fresh database instead)"
+    )]
+    RestoreObjectExists { type_name: String, object_id: u64 },
+
     #[error("field not found: '{field}' on type '{type_name}'")]
     FieldNotFound { type_name: String, field: String },
 

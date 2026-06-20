@@ -3945,6 +3945,7 @@ impl Database {
         &self,
         type_name: &str,
         rows: Vec<(u64, FieldMap)>,
+        reject_existing: bool,
     ) -> EngineResult<()> {
         if rows.is_empty() {
             return Ok(());
@@ -3963,6 +3964,22 @@ impl Database {
         let mut max_id = 0u64;
 
         for (object_id, fields) in &rows {
+            // Additive (online) restore: refuse an id that already exists rather
+            // than overwriting it — restore_objects is an insert path and would
+            // leave the prior object's unique/index/edge entries stale. A
+            // deleted id reads as absent here, so it is reusable.
+            if reject_existing {
+                let key = KeyBuilder::object(type_id, *object_id);
+                if self.storage.get(&txn, &key).map_err(EngineError::Storage)?.is_some() {
+                    for (id, _) in &staged {
+                        self.rollback_version(type_id, *id);
+                    }
+                    return Err(EngineError::RestoreObjectExists {
+                        type_name: type_name.into(),
+                        object_id: *object_id,
+                    });
+                }
+            }
             match self.stage_create_writes(
                 &mut txn, type_name, type_def, type_id, *object_id, fields, &mut puts,
                 &mut staged_unique,
@@ -9144,7 +9161,7 @@ mod tests {
                 f
             }),
         ];
-        db.restore_objects("User", rows).unwrap();
+        db.restore_objects("User", rows, false).unwrap();
 
         // Ids preserved exactly.
         assert_eq!(
@@ -9204,7 +9221,7 @@ mod tests {
                 f
             }),
         ];
-        let r = db.restore_objects("User", rows);
+        let r = db.restore_objects("User", rows, false);
         assert!(matches!(r, Err(EngineError::UniqueViolation { .. })), "got {r:?}");
         // Nothing landed.
         assert!(db.get("User", 1).is_err());
@@ -9235,7 +9252,7 @@ mod tests {
                     (id, f)
                 })
                 .collect();
-            db.restore_objects("Item", rows).unwrap();
+            db.restore_objects("Item", rows, false).unwrap();
         }
         let db = Database::open(schema, dir.path()).unwrap();
         assert_eq!(db.get("Item", 42).unwrap().fields.get("n"), Some(&Value::U32(42)));
@@ -9252,7 +9269,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let schema = parse_schema(r#"type Doc { embedding: Vector<3> }"#).unwrap();
         let db = Database::open(schema, dir.path()).unwrap();
-        db.restore_objects("Doc", vec![(7, FieldMap::new())]).unwrap();
+        db.restore_objects("Doc", vec![(7, FieldMap::new())], false).unwrap();
 
         let mut buf = bytes::BytesMut::new();
         for f in [1.0f32, 2.0, 3.0] {

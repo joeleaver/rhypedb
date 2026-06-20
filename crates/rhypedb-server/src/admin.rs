@@ -1034,11 +1034,28 @@ struct ImportQuery {
     vectors: Option<String>,
 }
 
+/// Per-process monotonic counter making each online-import temp file unique even
+/// when two imports read the clock in the same instant.
+static IMPORT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Removes a temp file on drop unless disarmed — so a cancelled handler (client
+/// disconnect) does not leak the streamed file into the data dir.
+struct TempFileGuard(std::path::PathBuf);
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn server_error(msg: &str) -> Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": msg }))).into_response()
+}
+
 /// `POST /admin/import/stream` — apply a logical NDJSON dump to the LIVE
-/// database (additive, non-atomic, upsert-by-id; see `run_online_import`). The
-/// body is streamed to a temp file (OOM-safe) before being applied on the
-/// blocking pool. Refused with 409 while a field-type migration is in flight; a
-/// concurrent hot-reload is fenced for the apply.
+/// database (additive, insert-only, refuses id collisions; see
+/// `run_online_import`). The body is streamed to a temp file (OOM-safe) before
+/// being applied on the blocking pool. Refused with 409 while a field-type
+/// migration is in flight; a concurrent hot-reload is fenced for the apply.
 async fn import_stream(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ImportQuery>,
@@ -1055,28 +1072,34 @@ async fn import_stream(
         }
     };
 
-    // Stream the body to a temp file under the data dir FIRST — no locks held
-    // during the (potentially large) upload.
+    // Unique temp path (pid + monotonic nonce + clock) so concurrent imports
+    // never collide on the file. The guard removes it on EVERY exit, including
+    // handler cancellation.
+    let nonce = IMPORT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = state.data_dir.join(format!(
-        ".rhypedb-online-import-{}-{nanos}.ndjson",
+        ".rhypedb-online-import-{}-{nonce}-{nanos}.ndjson",
         std::process::id()
     ));
+    let _tmp_guard = TempFileGuard(tmp.clone());
+
+    // Stream the body to the temp file FIRST — no locks held during the
+    // (potentially large) upload. A write failure here is a server-side IO error.
     if let Err(m) = stream_body_to_file(body, &tmp).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return bad_request(&m);
+        return server_error(&m);
     }
 
     // Fence a concurrent hot-reload (like /query) and refuse a migration in
-    // flight, then apply on the blocking pool.
+    // flight, then apply on the blocking pool. (The fence is held for the whole
+    // apply — a long import blocks a reload for its duration, which is intended:
+    // the import needs a stable schema.)
     let _epoch = state.reload_lock.read().await;
     let db = state.db();
     let migrating = db.migrating_fields();
     if migrating > 0 {
-        let _ = tokio::fs::remove_file(&tmp).await;
         return (
             StatusCode::CONFLICT,
             Json(json!({
@@ -1094,7 +1117,6 @@ async fn import_stream(
         crate::import::run_online_import(&apply_path, &db, vectors, vectorizer.as_deref())
     })
     .await;
-    let _ = tokio::fs::remove_file(&tmp).await;
 
     match result {
         Ok(Ok(report)) => (
@@ -1109,12 +1131,9 @@ async fn import_stream(
             })),
         )
             .into_response(),
+        // Import errors are dump/schema/collision issues (client-facing).
         Ok(Err(msg)) => bad_request(&msg),
-        Err(join) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("import task failed: {join}") })),
-        )
-            .into_response(),
+        Err(join) => server_error(&format!("import task failed: {join}")),
     }
 }
 

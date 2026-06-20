@@ -133,9 +133,9 @@ curl -X POST "http://127.0.0.1:4200/admin/import/stream?vectors=raw" \
 Unlike the offline path it can't stage-and-swap (the server holds the data dir open), so it writes directly to the live database. That means:
 
 - **Additive and non-atomic** — a mid-stream failure can leave partially-imported data (there is no all-or-nothing swap).
-- **Upsert-by-id** — because ids are preserved verbatim, importing an object whose id already exists *overwrites* it. That is what you want for re-importing, a replica, or disjoint id spaces, but it will clobber unrelated objects if you merge two databases that both assigned the same ids. (True cross-database merge would need id remapping, which the format deliberately avoids.)
+- **Insert-only; refuses id collisions** — ids are preserved verbatim, and the format is built for restoring a whole database into a *fresh* dir, not merging into a populated one. An imported id that already exists is *refused* (overwriting it would leave the old object's unique/index/edge entries stale). You can still import into a populated DB with a disjoint id space; to replace existing data, import into a fresh database.
 - **Refused during a migration** — returns `409` while a field-type migration is in flight.
-- `vectors=reembed` enqueues re-embedding jobs for the live worker (so `@vectorize` vectors fill in asynchronously); `raw`/`none` behave as offline.
+- **Vectors are searchable immediately** — imported vectors are written through the live index, not just the on-disk keys, so no restart is needed. `vectors=reembed` instead enqueues re-embedding jobs for `@vectorize` fields (the worker fills them in asynchronously).
 
 Use the offline `rhypedb-import` for the safe, all-or-nothing path; use online import when you need to load into a running server and accept the upsert/non-atomic semantics.
 

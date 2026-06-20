@@ -95,7 +95,9 @@ pub fn run_import(
     let report = {
         let db = Database::open(schema, &staging)
             .map_err(|e| format!("open staging dir: {e}"))?;
-        let mut report = import_pass(src, &db, opts)?;
+        // Offline: fresh staging dir, so ids never collide (reject_existing=false);
+        // vectors restore to LSM only and the HNSW rebuilds on first open.
+        let mut report = import_pass(src, &db, opts, false, None)?;
         // The validation above checked the file's INTERNAL counts; re-check what
         // we actually imported against the trailer to catch a file that changed
         // between the validate read and the import read (TOCTOU). verify_counts
@@ -350,26 +352,52 @@ fn flush_objects(
     db: &Database,
     ty: &Option<String>,
     buf: &mut Vec<(u64, FieldMap)>,
+    reject_existing: bool,
 ) -> Result<(), String> {
     if let Some(t) = ty
         && !buf.is_empty()
     {
-        db.restore_objects(t, std::mem::take(buf))
+        db.restore_objects(t, std::mem::take(buf), reject_existing)
             .map_err(|e| format!("restore objects of {t}: {e}"))?;
     }
     Ok(())
+}
+
+/// Decode a big-endian f32 vector payload (as stored in `v:` keys / shipped in a
+/// dump) into a `Vec<f32>`.
+fn bytes_to_f32_be(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 fn flush_vectors(
     db: &Database,
     key: &Option<(String, String)>,
     buf: &mut Vec<(u64, Bytes)>,
+    vectorizer: Option<&Vectorizer>,
 ) -> Result<(), String> {
     if let Some((t, f)) = key
         && !buf.is_empty()
     {
-        db.restore_vectors(t, f, &std::mem::take(buf))
-            .map_err(|e| format!("restore vectors of {t}.{f}: {e}"))?;
+        let rows = std::mem::take(buf);
+        match vectorizer {
+            // Online: write through the live vectorizer so the vectors land in
+            // the in-memory HNSW index and are immediately searchable.
+            // `restore_vectors` writes only the LSM `v:` keys, which the live
+            // index would not see until the next restart rebuilds it.
+            Some(vz) => {
+                let f32_rows: Vec<(u64, Vec<f32>)> =
+                    rows.iter().map(|(id, b)| (*id, bytes_to_f32_be(b))).collect();
+                vz.ingest_vectors(t, f, &f32_rows)
+                    .map_err(|e| format!("ingest vectors of {t}.{f}: {e}"))?;
+            }
+            // Offline: the HNSW index rebuilds from the `v:` keys on next open.
+            None => {
+                db.restore_vectors(t, f, &rows)
+                    .map_err(|e| format!("restore vectors of {t}.{f}: {e}"))?;
+            }
+        }
     }
     Ok(())
 }
@@ -473,17 +501,21 @@ fn reembed_pass(db: &Database, report: &mut ImportReport) -> Result<(), String> 
 /// Apply a logical export to a LIVE, already-open database — the online
 /// counterpart of [`run_import`]. The live server holds the data dir open, so
 /// there is NO staging + atomic swap: this writes directly, which makes it
-/// **additive, non-atomic** (a mid-stream failure can leave partial data) with
-/// **upsert-by-id** semantics — an imported id overwrites any existing object at
-/// that id. That is correct for re-importing / a replica / disjoint id spaces,
-/// but HAZARDOUS for merging two unrelated databases, because the format
-/// preserves ids verbatim with no remap. Objects are applied against the LIVE
-/// schema (the dump's schema line is ignored); a field the schema lacks surfaces
-/// as an error. The caller MUST refuse a concurrent field-type migration first.
+/// **additive and non-atomic** (a mid-stream failure can leave partial data).
+/// It is **insert-only and refuses id collisions**: the id-preserving, no-remap
+/// format is built for restoring a whole database into a *fresh* dir, not for
+/// merging into a populated one, and overwriting an existing id would leave its
+/// prior unique/index/edge entries stale — so an imported id that already
+/// exists fails the import (`RestoreObjectExists`). That still allows importing
+/// into a populated DB with a disjoint id space; to replace existing data,
+/// import into a fresh database. Objects apply against the LIVE schema (the
+/// dump's schema line is ignored); a field the schema lacks surfaces as an
+/// error. The caller MUST refuse a concurrent field-type migration first.
 ///
-/// In `Reembed` mode the dump omits `@vectorize` vectors; this enqueues an
-/// embedding job per imported `@vectorize` object so the live worker re-derives
-/// them from source text asynchronously.
+/// Vectors are written through the live `vectorizer` (when present) so they are
+/// immediately searchable. In `Reembed` mode the dump omits `@vectorize`
+/// vectors; this enqueues an embedding job per imported `@vectorize` object so
+/// the live worker re-derives them from source text asynchronously.
 pub fn run_online_import(
     src: &Path,
     db: &Database,
@@ -492,7 +524,9 @@ pub fn run_online_import(
 ) -> Result<ImportReport, String> {
     let validated = validate_file(src)?;
     let opts = ImportOptions { force: false, vectors };
-    let mut report = import_pass(src, db, &opts)?;
+    // Online: additive into the live DB — refuse an id that already exists, and
+    // write vectors through the live index (when a vectorizer is present).
+    let mut report = import_pass(src, db, &opts, true, vectorizer)?;
     verify_counts(&report, &validated, &opts)?;
     if vectors == VectorImportMode::Reembed {
         report.reembed_enqueued = enqueue_reembed(src, db, vectorizer)?;
@@ -567,6 +601,8 @@ fn import_pass(
     path: &Path,
     db: &Database,
     opts: &ImportOptions,
+    reject_existing: bool,
+    vectorizer: Option<&Vectorizer>,
 ) -> Result<ImportReport, String> {
     let file =
         std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -592,7 +628,7 @@ fn import_pass(
                 let t = str_field(&v, "type")?;
                 if obj_type.as_deref() != Some(t) {
                     // Type changed → flush the previous type's buffer.
-                    flush_objects(db, &obj_type, &mut obj_buf)?;
+                    flush_objects(db, &obj_type, &mut obj_buf, reject_existing)?;
                     obj_type = Some(t.to_owned());
                 }
                 let id = u64_field(&v, "id")?;
@@ -600,14 +636,14 @@ fn import_pass(
                     .map_err(|e| format!("object {t}:{id} fields: {e}"))?;
                 obj_buf.push((id, fields));
                 if obj_buf.len() >= IMPORT_CHUNK {
-                    flush_objects(db, &obj_type, &mut obj_buf)?;
+                    flush_objects(db, &obj_type, &mut obj_buf, reject_existing)?;
                 }
                 report.objects += 1;
             }
 
             Some("edge") => {
                 // All objects precede all edges, so every endpoint now exists.
-                flush_objects(db, &obj_type, &mut obj_buf)?;
+                flush_objects(db, &obj_type, &mut obj_buf, reject_existing)?;
                 obj_type = None;
                 let src_type = str_field(&v, "type")?;
                 let src = u64_field(&v, "src")?;
@@ -626,7 +662,7 @@ fn import_pass(
             }
 
             Some("vector") => {
-                flush_objects(db, &obj_type, &mut obj_buf)?;
+                flush_objects(db, &obj_type, &mut obj_buf, reject_existing)?;
                 obj_type = None;
                 if opts.vectors == VectorImportMode::None {
                     continue;
@@ -635,7 +671,7 @@ fn import_pass(
                 let field = str_field(&v, "field")?;
                 let key = (t.to_owned(), field.to_owned());
                 if vec_key.as_ref() != Some(&key) {
-                    flush_vectors(db, &vec_key, &mut vec_buf)?;
+                    flush_vectors(db, &vec_key, &mut vec_buf, vectorizer)?;
                     vec_key = Some(key);
                 }
                 let id = u64_field(&v, "id")?;
@@ -645,15 +681,15 @@ fn import_pass(
                 .map_err(|e| format!("vector {t}:{id}.{field}: {e}"))?;
                 vec_buf.push((id, Bytes::from(raw)));
                 if vec_buf.len() >= IMPORT_CHUNK {
-                    flush_vectors(db, &vec_key, &mut vec_buf)?;
+                    flush_vectors(db, &vec_key, &mut vec_buf, vectorizer)?;
                 }
                 report.vectors += 1;
             }
 
             Some("trailer") => {
-                flush_objects(db, &obj_type, &mut obj_buf)?;
+                flush_objects(db, &obj_type, &mut obj_buf, reject_existing)?;
                 obj_type = None;
-                flush_vectors(db, &vec_key, &mut vec_buf)?;
+                flush_vectors(db, &vec_key, &mut vec_buf, vectorizer)?;
                 vec_key = None;
                 if let Some(c) = v.get("counts").and_then(Json::as_object) {
                     report.types = c.len();
@@ -666,8 +702,8 @@ fn import_pass(
 
     // The trailer was validated to be present + last, so the buffers above are
     // already flushed; this is a belt-and-suspenders final flush.
-    flush_objects(db, &obj_type, &mut obj_buf)?;
-    flush_vectors(db, &vec_key, &mut vec_buf)?;
+    flush_objects(db, &obj_type, &mut obj_buf, reject_existing)?;
+    flush_vectors(db, &vec_key, &mut vec_buf, vectorizer)?;
     Ok(report)
 }
 
@@ -999,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    fn online_import_additive_upsert() {
+    fn online_import_refuses_id_collision() {
         // A LIVE target DB already holding User id 1.
         let sdl = r#"type User { score: i64
             note: String }"#;
@@ -1010,38 +1046,30 @@ mod tests {
         f.insert("note".into(), Value::String("original".into()));
         let id1 = target.create("User", f).unwrap().id;
 
-        // Source DB (same schema): id 1 (collides) + id 2 (new).
+        // Source DB (same schema) whose first id collides with the target's.
         let src_dir = tempfile::tempdir().unwrap();
         let src = Database::open(parse_schema(sdl).unwrap(), src_dir.path()).unwrap();
-        let mut a = FieldMap::new();
-        a.insert("score".into(), Value::I64(11));
-        a.insert("note".into(), Value::String("from-import".into()));
-        let s1 = src.create("User", a).unwrap().id;
-        let mut b = FieldMap::new();
-        b.insert("score".into(), Value::I64(22));
-        b.insert("note".into(), Value::String("new".into()));
-        let s2 = src.create("User", b).unwrap().id;
-        assert_eq!(s1, id1, "both DBs start fresh so the first id collides");
+        for (s, n) in [(11i64, "from-import"), (22, "new")] {
+            let mut a = FieldMap::new();
+            a.insert("score".into(), Value::I64(s));
+            a.insert("note".into(), Value::String(n.into()));
+            src.create("User", a).unwrap();
+        }
         let dump = src_dir.path().join("d.ndjson");
         let mut buf = Vec::new();
         src.logical_export_stream(&mut buf, &LogicalExportOptions::default()).unwrap();
         std::fs::write(&dump, &buf).unwrap();
         drop(src);
 
-        // Online import into the live target (raw vectors, no vectorizer).
-        let report = run_online_import(&dump, &target, VectorImportMode::Raw, None).unwrap();
-        assert_eq!(report.objects, 2);
-
-        // Upsert-by-id: id 1 OVERWRITTEN by the imported row; id 2 ADDED.
+        // Online import is additive: the colliding id is REFUSED (no overwrite).
+        let err = run_online_import(&dump, &target, VectorImportMode::Raw, None)
+            .expect_err("a colliding id must be refused");
+        assert!(err.contains("already exists"), "got: {err}");
+        // The existing object is untouched.
         assert_eq!(
-            target.get("User", s1).unwrap().fields.get("note"),
-            Some(&Value::String("from-import".into())),
-            "existing id is overwritten (upsert-by-id)"
-        );
-        assert_eq!(
-            target.get("User", s2).unwrap().fields.get("score"),
-            Some(&Value::I64(22)),
-            "new id is added"
+            target.get("User", id1).unwrap().fields.get("note"),
+            Some(&Value::String("original".into())),
+            "existing object must not be overwritten"
         );
     }
 
@@ -1073,5 +1101,53 @@ mod tests {
         let err = run_online_import(&dump, &target, VectorImportMode::Reembed, None)
             .expect_err("reembed online without a vectorizer must fail");
         assert!(err.contains("reembed") && err.contains("vectorizer"), "got: {err}");
+    }
+
+    #[test]
+    fn online_import_indexes_vectors_for_live_search() {
+        use std::sync::Arc;
+        // BYO vector field (no @vectorize → no model/worker needed).
+        let sdl = r#"type Doc { body: String
+            vec: Vector<4> }"#;
+        // Source DB with one vector.
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = Database::open(parse_schema(sdl).unwrap(), src_dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("body".into(), Value::String("x".into()));
+        let id = src.create("Doc", f).unwrap().id;
+        src.restore_vectors("Doc", "vec", &[(id, vec_bytes(1.0))]).unwrap();
+        let dump = src_dir.path().join("d.ndjson");
+        let mut buf = Vec::new();
+        src.logical_export_stream(&mut buf, &LogicalExportOptions::default()).unwrap();
+        std::fs::write(&dump, &buf).unwrap();
+        drop(src);
+
+        // Live target with a vectorizer over its (empty) storage.
+        let tgt_dir = tempfile::tempdir().unwrap();
+        let target = Database::open(parse_schema(sdl).unwrap(), tgt_dir.path()).unwrap();
+        let vz = Arc::new(
+            Vectorizer::new(
+                Arc::clone(target.storage()),
+                target.schema().clone(),
+                target.type_ids().clone(),
+                target.field_ids().clone(),
+            )
+            .unwrap(),
+        );
+
+        // Online import WITH the vectorizer routes vectors through the live index.
+        let report =
+            run_online_import(&dump, &target, VectorImportMode::Raw, Some(&vz)).unwrap();
+        assert_eq!(report.objects, 1);
+        assert_eq!(report.vectors, 1);
+
+        // The vector is in the live HNSW index immediately — no restart needed.
+        let status = vz.status();
+        let idx = status
+            .index_stats
+            .iter()
+            .find(|s| s.name == "Doc.vec")
+            .expect("Doc.vec index exists");
+        assert_eq!(idx.vectors, 1, "imported vector reached the live HNSW index");
     }
 }
