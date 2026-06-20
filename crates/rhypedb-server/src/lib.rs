@@ -481,37 +481,197 @@ pub async fn run() {
         println!("  *    /admin/* (compact, reload, migrations*) — DISABLED (set RHYPEDB_ADMIN_TOKEN to enable; returns 403)");
     }
 
-    // Spawn the binary TCP accept loop.
-    let tcp_state = state.clone();
-    tokio::spawn(async move {
-        loop {
-            match tcp_listener.accept().await {
-                Ok((socket, _addr)) => {
-                    let conn_state = tcp_state.clone();
-                    tokio::spawn(async move {
-                        handle_tcp_connection(socket, conn_state).await;
-                    });
-                }
-                Err(e) => {
-                    eprintln!("tcp accept error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-        }
-    });
-
-    axum::serve(listener, app).await.unwrap();
+    // Serve both listeners until a shutdown signal (the platform's SIGTERM on
+    // scale-to-zero, or Ctrl-C), then drain in-flight requests and flush the
+    // memtable so the next cold-start replays an empty WAL.
+    serve(state, app, listener, tcp_listener, shutdown_signal()).await;
 }
 
-async fn handle_tcp_connection(socket: tokio::net::TcpStream, state: Arc<AppState>) {
+/// How long in-flight requests are allowed to drain after a shutdown signal
+/// before we flush and exit regardless. Kept comfortably under a typical 30s
+/// platform stop window (e.g. Kubernetes `terminationGracePeriodSeconds`) so the
+/// flush always lands before the platform's SIGKILL backstop.
+const GRACEFUL_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long to wait for the vectorizer embed worker to finish its in-flight batch
+/// and stop before flushing. Bounded so a slow embed batch can't eat the stop
+/// window — on timeout we flush anyway (the un-stored batch is WAL-durable and
+/// replays on restart).
+const WORKER_QUIESCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolve on the first shutdown signal: SIGTERM (the platform's graceful stop)
+/// or SIGINT / Ctrl-C. On non-unix only Ctrl-C is wired. A SIGTERM-handler install
+/// failure on unix is fatal: the managed-service stop contract IS SIGTERM, so
+/// silently degrading to Ctrl-C-only would kill graceful shutdown on exactly the
+/// platform that depends on it — better to fail loud at startup.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                eprintln!("FATAL: could not install SIGTERM handler: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+/// Serve the HTTP and binary-TCP listeners until `shutdown` resolves, then stop
+/// accepting, drain in-flight requests (bounded by [`GRACEFUL_DRAIN`]), and flush
+/// the active memtable to an SST so the next cold-start replays an empty WAL.
+/// Factored out of [`run`] so a test can drive shutdown with its own future
+/// instead of a real signal.
+///
+/// Without this the process is SIGKILLed mid-request on scale-to-zero: committed
+/// data is still WAL-durable (no loss), but every restart pays a full WAL replay
+/// and the LSM compaction worker never gets to join.
+async fn serve(
+    state: Arc<AppState>,
+    app: Router,
+    http_listener: TcpListener,
+    tcp_listener: TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    // A single signal flips this watch; both listeners observe it. `watch` retains
+    // the latest value, so a receiver that subscribes after the flip still sees it.
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            eprintln!("shutdown signal received — draining (up to {GRACEFUL_DRAIN:?})");
+            let _ = shutdown_tx.send(true);
+        });
+    }
+
+    // HTTP: axum's own graceful shutdown stops accepting and waits for in-flight
+    // handlers to finish before the future resolves. A fatal serve error flips the
+    // shutdown watch so the whole server drains + flushes + exits (the platform
+    // then restarts it) rather than silently running with a dead HTTP listener —
+    // the old code `.unwrap()`'d here, crashing the process on the same error.
+    let http_task = {
+        let mut rx = shutdown_tx.subscribe();
+        let err_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            let signalled = async move {
+                let _ = rx.wait_for(|flagged| *flagged).await;
+            };
+            if let Err(e) = axum::serve(http_listener, app)
+                .with_graceful_shutdown(signalled)
+                .await
+            {
+                eprintln!("http serve error: {e} — initiating shutdown");
+                let _ = err_tx.send(true);
+            }
+        })
+    };
+
+    // Binary TCP: select the accept loop against the shutdown watch. On shutdown
+    // stop accepting and let in-flight connections finish (bounded by the outer
+    // drain timeout below). `conns.join_next()` reaps finished connections so the
+    // set can't grow unbounded while accepting.
+    let tcp_state = state.clone();
+    let mut tcp_shutdown = shutdown_tx.subscribe();
+    let tcp_task = tokio::spawn(async move {
+        let mut conns = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = tcp_listener.accept() => match accepted {
+                    Ok((socket, _addr)) => {
+                        let conn_state = tcp_state.clone();
+                        let conn_shutdown = tcp_shutdown.clone();
+                        conns.spawn(async move {
+                            handle_tcp_connection(socket, conn_state, conn_shutdown).await;
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("tcp accept error: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                },
+                Some(_) = conns.join_next() => {}
+                _ = tcp_shutdown.changed() => break,
+            }
+        }
+        // Stop accepting new connections; drain the in-flight ones.
+        drop(tcp_listener);
+        while conns.join_next().await.is_some() {}
+    });
+
+    // Serve until the shutdown signal arrives.
+    let _ = shutdown_tx.subscribe().wait_for(|flagged| *flagged).await;
+
+    // Bound the drain so the flush always lands before the platform's SIGKILL.
+    let drain = async {
+        let _ = http_task.await;
+        let _ = tcp_task.await;
+    };
+    if tokio::time::timeout(GRACEFUL_DRAIN, drain).await.is_err() {
+        eprintln!("in-flight drain exceeded {GRACEFUL_DRAIN:?} — flushing and exiting anyway");
+    }
+
+    // Quiesce the vectorizer embed worker BEFORE flushing: stop_worker joins the
+    // worker thread, so any in-flight embed batch finishes its store-and-index
+    // commit first — closing the claim→store window that would otherwise orphan
+    // an embedding on exit — and it saves the HNSW snapshots for a faster
+    // cold-start. Those vector commits then land in the flush below. (Engine-
+    // internal workers — migration backfill, cover refresh — aren't owned by the
+    // server; any in-flight commits of theirs are WAL-durable and replay on
+    // restart, so the empty-WAL cold-start is guaranteed for request-path +
+    // vectorizer writes and best-effort otherwise.)
+    if let Some(vectorizer) = state.vectorizer.clone() {
+        let stop = tokio::task::spawn_blocking(move || vectorizer.stop_worker());
+        if tokio::time::timeout(WORKER_QUIESCE_BUDGET, stop).await.is_err() {
+            eprintln!(
+                "vectorizer worker did not stop within {WORKER_QUIESCE_BUDGET:?}; flushing anyway"
+            );
+        }
+    }
+
+    // Flush the active memtable to an SST. Mirrors /admin/compact: flush() is
+    // blocking, so run it on a blocking thread. A flush failure is non-fatal —
+    // committed data is WAL-durable and replays on restart.
+    let storage = state.db().storage().clone();
+    match tokio::task::spawn_blocking(move || storage.flush()).await {
+        Ok(Ok(())) => eprintln!("flushed memtable on shutdown; exiting cleanly"),
+        Ok(Err(e)) => {
+            eprintln!("shutdown flush failed: {e} (data is WAL-durable; restart will replay)")
+        }
+        Err(e) => eprintln!("shutdown flush task panicked: {e}"),
+    }
+}
+
+async fn handle_tcp_connection(
+    socket: tokio::net::TcpStream,
+    state: Arc<AppState>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     let (read, write) = socket.into_split();
     let mut reader = tokio::io::BufReader::new(read);
     let mut writer = tokio::io::BufWriter::new(write);
-    handle_connection_stream(&mut reader, &mut writer, state).await;
+    handle_connection_stream(&mut reader, &mut writer, state, shutdown).await;
 }
 
-async fn handle_connection_stream<R, W>(reader: &mut R, writer: &mut W, state: Arc<AppState>)
-where
+async fn handle_connection_stream<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    state: Arc<AppState>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -522,14 +682,23 @@ where
     let mut response_buf: Vec<u8> = Vec::with_capacity(4 * 1024);
 
     loop {
-        let frame = match protocol::read_frame(reader).await {
-            Ok(f) => f,
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                    eprintln!("tcp read_frame error: {e}");
+        // Only check shutdown at this request boundary: an in-flight request has
+        // already passed `read_frame` and runs to its write before the next loop,
+        // so a graceful stop never truncates a response — it just stops reading
+        // new frames and closes an otherwise-idle connection promptly (matching
+        // axum's HTTP graceful-shutdown semantics). `read_frame` is dropped if
+        // shutdown wins, which is fine: we close the socket either way.
+        let frame = tokio::select! {
+            read = protocol::read_frame(reader) => match read {
+                Ok(f) => f,
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                        eprintln!("tcp read_frame error: {e}");
+                    }
+                    return;
                 }
-                return;
-            }
+            },
+            _ = shutdown.changed() => return,
         };
 
         match frame.kind {
@@ -729,10 +898,11 @@ mod tcp_tests {
         let (mut client, server) = duplex(4096);
 
         let handler = tokio::spawn(async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let (read, write) = tokio::io::split(server);
             let mut reader = tokio::io::BufReader::new(read);
             let mut writer = tokio::io::BufWriter::new(write);
-            handle_connection_stream(&mut reader, &mut writer, state).await;
+            handle_connection_stream(&mut reader, &mut writer, state, shutdown_rx).await;
         });
 
         protocol::write_frame(&mut client, 1, protocol::REQ_PING, &[]).await.unwrap();
@@ -751,10 +921,11 @@ mod tcp_tests {
         let (mut client, server) = duplex(8192);
 
         let handler = tokio::spawn(async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let (read, write) = tokio::io::split(server);
             let mut reader = tokio::io::BufReader::new(read);
             let mut writer = tokio::io::BufWriter::new(write);
-            handle_connection_stream(&mut reader, &mut writer, state).await;
+            handle_connection_stream(&mut reader, &mut writer, state, shutdown_rx).await;
         });
 
         // Create a user via the binary protocol.
@@ -800,10 +971,11 @@ mod tcp_tests {
         let (mut client, server) = duplex(4096);
 
         let handler = tokio::spawn(async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let (read, write) = tokio::io::split(server);
             let mut reader = tokio::io::BufReader::new(read);
             let mut writer = tokio::io::BufWriter::new(write);
-            handle_connection_stream(&mut reader, &mut writer, state).await;
+            handle_connection_stream(&mut reader, &mut writer, state, shutdown_rx).await;
         });
 
         let bad_query = protocol::encode_query_payload("THIS IS NOT VALID");
@@ -826,10 +998,11 @@ mod tcp_tests {
         let (mut client, server) = duplex(16384);
 
         let handler = tokio::spawn(async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             let (read, write) = tokio::io::split(server);
             let mut reader = tokio::io::BufReader::new(read);
             let mut writer = tokio::io::BufWriter::new(write);
-            handle_connection_stream(&mut reader, &mut writer, state).await;
+            handle_connection_stream(&mut reader, &mut writer, state, shutdown_rx).await;
         });
 
         // Send 10 creates in sequence.
@@ -848,5 +1021,96 @@ mod tcp_tests {
 
         drop(client);
         let _ = handler.await;
+    }
+
+    fn count_ssts(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "sst"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// A shutdown signal must drain and then flush the active memtable to an SST,
+    /// so the next cold-start replays an empty WAL instead of being SIGKILLed
+    /// mid-request with the memtable un-persisted.
+    #[tokio::test]
+    async fn graceful_shutdown_flushes_memtable() {
+        use std::time::Duration;
+
+        let state = test_state();
+        let sst_dir = state.data_dir.join("sst");
+        let before = count_ssts(&sst_dir);
+
+        // Write a row so the active memtable is non-empty — flush is a no-op on an
+        // empty memtable, so without this the test would prove nothing.
+        execute_query(&state, r#"User.create({ name: "Persist", age: 7 })"#).unwrap();
+
+        // Ephemeral ports so the test never collides with a fixed bind.
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app = Router::new()
+            .route("/health", get(handle_health))
+            .with_state(state.clone());
+
+        // Drive shutdown with our own oneshot instead of a real SIGTERM.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let serve_task = tokio::spawn(serve(
+            state.clone(),
+            app,
+            http_listener,
+            tcp_listener,
+            async move {
+                let _ = rx.await;
+            },
+        ));
+
+        // Trigger graceful shutdown; serve() should drain, flush, and return.
+        tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), serve_task)
+            .await
+            .expect("serve did not shut down within 10s")
+            .expect("serve task panicked");
+
+        let after = count_ssts(&sst_dir);
+        assert!(
+            after > before,
+            "graceful shutdown should flush the memtable to a new SST (before={before}, after={after})"
+        );
+    }
+
+    /// An idle binary-protocol connection (the common pooled/keep-alive case) must
+    /// close promptly when shutdown fires, rather than blocking on `read_frame`
+    /// and holding the drain open for the full timeout.
+    #[tokio::test]
+    async fn idle_tcp_connection_closes_on_shutdown() {
+        use std::time::Duration;
+
+        let state = test_state();
+        let (mut client, server) = duplex(4096);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handler = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut writer = tokio::io::BufWriter::new(write);
+            handle_connection_stream(&mut reader, &mut writer, state, shutdown_rx).await;
+        });
+
+        // Prove the connection is live, then leave it idle (send no more frames).
+        protocol::write_frame(&mut client, 1, protocol::REQ_PING, &[]).await.unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.kind, protocol::RESP_PONG);
+
+        // Shutdown must close the idle connection without waiting on a next frame.
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("idle connection did not close promptly on shutdown")
+            .expect("connection handler panicked");
+
+        drop(client);
     }
 }
