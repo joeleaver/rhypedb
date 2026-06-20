@@ -586,50 +586,53 @@ pub async fn run() {
     // authoritative — opening restored SSTs under a different schema would
     // reconcile/mutate the on-disk catalog).
     let schema_path: PathBuf = if let Some(snapshot) = &restore_from {
-        match restore::restore_from_snapshot(snapshot, &cli.data_dir, restore_force) {
-            Ok(report) => {
-                if report.skipped {
-                    println!(
-                        "restore: {} already holds this snapshot ({}) — serving existing data",
-                        cli.data_dir.display(),
-                        snapshot.display()
-                    );
-                } else {
-                    println!(
-                        "restored {} SSTs + WAL + {} HNSW snapshot(s) from {} into {}",
-                        report.sst_count,
-                        report.hnsw_count,
-                        snapshot.display(),
-                        cli.data_dir.display()
-                    );
-                }
-                for (plan_id, converter) in &report.in_flight {
-                    eprintln!(
-                        "WARNING: restored backup was MID-MIGRATION (plan {plan_id}, converter \
-                         {converter}); register that converter before serving."
-                    );
-                }
-            }
+        let report = match restore::restore_from_snapshot(snapshot, &cli.data_dir, restore_force) {
+            Ok(report) => report,
             Err(e) => {
                 eprintln!("restore failed: {e}");
                 std::process::exit(1);
             }
-        }
+        };
         let restored_schema = cli.data_dir.join("schema.rhype");
-        // If --schema was ALSO given, it must match the snapshot's exactly. The
-        // snapshot still wins; this is a cheap guard against an operator pointing
-        // at the wrong schema.
-        if let Some(explicit) = &cli.schema
-            && read_and_parse_schema(&restored_schema) != read_and_parse_schema(explicit)
-        {
-            eprintln!(
-                "--schema {explicit:?} does not match the restored snapshot's schema \
-                 ({restored_schema:?}); the snapshot's schema is authoritative — omit \
-                 --schema or pass the matching file."
+        if report.skipped {
+            // Already restored: the data dir is a normal, possibly-evolved live DB
+            // (a post-restore migration mutates the catalog but not the frozen
+            // schema.rhype). Prefer the operator's --schema (kept current) if given;
+            // otherwise fall back to the data-dir copy, like a plain reopen.
+            println!(
+                "restore: {} already holds this snapshot ({}) — serving existing data",
+                cli.data_dir.display(),
+                snapshot.display()
             );
-            std::process::exit(1);
+            cli.schema.clone().unwrap_or(restored_schema)
+        } else {
+            println!(
+                "restored {} SSTs + WAL + {} HNSW snapshot(s) from {} into {}",
+                report.sst_count,
+                report.hnsw_count,
+                snapshot.display(),
+                cli.data_dir.display()
+            );
+            for (plan_id, converter) in &report.in_flight {
+                eprintln!(
+                    "WARNING: restored backup was MID-MIGRATION (plan {plan_id}, converter \
+                     {converter}); register that converter before serving."
+                );
+            }
+            // The snapshot's schema is authoritative. If --schema was ALSO given
+            // and differs, WARN (the snapshot still wins) rather than refuse — a
+            // benign reorder shouldn't brick an unattended wake.
+            if let Some(explicit) = &cli.schema
+                && read_and_parse_schema(&restored_schema) != read_and_parse_schema(explicit)
+            {
+                eprintln!(
+                    "WARNING: --schema {explicit:?} differs from the restored snapshot's \
+                     schema; using the snapshot's schema ({restored_schema:?}), which is \
+                     authoritative for the restored data."
+                );
+            }
+            restored_schema
         }
-        restored_schema
     } else {
         cli.schema.clone().unwrap_or_else(|| {
             eprintln!("--schema <path> is required (unless --restore-from is given)");
