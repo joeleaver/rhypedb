@@ -11,10 +11,10 @@
 //! file is purely additive. The file is loaded only from an explicit path (no
 //! auto-discovery). Unknown keys are rejected so a typo fails loud.
 //!
-//! [`resolve`] is PURE — it takes the three layers and returns the effective
-//! [`ServerConfig`] (or an error string). It does not read env, touch the
-//! filesystem, or exit; the caller (`run`) owns I/O + `process::exit`. This keeps
-//! the precedence logic exhaustively unit-testable.
+//! [`resolve`] takes the three layers and returns the effective [`ServerConfig`].
+//! It does not read env, touch the filesystem, or exit (the caller owns I/O +
+//! `process::exit`) — it only emits stderr WARNINGs for out-of-range tuning values.
+//! That keeps the precedence logic exhaustively unit-testable on the return value.
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -48,8 +48,10 @@ pub struct FileConfig {
     pub ef: Option<i64>,
     pub rerank: Option<i64>,
     pub cache_max_entries: Option<i64>,
-    pub graceful_drain_secs: Option<u64>,
-    pub worker_quiesce_budget_secs: Option<u64>,
+    // i64 (not u64) so a negative value range-checks to warn+default in `resolve`,
+    // consistent with the other tuning knobs, instead of being a fatal type error.
+    pub graceful_drain_secs: Option<i64>,
+    pub worker_quiesce_budget_secs: Option<i64>,
 }
 
 /// A snapshot of the relevant env vars (raw, unparsed). Built once via
@@ -59,7 +61,9 @@ pub struct EnvLayer {
     pub admin_token: Option<String>,
     pub ef: Option<String>,
     pub rerank: Option<String>,
-    pub restore_from: Option<String>,
+    // PathBuf via var_os (not var) so a non-UTF-8 restore path is preserved, as
+    // the original run() did.
+    pub restore_from: Option<PathBuf>,
     pub restore_from_force: Option<String>,
 }
 
@@ -69,7 +73,7 @@ impl EnvLayer {
             admin_token: std::env::var("RHYPEDB_ADMIN_TOKEN").ok(),
             ef: std::env::var("RHYPEDB_EF").ok(),
             rerank: std::env::var("RHYPEDB_RERANK").ok(),
-            restore_from: std::env::var("RHYPEDB_RESTORE_FROM").ok(),
+            restore_from: std::env::var_os("RHYPEDB_RESTORE_FROM").map(PathBuf::from),
             restore_from_force: std::env::var("RHYPEDB_RESTORE_FROM_FORCE").ok(),
         }
     }
@@ -159,10 +163,10 @@ fn positive_or_default(name: &str, v: Option<i64>, default: u64) -> u64 {
     }
 }
 
-/// Resolve the effective config from the three layers. PURE: no env, no fs, no
-/// exit. Returns `Err` only for a genuinely fatal config combination (today: a
-/// missing schema with no restore — surfaced by the caller, which also injects the
-/// "unless --restore-from" allowance). Out-of-range tuning knobs warn + fall back.
+/// Resolve the effective config from the three layers. No env / fs / exit (the
+/// caller owns those); only emits stderr WARNINGs for out-of-range tuning knobs,
+/// which fall back to the lower layer / default. The return value is fully
+/// determined by the inputs, so the precedence matrix is unit-tested on it.
 pub fn resolve(
     cli: &CliLayer,
     env: &EnvLayer,
@@ -207,13 +211,20 @@ pub fn resolve(
         // Bool Model A: a store_true flag can only force `true`; otherwise fall to
         // env (truthy string) then file then default-false. OR is exactly this.
         no_sync: cli.no_sync || f_no_sync.unwrap_or(false),
-        admin_token: env.admin_token.clone().or(f_admin).filter(|t| !t.is_empty()),
+        // An empty env token is treated as "unset" so it falls through to the file
+        // rather than shadowing a real file token; an empty file token is also None.
+        admin_token: env
+            .admin_token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .or(f_admin)
+            .filter(|t| !t.is_empty()),
         default_ef: finalize_ef(ef_raw),
         default_rerank: finalize_rerank(rerank_raw),
         restore_from: cli
             .restore_from
             .clone()
-            .or_else(|| env.restore_from.clone().map(PathBuf::from))
+            .or_else(|| env.restore_from.clone())
             .or(f_restore_from),
         restore_force: cli.restore_force
             || env.restore_from_force.as_deref().map(env_truthy).unwrap_or(false)
@@ -225,24 +236,48 @@ pub fn resolve(
         ) as usize,
         graceful_drain: Duration::from_secs(positive_or_default(
             "graceful_drain_secs",
-            f_drain.map(|v| v as i64),
+            f_drain,
             DEFAULT_GRACEFUL_DRAIN_SECS,
         )),
         worker_quiesce_budget: Duration::from_secs(positive_or_default(
             "worker_quiesce_budget_secs",
-            f_quiesce.map(|v| v as i64),
+            f_quiesce,
             DEFAULT_WORKER_QUIESCE_SECS,
         )),
     }
 }
 
+/// Strip the source-snippet lines (the ones containing `|`) from a rendered toml
+/// error, keeping the `line N, column M` location and the trailing message. A toml
+/// error echoes the offending SOURCE LINE, which for a malformed `admin_token = …`
+/// would leak the secret to stderr — so it must never be printed verbatim.
+fn redact_toml_error(rendered: &str) -> String {
+    let kept: Vec<&str> = rendered
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains('|'))
+        .collect();
+    if kept.is_empty() {
+        "parse error".to_string()
+    } else {
+        kept.join(": ")
+    }
+}
+
 /// Load + parse a `rhypedb.toml`. Every failure (unreadable, invalid TOML,
-/// unknown key, wrong-typed value) is a fatal, legible error naming the FILE.
+/// unknown key, wrong-typed value) is a fatal, legible error naming the FILE. The
+/// parse error is REDACTED of its source snippet so file contents (e.g. a secret
+/// on the offending line) never reach the log.
 pub fn load_config_file(path: &std::path::Path) -> Result<FileConfig, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read config file {}: {e}", path.display()))?;
-    toml::from_str(&text)
-        .map_err(|e| format!("invalid config file {}: {e}", path.display()))
+    toml::from_str(&text).map_err(|e| {
+        format!(
+            "invalid config file {}: {}",
+            path.display(),
+            redact_toml_error(&e.to_string())
+        )
+    })
 }
 
 #[cfg(test)]
@@ -412,5 +447,46 @@ mod tests {
     #[test]
     fn load_missing_file_is_error() {
         assert!(load_config_file(std::path::Path::new("/no/such/rhypedb.toml")).is_err());
+    }
+
+    #[test]
+    fn toml_parse_error_does_not_leak_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        // Unterminated string on the admin_token line — toml renders the source line.
+        std::fs::write(&p, "admin_token = \"SUPERSECRET").unwrap();
+        let err = load_config_file(&p).unwrap_err();
+        assert!(!err.contains("SUPERSECRET"), "secret leaked into error: {err}");
+        assert!(err.contains("invalid config file"), "{err}");
+        // A wrong-typed token value must also not echo the value.
+        std::fs::write(&p, "admin_token = 12345\nlisten = [\"oops\"]").unwrap();
+        let err = load_config_file(&p).unwrap_err();
+        assert!(!err.contains("oops"), "value leaked: {err}");
+    }
+
+    #[test]
+    fn negative_drain_warns_and_defaults() {
+        let f = file("graceful_drain_secs = -3\nworker_quiesce_budget_secs = -1");
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.graceful_drain, Duration::from_secs(DEFAULT_GRACEFUL_DRAIN_SECS));
+        assert_eq!(c.worker_quiesce_budget, Duration::from_secs(DEFAULT_WORKER_QUIESCE_SECS));
+    }
+
+    #[test]
+    fn empty_env_admin_token_falls_through_to_file() {
+        let f = file(r#"admin_token = "file-tok""#);
+        let env = EnvLayer { admin_token: Some(String::new()), ..Default::default() };
+        let c = resolve(&CliLayer::default(), &env, Some(&f));
+        assert_eq!(c.admin_token, Some("file-tok".into()), "empty env must not shadow the file");
+    }
+
+    #[test]
+    fn env_restore_from_is_used() {
+        let env = EnvLayer {
+            restore_from: Some(PathBuf::from("/snap/from/env")),
+            ..Default::default()
+        };
+        let c = resolve(&CliLayer::default(), &env, None);
+        assert_eq!(c.restore_from, Some(PathBuf::from("/snap/from/env")));
     }
 }

@@ -9,6 +9,8 @@
 #
 # Every key is shown with its default, commented out. Uncomment to override.
 # Unknown/typo'd keys, invalid TOML, or wrong types are a fatal startup error.
+# Relative paths resolve against the server's working directory (not this file's
+# location) — prefer absolute paths here.
 
 # Path to the SDL schema file. Required UNLESS restore_from is set (a restored
 # data dir carries its own authoritative schema.rhype).

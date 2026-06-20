@@ -72,9 +72,11 @@ layer or the default, so a fat-fingered tuning hint never bricks an unattended
 start. The boolean flags (`--no-sync`, `--restore-force`) can only force a value
 *on*; to keep one off, leave it unset everywhere.
 
-The effective resolved config is logged at startup (the `admin_token` is **never**
-printed — only whether admin is enabled). Keep any config file containing
-`admin_token` out of version control. A commented example with every key and its
+Relative paths (`schema`, `data_dir`, `restore_from`) resolve against the server's
+**current working directory**, not the config file's location — prefer absolute
+paths in a config file. The effective resolved config is logged at startup (the
+`admin_token` is **never** printed — only whether admin is enabled). Keep any
+config file containing `admin_token` out of version control. A commented example with every key and its
 default ships at [`docs/examples/rhypedb.toml`](https://github.com/joeleaver/rhypedb/blob/master/docs/examples/rhypedb.toml).
 
 ## Restore on boot

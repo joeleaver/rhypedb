@@ -798,13 +798,13 @@ pub async fn run() {
     println!("  GET  /health    — health check");
     println!("  GET  /schema    — schema introspection (JSON + SDL)");
     if admin_enabled {
-        println!("  *    /admin/* (compact, reload, migrations*) — admin (RHYPEDB_ADMIN_TOKEN set)");
+        println!("  *    /admin/* (compact, reload, migrations*) — admin (token configured)");
         println!(
             "       built-in converters: {}",
             converters::BUILTIN_CONVERTER_NAMES.join(", ")
         );
     } else {
-        println!("  *    /admin/* (compact, reload, migrations*) — DISABLED (set RHYPEDB_ADMIN_TOKEN to enable; returns 403)");
+        println!("  *    /admin/* (compact, reload, migrations*) — DISABLED (set RHYPEDB_ADMIN_TOKEN or admin_token in the config file to enable; returns 403)");
     }
 
     // Serve both listeners until a shutdown signal (the platform's SIGTERM on
