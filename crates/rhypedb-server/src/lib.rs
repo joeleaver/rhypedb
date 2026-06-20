@@ -985,6 +985,12 @@ async fn handle_connection_stream<R, W>(
     // collapse to one `write_all` instead of four.
     let mut response_buf: Vec<u8> = Vec::with_capacity(4 * 1024);
 
+    // Per-connection prepared statements (Postgres-style session scope): a parsed
+    // query pinned by id for this connection, freed when it closes. Lock-free —
+    // this task owns the map.
+    let mut prepared: HashMap<u64, Arc<rhypedb_query::ast::Query>> = HashMap::new();
+    let mut next_stmt_id: u64 = 1;
+
     loop {
         // Only check shutdown at this request boundary: an in-flight request has
         // already passed `read_frame` and runs to its write before the next loop,
@@ -1043,54 +1049,107 @@ async fn handle_connection_stream<R, W>(
                     let _epoch = state.reload_lock.read().await;
                     execute_query(&state, &query_text)
                 };
-                let write_result = match response {
-                    Ok(QueryOutput::Objects(objs)) => {
-                        protocol::write_frame_buffered(
+                if let Err(e) =
+                    write_query_result(writer, &mut response_buf, frame.req_id, &state, response).await
+                {
+                    eprintln!("tcp write_frame error: {e}");
+                    return;
+                }
+            }
+            protocol::REQ_PREPARE => {
+                let query_text = match protocol::decode_query_payload(&frame.payload) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        let msg = format!("decode: {e}");
+                        let _ = protocol::write_frame_buffered(
                             writer,
                             &mut response_buf,
                             frame.req_id,
-                            protocol::RESP_OBJECTS,
-                            |buf| protocol::encode_objects_payload_into(&objs, buf),
+                            protocol::RESP_ERROR,
+                            |buf| protocol::encode_error_payload_into(&msg, buf),
                         )
-                        .await
+                        .await;
+                        continue;
                     }
-                    Ok(QueryOutput::Single(obj)) => {
-                        if let Some(vectorizer) = &state.vectorizer {
-                            enqueue_vectorize(vectorizer, &state.db(), &obj);
-                        }
-                        protocol::write_frame_buffered(
-                            writer,
-                            &mut response_buf,
-                            frame.req_id,
-                            protocol::RESP_SINGLE,
-                            |buf| protocol::encode_object(&obj, buf),
-                        )
-                        .await
-                    }
-                    Ok(QueryOutput::Done) => protocol::write_frame_buffered(
-                        writer,
-                        &mut response_buf,
-                        frame.req_id,
-                        protocol::RESP_DONE,
-                        |_| {},
-                    )
-                    .await,
-                    Ok(QueryOutput::IdSet { .. })
-                    | Ok(QueryOutput::IdSetWithFields { .. }) => unreachable!(
-                        "QueryOutput::IdSet variants should be materialized to Objects before leaving execute()"
-                    ),
-                    Err(msg) => protocol::write_frame_buffered(
+                };
+                // Parse + cache (reuses the global parsed-query cache), pin under a
+                // per-connection id. Bound the registry so a client can't prepare
+                // without limit.
+                let write_result = if prepared.len() >= MAX_PREPARED_PER_CONN {
+                    let msg = format!(
+                        "too many prepared statements on this connection (max {MAX_PREPARED_PER_CONN})"
+                    );
+                    protocol::write_frame_buffered(
                         writer,
                         &mut response_buf,
                         frame.req_id,
                         protocol::RESP_ERROR,
                         |buf| protocol::encode_error_payload_into(&msg, buf),
                     )
-                    .await,
+                    .await
+                } else {
+                    match state.query_cache.get_or_parse(&query_text) {
+                        Ok(query) => {
+                            let id = next_stmt_id;
+                            next_stmt_id += 1;
+                            prepared.insert(id, query);
+                            protocol::write_frame_buffered(
+                                writer,
+                                &mut response_buf,
+                                frame.req_id,
+                                protocol::RESP_PREPARED,
+                                |buf| protocol::encode_prepared_payload_into(id, buf),
+                            )
+                            .await
+                        }
+                        Err(e) => {
+                            let msg = format!("parse error: {e}");
+                            protocol::write_frame_buffered(
+                                writer,
+                                &mut response_buf,
+                                frame.req_id,
+                                protocol::RESP_ERROR,
+                                |buf| protocol::encode_error_payload_into(&msg, buf),
+                            )
+                            .await
+                        }
+                    }
                 };
-
                 if let Err(e) = write_result {
-                    eprintln!("tcp write_frame error: {e}");
+                    eprintln!("tcp prepare write error: {e}");
+                    return;
+                }
+            }
+            protocol::REQ_EXECUTE => {
+                let stmt_id = match protocol::decode_execute_payload(&frame.payload) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let msg = format!("decode: {e}");
+                        let _ = protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            frame.req_id,
+                            protocol::RESP_ERROR,
+                            |buf| protocol::encode_error_payload_into(&msg, buf),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                // Clone the Arc so we don't hold the map borrow across the await.
+                let response = match prepared.get(&stmt_id).cloned() {
+                    Some(query) => {
+                        let _epoch = state.reload_lock.read().await;
+                        execute_parsed(&state, &query)
+                    }
+                    None => Err(format!(
+                        "unknown statement id {stmt_id} — prepare it on this connection first"
+                    )),
+                };
+                if let Err(e) =
+                    write_query_result(writer, &mut response_buf, frame.req_id, &state, response).await
+                {
+                    eprintln!("tcp execute write error: {e}");
                     return;
                 }
             }
@@ -1155,6 +1214,15 @@ fn execute_query(state: &AppState, query_text: &str) -> Result<QueryOutput, Stri
         .query_cache
         .get_or_parse(query_text)
         .map_err(|e| format!("parse error: {e}"))?;
+    execute_parsed(state, &query)
+}
+
+/// Execute an already-parsed query (the shared tail of `execute_query` and the
+/// binary protocol's prepared-statement `Execute` path).
+fn execute_parsed(
+    state: &AppState,
+    query: &rhypedb_query::ast::Query,
+) -> Result<QueryOutput, String> {
     let db = state.db();
     let ctx = ExecContext {
         db: &db,
@@ -1162,7 +1230,54 @@ fn execute_query(state: &AppState, query_text: &str) -> Result<QueryOutput, Stri
         default_ef: state.default_ef,
         default_rerank: state.default_rerank,
     };
-    rhypedb_query::executor::execute(&ctx, &query).map_err(|e| format!("{e}"))
+    rhypedb_query::executor::execute(&ctx, query).map_err(|e| format!("{e}"))
+}
+
+/// Max prepared statements per connection — bounds a client that prepares without
+/// bound. Far above any realistic working set; a connection close frees them all.
+const MAX_PREPARED_PER_CONN: usize = 4096;
+
+/// Write a `QueryOutput`/error as the appropriate response frame. Shared by the
+/// `Query` and prepared-`Execute` paths so they stay byte-identical.
+async fn write_query_result<W>(
+    writer: &mut W,
+    response_buf: &mut Vec<u8>,
+    req_id: u32,
+    state: &AppState,
+    result: Result<QueryOutput, String>,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match result {
+        Ok(QueryOutput::Objects(objs)) => {
+            protocol::write_frame_buffered(writer, response_buf, req_id, protocol::RESP_OBJECTS, |buf| {
+                protocol::encode_objects_payload_into(&objs, buf)
+            })
+            .await
+        }
+        Ok(QueryOutput::Single(obj)) => {
+            if let Some(vectorizer) = &state.vectorizer {
+                enqueue_vectorize(vectorizer, &state.db(), &obj);
+            }
+            protocol::write_frame_buffered(writer, response_buf, req_id, protocol::RESP_SINGLE, |buf| {
+                protocol::encode_object(&obj, buf)
+            })
+            .await
+        }
+        Ok(QueryOutput::Done) => {
+            protocol::write_frame_buffered(writer, response_buf, req_id, protocol::RESP_DONE, |_| {}).await
+        }
+        Ok(QueryOutput::IdSet { .. }) | Ok(QueryOutput::IdSetWithFields { .. }) => unreachable!(
+            "QueryOutput::IdSet variants should be materialized to Objects before leaving execute()"
+        ),
+        Err(msg) => {
+            protocol::write_frame_buffered(writer, response_buf, req_id, protocol::RESP_ERROR, |buf| {
+                protocol::encode_error_payload_into(&msg, buf)
+            })
+            .await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1294,6 +1409,73 @@ mod tcp_tests {
             Some(&Value::String("Alice".into()))
         );
         assert_eq!(fetched.fields.get("age"), Some(&Value::U32(30)));
+
+        drop(client);
+        let _ = handler.await;
+    }
+
+    #[tokio::test]
+    async fn prepare_execute_via_tcp() {
+        let state = test_state();
+        let (mut client, server) = duplex(8192);
+
+        let handler = tokio::spawn(async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let (read, write) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut writer = tokio::io::BufWriter::new(write);
+            handle_connection_stream(&mut reader, &mut writer, state, shutdown_rx).await;
+        });
+
+        // Prepare + execute a create.
+        let prep = protocol::encode_prepare_payload(r#"User.create({ name: "Zed", age: 9 })"#);
+        protocol::write_frame(&mut client, 1, protocol::REQ_PREPARE, &prep).await.unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.req_id, 1);
+        assert_eq!(resp.kind, protocol::RESP_PREPARED);
+        let create_stmt = protocol::decode_prepared_payload(&resp.payload).unwrap();
+
+        let exec = protocol::encode_execute_payload(create_stmt);
+        protocol::write_frame(&mut client, 2, protocol::REQ_EXECUTE, &exec).await.unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.kind, protocol::RESP_SINGLE);
+        let uid = protocol::decode_single_payload(&resp.payload).unwrap().id;
+
+        // Prepare a get, then EXECUTE IT TWICE by id — the point of statement ids
+        // (no re-parse, no re-sent query string; each run reflects current data).
+        let prep_get = protocol::encode_prepare_payload(&format!("User.get({uid})"));
+        protocol::write_frame(&mut client, 3, protocol::REQ_PREPARE, &prep_get).await.unwrap();
+        let get_stmt =
+            protocol::decode_prepared_payload(&protocol::read_frame(&mut client).await.unwrap().payload)
+                .unwrap();
+        assert_ne!(get_stmt, create_stmt, "ids are distinct per prepare");
+
+        let exec_get = protocol::encode_execute_payload(get_stmt);
+        for req in [4u32, 5u32] {
+            protocol::write_frame(&mut client, req, protocol::REQ_EXECUTE, &exec_get).await.unwrap();
+            let resp = protocol::read_frame(&mut client).await.unwrap();
+            assert_eq!(resp.req_id, req);
+            assert_eq!(resp.kind, protocol::RESP_OBJECTS);
+            let objs = protocol::decode_objects_payload(&resp.payload).unwrap();
+            assert_eq!(objs.len(), 1);
+            assert_eq!(objs[0].id, uid);
+            assert_eq!(objs[0].fields.get("name"), Some(&Value::String("Zed".into())));
+        }
+
+        // Executing an unknown id is a clean error, not a crash.
+        let bad = protocol::encode_execute_payload(9999);
+        protocol::write_frame(&mut client, 6, protocol::REQ_EXECUTE, &bad).await.unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.kind, protocol::RESP_ERROR);
+        assert!(protocol::decode_error_payload(&resp.payload)
+            .unwrap()
+            .contains("unknown statement id"));
+
+        // Preparing a bad query errors at PREPARE time (before any execute).
+        let badprep = protocol::encode_prepare_payload("NOT A VALID QUERY @#$");
+        protocol::write_frame(&mut client, 7, protocol::REQ_PREPARE, &badprep).await.unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.kind, protocol::RESP_ERROR);
 
         drop(client);
         let _ = handler.await;

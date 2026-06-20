@@ -12,20 +12,29 @@
 //!
 //! # Client request types
 //!
-//! | byte | name  | payload                                  |
-//! |------|-------|------------------------------------------|
-//! | 0x01 | Query | `[q_len: u32 BE][utf8 query]`            |
-//! | 0x02 | Ping  | empty                                    |
+//! | byte | name        | payload                                  |
+//! |------|-------------|------------------------------------------|
+//! | 0x01 | Query       | `[q_len: u32 BE][utf8 query]`            |
+//! | 0x02 | Ping        | empty                                    |
+//! | 0x03 | VectorBatch | see `decode_vector_batch_payload`        |
+//! | 0x04 | Prepare     | `[q_len: u32 BE][utf8 query]` (same as Query) |
+//! | 0x05 | Execute     | `[stmt_id: u64 BE]`                      |
+//!
+//! A `Prepare` parses + caches the query for the LIFETIME OF THE CONNECTION and
+//! returns a `Prepared(stmt_id)`; subsequent `Execute(stmt_id)` re-run it with no
+//! re-parse and no re-sent query string. Statement IDs are per-connection (like a
+//! Postgres session) and are dropped when the connection closes.
 //!
 //! # Server response types
 //!
-//! | byte | name    | payload                                            |
-//! |------|---------|----------------------------------------------------|
-//! | 0x80 | Objects | `[count: u32 BE]` then `count` encoded objects     |
-//! | 0x81 | Single  | one encoded object                                 |
-//! | 0x82 | Done    | empty                                              |
-//! | 0x83 | Error   | `[msg_len: u32 BE][utf8 msg]`                      |
-//! | 0x84 | Pong    | empty                                              |
+//! | byte | name     | payload                                            |
+//! |------|----------|----------------------------------------------------|
+//! | 0x80 | Objects  | `[count: u32 BE]` then `count` encoded objects     |
+//! | 0x81 | Single   | one encoded object                                 |
+//! | 0x82 | Done     | empty                                              |
+//! | 0x83 | Error    | `[msg_len: u32 BE][utf8 msg]`                      |
+//! | 0x84 | Pong     | empty                                              |
+//! | 0x85 | Prepared | `[stmt_id: u64 BE]`                                |
 //!
 //! # Object encoding
 //!
@@ -50,6 +59,10 @@ pub const REQ_QUERY: u8 = 0x01;
 pub const REQ_PING: u8 = 0x02;
 /// Bulk ingest of caller-supplied (precomputed) vectors for one Vector field.
 pub const REQ_VECTOR_BATCH: u8 = 0x03;
+/// Parse + cache a query for the connection's lifetime; replies `Prepared(id)`.
+pub const REQ_PREPARE: u8 = 0x04;
+/// Run a previously-prepared statement by id; replies like `Query`.
+pub const REQ_EXECUTE: u8 = 0x05;
 
 // Response types
 pub const RESP_OBJECTS: u8 = 0x80;
@@ -57,6 +70,8 @@ pub const RESP_SINGLE: u8 = 0x81;
 pub const RESP_DONE: u8 = 0x82;
 pub const RESP_ERROR: u8 = 0x83;
 pub const RESP_PONG: u8 = 0x84;
+/// Reply to `Prepare`: the assigned per-connection statement id.
+pub const RESP_PREPARED: u8 = 0x85;
 
 /// A parsed inbound frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -422,6 +437,48 @@ pub fn decode_query_payload(data: &[u8]) -> io::Result<String> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("query utf8: {e}")))
 }
 
+/// Encode a `Prepare` request payload — identical to a `Query` payload.
+pub fn encode_prepare_payload(query: &str) -> Vec<u8> {
+    encode_query_payload(query)
+}
+
+/// Encode an `Execute` request payload: `[stmt_id: u64 BE]`.
+pub fn encode_execute_payload(stmt_id: u64) -> Vec<u8> {
+    stmt_id.to_be_bytes().to_vec()
+}
+
+/// Decode an `Execute` request payload into the statement id.
+pub fn decode_execute_payload(data: &[u8]) -> io::Result<u64> {
+    if data.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "execute: statement id missing",
+        ));
+    }
+    Ok(u64::from_be_bytes(data[0..8].try_into().unwrap()))
+}
+
+/// Encode a `Prepared` response into a caller-provided buffer: `[stmt_id: u64 BE]`.
+pub fn encode_prepared_payload_into(stmt_id: u64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&stmt_id.to_be_bytes());
+}
+
+/// Encode a `Prepared` response payload: `[stmt_id: u64 BE]`.
+pub fn encode_prepared_payload(stmt_id: u64) -> Vec<u8> {
+    stmt_id.to_be_bytes().to_vec()
+}
+
+/// Decode a `Prepared` response payload into the statement id.
+pub fn decode_prepared_payload(data: &[u8]) -> io::Result<u64> {
+    if data.len() < 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "prepared: statement id missing",
+        ));
+    }
+    Ok(u64::from_be_bytes(data[0..8].try_into().unwrap()))
+}
+
 /// Encode an Error response payload: length-prefixed UTF-8 message.
 pub fn encode_error_payload(msg: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + msg.len());
@@ -468,6 +525,32 @@ mod tests {
             fields,
             raw_fields: None,
         }
+    }
+
+    #[test]
+    fn execute_and_prepared_payload_roundtrip() {
+        for id in [0u64, 1, 42, u64::MAX] {
+            assert_eq!(
+                decode_execute_payload(&encode_execute_payload(id)).unwrap(),
+                id
+            );
+            assert_eq!(
+                decode_prepared_payload(&encode_prepared_payload(id)).unwrap(),
+                id
+            );
+        }
+        // `encode_prepare_payload` is a Query payload — round-trips via the query decoder.
+        assert_eq!(
+            decode_query_payload(&encode_prepare_payload("User.get(1)")).unwrap(),
+            "User.get(1)"
+        );
+    }
+
+    #[test]
+    fn execute_and_prepared_reject_short_buffers() {
+        assert!(decode_execute_payload(&[0u8; 7]).is_err());
+        assert!(decode_prepared_payload(&[0u8; 4]).is_err());
+        assert!(decode_execute_payload(&[]).is_err());
     }
 
     #[test]

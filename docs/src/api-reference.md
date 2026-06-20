@@ -249,6 +249,8 @@ For high-throughput clients, the server speaks a length-prefixed binary protocol
 | `0x01` | Query | `[ q_len: u32 BE ][ utf-8 query ]` |
 | `0x02` | Ping | *(empty)* |
 | `0x03` | VectorBatch | bulk vector ingest for one `Vector` field |
+| `0x04` | Prepare | `[ q_len: u32 BE ][ utf-8 query ]` (same as Query) |
+| `0x05` | Execute | `[ stmt_id: u64 BE ]` |
 
 ### Server response types
 
@@ -259,5 +261,18 @@ For high-throughput clients, the server speaks a length-prefixed binary protocol
 | `0x82` | Done | *(empty)* |
 | `0x83` | Error | `[ msg_len: u32 BE ][ utf-8 message ]` |
 | `0x84` | Pong | *(empty)* |
+| `0x85` | Prepared | `[ stmt_id: u64 BE ]` |
 
 `VectorBatch` (`0x03`) bulk-ingests caller-supplied `f32` vectors for one type's `Vector` field — the path used by `rhypedb-import` and the recommended way to load precomputed vectors at scale.
+
+### Prepared statements
+
+`Prepare` (`0x04`) parses a query and caches it for the **lifetime of the
+connection**, replying with a `Prepared` (`0x85`) carrying a `stmt_id`. Subsequent
+`Execute` (`0x05`) messages re-run that statement by id — no re-parse and no
+re-sent query string — and reply exactly like `Query` (Objects / Single / Done /
+Error). Each `Execute` runs against the current data, so a prepared read reflects
+the latest writes. Statement ids are per-connection (like a Postgres session) and
+are dropped when the connection closes; executing an unknown id is an `Error`. This
+is purely a transport optimization for hot, repeated queries — there are no bind
+parameters yet (the query is fixed at `Prepare` time).
