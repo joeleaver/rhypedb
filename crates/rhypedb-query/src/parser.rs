@@ -149,7 +149,9 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        let mut is_float = false;
         if self.peek() == Some('.') {
+            is_float = true;
             self.advance();
             while let Some(ch) = self.peek() {
                 if ch.is_ascii_digit() {
@@ -158,6 +160,34 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
+        }
+
+        // Optional exponent `[eE][+-]?digits` (so `1e5`, `1.2e-3`, `-3E+2` parse
+        // as floats). Only consumed when at least one exponent digit follows;
+        // otherwise the `e` is left in place so a bare integer still parses.
+        if matches!(self.peek(), Some('e' | 'E')) {
+            let exp_start = self.pos;
+            self.advance();
+            if matches!(self.peek(), Some('+' | '-')) {
+                self.advance();
+            }
+            let mut saw_digit = false;
+            while let Some(ch) = self.peek() {
+                if ch.is_ascii_digit() {
+                    saw_digit = true;
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            if saw_digit {
+                is_float = true;
+            } else {
+                self.pos = exp_start; // not a valid exponent — rewind
+            }
+        }
+
+        if is_float {
             let val: f64 = self.input[start..self.pos]
                 .parse()
                 .map_err(|_| self.error("invalid float"))?;
@@ -699,6 +729,25 @@ mod tests {
             }
             _ => panic!("expected Filter source"),
         }
+    }
+
+    #[test]
+    fn parse_scientific_notation_floats() {
+        fn cmp_value(sdl: &str) -> Literal {
+            match parse_query(sdl).unwrap().source {
+                Source::Filter { predicate, .. } => match predicate {
+                    Predicate::Compare { value, .. } => value,
+                    other => panic!("expected Compare, got {other:?}"),
+                },
+                other => panic!("expected Filter source, got {other:?}"),
+            }
+        }
+        assert_eq!(cmp_value("T.filter(.x > 1e5)"), Literal::Float(1e5));
+        assert_eq!(cmp_value("T.filter(.x > 1.2e-3)"), Literal::Float(1.2e-3));
+        assert_eq!(cmp_value("T.filter(.x > -3E+2)"), Literal::Float(-3E+2));
+        assert_eq!(cmp_value("T.filter(.x > 2.5)"), Literal::Float(2.5));
+        // No exponent → still an integer literal.
+        assert_eq!(cmp_value("T.filter(.x > 42)"), Literal::Int(42));
     }
 
     #[test]
