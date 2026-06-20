@@ -154,6 +154,14 @@ fn already_restored(data_dir: &Path, want: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// The snapshot identity recorded in a leftover `RESTORE_IN_PROGRESS` marker, if
+/// present and parseable. Used to resume ONLY an interrupted restore of the SAME
+/// snapshot (a marker for a different snapshot grants no force bypass).
+fn marker_identity(data_dir: &Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(data_dir.join(IN_PROGRESS)).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text).ok()
+}
+
 /// Restore the physical backup in `snapshot_dir` into `data_dir`, returning a
 /// report. Destructive (clears stale data) unless the sentinel shows the same
 /// snapshot is already restored, in which case it is a no-op regardless of
@@ -199,12 +207,15 @@ pub(crate) fn restore_from_snapshot(
 
     // 2. Ensure the data dir exists (non-destructive), then refuse if the snapshot
     //    IS the data dir or lives inside it — the clear would destroy the source.
+    //    Fail CLOSED: a canonicalize error on a source-safety check is fatal, not
+    //    a silent skip. (Both dirs exist here — data_dir was just created, the
+    //    snapshot's MANIFEST.json already read — so this never spuriously fires.)
     std::fs::create_dir_all(data_dir).map_err(|e| format!("create data dir: {e}"))?;
-    if let (Ok(snap), Ok(data)) = (
-        std::fs::canonicalize(snapshot_dir),
-        std::fs::canonicalize(data_dir),
-    ) && snap.starts_with(&data)
-    {
+    let snap_canon =
+        std::fs::canonicalize(snapshot_dir).map_err(|e| format!("canonicalize snapshot dir: {e}"))?;
+    let data_canon =
+        std::fs::canonicalize(data_dir).map_err(|e| format!("canonicalize data dir: {e}"))?;
+    if snap_canon.starts_with(&data_canon) {
         return Err(format!(
             "--restore-from {} is the data dir (or inside it); refusing to clear the source",
             snapshot_dir.display()
@@ -215,15 +226,14 @@ pub(crate) fn restore_from_snapshot(
     //    fail loud (DataDirLocked) — we never clear a dir another instance serves.
     let guard = DataDirGuard::acquire(data_dir).map_err(|e| e.to_string())?;
 
-    // A leftover marker means a previous restore was interrupted; the load-bearing
-    // files present are THIS restore's own partial output, so re-restoring is safe
-    // and must bypass the "non-empty needs --force" gate.
-    let resuming = data_dir.join(IN_PROGRESS).is_file();
-
     // 4. Idempotency: this exact snapshot is already fully restored → no-op (do
-    //    NOT re-clobber; preserves writes made since the restore). Independent of
-    //    `force`. Skipped when resuming (the prior attempt didn't finish).
-    if !resuming && already_restored(data_dir, &identity) {
+    //    NOT re-clobber; preserves writes made since the restore). The sentinel is
+    //    written LAST, so a matching sentinel means the restore COMPLETED even if a
+    //    stale in-progress marker survived a failed cleanup — so this takes priority
+    //    over the resume path, and we sweep the stale marker.
+    if already_restored(data_dir, &identity) {
+        let _ = std::fs::remove_file(data_dir.join(IN_PROGRESS));
+        let _ = fsync_dir(data_dir);
         drop(guard);
         return Ok(RestoreReport {
             skipped: true,
@@ -233,8 +243,15 @@ pub(crate) fn restore_from_snapshot(
         });
     }
 
+    // A marker for THIS SAME snapshot means a previous restore of it was interrupted
+    // mid-copy (sentinel absent above); the load-bearing files present are that
+    // restore's own partial output, so re-restoring is safe and bypasses the
+    // "non-empty needs --force" gate. A marker for a DIFFERENT snapshot is stale and
+    // grants no such bypass (the operator must --force to switch snapshots).
+    let resuming = marker_identity(data_dir).as_ref() == Some(&identity);
+
     // 5. A real pre-existing DB (not our sentinel'd restore, not an interrupted
-    //    one) requires --restore-force.
+    //    restore of this same snapshot) requires --restore-force.
     if data_dir_non_empty(data_dir) && !force && !resuming {
         return Err(format!(
             "{} already contains a database (use --restore-force / \
@@ -540,9 +557,14 @@ mod tests {
         make_backup(&snap, 100, 1, &["1.sst"], &["1.sst"], &[], &[]);
 
         restore_from_snapshot(&snap, &data, false).unwrap();
-        // Simulate a crash mid-restore: sentinel gone, marker + partial files left.
+        // Simulate a crash mid-restore: sentinel gone, partial files + a marker
+        // stamped with THIS snapshot's identity left behind (as the real code does).
         std::fs::remove_file(data.join(SENTINEL)).unwrap();
-        std::fs::write(data.join(IN_PROGRESS), b"{}").unwrap();
+        std::fs::write(
+            data.join(IN_PROGRESS),
+            serde_json::json!({"created_at_ms": 100, "max_version": 1}).to_string(),
+        )
+        .unwrap();
 
         // Next boot, force OFF (the documented managed config) must RESUME, not
         // refuse with "already contains a database".
@@ -551,6 +573,50 @@ mod tests {
         assert!(data.join("sst/1.sst").is_file());
         assert!(data.join(SENTINEL).is_file());
         assert!(!data.join(IN_PROGRESS).exists(), "marker cleared after a successful resume");
+    }
+
+    #[test]
+    fn surviving_marker_after_complete_restore_still_skips() {
+        let (_s, snap) = temp();
+        let (_d, data) = temp();
+        make_backup(&snap, 100, 1, &["1.sst"], &["1.sst"], &[], &[]);
+
+        restore_from_snapshot(&snap, &data, false).unwrap();
+        // A completed restore (sentinel present + matching) whose marker-removal
+        // failed: the marker survives with the matching identity. The next boot must
+        // SKIP (sentinel-match wins), NOT re-restore + clobber, and sweep the marker.
+        std::fs::write(data.join("sst/post.sst"), b"live-write").unwrap();
+        std::fs::write(
+            data.join(IN_PROGRESS),
+            serde_json::json!({"created_at_ms": 100, "max_version": 1}).to_string(),
+        )
+        .unwrap();
+
+        let r = restore_from_snapshot(&snap, &data, false).unwrap();
+        assert!(r.skipped, "a matching sentinel means restore completed — must skip");
+        assert!(data.join("sst/post.sst").is_file(), "skip must not clobber live writes");
+        assert!(!data.join(IN_PROGRESS).exists(), "stale marker swept on skip");
+    }
+
+    #[test]
+    fn stale_marker_for_a_different_snapshot_does_not_bypass_force() {
+        let (_s, snap) = temp();
+        let (_d, data) = temp();
+        make_backup(&snap, 200, 2, &["b.sst"], &["b.sst"], &[], &[]);
+        // A real pre-existing DB plus a leftover marker from an interrupted restore
+        // of a DIFFERENT snapshot (identity 100/1). Restoring snapshot 200/2 must NOT
+        // treat the foreign marker as a resume — it still needs --force.
+        std::fs::create_dir_all(data.join("sst")).unwrap();
+        std::fs::write(data.join("sst/foreign.sst"), b"real-db").unwrap();
+        std::fs::write(
+            data.join(IN_PROGRESS),
+            serde_json::json!({"created_at_ms": 100, "max_version": 1}).to_string(),
+        )
+        .unwrap();
+
+        let err = restore_from_snapshot(&snap, &data, false).unwrap_err();
+        assert!(err.contains("already contains a database"), "{err}");
+        assert!(data.join("sst/foreign.sst").is_file(), "must not clobber without force");
     }
 
     #[test]
