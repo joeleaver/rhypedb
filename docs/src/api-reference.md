@@ -97,8 +97,12 @@ mod client;                                   // the generated module
 use client::{User, Row};
 
 // Build a query string — send `.build()` as the `query` of a `POST /query` body.
-let query = User::all().filter(".age > 18").limit(10).build();
+let read = User::all().filter(".age > 18").limit(10).build();
 // -> "User.filter(.age > 18).limit(10)"
+
+// Typed create from a row's set fields (strings are escaped; numbers/bools coerce):
+let write = User::create(&User { name: Some("Ann".into()), age: Some(30), ..Default::default() }).build();
+// -> r#"User.create({ name: "Ann", age: 30 })"#
 
 // Parse the response into typed rows: the object `id` from the envelope plus the
 // typed `fields`, for both `{ "object": .. }` and `{ "objects": [..] }` shapes.
@@ -117,11 +121,12 @@ rhypedb-codegen --schema schema.rhype --lang ts --out client.ts
 ```typescript
 import { User, parseResponse, type Row } from "./client.ts";
 
-const query = User.all().filter(".age > 18").limit(10).build();
+const read = User.all().filter(".age > 18").limit(10).build();
+const write = User.create({ name: "Ann", age: 30 }).build();   // typed create
 const rows: Array<Row<User>> = parseResponse<User>(responseJson);   // { id, data }
 ```
 
-The builder is transport-agnostic — bring your own HTTP client. Relations and vector fields are documented per type but are not scalar columns; typed `create`/write queries are planned.
+The builder is transport-agnostic — bring your own HTTP client. Relations and vector fields are documented per type but are not scalar columns. Typed `create` sets a row's scalar fields (strings escaped, numbers/bools coerced); `DateTime`/`Bytes`/`Json` fields have no query-literal form and are skipped.
 
 ### Admin plane (gated by `RHYPEDB_ADMIN_TOKEN`)
 

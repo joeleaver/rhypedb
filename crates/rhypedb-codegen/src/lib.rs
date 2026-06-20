@@ -112,6 +112,28 @@ impl<T: serde::de::DeserializeOwned> Row<T> {
         Err(String::from("response had neither `object` nor `objects`"))
     }
 }
+
+/// Quote + escape a string as a rhypedb query string literal.
+fn rhypedb_str_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Format a numeric/bool value as a query literal. `Debug` keeps floats
+/// float-shaped (`1.0`, `1.5`, `1e20`) and ints int-shaped (`30`); both coerce to
+/// the field's declared scalar type on the server.
+fn rhypedb_lit<T: std::fmt::Debug>(v: &T) -> String {
+    format!("{v:?}")
+}
 "#;
 
 /// Generate a Rust module (source text) of typed row structs for `schema`.
@@ -197,6 +219,28 @@ fn emit_struct(out: &mut String, td: &TypeDef) {
         "    /// `{t}.filter(predicate)` — e.g. `{t}::filter(\".age > 18\")`.\n    pub fn filter(predicate: &str) -> Query<{t}> {{ Query::raw(format!(\"{t}.filter({{predicate}})\")) }}\n"
     ));
 
+    // Typed create from a row's set (`Some`) fields. Only String/int/float/Bool
+    // are settable via a QL literal; `DateTime`/`Bytes`/`Json` have no literal
+    // coercion on the server and are skipped.
+    out.push_str(&format!(
+        "\n    /// `{t}.create({{ .. }})` from this row's set (`Some`) fields.\n    /// `DateTime`/`Bytes`/`Json` fields are not settable via a literal and are skipped.\n    pub fn create(row: &{t}) -> Query<{t}> {{\n        let mut parts: Vec<String> = Vec::new();\n"
+    ));
+    for f in td.fields.iter().filter(|f| matches!(&f.field_type, FieldType::Scalar(s) if is_creatable_scalar(s))) {
+        let ident = ident_for(&f.name);
+        let key = &f.name;
+        let helper = if matches!(&f.field_type, FieldType::Scalar(ScalarType::String)) {
+            "rhypedb_str_lit"
+        } else {
+            "rhypedb_lit"
+        };
+        out.push_str(&format!(
+            "        if let Some(v) = &row.{ident} {{ parts.push(format!(\"{key}: {{}}\", {helper}(v))); }}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "        Query::raw(format!(\"{t}.create({{{{ {{}} }}}})\", parts.join(\", \")))\n    }}\n"
+    ));
+
     out.push_str("}\n");
 }
 
@@ -217,6 +261,23 @@ fn scalar_rust_type(s: &ScalarType) -> &'static str {
         ScalarType::Bytes => "String",
         ScalarType::Json => "serde_json::Value",
     }
+}
+
+/// Scalar types settable via a query literal at `create` time. The engine has no
+/// literal coercion for `DateTime`/`Json` (declarable-but-unwired) and `/query`
+/// round-trips `Bytes` only as a placeholder, so those are excluded.
+fn is_creatable_scalar(s: &ScalarType) -> bool {
+    matches!(
+        s,
+        ScalarType::String
+            | ScalarType::U32
+            | ScalarType::U64
+            | ScalarType::I32
+            | ScalarType::I64
+            | ScalarType::F32
+            | ScalarType::F64
+            | ScalarType::Bool
+    )
 }
 
 /// A valid Rust field identifier for a schema field name. SDL field names are
@@ -291,6 +352,16 @@ export function parseResponse<T>(resp: any): Array<Row<T>> {
   if (resp && Array.isArray(resp.objects)) return resp.objects.map(toRow);
   throw new Error("response had neither `object` nor `objects`");
 }
+
+/** Quote + escape a string as a rhypedb query string literal. */
+function rhypedbStr(s: string): string {
+  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
+/** Format a number/boolean as a query literal (coerced to the field type server-side). */
+function rhypedbLit(v: number | boolean): string {
+  return String(v);
+}
 "#;
 
 /// Generate a TypeScript module (source text) of typed interfaces + query
@@ -360,6 +431,27 @@ fn emit_ts_type(out: &mut String, td: &TypeDef) {
     out.push_str(&format!(
         "  /** `{t}.filter(predicate)`. */\n  filter(predicate: string): Query {{ return new Query(`{t}.filter(${{predicate}})`); }},\n"
     ));
+
+    // Typed create from a row's set fields (DateTime/Bytes/Json skipped — no
+    // literal coercion server-side).
+    out.push_str(&format!(
+        "  /** `{t}.create({{ .. }})` from `row`'s set fields (DateTime/Bytes/Json skipped). */\n  create(row: {t}): Query {{\n    const parts: string[] = [];\n"
+    ));
+    for f in td.fields.iter().filter(|f| matches!(&f.field_type, FieldType::Scalar(s) if is_creatable_scalar(s))) {
+        let key = &f.name;
+        let helper = if matches!(&f.field_type, FieldType::Scalar(ScalarType::String)) {
+            "rhypedbStr"
+        } else {
+            "rhypedbLit"
+        };
+        out.push_str(&format!(
+            "    if (row.{key} !== undefined) parts.push(`{key}: ${{{helper}(row.{key})}}`);\n"
+        ));
+    }
+    out.push_str(&format!(
+        "    return new Query(`{t}.create({{ ${{parts.join(\", \")}} }})`);\n  }},\n"
+    ));
+
     out.push_str("};\n");
 }
 
@@ -481,6 +573,36 @@ mod tests {
         assert!(code.contains("pub fn all() -> Query<User> { Query::raw(String::from(\"User\")) }"));
         assert!(code.contains("pub fn get(id: u64) -> Query<User> { Query::raw(format!(\"User.get({id})\")) }"));
         assert!(code.contains("pub fn filter(predicate: &str) -> Query<User> { Query::raw(format!(\"User.filter({predicate})\")) }"));
+    }
+
+    #[test]
+    fn emits_typed_create() {
+        let code = gen_rs(
+            r#"type User { name: String  age: i64  score: f64  active: Bool  created: DateTime  blob: Bytes  meta: Json }"#,
+        );
+        assert!(code.contains("pub fn create(row: &User) -> Query<User> {"));
+        assert!(code.contains(r#"if let Some(v) = &row.name { parts.push(format!("name: {}", rhypedb_str_lit(v))); }"#));
+        assert!(code.contains(r#"if let Some(v) = &row.age { parts.push(format!("age: {}", rhypedb_lit(v))); }"#));
+        assert!(code.contains(r#"if let Some(v) = &row.score { parts.push(format!("score: {}", rhypedb_lit(v))); }"#));
+        assert!(code.contains(r#"if let Some(v) = &row.active { parts.push(format!("active: {}", rhypedb_lit(v))); }"#));
+        // DateTime/Bytes/Json are not settable via a literal — skipped.
+        assert!(!code.contains("row.created"));
+        assert!(!code.contains("row.blob"));
+        assert!(!code.contains("row.meta"));
+        assert!(code.contains("fn rhypedb_str_lit(s: &str) -> String"));
+        assert!(code.contains("fn rhypedb_lit<T: std::fmt::Debug>(v: &T) -> String"));
+    }
+
+    #[test]
+    fn ts_emits_typed_create() {
+        let code = gen_ts(r#"type User { name: String  age: i64  active: Bool  created: DateTime }"#);
+        assert!(code.contains("create(row: User): Query {"));
+        assert!(code.contains("if (row.name !== undefined) parts.push(`name: ${rhypedbStr(row.name)}`);"));
+        assert!(code.contains("if (row.age !== undefined) parts.push(`age: ${rhypedbLit(row.age)}`);"));
+        assert!(code.contains("if (row.active !== undefined) parts.push(`active: ${rhypedbLit(row.active)}`);"));
+        assert!(!code.contains("row.created")); // DateTime skipped
+        assert!(code.contains("function rhypedbStr(s: string): string"));
+        assert!(code.contains("function rhypedbLit(v: number | boolean): string"));
     }
 
     #[test]
