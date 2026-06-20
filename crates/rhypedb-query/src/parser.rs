@@ -203,17 +203,51 @@ impl<'a> Parser<'a> {
     fn parse_string_literal(&mut self) -> QueryResult<String> {
         self.skip_ws();
         self.expect_char('"')?;
-        let start = self.pos;
+        let mut out = String::new();
         while let Some(ch) = self.peek() {
-            if ch == '"' {
-                let s = self.input[start..self.pos].to_string();
-                self.advance(); // consume closing quote
-                return Ok(s);
+            match ch {
+                '"' => {
+                    self.advance(); // consume closing quote
+                    return Ok(out);
+                }
+                '\\' => {
+                    self.advance(); // consume the backslash
+                    match self.peek() {
+                        Some('"') => {
+                            out.push('"');
+                            self.advance();
+                        }
+                        Some('\\') => {
+                            out.push('\\');
+                            self.advance();
+                        }
+                        Some('n') => {
+                            out.push('\n');
+                            self.advance();
+                        }
+                        Some('t') => {
+                            out.push('\t');
+                            self.advance();
+                        }
+                        Some('r') => {
+                            out.push('\r');
+                            self.advance();
+                        }
+                        // Unknown escape: preserve the backslash + char verbatim
+                        // (lenient — e.g. a Windows path `C:\foo` survives).
+                        Some(other) => {
+                            out.push('\\');
+                            out.push(other);
+                            self.advance();
+                        }
+                        None => return Err(self.error("unterminated string (trailing backslash)")),
+                    }
+                }
+                _ => {
+                    out.push(ch);
+                    self.advance();
+                }
             }
-            if ch == '\\' {
-                self.advance(); // skip escape
-            }
-            self.advance();
         }
         Err(self.error("unterminated string"))
     }
@@ -748,6 +782,28 @@ mod tests {
         assert_eq!(cmp_value("T.filter(.x > 2.5)"), Literal::Float(2.5));
         // No exponent → still an integer literal.
         assert_eq!(cmp_value("T.filter(.x > 42)"), Literal::Int(42));
+    }
+
+    #[test]
+    fn parse_string_escapes() {
+        fn str_value(sdl: &str) -> String {
+            match parse_query(sdl).unwrap().source {
+                Source::Create { fields, .. } => match fields.get("s") {
+                    Some(Literal::String(s)) => s.clone(),
+                    other => panic!("expected String, got {other:?}"),
+                },
+                other => panic!("expected Create, got {other:?}"),
+            }
+        }
+        // Escaped quote and backslash now unescape correctly.
+        assert_eq!(str_value(r#"T.create({ s: "say \"hi\"" })"#), r#"say "hi""#);
+        assert_eq!(str_value(r#"T.create({ s: "a\\b" })"#), r"a\b");
+        // Newline / tab.
+        assert_eq!(str_value(r#"T.create({ s: "a\nb\tc" })"#), "a\nb\tc");
+        // Unknown escape is preserved verbatim (e.g. a Windows path).
+        assert_eq!(str_value(r#"T.create({ s: "C:\foo" })"#), r"C:\foo");
+        // Plain strings are unchanged.
+        assert_eq!(str_value(r#"T.create({ s: "plain" })"#), "plain");
     }
 
     #[test]
