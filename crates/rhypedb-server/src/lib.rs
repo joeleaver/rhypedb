@@ -11,7 +11,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
@@ -27,6 +27,7 @@ use rhypedb_schema::{
 };
 
 mod admin;
+mod config;
 mod converters;
 pub mod import;
 mod protocol;
@@ -38,9 +39,15 @@ use query_cache::QueryCache;
 #[derive(Parser)]
 #[command(name = "rhypedb", about = "rhypedb database server")]
 struct Cli {
-    /// Path to the SDL schema file. Required, EXCEPT with `--restore-from`: a
-    /// restored data dir carries its own authoritative `schema.rhype`, so the
-    /// flag is optional there (and, if given, must match the snapshot's schema).
+    /// Path to a TOML config file (also `RHYPEDB_CONFIG`). Optional; explicit path
+    /// only (no auto-discovery). CLI flags and env vars override file values;
+    /// see `rhypedb.toml` docs.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Path to the SDL schema file. Required, EXCEPT with `--restore-from` (a
+    /// restored data dir carries its own authoritative `schema.rhype`) or when set
+    /// via the config file. If given with `--restore-from`, must match the snapshot.
     #[arg(short, long)]
     schema: Option<PathBuf>,
 
@@ -116,6 +123,12 @@ pub(crate) struct AppState {
     /// `rerank:`, read ONCE from `RHYPEDB_RERANK`. `None` = no full-precision
     /// rerank by default. A per-query `ef:`/`rerank:` always overrides these.
     pub(crate) default_rerank: Option<usize>,
+    /// How long in-flight requests may drain on shutdown before a forced flush+exit
+    /// (config `graceful_drain_secs`, default 20s). Read by `serve`.
+    pub(crate) graceful_drain: std::time::Duration,
+    /// How long to wait for the vectorizer embed worker to quiesce on shutdown
+    /// (config `worker_quiesce_budget_secs`, default 10s). Read by `serve`.
+    pub(crate) worker_quiesce_budget: std::time::Duration,
 }
 
 impl AppState {
@@ -183,42 +196,6 @@ fn value_to_json(v: Value) -> serde_json::Value {
         Value::Bytes(b) => serde_json::json!(format!("<{} bytes>", b.len())),
         Value::Null => serde_json::Value::Null,
     }
-}
-
-/// Parse the `RHYPEDB_EF` / `RHYPEDB_RERANK` env values into server-wide
-/// `.similar` defaults. Both are optional tuning knobs: an absent, empty,
-/// non-integer, or out-of-range value is IGNORED with a warning (the server
-/// must not refuse to start over a fat-fingered tuning hint). `ef` must be
-/// `>= 1` (matching the per-query parser); `rerank: 0` means "off" and is
-/// normalised to `None` (no default rerank). Takes the raw strings so it is
-/// unit-testable without mutating the process environment.
-fn parse_vector_search_defaults(
-    ef: Option<&str>,
-    rerank: Option<&str>,
-) -> (Option<usize>, Option<usize>) {
-    fn parse_knob(name: &str, raw: Option<&str>, min: usize) -> Option<usize> {
-        let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
-        match raw.parse::<usize>() {
-            Ok(n) if n >= min => Some(n),
-            Ok(n) => {
-                eprintln!(
-                    "WARNING: {name}={n} is below the minimum of {min}; ignoring it."
-                );
-                None
-            }
-            Err(_) => {
-                eprintln!(
-                    "WARNING: {name}=\"{raw}\" is not a non-negative integer; ignoring it."
-                );
-                None
-            }
-        }
-    }
-    // ef must be >= 1 (a width of 0 explores nothing). rerank accepts 0 = off,
-    // which collapses to "no default rerank".
-    let default_ef = parse_knob("RHYPEDB_EF", ef, 1);
-    let default_rerank = parse_knob("RHYPEDB_RERANK", rerank, 0).filter(|&n| n > 0);
-    (default_ef, default_rerank)
 }
 
 async fn handle_query(
@@ -548,11 +525,48 @@ fn quantization_name(q: &QuantizationType) -> &'static str {
     }
 }
 
-/// An env var set to a truthy value (`1`/`true`/`yes`/`on`, case-insensitive).
-fn env_truthy(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+/// Build the CLI layer for config resolution. Flags WITH a clap default
+/// (`data_dir`/`listen`/`tcp_listen`) contribute ONLY when the user actually typed
+/// them (`ValueSource::CommandLine`), so a default never shadows env/file.
+fn cli_layer(cli: &Cli, matches: &clap::ArgMatches) -> config::CliLayer {
+    let typed =
+        |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+    config::CliLayer {
+        schema: cli.schema.clone(),
+        data_dir: typed("data_dir").then(|| cli.data_dir.clone()),
+        listen: typed("listen").then(|| cli.listen.clone()),
+        tcp_listen: typed("tcp_listen").then(|| cli.tcp_listen.clone()),
+        no_sync: cli.no_sync,
+        restore_from: cli.restore_from.clone(),
+        restore_force: cli.restore_force,
+    }
+}
+
+/// Log the effective resolved config at startup. NEVER prints the admin token —
+/// only whether admin is enabled. Fields are printed explicitly (no `{:?}` of the
+/// whole struct) so a secret can't leak through a derived Debug.
+fn log_effective_config(cfg: &config::ServerConfig, schema_path: &std::path::Path) {
+    println!("effective config:");
+    println!("  schema         = {}", schema_path.display());
+    println!("  data_dir       = {}", cfg.data_dir.display());
+    println!("  listen         = {}", cfg.listen);
+    println!("  tcp_listen     = {}", cfg.tcp_listen);
+    println!("  no_sync        = {}", cfg.no_sync);
+    println!(
+        "  admin          = {}",
+        if cfg.admin_token.is_some() { "enabled" } else { "disabled" }
+    );
+    println!(
+        "  ef default     = {}",
+        cfg.default_ef.map_or_else(|| "heuristic".to_string(), |n| n.to_string())
+    );
+    println!(
+        "  rerank default = {}",
+        cfg.default_rerank.map_or_else(|| "off".to_string(), |n| n.to_string())
+    );
+    println!("  cache_max      = {}", cfg.cache_max_entries);
+    println!("  graceful_drain = {:?}", cfg.graceful_drain);
+    println!("  worker_quiesce = {:?}", cfg.worker_quiesce_budget);
 }
 
 /// Read + parse an SDL schema file, exiting the process with a legible message on
@@ -571,47 +585,65 @@ fn read_and_parse_schema(path: &std::path::Path) -> Schema {
 /// Parse the CLI, open the database, and serve until shutdown. Callers provide
 /// the async runtime (this crate's `main` uses `#[tokio::main]`).
 pub async fn run() {
-    let cli = Cli::parse();
+    // Parse via ArgMatches so the config layer can tell an explicitly-typed flag
+    // from a clap default (value_source) — a defaulted value must not shadow env/file.
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    // Restore-on-boot config. CLI flag wins over env (clap has no `env` feature
-    // here, matching the RHYPEDB_ADMIN_TOKEN / EF / RERANK pattern).
-    let restore_from = cli
-        .restore_from
+    // Optional TOML config file: explicit `--config` / `RHYPEDB_CONFIG` only.
+    let config_path = cli
+        .config
         .clone()
-        .or_else(|| std::env::var_os("RHYPEDB_RESTORE_FROM").map(PathBuf::from));
-    let restore_force = cli.restore_force || env_truthy("RHYPEDB_RESTORE_FROM_FORCE");
+        .or_else(|| std::env::var_os("RHYPEDB_CONFIG").map(PathBuf::from));
+    let file_config = match &config_path {
+        Some(p) => match config::load_config_file(p) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    // Resolve the effective config: CLI flag > env var > config file > default.
+    let cfg = config::resolve(
+        &cli_layer(&cli, &matches),
+        &config::EnvLayer::from_env(),
+        file_config.as_ref(),
+    );
 
     // If asked, restore a snapshot into the data dir BEFORE opening it, and take
     // the schema from the restored dir (the snapshot's schema.rhype is
     // authoritative — opening restored SSTs under a different schema would
     // reconcile/mutate the on-disk catalog).
-    let schema_path: PathBuf = if let Some(snapshot) = &restore_from {
-        let report = match restore::restore_from_snapshot(snapshot, &cli.data_dir, restore_force) {
+    let schema_path: PathBuf = if let Some(snapshot) = &cfg.restore_from {
+        let report = match restore::restore_from_snapshot(snapshot, &cfg.data_dir, cfg.restore_force) {
             Ok(report) => report,
             Err(e) => {
                 eprintln!("restore failed: {e}");
                 std::process::exit(1);
             }
         };
-        let restored_schema = cli.data_dir.join("schema.rhype");
+        let restored_schema = cfg.data_dir.join("schema.rhype");
         if report.skipped {
             // Already restored: the data dir is a normal, possibly-evolved live DB
             // (a post-restore migration mutates the catalog but not the frozen
-            // schema.rhype). Prefer the operator's --schema (kept current) if given;
+            // schema.rhype). Prefer the operator's schema (kept current) if given;
             // otherwise fall back to the data-dir copy, like a plain reopen.
             println!(
                 "restore: {} already holds this snapshot ({}) — serving existing data",
-                cli.data_dir.display(),
+                cfg.data_dir.display(),
                 snapshot.display()
             );
-            cli.schema.clone().unwrap_or(restored_schema)
+            cfg.schema.clone().unwrap_or(restored_schema)
         } else {
             println!(
                 "restored {} SSTs + WAL + {} HNSW snapshot(s) from {} into {}",
                 report.sst_count,
                 report.hnsw_count,
                 snapshot.display(),
-                cli.data_dir.display()
+                cfg.data_dir.display()
             );
             for (plan_id, converter) in &report.in_flight {
                 eprintln!(
@@ -619,14 +651,14 @@ pub async fn run() {
                      {converter}); register that converter before serving."
                 );
             }
-            // The snapshot's schema is authoritative. If --schema was ALSO given
+            // The snapshot's schema is authoritative. If a schema was ALSO given
             // and differs, WARN (the snapshot still wins) rather than refuse — a
             // benign reorder shouldn't brick an unattended wake.
-            if let Some(explicit) = &cli.schema
+            if let Some(explicit) = &cfg.schema
                 && read_and_parse_schema(&restored_schema) != read_and_parse_schema(explicit)
             {
                 eprintln!(
-                    "WARNING: --schema {explicit:?} differs from the restored snapshot's \
+                    "WARNING: schema {explicit:?} differs from the restored snapshot's \
                      schema; using the snapshot's schema ({restored_schema:?}), which is \
                      authoritative for the restored data."
                 );
@@ -634,19 +666,21 @@ pub async fn run() {
             restored_schema
         }
     } else {
-        cli.schema.clone().unwrap_or_else(|| {
-            eprintln!("--schema <path> is required (unless --restore-from is given)");
+        cfg.schema.clone().unwrap_or_else(|| {
+            eprintln!("a schema is required (set --schema, RHYPEDB schema in the config file, or use --restore-from)");
             std::process::exit(1);
         })
     };
 
     let schema = read_and_parse_schema(&schema_path);
 
+    log_effective_config(&cfg, &schema_path);
+
     let db = Database::open_with_options(
         schema.clone(),
-        &cli.data_dir,
+        &cfg.data_dir,
         rhypedb_engine::database::OpenOptions {
-            sync_on_commit: !cli.no_sync,
+            sync_on_commit: !cfg.no_sync,
             ..Default::default()
         },
     )
@@ -654,7 +688,7 @@ pub async fn run() {
         eprintln!("failed to open database: {e}");
         std::process::exit(1);
     });
-    if cli.no_sync {
+    if cfg.no_sync {
         eprintln!(
             "WARNING: --no-sync is on. WAL writes will not fsync; power loss can drop \
              the last N records. Equivalent to Postgres fsync=off."
@@ -705,28 +739,23 @@ pub async fn run() {
         None
     };
 
-    // Card 5: read the admin token ONCE. Unset → admin endpoints return 403.
-    let admin_token = std::env::var("RHYPEDB_ADMIN_TOKEN").ok().filter(|t| !t.is_empty());
-    let admin_enabled = admin_token.is_some();
-
-    // Server-wide `.similar` defaults, read ONCE. A per-query `ef:`/`rerank:`
-    // overrides these; an invalid value is warned-about and ignored (above).
-    let (default_ef, default_rerank) = parse_vector_search_defaults(
-        std::env::var("RHYPEDB_EF").ok().as_deref(),
-        std::env::var("RHYPEDB_RERANK").ok().as_deref(),
-    );
+    // All of these are now resolved from CLI > env > config-file > default (see
+    // `config::resolve`). Admin disabled (token None) → admin endpoints return 403.
+    let admin_enabled = cfg.admin_token.is_some();
 
     let state = Arc::new(AppState {
         db: ArcSwap::from(db),
         vectorizer,
-        query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
-        admin_token,
+        query_cache: QueryCache::new(cfg.cache_max_entries),
+        admin_token: cfg.admin_token.clone(),
         reload_lock: tokio::sync::RwLock::new(()),
         pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
-        data_dir: cli.data_dir.clone(),
+        data_dir: cfg.data_dir.clone(),
         schema_path: schema_path.clone(),
-        default_ef,
-        default_rerank,
+        default_ef: cfg.default_ef,
+        default_rerank: cfg.default_rerank,
+        graceful_drain: cfg.graceful_drain,
+        worker_quiesce_budget: cfg.worker_quiesce_budget,
     });
 
     // Re-register completion watchers for any migration left in flight by a prior
@@ -737,7 +766,7 @@ pub async fn run() {
     // Sweep orphaned `.rhypedb-backup-stream-*` temp dirs from a previously
     // hard-killed run (their TempDirGuard never ran) so leaked hard-linked SST
     // inodes don't accumulate on the volume.
-    admin::reap_backup_temp_dirs(&cli.data_dir);
+    admin::reap_backup_temp_dirs(&cfg.data_dir);
 
     let app = Router::new()
         .route("/query", post(handle_query))
@@ -749,32 +778,25 @@ pub async fn run() {
         .merge(admin::admin_router(state.clone()))
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(&cli.listen)
+    let listener = tokio::net::TcpListener::bind(&cfg.listen)
         .await
         .unwrap_or_else(|e| {
-            eprintln!("failed to bind {}: {e}", cli.listen);
+            eprintln!("failed to bind {}: {e}", cfg.listen);
             std::process::exit(1);
         });
 
-    let tcp_listener = TcpListener::bind(&cli.tcp_listen)
+    let tcp_listener = TcpListener::bind(&cfg.tcp_listen)
         .await
         .unwrap_or_else(|e| {
-            eprintln!("failed to bind {}: {e}", cli.tcp_listen);
+            eprintln!("failed to bind {}: {e}", cfg.tcp_listen);
             std::process::exit(1);
         });
 
-    println!("rhypedb HTTP listening on {}", cli.listen);
-    println!("rhypedb binary TCP listening on {}", cli.tcp_listen);
+    println!("rhypedb HTTP listening on {}", cfg.listen);
+    println!("rhypedb binary TCP listening on {}", cfg.tcp_listen);
     println!("  POST /query     — execute queries");
     println!("  GET  /health    — health check");
     println!("  GET  /schema    — schema introspection (JSON + SDL)");
-    if default_ef.is_some() || default_rerank.is_some() {
-        println!(
-            "  vector .similar defaults: ef={} rerank={} (per-query args override)",
-            default_ef.map_or_else(|| "heuristic".to_string(), |n| n.to_string()),
-            default_rerank.map_or_else(|| "off".to_string(), |n| n.to_string()),
-        );
-    }
     if admin_enabled {
         println!("  *    /admin/* (compact, reload, migrations*) — admin (RHYPEDB_ADMIN_TOKEN set)");
         println!(
@@ -791,17 +813,6 @@ pub async fn run() {
     serve(state, app, listener, tcp_listener, shutdown_signal()).await;
 }
 
-/// How long in-flight requests are allowed to drain after a shutdown signal
-/// before we flush and exit regardless. Kept comfortably under a typical 30s
-/// platform stop window (e.g. Kubernetes `terminationGracePeriodSeconds`) so the
-/// flush always lands before the platform's SIGKILL backstop.
-const GRACEFUL_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// How long to wait for the vectorizer embed worker to finish its in-flight batch
-/// and stop before flushing. Bounded so a slow embed batch can't eat the stop
-/// window — on timeout we flush anyway (the un-stored batch is WAL-durable and
-/// replays on restart).
-const WORKER_QUIESCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Resolve on the first shutdown signal: SIGTERM (the platform's graceful stop)
 /// or SIGINT / Ctrl-C. On non-unix only Ctrl-C is wired. A SIGTERM-handler install
@@ -835,8 +846,8 @@ async fn shutdown_signal() {
 }
 
 /// Serve the HTTP and binary-TCP listeners until `shutdown` resolves, then stop
-/// accepting, drain in-flight requests (bounded by [`GRACEFUL_DRAIN`]), and flush
-/// the active memtable to an SST so the next cold-start replays an empty WAL.
+/// accepting, drain in-flight requests (bounded by `state.graceful_drain`), and
+/// flush the active memtable to an SST so the next cold-start replays an empty WAL.
 /// Factored out of [`run`] so a test can drive shutdown with its own future
 /// instead of a real signal.
 ///
@@ -850,6 +861,10 @@ async fn serve(
     tcp_listener: TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
+    // Shutdown timing knobs, resolved from config (Copy, so spawns capture freely).
+    let graceful_drain = state.graceful_drain;
+    let worker_quiesce_budget = state.worker_quiesce_budget;
+
     // A single signal flips this watch; both listeners observe it. `watch` retains
     // the latest value, so a receiver that subscribes after the flip still sees it.
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
@@ -857,7 +872,7 @@ async fn serve(
         let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             shutdown.await;
-            eprintln!("shutdown signal received — draining (up to {GRACEFUL_DRAIN:?})");
+            eprintln!("shutdown signal received — draining (up to {graceful_drain:?})");
             let _ = shutdown_tx.send(true);
         });
     }
@@ -924,8 +939,8 @@ async fn serve(
         let _ = http_task.await;
         let _ = tcp_task.await;
     };
-    if tokio::time::timeout(GRACEFUL_DRAIN, drain).await.is_err() {
-        eprintln!("in-flight drain exceeded {GRACEFUL_DRAIN:?} — flushing and exiting anyway");
+    if tokio::time::timeout(graceful_drain, drain).await.is_err() {
+        eprintln!("in-flight drain exceeded {graceful_drain:?} — flushing and exiting anyway");
     }
 
     // Quiesce the vectorizer embed worker BEFORE flushing: stop_worker joins the
@@ -939,9 +954,9 @@ async fn serve(
     // vectorizer writes and best-effort otherwise.)
     if let Some(vectorizer) = state.vectorizer.clone() {
         let stop = tokio::task::spawn_blocking(move || vectorizer.stop_worker());
-        if tokio::time::timeout(WORKER_QUIESCE_BUDGET, stop).await.is_err() {
+        if tokio::time::timeout(worker_quiesce_budget, stop).await.is_err() {
             eprintln!(
-                "vectorizer worker did not stop within {WORKER_QUIESCE_BUDGET:?}; flushing anyway"
+                "vectorizer worker did not stop within {worker_quiesce_budget:?}; flushing anyway"
             );
         }
     }
@@ -1331,33 +1346,9 @@ mod tcp_tests {
             schema_path,
             default_ef: None,
             default_rerank: None,
+            graceful_drain: std::time::Duration::from_secs(20),
+            worker_quiesce_budget: std::time::Duration::from_secs(10),
         })
-    }
-
-    #[test]
-    fn parse_vector_search_defaults_normalises() {
-        // Valid values pass through.
-        assert_eq!(
-            parse_vector_search_defaults(Some("128"), Some("40")),
-            (Some(128), Some(40))
-        );
-        // Unset -> no defaults.
-        assert_eq!(parse_vector_search_defaults(None, None), (None, None));
-        // Empty / whitespace-only -> ignored; surrounding whitespace trimmed.
-        assert_eq!(
-            parse_vector_search_defaults(Some("   "), Some(" 50 ")),
-            (None, Some(50))
-        );
-        // ef must be >= 1; ef=0 is ignored. rerank=0 means "off" -> None.
-        assert_eq!(
-            parse_vector_search_defaults(Some("0"), Some("0")),
-            (None, None)
-        );
-        // Garbage / negative -> ignored (server still starts).
-        assert_eq!(
-            parse_vector_search_defaults(Some("abc"), Some("-5")),
-            (None, None)
-        );
     }
 
     #[tokio::test]

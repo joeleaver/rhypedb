@@ -29,6 +29,53 @@ rhypedb-server --schema schema.rhype --data-dir /var/lib/rhypedb
 | `RHYPEDB_RERANK` | Default rerank pool size for `.similar` queries that omit `rerank:` (`0` = off; overridable per query). An invalid value is ignored with a warning. |
 | `RHYPEDB_RESTORE_FROM` | Snapshot directory to restore on boot (same as `--restore-from`; the flag wins if both are set). |
 | `RHYPEDB_RESTORE_FROM_FORCE` | `1`/`true`/`yes`/`on` ⇒ same as `--restore-force`. |
+| `RHYPEDB_CONFIG` | Path to a TOML config file (same as `--config`; the flag wins if both are set). |
+
+## Configuration file
+
+Instead of (or alongside) flags and env vars, point the server at a TOML config
+file with `--config <path>` or `RHYPEDB_CONFIG`. There is no auto-discovery — the
+file is loaded only from the explicit path.
+
+**Precedence (most-specific wins):**
+
+```text
+CLI flag  >  env var  >  config file  >  built-in default
+```
+
+So a config file is a *fallback layer*: anything you also pass as a flag or env var
+overrides it, and with no `--config` the server behaves exactly as before.
+
+The keys map one-to-one to the flags/env vars (flat, `snake_case`):
+
+| Key | Type | Default | Equivalent flag / env |
+| --- | --- | --- | --- |
+| `schema` | path | *(required unless `restore_from`)* | `--schema` |
+| `data_dir` | path | `./rhypedb-data` | `--data-dir` |
+| `listen` | string | `127.0.0.1:4200` | `--listen` |
+| `tcp_listen` | string | `127.0.0.1:4201` | `--tcp-listen` |
+| `no_sync` | bool | `false` | `--no-sync` |
+| `admin_token` | string | *(unset → admin off)* | `RHYPEDB_ADMIN_TOKEN` |
+| `ef` | int ≥ 1 | *(heuristic)* | `RHYPEDB_EF` |
+| `rerank` | int (`0` = off) | `off` | `RHYPEDB_RERANK` |
+| `restore_from` | path | *(off)* | `--restore-from` |
+| `restore_from_force` | bool | `false` | `--restore-force` |
+| `cache_max_entries` | int ≥ 1 | `256` | *(file only)* |
+| `graceful_drain_secs` | int ≥ 1 | `20` | *(file only)* |
+| `worker_quiesce_budget_secs` | int ≥ 1 | `10` | *(file only)* |
+
+**Validation.** A typo'd or unknown key, invalid TOML, a wrong-typed value (e.g.
+`ef = "x"`), or an unreadable `--config` path is a **fatal startup error** (exit 1)
+that names the file. Out-of-range *tuning* values (`ef`/`rerank`/`cache`/drain
+below their minimum) are **warned about and ignored** — they fall back to the lower
+layer or the default, so a fat-fingered tuning hint never bricks an unattended
+start. The boolean flags (`--no-sync`, `--restore-force`) can only force a value
+*on*; to keep one off, leave it unset everywhere.
+
+The effective resolved config is logged at startup (the `admin_token` is **never**
+printed — only whether admin is enabled). Keep any config file containing
+`admin_token` out of version control. A commented example with every key and its
+default ships at [`docs/examples/rhypedb.toml`](https://github.com/joeleaver/rhypedb/blob/master/docs/examples/rhypedb.toml).
 
 ## Restore on boot
 

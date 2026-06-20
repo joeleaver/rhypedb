@@ -1403,6 +1403,8 @@ mod tests {
             schema_path,
             default_ef: None,
             default_rerank: None,
+            graceful_drain: std::time::Duration::from_secs(20),
+            worker_quiesce_budget: std::time::Duration::from_secs(10),
         });
         let app = Router::new()
             .merge(admin_router(state.clone()))

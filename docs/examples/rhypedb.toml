@@ -1,0 +1,47 @@
+# Example rhypedb.toml — point the server at it with:
+#   rhypedb-server --config rhypedb.toml
+# (or set RHYPEDB_CONFIG=/path/to/rhypedb.toml)
+#
+# This file is a FALLBACK layer. Precedence, most-specific wins:
+#   CLI flag  >  env var  >  config file  >  built-in default
+# So anything you also pass as a flag/env overrides the value here, and with no
+# --config the server behaves exactly as if this file did not exist.
+#
+# Every key is shown with its default, commented out. Uncomment to override.
+# Unknown/typo'd keys, invalid TOML, or wrong types are a fatal startup error.
+
+# Path to the SDL schema file. Required UNLESS restore_from is set (a restored
+# data dir carries its own authoritative schema.rhype).
+# schema = "schema.rhype"
+
+# Storage directory (created if absent).
+# data_dir = "./rhypedb-data"
+
+# HTTP and binary-TCP listen addresses.
+# listen = "127.0.0.1:4200"
+# tcp_listen = "127.0.0.1:4201"
+
+# Skip the WAL fsync at commit. Faster, but a power loss can drop the last few
+# writes (Postgres fsync=off). Don't use in production.
+# no_sync = false
+
+# Bearer token gating all /admin/* endpoints. Unset => admin endpoints return 403.
+# KEEP A FILE CONTAINING THIS OUT OF VERSION CONTROL.
+# admin_token = "change-me"
+
+# Server-wide defaults for `.similar` queries that omit the argument; a per-query
+# ef:/rerank: always overrides. ef must be >= 1; rerank 0 means off. An
+# out-of-range value here is warned-about and ignored (falls back to the default).
+# ef = 200
+# rerank = 50
+
+# Restore a physical backup snapshot into data_dir BEFORE serving (the snapshot's
+# schema.rhype becomes authoritative). Idempotent across restarts.
+# restore_from = "/restore/snapshot"
+# restore_from_force = false
+
+# Tuning knobs (config-file only; no flag/env in this version). Each must be >= 1;
+# a smaller value is warned-about and falls back to the default shown.
+# cache_max_entries = 256            # parsed-query cache size
+# graceful_drain_secs = 20           # in-flight drain budget on shutdown
+# worker_quiesce_budget_secs = 10    # vectorizer-worker stop budget on shutdown

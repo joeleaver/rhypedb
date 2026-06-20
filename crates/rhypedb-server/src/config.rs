@@ -1,0 +1,416 @@
+//! Server configuration.
+//!
+//! A `rhypedb.toml` config file is an OPTIONAL fallback layer beneath the CLI
+//! flags and env vars that already exist. Precedence, most-specific wins:
+//!
+//! ```text
+//! CLI flag  >  env var  >  config file  >  built-in default
+//! ```
+//!
+//! With no `--config` / `RHYPEDB_CONFIG`, behaviour is exactly as before — the
+//! file is purely additive. The file is loaded only from an explicit path (no
+//! auto-discovery). Unknown keys are rejected so a typo fails loud.
+//!
+//! [`resolve`] is PURE — it takes the three layers and returns the effective
+//! [`ServerConfig`] (or an error string). It does not read env, touch the
+//! filesystem, or exit; the caller (`run`) owns I/O + `process::exit`. This keeps
+//! the precedence logic exhaustively unit-testable.
+
+use serde::Deserialize;
+use std::path::PathBuf;
+use std::time::Duration;
+
+// Defaults. These are the SINGLE source of truth for the effective values; the
+// clap `default_value`s on the flags are kept only so `--help` shows them and
+// MUST equal these.
+pub const DEFAULT_DATA_DIR: &str = "./rhypedb-data";
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:4200";
+pub const DEFAULT_TCP_LISTEN: &str = "127.0.0.1:4201";
+pub const DEFAULT_CACHE_MAX_ENTRIES: usize = crate::query_cache::DEFAULT_CACHE_SIZE;
+pub const DEFAULT_GRACEFUL_DRAIN_SECS: u64 = 20;
+pub const DEFAULT_WORKER_QUIESCE_SECS: u64 = 10;
+
+/// The on-disk `rhypedb.toml`. Every field optional (a file may set any subset);
+/// unknown keys are rejected (a typo like `admin_tocken` fails loud). `ef`/`rerank`/
+/// `cache_max_entries` are `i64` so a NEGATIVE value is a range check in `resolve`
+/// (warn + ignore), while a wrong TYPE (e.g. `ef = "x"`) is a loud parse error.
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FileConfig {
+    pub schema: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
+    pub listen: Option<String>,
+    pub tcp_listen: Option<String>,
+    pub no_sync: Option<bool>,
+    pub restore_from: Option<PathBuf>,
+    pub restore_from_force: Option<bool>,
+    pub admin_token: Option<String>,
+    pub ef: Option<i64>,
+    pub rerank: Option<i64>,
+    pub cache_max_entries: Option<i64>,
+    pub graceful_drain_secs: Option<u64>,
+    pub worker_quiesce_budget_secs: Option<u64>,
+}
+
+/// A snapshot of the relevant env vars (raw, unparsed). Built once via
+/// [`EnvLayer::from_env`]; `resolve` interprets these so it never reads env itself.
+#[derive(Debug, Default)]
+pub struct EnvLayer {
+    pub admin_token: Option<String>,
+    pub ef: Option<String>,
+    pub rerank: Option<String>,
+    pub restore_from: Option<String>,
+    pub restore_from_force: Option<String>,
+}
+
+impl EnvLayer {
+    pub fn from_env() -> Self {
+        Self {
+            admin_token: std::env::var("RHYPEDB_ADMIN_TOKEN").ok(),
+            ef: std::env::var("RHYPEDB_EF").ok(),
+            rerank: std::env::var("RHYPEDB_RERANK").ok(),
+            restore_from: std::env::var("RHYPEDB_RESTORE_FROM").ok(),
+            restore_from_force: std::env::var("RHYPEDB_RESTORE_FROM_FORCE").ok(),
+        }
+    }
+}
+
+/// The CLI flag layer. For flags WITH a clap default (`data_dir`/`listen`/
+/// `tcp_listen`) the field is `Some` ONLY when the user actually typed the flag
+/// (decided via `ArgMatches::value_source`), so an unspecified flag's default
+/// does not shadow env/file. Bool flags are plain bools (store_true can only push
+/// toward `true`).
+#[derive(Debug, Default)]
+pub struct CliLayer {
+    pub schema: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
+    pub listen: Option<String>,
+    pub tcp_listen: Option<String>,
+    pub no_sync: bool,
+    pub restore_from: Option<PathBuf>,
+    pub restore_force: bool,
+}
+
+/// The effective, resolved configuration the server runs with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerConfig {
+    pub schema: Option<PathBuf>,
+    pub data_dir: PathBuf,
+    pub listen: String,
+    pub tcp_listen: String,
+    pub no_sync: bool,
+    pub admin_token: Option<String>,
+    pub default_ef: Option<usize>,
+    pub default_rerank: Option<usize>,
+    pub restore_from: Option<PathBuf>,
+    pub restore_force: bool,
+    pub cache_max_entries: usize,
+    pub graceful_drain: Duration,
+    pub worker_quiesce_budget: Duration,
+}
+
+fn env_truthy(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Parse an env string to an integer, warning (and dropping to `None`) if present
+/// but unparseable — matching the existing `RHYPEDB_EF`/`RHYPEDB_RERANK` contract.
+fn env_int(name: &str, raw: Option<&str>) -> Option<i64> {
+    let s = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match s.parse::<i64>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            eprintln!("WARNING: {name}=\"{s}\" is not an integer; ignoring it.");
+            None
+        }
+    }
+}
+
+/// Validate a resolved `ef` (must be >= 1) — warn + drop otherwise.
+fn finalize_ef(raw: Option<i64>) -> Option<usize> {
+    match raw {
+        Some(n) if n >= 1 => Some(n as usize),
+        Some(n) => {
+            eprintln!("WARNING: ef must be >= 1 (got {n}); ignoring it.");
+            None
+        }
+        None => None,
+    }
+}
+
+/// Validate a resolved `rerank` — `0` (or negative) means off → `None`.
+fn finalize_rerank(raw: Option<i64>) -> Option<usize> {
+    match raw {
+        Some(n) if n > 0 => Some(n as usize),
+        _ => None,
+    }
+}
+
+/// A positive-or-default knob (cache size, drain/quiesce seconds): warn + use the
+/// default if the file value is < 1.
+fn positive_or_default(name: &str, v: Option<i64>, default: u64) -> u64 {
+    match v {
+        Some(n) if n >= 1 => n as u64,
+        Some(n) => {
+            eprintln!("WARNING: {name} must be >= 1 (got {n}); using the default {default}.");
+            default
+        }
+        None => default,
+    }
+}
+
+/// Resolve the effective config from the three layers. PURE: no env, no fs, no
+/// exit. Returns `Err` only for a genuinely fatal config combination (today: a
+/// missing schema with no restore — surfaced by the caller, which also injects the
+/// "unless --restore-from" allowance). Out-of-range tuning knobs warn + fall back.
+pub fn resolve(
+    cli: &CliLayer,
+    env: &EnvLayer,
+    file: Option<&FileConfig>,
+) -> ServerConfig {
+    let f_schema = file.and_then(|f| f.schema.clone());
+    let f_data_dir = file.and_then(|f| f.data_dir.clone());
+    let f_listen = file.and_then(|f| f.listen.clone());
+    let f_tcp = file.and_then(|f| f.tcp_listen.clone());
+    let f_no_sync = file.and_then(|f| f.no_sync);
+    let f_restore_from = file.and_then(|f| f.restore_from.clone());
+    let f_restore_force = file.and_then(|f| f.restore_from_force);
+    let f_admin = file.and_then(|f| f.admin_token.clone());
+    let f_ef = file.and_then(|f| f.ef);
+    let f_rerank = file.and_then(|f| f.rerank);
+    let f_cache = file.and_then(|f| f.cache_max_entries);
+    let f_drain = file.and_then(|f| f.graceful_drain_secs);
+    let f_quiesce = file.and_then(|f| f.worker_quiesce_budget_secs);
+
+    // ef / rerank: cli (none today) > env (parsed string) > file, validated ONCE
+    // on the resolved value. A valid env value wins over the file.
+    let ef_raw = env_int("RHYPEDB_EF", env.ef.as_deref()).or(f_ef);
+    let rerank_raw = env_int("RHYPEDB_RERANK", env.rerank.as_deref()).or(f_rerank);
+
+    ServerConfig {
+        schema: cli.schema.clone().or(f_schema),
+        data_dir: cli
+            .data_dir
+            .clone()
+            .or(f_data_dir)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR)),
+        listen: cli
+            .listen
+            .clone()
+            .or(f_listen)
+            .unwrap_or_else(|| DEFAULT_LISTEN.to_string()),
+        tcp_listen: cli
+            .tcp_listen
+            .clone()
+            .or(f_tcp)
+            .unwrap_or_else(|| DEFAULT_TCP_LISTEN.to_string()),
+        // Bool Model A: a store_true flag can only force `true`; otherwise fall to
+        // env (truthy string) then file then default-false. OR is exactly this.
+        no_sync: cli.no_sync || f_no_sync.unwrap_or(false),
+        admin_token: env.admin_token.clone().or(f_admin).filter(|t| !t.is_empty()),
+        default_ef: finalize_ef(ef_raw),
+        default_rerank: finalize_rerank(rerank_raw),
+        restore_from: cli
+            .restore_from
+            .clone()
+            .or_else(|| env.restore_from.clone().map(PathBuf::from))
+            .or(f_restore_from),
+        restore_force: cli.restore_force
+            || env.restore_from_force.as_deref().map(env_truthy).unwrap_or(false)
+            || f_restore_force.unwrap_or(false),
+        cache_max_entries: positive_or_default(
+            "cache_max_entries",
+            f_cache,
+            DEFAULT_CACHE_MAX_ENTRIES as u64,
+        ) as usize,
+        graceful_drain: Duration::from_secs(positive_or_default(
+            "graceful_drain_secs",
+            f_drain.map(|v| v as i64),
+            DEFAULT_GRACEFUL_DRAIN_SECS,
+        )),
+        worker_quiesce_budget: Duration::from_secs(positive_or_default(
+            "worker_quiesce_budget_secs",
+            f_quiesce.map(|v| v as i64),
+            DEFAULT_WORKER_QUIESCE_SECS,
+        )),
+    }
+}
+
+/// Load + parse a `rhypedb.toml`. Every failure (unreadable, invalid TOML,
+/// unknown key, wrong-typed value) is a fatal, legible error naming the FILE.
+pub fn load_config_file(path: &std::path::Path) -> Result<FileConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read config file {}: {e}", path.display()))?;
+    toml::from_str(&text)
+        .map_err(|e| format!("invalid config file {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(toml_src: &str) -> FileConfig {
+        toml::from_str(toml_src).unwrap()
+    }
+
+    #[test]
+    fn no_file_no_env_yields_defaults() {
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), None);
+        assert_eq!(c.data_dir, PathBuf::from(DEFAULT_DATA_DIR));
+        assert_eq!(c.listen, DEFAULT_LISTEN);
+        assert_eq!(c.tcp_listen, DEFAULT_TCP_LISTEN);
+        assert!(!c.no_sync);
+        assert_eq!(c.admin_token, None);
+        assert_eq!(c.default_ef, None);
+        assert_eq!(c.default_rerank, None);
+        assert_eq!(c.restore_from, None);
+        assert!(!c.restore_force);
+        assert_eq!(c.cache_max_entries, DEFAULT_CACHE_MAX_ENTRIES);
+        assert_eq!(c.graceful_drain, Duration::from_secs(DEFAULT_GRACEFUL_DRAIN_SECS));
+        assert_eq!(c.schema, None);
+    }
+
+    #[test]
+    fn file_overrides_default() {
+        let f = file(
+            r#"
+            data_dir = "/var/lib/rhypedb"
+            listen = "0.0.0.0:9000"
+            no_sync = true
+            ef = 200
+            cache_max_entries = 1024
+            graceful_drain_secs = 45
+        "#,
+        );
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.data_dir, PathBuf::from("/var/lib/rhypedb"));
+        assert_eq!(c.listen, "0.0.0.0:9000");
+        assert!(c.no_sync);
+        assert_eq!(c.default_ef, Some(200));
+        assert_eq!(c.cache_max_entries, 1024);
+        assert_eq!(c.graceful_drain, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn env_wins_over_file() {
+        let f = file(r#"ef = 200
+            rerank = 5
+            admin_token = "file-token""#);
+        let env = EnvLayer {
+            ef: Some("100".into()),
+            admin_token: Some("env-token".into()),
+            ..Default::default()
+        };
+        let c = resolve(&CliLayer::default(), &env, Some(&f));
+        assert_eq!(c.default_ef, Some(100), "env ef wins over file");
+        assert_eq!(c.default_rerank, Some(5), "file rerank used when env absent");
+        assert_eq!(c.admin_token, Some("env-token".into()));
+    }
+
+    #[test]
+    fn flag_wins_over_env_and_file() {
+        let f = file(r#"data_dir = "/from/file"
+            listen = "1.1.1.1:1""#);
+        let env = EnvLayer {
+            restore_from: Some("/from/env".into()),
+            ..Default::default()
+        };
+        let cli = CliLayer {
+            data_dir: Some(PathBuf::from("/from/flag")),
+            restore_from: Some(PathBuf::from("/from/flag-restore")),
+            ..Default::default()
+        };
+        let c = resolve(&cli, &env, Some(&f));
+        assert_eq!(c.data_dir, PathBuf::from("/from/flag"));
+        assert_eq!(c.listen, "1.1.1.1:1", "file used when no flag");
+        assert_eq!(c.restore_from, Some(PathBuf::from("/from/flag-restore")));
+    }
+
+    #[test]
+    fn bool_model_a_or_across_layers() {
+        // Only flag.
+        let cli = CliLayer { no_sync: true, restore_force: true, ..Default::default() };
+        let c = resolve(&cli, &EnvLayer::default(), None);
+        assert!(c.no_sync && c.restore_force);
+
+        // Only env (restore_from_force truthy string).
+        let env = EnvLayer { restore_from_force: Some("yes".into()), ..Default::default() };
+        let c = resolve(&CliLayer::default(), &env, None);
+        assert!(c.restore_force);
+        let env = EnvLayer { restore_from_force: Some("0".into()), ..Default::default() };
+        let c = resolve(&CliLayer::default(), &env, None);
+        assert!(!c.restore_force, "env '0' is falsey");
+
+        // Only file.
+        let f = file("no_sync = true\nrestore_from_force = true");
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert!(c.no_sync && c.restore_force);
+
+        // None.
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), None);
+        assert!(!c.no_sync && !c.restore_force);
+    }
+
+    #[test]
+    fn ef_rerank_range_validation_warns_and_drops() {
+        // ef < 1 and negative -> None (heuristic); rerank 0 -> off.
+        let f = file("ef = 0\nrerank = 0");
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.default_ef, None);
+        assert_eq!(c.default_rerank, None);
+
+        let f = file("ef = -5");
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.default_ef, None);
+
+        // A bad env string is ignored, falling through to the file value.
+        let f = file("ef = 64");
+        let env = EnvLayer { ef: Some("abc".into()), ..Default::default() };
+        let c = resolve(&CliLayer::default(), &env, Some(&f));
+        assert_eq!(c.default_ef, Some(64));
+    }
+
+    #[test]
+    fn cache_and_drain_below_one_fall_back_to_default() {
+        let f = file("cache_max_entries = 0\ngraceful_drain_secs = 0");
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.cache_max_entries, DEFAULT_CACHE_MAX_ENTRIES);
+        assert_eq!(c.graceful_drain, Duration::from_secs(DEFAULT_GRACEFUL_DRAIN_SECS));
+    }
+
+    #[test]
+    fn empty_admin_token_is_none() {
+        let f = file(r#"admin_token = """#);
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.admin_token, None);
+    }
+
+    #[test]
+    fn schema_from_file_satisfies_resolution() {
+        let f = file(r#"schema = "/etc/rhypedb/schema.rhype""#);
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.schema, Some(PathBuf::from("/etc/rhypedb/schema.rhype")));
+    }
+
+    #[test]
+    fn load_rejects_unknown_key_and_bad_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+
+        std::fs::write(&p, "admin_tocken = \"x\"").unwrap();
+        let err = load_config_file(&p).unwrap_err();
+        assert!(err.contains("invalid config file"), "{err}");
+
+        std::fs::write(&p, "ef = \"not-an-int\"").unwrap();
+        assert!(load_config_file(&p).is_err());
+
+        std::fs::write(&p, "data_dir = \"/ok\"\nlisten = \"a:1\"").unwrap();
+        let ok = load_config_file(&p).unwrap();
+        assert_eq!(ok.data_dir, Some(PathBuf::from("/ok")));
+    }
+
+    #[test]
+    fn load_missing_file_is_error() {
+        assert!(load_config_file(std::path::Path::new("/no/such/rhypedb.toml")).is_err());
+    }
+}
