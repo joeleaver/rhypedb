@@ -1107,17 +1107,30 @@ where
 }
 
 /// Write an `Event` push (JSON `WireEvent`, tagged with the subscription handle).
+///
+/// An `Event` whose JSON would exceed the frame cap (e.g. a multi-MiB string
+/// field) is NOT shippable — the peer's `read_frame` would reject "frame too
+/// large" and tear the connection. In that case we downgrade to a `SubLagged`
+/// (the documented "reconcile by re-query" path) and count it as a drop.
 async fn write_event_push<W>(
     writer: &mut W,
     buf: &mut Vec<u8>,
     handle: u32,
     event: &ChangeEvent,
+    events_dropped: &AtomicU64,
 ) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    // Encode separately so we can size-check before committing the frame.
+    let mut payload = Vec::new();
+    protocol::encode_event_payload_into(event, &mut payload);
+    if payload.len() > protocol::MAX_FRAME_PAYLOAD {
+        events_dropped.fetch_add(1, Ordering::Relaxed);
+        return write_sublagged(writer, buf, handle).await;
+    }
     protocol::write_frame_buffered(writer, buf, handle, protocol::RESP_EVENT, |b| {
-        protocol::encode_event_payload_into(event, b)
+        b.extend_from_slice(&payload)
     })
     .await
 }
@@ -1148,6 +1161,12 @@ async fn handle_connection_stream<R, W>(
     // collapse to one `write_all` instead of four.
     let mut response_buf: Vec<u8> = Vec::with_capacity(4 * 1024);
 
+    // Cancel-safe inbound framing. The loop's `select!` cancels an in-flight read
+    // whenever a push/lag arm wins (they `continue`), so the read MUST survive a
+    // dropped future — `FrameReader` keeps partially-read bytes in a task-owned
+    // buffer (a plain `read_frame` built on `read_exact` would desync the stream).
+    let mut frame_reader = protocol::FrameReader::new();
+
     // Per-connection prepared statements (Postgres-style session scope): a parsed
     // query pinned by id for this connection, freed when it closes. Lock-free —
     // this task owns the map.
@@ -1176,17 +1195,19 @@ async fn handle_connection_stream<R, W>(
     let mut subscription_mode = false;
 
     loop {
-        // Multiplex three sources on this one task (so writes never interleave —
-        // only one branch runs to completion at a time):
+        // Multiplex three sources on this one task (so whole frames never
+        // interleave — only one branch's write runs to completion at a time):
         //   • an inbound client frame,
         //   • a server-pushed change event for one of this connection's subs,
         //   • a lag wake-up (a sub overflowed and must emit `SubLagged`).
-        // Shutdown is checked at this boundary only: an in-flight request runs to
-        // its write before the next loop, so a graceful stop never truncates a
-        // response — it stops reading new frames and closes promptly (matching
-        // axum's HTTP graceful-shutdown semantics).
+        // The push/lag arms `continue`, which CANCELS the in-flight inbound read;
+        // `frame_reader` makes that safe by retaining partial bytes across the
+        // cancellation. Shutdown is checked at this boundary only: an in-flight
+        // request runs to its write before the next loop, so a graceful stop never
+        // truncates a response — it stops reading new frames and closes promptly
+        // (matching axum's HTTP graceful-shutdown semantics).
         let frame = tokio::select! {
-            read = protocol::read_frame(reader) => match read {
+            read = frame_reader.next_frame(reader) => match read {
                 Ok(f) => f,
                 Err(e) => {
                     if e.kind() != std::io::ErrorKind::UnexpectedEof {
@@ -1206,8 +1227,14 @@ async fn handle_connection_stream<R, W>(
                             eprintln!("tcp sublagged write error: {e}");
                             return;
                         }
-                        if let Err(e) =
-                            write_event_push(writer, &mut response_buf, push.req_id, &push.event).await
+                        if let Err(e) = write_event_push(
+                            writer,
+                            &mut response_buf,
+                            push.req_id,
+                            &push.event,
+                            &state.events_dropped,
+                        )
+                        .await
                         {
                             eprintln!("tcp event write error: {e}");
                             return;
@@ -1482,14 +1509,26 @@ async fn handle_connection_stream<R, W>(
                             "subscription handle {handle} already in use on this connection"
                         ));
                     }
-                    // Atomically reserve a process-wide slot (race-safe across
-                    // connections); back it out if we are over the cap.
-                    let prev = state.network_subs.fetch_add(1, Ordering::SeqCst);
-                    if prev >= MAX_SUBSCRIPTIONS_TOTAL {
-                        state.network_subs.fetch_sub(1, Ordering::SeqCst);
-                        return Err(format!(
-                            "server subscription limit reached (max {MAX_SUBSCRIPTIONS_TOTAL})"
-                        ));
+                    // Reserve a process-wide slot with a CAS loop so the counter
+                    // never exceeds the cap even transiently (a fetch_add-then-back-out
+                    // would let `/status` momentarily report a value above the
+                    // documented ceiling). Race-safe across connections.
+                    let mut cur = state.network_subs.load(Ordering::Acquire);
+                    loop {
+                        if cur >= MAX_SUBSCRIPTIONS_TOTAL {
+                            return Err(format!(
+                                "server subscription limit reached (max {MAX_SUBSCRIPTIONS_TOTAL})"
+                            ));
+                        }
+                        match state.network_subs.compare_exchange_weak(
+                            cur,
+                            cur + 1,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => cur = actual,
+                        }
                     }
                     let lagged = Arc::new(AtomicBool::new(false));
                     let sink = ConnEventSink {
@@ -2416,5 +2455,35 @@ mod tcp_tests {
 
         drop(sub);
         let _ = sub_h.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_event_downgrades_to_sublagged() {
+        // An Event whose JSON would exceed the 16 MiB frame cap can't be shipped
+        // (the peer's read_frame rejects "frame too large" and tears the
+        // connection). It must downgrade to a SubLagged instead.
+        let (mut client, mut server) = duplex(64 * 1024);
+        let big = "x".repeat(protocol::MAX_FRAME_PAYLOAD); // 16 MiB → event JSON exceeds the cap
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("name".to_string(), serde_json::Value::String(big));
+        let ev = ChangeEvent {
+            version: 1,
+            kind: ChangeKind::Create,
+            type_name: "User".into(),
+            object_id: 1,
+            fields: Some(fields),
+        };
+        let dropped = Arc::new(AtomicU64::new(0));
+        let d2 = Arc::clone(&dropped);
+        let writer = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            write_event_push(&mut server, &mut buf, 5, &ev, &d2).await.unwrap();
+        });
+
+        let f = read_frame_timeout(&mut client, 5000).await.expect("a downgraded frame");
+        assert_eq!(f.kind, protocol::RESP_SUBLAGGED, "oversized event must become SubLagged");
+        assert_eq!(f.req_id, 5);
+        let _ = writer.await;
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 }

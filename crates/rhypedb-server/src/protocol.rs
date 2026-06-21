@@ -169,6 +169,93 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<F
     })
 }
 
+/// A **cancellation-safe** inbound frame reader.
+///
+/// [`read_frame`] is built on `read_exact`, which is NOT cancel-safe: if its
+/// future is dropped after it has copied some bytes out of the underlying reader
+/// but before completing, those bytes are lost and the stream desyncs. That is
+/// fine when the only competing `select!` arm closes the connection, but the
+/// subscription connection loop also races server pushes and lag wake-ups that
+/// `continue` the loop — so a partially-read inbound control frame must survive a
+/// cancelled read.
+///
+/// `FrameReader` owns a reusable accumulation buffer and parses whole frames out
+/// of it. Each await is a single [`AsyncReadExt::read_buf`] (which IS cancel-safe
+/// — a dropped poll leaves the buffer untouched), and the bytes read so far live
+/// in the task-owned buffer, so dropping a [`FrameReader::next_frame`] future
+/// mid-frame loses nothing; the next call resumes. It also tolerates a read that
+/// returns more than one frame's worth of bytes (TCP coalescing / read-ahead).
+#[derive(Default)]
+pub struct FrameReader {
+    buf: Vec<u8>,
+    /// Parse cursor into `buf`; bytes before it are already-returned frames.
+    start: usize,
+}
+
+impl FrameReader {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(8 * 1024),
+            start: 0,
+        }
+    }
+
+    /// Read the next complete frame. Cancel-safe across `select!` iterations.
+    pub async fn next_frame<R: AsyncReadExt + Unpin>(&mut self, reader: &mut R) -> io::Result<Frame> {
+        loop {
+            // Try to parse a complete frame from the buffered bytes first.
+            let avail = self.buf.len() - self.start;
+            if avail >= 4 {
+                let off = self.start;
+                let len = u32::from_be_bytes(self.buf[off..off + 4].try_into().unwrap()) as usize;
+                if len < 5 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("frame too small: {len} bytes"),
+                    ));
+                }
+                if len > MAX_FRAME_PAYLOAD + 5 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("frame too large: {len} bytes"),
+                    ));
+                }
+                if avail >= 4 + len {
+                    let body = off + 4;
+                    let req_id = u32::from_be_bytes(self.buf[body..body + 4].try_into().unwrap());
+                    let kind = self.buf[body + 4];
+                    let payload = self.buf[body + 5..off + 4 + len].to_vec();
+                    self.start += 4 + len;
+                    // Fully drained → reset to keep the buffer from growing.
+                    if self.start == self.buf.len() {
+                        self.buf.clear();
+                        self.start = 0;
+                    }
+                    return Ok(Frame {
+                        req_id,
+                        kind,
+                        payload,
+                    });
+                }
+            }
+            // Need more bytes. Compact the consumed prefix first so the buffer is
+            // bounded by at most one in-flight frame (+ any read-ahead).
+            if self.start > 0 {
+                self.buf.drain(0..self.start);
+                self.start = 0;
+            }
+            // Cancel-safe append: a dropped future leaves `buf` untouched.
+            let n = reader.read_buf(&mut self.buf).await?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed mid-frame",
+                ));
+            }
+        }
+    }
+}
+
 /// Write one frame to an async writer. Issues 4 successive `write_all` calls
 /// which the underlying BufWriter coalesces before flushing.
 ///
@@ -595,15 +682,20 @@ fn kind_bit(kind: ChangeKind) -> u8 {
 /// bitmask matches all kinds (vs. naming specific bits).
 pub fn encode_subscribe_filter(filter: &SubscriptionFilter) -> Vec<u8> {
     let mut out = Vec::new();
+    // Treat an empty type name as "no type filter": the decoder rejects a
+    // zero-length name (the only "match-all" encoding clears the flag), so
+    // emitting one here would produce a payload our own decoder refuses. This
+    // keeps encode→decode a faithful round-trip.
+    let type_name = filter.type_name.as_deref().filter(|s| !s.is_empty());
     let mut flags = 0u8;
-    if filter.type_name.is_some() {
+    if type_name.is_some() {
         flags |= FILTER_FLAG_TYPE;
     }
     if filter.object_id.is_some() {
         flags |= FILTER_FLAG_OBJECT;
     }
     out.push(flags);
-    if let Some(tn) = &filter.type_name {
+    if let Some(tn) = type_name {
         let b = tn.as_bytes();
         out.extend_from_slice(&(b.len() as u16).to_be_bytes());
         out.extend_from_slice(b);
@@ -941,6 +1033,102 @@ mod tests {
         assert!(decode_subscribe_filter(&[FILTER_FLAG_TYPE, 0, 4, b'U', b's']).is_err());
         // trailing bytes after a valid all-filter.
         assert!(decode_subscribe_filter(&[0x00, 0x00, 0xFF]).is_err());
+    }
+
+    #[test]
+    fn encode_filter_normalises_empty_type_name() {
+        // Some("") must not emit a zero-length name the strict decoder rejects;
+        // the encoder normalises it to "no type filter".
+        let f = SubscriptionFilter {
+            type_name: Some(String::new()),
+            object_id: None,
+            kinds: vec![],
+        };
+        let bytes = encode_subscribe_filter(&f);
+        let back = decode_subscribe_filter(&bytes).expect("must round-trip");
+        assert_eq!(back.type_name, None);
+    }
+
+    #[tokio::test]
+    async fn frame_reader_handles_segmentation_and_coalescing() {
+        use tokio::io::duplex;
+        let (mut client, mut server) = duplex(64 * 1024);
+
+        // Build three frames.
+        let f1 = encode_query_payload("User.get(1)");
+        let f2 = encode_query_payload("User.get(2)");
+        let mut two = Vec::new();
+        // Frame 3 carries an empty payload (Ping-like).
+        let mk = |req: u32, kind: u8, p: &[u8]| {
+            let mut v = Vec::new();
+            v.extend_from_slice(&((5 + p.len()) as u32).to_be_bytes());
+            v.extend_from_slice(&req.to_be_bytes());
+            v.push(kind);
+            v.extend_from_slice(p);
+            v
+        };
+        let frame1 = mk(1, REQ_QUERY, &f1);
+        let frame2 = mk(2, REQ_QUERY, &f2);
+        let frame3 = mk(3, REQ_PING, &[]);
+
+        let mut reader = FrameReader::new();
+        let reader_task = tokio::spawn(async move {
+            let a = reader.next_frame(&mut server).await.unwrap();
+            let b = reader.next_frame(&mut server).await.unwrap();
+            let c = reader.next_frame(&mut server).await.unwrap();
+            (a, b, c)
+        });
+
+        // Frame 1: write it ONE BYTE AT A TIME (worst-case segmentation).
+        for byte in &frame1 {
+            tokio::io::AsyncWriteExt::write_all(&mut client, &[*byte]).await.unwrap();
+            tokio::io::AsyncWriteExt::flush(&mut client).await.unwrap();
+        }
+        // Frames 2 and 3 in a SINGLE write (coalesced / read-ahead).
+        two.extend_from_slice(&frame2);
+        two.extend_from_slice(&frame3);
+        tokio::io::AsyncWriteExt::write_all(&mut client, &two).await.unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut client).await.unwrap();
+
+        let (a, b, c) = reader_task.await.unwrap();
+        assert_eq!((a.req_id, a.kind), (1, REQ_QUERY));
+        assert_eq!(decode_query_payload(&a.payload).unwrap(), "User.get(1)");
+        assert_eq!((b.req_id, b.kind), (2, REQ_QUERY));
+        assert_eq!(decode_query_payload(&b.payload).unwrap(), "User.get(2)");
+        assert_eq!((c.req_id, c.kind, c.payload.len()), (3, REQ_PING, 0));
+    }
+
+    #[tokio::test]
+    async fn frame_reader_survives_cancellation_mid_frame() {
+        use tokio::io::duplex;
+        let (mut client, mut server) = duplex(64 * 1024);
+        let payload = encode_query_payload("User.get(7)");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&((5 + payload.len()) as u32).to_be_bytes());
+        frame.extend_from_slice(&9u32.to_be_bytes());
+        frame.push(REQ_QUERY);
+        frame.extend_from_slice(&payload);
+
+        let mut reader = FrameReader::new();
+        // Write the first half, then repeatedly CANCEL next_frame (drop the
+        // future via select! with an immediately-ready branch) — a cancel-unsafe
+        // reader would lose the buffered half and desync.
+        let half = frame.len() / 2;
+        tokio::io::AsyncWriteExt::write_all(&mut client, &frame[..half]).await.unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut client).await.unwrap();
+        for _ in 0..5 {
+            tokio::select! {
+                biased;
+                _ = std::future::ready(()) => {} // always wins → cancels next_frame
+                _ = reader.next_frame(&mut server) => panic!("frame not complete yet"),
+            }
+        }
+        // Now write the rest; the frame must still parse intact.
+        tokio::io::AsyncWriteExt::write_all(&mut client, &frame[half..]).await.unwrap();
+        tokio::io::AsyncWriteExt::flush(&mut client).await.unwrap();
+        let f = reader.next_frame(&mut server).await.unwrap();
+        assert_eq!((f.req_id, f.kind), (9, REQ_QUERY));
+        assert_eq!(decode_query_payload(&f.payload).unwrap(), "User.get(7)");
     }
 
     #[test]
