@@ -6168,6 +6168,15 @@ impl Database {
         &self.subscriptions
     }
 
+    /// Clone the `Arc<SubscriptionHub>` so a long-lived consumer (e.g. a network
+    /// connection) can hold the hub directly. The hub `Arc` is preserved verbatim
+    /// across a hot-reload (`reload_handle`/`clone_into_new_handle` carry the same
+    /// `Arc`), so a subscription registered on the returned handle keeps receiving
+    /// events from post-reload commits.
+    pub fn subscriptions_arc(&self) -> Arc<SubscriptionHub> {
+        Arc::clone(&self.subscriptions)
+    }
+
     pub fn storage(&self) -> &Arc<LsmTree> {
         &self.storage
     }

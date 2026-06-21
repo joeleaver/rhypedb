@@ -75,11 +75,49 @@ impl SubscriptionFilter {
     }
 }
 
-/// A registered subscription with its callback channel.
+/// The outcome of offering an event to a subscriber's [`EventSink`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// The sink accepted the event, OR a bounded sink intentionally dropped it
+    /// (e.g. after flagging a lag) but wants to stay registered. Keep the sub.
+    Delivered,
+    /// The consumer is permanently gone (channel closed / receiver dropped).
+    /// The hub removes the subscription.
+    Disconnected,
+}
+
+/// A transport-agnostic delivery target for change events. The hub invokes
+/// [`EventSink::deliver`] for every matching subscription on every published
+/// event — from the engine's SYNCHRONOUS commit context — so an implementation
+/// MUST NOT block or await. A bounded network sink applies its own
+/// slow-consumer policy here (drop + flag) and returns [`Delivery::Delivered`]
+/// so the subscription survives; it returns [`Delivery::Disconnected`] only when
+/// the consumer is truly gone.
+pub trait EventSink: Send + Sync {
+    fn deliver(&self, event: &ChangeEvent) -> Delivery;
+}
+
+/// The built-in unbounded sink backing [`SubscriptionHub::subscribe`]: a plain
+/// `std::sync::mpsc::Sender`. Never reports `Full` (the channel is unbounded);
+/// reports `Disconnected` once the receiver is dropped.
+struct ChannelSink {
+    sender: std::sync::mpsc::Sender<ChangeEvent>,
+}
+
+impl EventSink for ChannelSink {
+    fn deliver(&self, event: &ChangeEvent) -> Delivery {
+        match self.sender.send(event.clone()) {
+            Ok(()) => Delivery::Delivered,
+            Err(_) => Delivery::Disconnected,
+        }
+    }
+}
+
+/// A registered subscription with its delivery sink.
 struct Subscription {
     id: u64,
     filter: SubscriptionFilter,
-    sender: std::sync::mpsc::Sender<ChangeEvent>,
+    sink: Box<dyn EventSink>,
 }
 
 /// The subscription hub — manages subscriptions and dispatches change events.
@@ -107,21 +145,31 @@ impl SubscriptionHub {
     }
 
     /// Register a new subscription. Returns a subscription ID and a receiver
-    /// channel for change events.
+    /// channel for change events. The channel is UNBOUNDED — suitable for
+    /// in-process consumers that drain promptly; a network transport should use
+    /// [`SubscriptionHub::subscribe_sink`] with a bounded sink instead.
     pub fn subscribe(
         &self,
         filter: SubscriptionFilter,
     ) -> (u64, std::sync::mpsc::Receiver<ChangeEvent>) {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.subscribe_sink(filter, Box::new(ChannelSink { sender }));
+        (id, receiver)
+    }
 
+    /// Register a subscription backed by a caller-supplied [`EventSink`].
+    /// Returns the subscription ID (pass it to [`SubscriptionHub::unsubscribe`]).
+    /// This is the transport-agnostic entry point: the network layer supplies a
+    /// BOUNDED sink that enforces its own slow-consumer policy, keeping the hub
+    /// itself free of any buffering or transport concern.
+    pub fn subscribe_sink(&self, filter: SubscriptionFilter, sink: Box<dyn EventSink>) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         self.subscriptions.write().push(Subscription {
             id,
             filter,
-            sender,
+            sink,
         });
-
-        (id, receiver)
+        id
     }
 
     /// Unsubscribe by ID. Returns true if the subscription was found and removed.
@@ -136,14 +184,15 @@ impl SubscriptionHub {
     /// Called by the engine on every committed mutation.
     pub fn publish(&self, event: ChangeEvent) {
         let subs = self.subscriptions.read();
-        // Collect dead subscriptions (where the receiver was dropped).
+        // Collect dead subscriptions (sink reported the consumer is gone).
         let mut dead_ids = Vec::new();
 
         for sub in subs.iter() {
             if sub.filter.matches(&event)
-                && sub.sender.send(event.clone()).is_err() {
-                    dead_ids.push(sub.id);
-                }
+                && sub.sink.deliver(&event) == Delivery::Disconnected
+            {
+                dead_ids.push(sub.id);
+            }
         }
 
         drop(subs);
@@ -287,6 +336,56 @@ mod tests {
         hub.publish(make_event(ChangeKind::Create, "User", 1));
 
         // The dead subscription should have been cleaned up.
+        assert_eq!(hub.subscription_count(), 0);
+    }
+
+    #[test]
+    fn custom_sink_delivered_keeps_disconnected_removes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A sink that records deliveries and reports Disconnected once a shared
+        // flag is set — exercising both Delivery outcomes through publish().
+        struct CountingSink {
+            count: Arc<AtomicUsize>,
+            dead: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl EventSink for CountingSink {
+            fn deliver(&self, _event: &ChangeEvent) -> Delivery {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                if self.dead.load(Ordering::SeqCst) {
+                    Delivery::Disconnected
+                } else {
+                    Delivery::Delivered
+                }
+            }
+        }
+
+        let hub = SubscriptionHub::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _id = hub.subscribe_sink(
+            SubscriptionFilter::for_type("User"),
+            Box::new(CountingSink {
+                count: count.clone(),
+                dead: dead.clone(),
+            }),
+        );
+
+        // Non-matching event: sink not called.
+        hub.publish(make_event(ChangeKind::Create, "Post", 1));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(hub.subscription_count(), 1);
+
+        // Matching event while Delivered: kept.
+        hub.publish(make_event(ChangeKind::Create, "User", 2));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(hub.subscription_count(), 1);
+
+        // Now report Disconnected: the next matching publish removes the sub.
+        dead.store(true, Ordering::SeqCst);
+        hub.publish(make_event(ChangeKind::Update, "User", 2));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
         assert_eq!(hub.subscription_count(), 0);
     }
 
