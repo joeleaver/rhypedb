@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -21,6 +22,7 @@ use rhypedb_engine::object::{Object, Value};
 use rhypedb_engine::vectorizer::Vectorizer;
 use rhypedb_query::executor::{ExecContext, QueryOutput};
 use rhypedb_schema::parser::parse_schema;
+use rhypedb_subscribe::{ChangeEvent, SubscriptionHub};
 use rhypedb_schema::{
     DistanceMetric, FieldDef, FieldType, IndexDef, OnDeletePolicy, QuantizationType, ScalarType,
     Schema,
@@ -30,7 +32,7 @@ mod admin;
 mod config;
 mod converters;
 pub mod import;
-mod protocol;
+pub mod protocol;
 mod query_cache;
 mod restore;
 
@@ -129,6 +131,15 @@ pub(crate) struct AppState {
     /// How long to wait for the vectorizer embed worker to quiesce on shutdown
     /// (config `worker_quiesce_budget_secs`, default 10s). Read by `serve`.
     pub(crate) worker_quiesce_budget: std::time::Duration,
+    /// Process-wide count of active network subscriptions (binary-protocol
+    /// SUBSCRIBE), bounded by [`MAX_SUBSCRIPTIONS_TOTAL`]. Shared (`Arc`) so a
+    /// connection's cleanup guard can decrement it on disconnect. Bounds both
+    /// the per-commit `publish()` fan-out and the worst-case buffered memory.
+    pub(crate) network_subs: Arc<AtomicUsize>,
+    /// Cumulative change events dropped because a subscriber's bounded buffer
+    /// overflowed (each drop is signalled to that client via `SubLagged`).
+    /// Exposed in `/status` as a slow-consumer health signal.
+    pub(crate) events_dropped: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -365,6 +376,8 @@ async fn handle_status(
 ) -> Json<serde_json::Value> {
     let mut result = serde_json::json!({
         "subscriptions": state.db().subscriptions().subscription_count(),
+        "network_subscriptions": state.network_subs.load(Ordering::Relaxed),
+        "events_dropped": state.events_dropped.load(Ordering::Relaxed),
     });
 
     if let Some(vectorizer) = &state.vectorizer {
@@ -756,6 +769,8 @@ pub async fn run() {
         default_rerank: cfg.default_rerank,
         graceful_drain: cfg.graceful_drain,
         worker_quiesce_budget: cfg.worker_quiesce_budget,
+        network_subs: Arc::new(AtomicUsize::new(0)),
+        events_dropped: Arc::new(AtomicU64::new(0)),
     });
 
     // Re-register completion watchers for any migration left in flight by a prior
@@ -794,6 +809,7 @@ pub async fn run() {
 
     println!("rhypedb HTTP listening on {}", cfg.listen);
     println!("rhypedb binary TCP listening on {}", cfg.tcp_listen);
+    println!("       (query/prepare/execute/vector-batch + subscribe/unsubscribe → change-event push)");
     println!("  POST /query     — execute queries");
     println!("  GET  /health    — health check");
     println!("  GET  /schema    — schema introspection (JSON + SDL)");
@@ -974,6 +990,138 @@ async fn serve(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Subscription transport (binary-protocol SUBSCRIBE/UNSUBSCRIBE + server push)
+// ---------------------------------------------------------------------------
+
+/// Per-connection bounded event buffer. A merely-slow consumer absorbs bursts up
+/// to this many events; on overflow the connection DROPS events and sends a
+/// `SubLagged` notice (so there is never unbounded buffering). The buffer is
+/// shared across all of a connection's subscriptions, so a single high-volume
+/// subscription can cause spurious lag on the connection's other subscriptions —
+/// acceptable for the trusted-backend model; put a firehose on its own connection.
+const EVENT_CHANNEL_CAP: usize = 256;
+
+/// Max live subscriptions on one connection.
+const MAX_SUBSCRIPTIONS_PER_CONN: usize = 64;
+
+/// Process-wide cap on concurrent network subscriptions. Bounds BOTH the
+/// per-commit `publish()` fan-out cost and the worst-case buffered memory
+/// (≤ `MAX_SUBSCRIPTIONS_TOTAL` connections × `EVENT_CHANNEL_CAP` events). The
+/// SUBSCRIBE path is open like `/query`; this cap is the DoS backstop
+/// (network-level access control is the deployment's responsibility, as it is
+/// for `/query`).
+const MAX_SUBSCRIPTIONS_TOTAL: usize = 512;
+
+/// One server-pushed change event destined for a connection's writer.
+struct ServerPush {
+    /// The subscription handle = the originating `Subscribe` frame's `req_id`.
+    req_id: u32,
+    event: ChangeEvent,
+}
+
+/// A bounded [`rhypedb_subscribe::EventSink`] bridging the hub to one
+/// connection's writer task. `deliver` runs in the engine's SYNCHRONOUS commit
+/// context and never blocks: it `try_send`s into the per-connection channel and,
+/// on a full buffer, drops the event, flags the lag, bumps the dropped counter,
+/// and wakes the writer so it emits a `SubLagged` promptly (even if no further
+/// event for that subscription ever arrives).
+struct ConnEventSink {
+    tx: tokio::sync::mpsc::Sender<ServerPush>,
+    req_id: u32,
+    lagged: Arc<AtomicBool>,
+    lag_signal: Arc<tokio::sync::Notify>,
+    events_dropped: Arc<AtomicU64>,
+}
+
+impl rhypedb_subscribe::EventSink for ConnEventSink {
+    fn deliver(&self, event: &ChangeEvent) -> rhypedb_subscribe::Delivery {
+        use rhypedb_subscribe::Delivery;
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.tx.try_send(ServerPush {
+            req_id: self.req_id,
+            event: event.clone(),
+        }) {
+            Ok(()) => Delivery::Delivered,
+            // Bounded buffer full: drop the event, flag the gap, wake the writer.
+            // Keep the subscription registered — the client gets a SubLagged.
+            Err(TrySendError::Full(_)) => {
+                self.lagged.store(true, Ordering::SeqCst);
+                self.events_dropped.fetch_add(1, Ordering::Relaxed);
+                self.lag_signal.notify_one();
+                Delivery::Delivered
+            }
+            // Receiver gone (connection closed): the hub drops the subscription.
+            Err(TrySendError::Closed(_)) => Delivery::Disconnected,
+        }
+    }
+}
+
+/// One connection's live subscription, keyed by its handle (the subscribe req_id).
+struct SubEntry {
+    /// The hub-assigned id (to `unsubscribe`).
+    sub_id: u64,
+    /// Set by the sink when an event for this subscription was dropped; the
+    /// writer clears it when it emits the `SubLagged`.
+    lagged: Arc<AtomicBool>,
+}
+
+/// Owns a connection's subscriptions and guarantees cleanup. The handler returns
+/// from many points (read/write errors, shutdown); a `Drop` guard — not trailing
+/// code — is the only way to be sure every subscription is unregistered from the
+/// hub and the process-wide counter is decremented on every exit path.
+struct ConnSubscriptions {
+    hub: Arc<SubscriptionHub>,
+    network_subs: Arc<AtomicUsize>,
+    subs: HashMap<u32, SubEntry>,
+}
+
+impl ConnSubscriptions {
+    /// Remove one subscription by handle; returns whether it existed.
+    fn remove(&mut self, handle: u32) -> bool {
+        if let Some(entry) = self.subs.remove(&handle) {
+            self.hub.unsubscribe(entry.sub_id);
+            self.network_subs.fetch_sub(1, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for ConnSubscriptions {
+    fn drop(&mut self) {
+        for (_handle, entry) in self.subs.drain() {
+            self.hub.unsubscribe(entry.sub_id);
+            self.network_subs.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Write a `SubLagged` push (empty payload, tagged with the subscription handle).
+async fn write_sublagged<W>(writer: &mut W, buf: &mut Vec<u8>, handle: u32) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    protocol::write_frame_buffered(writer, buf, handle, protocol::RESP_SUBLAGGED, |_| {}).await
+}
+
+/// Write an `Event` push (JSON `WireEvent`, tagged with the subscription handle).
+async fn write_event_push<W>(
+    writer: &mut W,
+    buf: &mut Vec<u8>,
+    handle: u32,
+    event: &ChangeEvent,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    protocol::write_frame_buffered(writer, buf, handle, protocol::RESP_EVENT, |b| {
+        protocol::encode_event_payload_into(event, b)
+    })
+    .await
+}
+
 async fn handle_tcp_connection(
     socket: tokio::net::TcpStream,
     state: Arc<AppState>,
@@ -1007,13 +1155,36 @@ async fn handle_connection_stream<R, W>(
     let mut prepared_bytes: usize = 0;
     let mut next_stmt_id: u64 = 1;
 
+    // Subscription state. The hub `Arc` is captured ONCE here: it is preserved
+    // across a hot-reload, so subscriptions keep delivering post-reload commits.
+    // `event_tx` is the producer side handed (cloned) to each subscription's
+    // bounded sink; we retain the original so `event_rx.recv()` never observes a
+    // closed channel for the connection's lifetime. `lag_signal` lets a sink wake
+    // the writer to emit a `SubLagged` even when no further event arrives.
+    let hub = state.db().subscriptions_arc();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ServerPush>(EVENT_CHANNEL_CAP);
+    let lag_signal = Arc::new(tokio::sync::Notify::new());
+    let mut conn_subs = ConnSubscriptions {
+        hub: Arc::clone(&hub),
+        network_subs: Arc::clone(&state.network_subs),
+        subs: HashMap::new(),
+    };
+    // Once a connection issues a SUBSCRIBE it becomes a "subscription connection"
+    // (sticky): the server may PUSH frames at any time, so the simple synchronous
+    // request/response arms (query/prepare/execute/vector-batch) are refused to
+    // protect a client that does not demultiplex. Run queries on another socket.
+    let mut subscription_mode = false;
+
     loop {
-        // Only check shutdown at this request boundary: an in-flight request has
-        // already passed `read_frame` and runs to its write before the next loop,
-        // so a graceful stop never truncates a response — it just stops reading
-        // new frames and closes an otherwise-idle connection promptly (matching
-        // axum's HTTP graceful-shutdown semantics). `read_frame` is dropped if
-        // shutdown wins, which is fine: we close the socket either way.
+        // Multiplex three sources on this one task (so writes never interleave —
+        // only one branch runs to completion at a time):
+        //   • an inbound client frame,
+        //   • a server-pushed change event for one of this connection's subs,
+        //   • a lag wake-up (a sub overflowed and must emit `SubLagged`).
+        // Shutdown is checked at this boundary only: an in-flight request runs to
+        // its write before the next loop, so a graceful stop never truncates a
+        // response — it stops reading new frames and closes promptly (matching
+        // axum's HTTP graceful-shutdown semantics).
         let frame = tokio::select! {
             read = protocol::read_frame(reader) => match read {
                 Ok(f) => f,
@@ -1024,8 +1195,81 @@ async fn handle_connection_stream<R, W>(
                     return;
                 }
             },
-            _ = shutdown.changed() => return,
+            maybe_push = event_rx.recv() => {
+                if let Some(push) = maybe_push {
+                    // Look the handle up fallibly: a push for a just-unsubscribed
+                    // handle can still be buffered — drop it silently.
+                    if let Some(entry) = conn_subs.subs.get(&push.req_id) {
+                        if entry.lagged.swap(false, Ordering::SeqCst)
+                            && let Err(e) = write_sublagged(writer, &mut response_buf, push.req_id).await
+                        {
+                            eprintln!("tcp sublagged write error: {e}");
+                            return;
+                        }
+                        if let Err(e) =
+                            write_event_push(writer, &mut response_buf, push.req_id, &push.event).await
+                        {
+                            eprintln!("tcp event write error: {e}");
+                            return;
+                        }
+                    }
+                }
+                continue;
+            }
+            _ = lag_signal.notified() => {
+                // Flush a SubLagged for every subscription currently flagged —
+                // delivered eagerly, NOT piggybacked on a future matching event
+                // (which may never come for a deleted/terminal object).
+                for (handle, entry) in conn_subs.subs.iter() {
+                    if entry.lagged.swap(false, Ordering::SeqCst)
+                        && let Err(e) = write_sublagged(writer, &mut response_buf, *handle).await
+                    {
+                        eprintln!("tcp sublagged write error: {e}");
+                        return;
+                    }
+                }
+                continue;
+            }
+            _ = shutdown.changed() => {
+                // Best-effort: tell each live subscriber to reconcile on reconnect
+                // (a deploy/scale-to-zero is the most likely time to miss events),
+                // then stop. The guard unregisters the subs on return.
+                for handle in conn_subs.subs.keys() {
+                    let _ = write_sublagged(writer, &mut response_buf, *handle).await;
+                }
+                return;
+            }
         };
+
+        // A subscription connection serves only subscribe/unsubscribe/ping; reject
+        // the synchronous request/response kinds so a non-demuxing client never
+        // races a push against an expected reply (see the protocol module docs).
+        if subscription_mode
+            && matches!(
+                frame.kind,
+                protocol::REQ_QUERY
+                    | protocol::REQ_PREPARE
+                    | protocol::REQ_EXECUTE
+                    | protocol::REQ_VECTOR_BATCH
+            )
+        {
+            let msg = "this connection has active subscriptions; open a separate \
+                       connection for queries"
+                .to_string();
+            if let Err(e) = protocol::write_frame_buffered(
+                writer,
+                &mut response_buf,
+                frame.req_id,
+                protocol::RESP_ERROR,
+                |buf| protocol::encode_error_payload_into(&msg, buf),
+            )
+            .await
+            {
+                eprintln!("tcp error write error: {e}");
+                return;
+            }
+            continue;
+        }
 
         match frame.kind {
             protocol::REQ_PING => {
@@ -1220,6 +1464,114 @@ async fn handle_connection_stream<R, W>(
                     return;
                 }
             }
+            protocol::REQ_SUBSCRIBE => {
+                // The subscribe frame's req_id is the subscription HANDLE: it tags
+                // every pushed Event/SubLagged for this stream and is the target of
+                // a later Unsubscribe.
+                let handle = frame.req_id;
+                let outcome: Result<(), String> = (|| {
+                    let filter = protocol::decode_subscribe_filter(&frame.payload)
+                        .map_err(|e| format!("decode: {e}"))?;
+                    if conn_subs.subs.len() >= MAX_SUBSCRIPTIONS_PER_CONN {
+                        return Err(format!(
+                            "too many subscriptions on this connection (max {MAX_SUBSCRIPTIONS_PER_CONN})"
+                        ));
+                    }
+                    if conn_subs.subs.contains_key(&handle) {
+                        return Err(format!(
+                            "subscription handle {handle} already in use on this connection"
+                        ));
+                    }
+                    // Atomically reserve a process-wide slot (race-safe across
+                    // connections); back it out if we are over the cap.
+                    let prev = state.network_subs.fetch_add(1, Ordering::SeqCst);
+                    if prev >= MAX_SUBSCRIPTIONS_TOTAL {
+                        state.network_subs.fetch_sub(1, Ordering::SeqCst);
+                        return Err(format!(
+                            "server subscription limit reached (max {MAX_SUBSCRIPTIONS_TOTAL})"
+                        ));
+                    }
+                    let lagged = Arc::new(AtomicBool::new(false));
+                    let sink = ConnEventSink {
+                        tx: event_tx.clone(),
+                        req_id: handle,
+                        lagged: Arc::clone(&lagged),
+                        lag_signal: Arc::clone(&lag_signal),
+                        events_dropped: Arc::clone(&state.events_dropped),
+                    };
+                    let sub_id = hub.subscribe_sink(filter, Box::new(sink));
+                    conn_subs.subs.insert(handle, SubEntry { sub_id, lagged });
+                    Ok(())
+                })();
+
+                let write_result = match outcome {
+                    Ok(()) => {
+                        subscription_mode = true;
+                        protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            handle,
+                            protocol::RESP_SUBSCRIBED,
+                            |_| {},
+                        )
+                        .await
+                    }
+                    Err(msg) => {
+                        protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            handle,
+                            protocol::RESP_ERROR,
+                            |buf| protocol::encode_error_payload_into(&msg, buf),
+                        )
+                        .await
+                    }
+                };
+                if let Err(e) = write_result {
+                    eprintln!("tcp subscribe write error: {e}");
+                    return;
+                }
+            }
+            protocol::REQ_UNSUBSCRIBE => {
+                let write_result = match protocol::decode_unsubscribe_payload(&frame.payload) {
+                    Ok(target) if conn_subs.remove(target) => {
+                        protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            frame.req_id,
+                            protocol::RESP_DONE,
+                            |_| {},
+                        )
+                        .await
+                    }
+                    Ok(target) => {
+                        let msg = format!("no active subscription with handle {target}");
+                        protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            frame.req_id,
+                            protocol::RESP_ERROR,
+                            |buf| protocol::encode_error_payload_into(&msg, buf),
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        let msg = format!("decode: {e}");
+                        protocol::write_frame_buffered(
+                            writer,
+                            &mut response_buf,
+                            frame.req_id,
+                            protocol::RESP_ERROR,
+                            |buf| protocol::encode_error_payload_into(&msg, buf),
+                        )
+                        .await
+                    }
+                };
+                if let Err(e) = write_result {
+                    eprintln!("tcp unsubscribe write error: {e}");
+                    return;
+                }
+            }
             other => {
                 let msg = format!("unknown request type 0x{other:02x}");
                 let _ = protocol::write_frame_buffered(
@@ -1348,6 +1700,8 @@ mod tcp_tests {
             default_rerank: None,
             graceful_drain: std::time::Duration::from_secs(20),
             worker_quiesce_budget: std::time::Duration::from_secs(10),
+            network_subs: Arc::new(AtomicUsize::new(0)),
+            events_dropped: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1783,5 +2137,284 @@ mod tcp_tests {
             .iter()
             .any(|t| t["name"] == "User"));
         assert!(body["sdl"].as_str().unwrap().contains("type User"));
+    }
+
+    // ----------------------------------------------------------------------
+    // Subscription transport
+    // ----------------------------------------------------------------------
+
+    use rhypedb_subscribe::{ChangeKind, SubscriptionFilter};
+
+    /// Spawn a connection handler bound to `state` over an in-memory duplex of
+    /// `buf` bytes; returns the client end + a (kept-alive) shutdown sender + the
+    /// handler join handle.
+    fn spawn_conn(
+        state: Arc<AppState>,
+        buf: usize,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client, server) = duplex(buf);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut writer = tokio::io::BufWriter::new(write);
+            handle_connection_stream(&mut reader, &mut writer, state, shutdown_rx).await;
+        });
+        (client, shutdown_tx, handle)
+    }
+
+    async fn send_subscribe(
+        client: &mut tokio::io::DuplexStream,
+        handle: u32,
+        filter: &SubscriptionFilter,
+    ) {
+        let payload = protocol::encode_subscribe_filter(filter);
+        protocol::write_frame(client, handle, protocol::REQ_SUBSCRIBE, &payload)
+            .await
+            .unwrap();
+        let resp = protocol::read_frame(client).await.unwrap();
+        assert_eq!(resp.kind, protocol::RESP_SUBSCRIBED, "expected Subscribed ack");
+        assert_eq!(resp.req_id, handle);
+    }
+
+    /// Create a `User` over `client` (a non-subscription connection) and return id.
+    async fn create_user(client: &mut tokio::io::DuplexStream, req_id: u32, name: &str, age: u32) -> u64 {
+        let q = format!(r#"User.create({{ name: "{name}", age: {age} }})"#);
+        let payload = protocol::encode_query_payload(&q);
+        protocol::write_frame(client, req_id, protocol::REQ_QUERY, &payload)
+            .await
+            .unwrap();
+        let resp = protocol::read_frame(client).await.unwrap();
+        assert_eq!(resp.kind, protocol::RESP_SINGLE, "create should return Single");
+        protocol::decode_single_payload(&resp.payload).unwrap().id
+    }
+
+    /// Read the next frame within `ms` (so a missing/absent push fails fast).
+    async fn read_frame_timeout(
+        client: &mut tokio::io::DuplexStream,
+        ms: u64,
+    ) -> Option<protocol::Frame> {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(ms),
+            protocol::read_frame(client),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_receives_create_and_update_events() {
+        let state = test_state();
+        let (mut sub, _s, sub_h) = spawn_conn(state.clone(), 64 * 1024);
+        let (mut w, _w, w_h) = spawn_conn(state.clone(), 8 * 1024);
+
+        send_subscribe(&mut sub, 100, &SubscriptionFilter::all()).await;
+        let id = create_user(&mut w, 1, "Alice", 30).await;
+
+        let f = read_frame_timeout(&mut sub, 2000).await.expect("create event");
+        assert_eq!(f.kind, protocol::RESP_EVENT);
+        assert_eq!(f.req_id, 100, "event tagged with the subscription handle");
+        let ev = protocol::decode_event_payload(&f.payload).unwrap();
+        assert_eq!(ev.v, protocol::EVENT_FORMAT_TAG);
+        assert_eq!(ev.kind, "create");
+        assert_eq!(ev.type_name, "User");
+        assert_eq!(ev.id, id.to_string());
+
+        // An update yields an update event.
+        let upd = protocol::encode_query_payload(&format!("User.get({id}).update({{ age: 31 }})"));
+        protocol::write_frame(&mut w, 2, protocol::REQ_QUERY, &upd).await.unwrap();
+        let _ = protocol::read_frame(&mut w).await.unwrap();
+        let f = read_frame_timeout(&mut sub, 2000).await.expect("update event");
+        let ev = protocol::decode_event_payload(&f.payload).unwrap();
+        assert_eq!(ev.kind, "update");
+
+        drop(sub);
+        drop(w);
+        let _ = sub_h.await;
+        let _ = w_h.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_kind_filter_only_delete_and_no_fields() {
+        let state = test_state();
+        let (mut sub, _s, _sh) = spawn_conn(state.clone(), 64 * 1024);
+        let (mut w, _w, _wh) = spawn_conn(state.clone(), 8 * 1024);
+
+        let mut filter = SubscriptionFilter::for_type("User");
+        filter.kinds = vec![ChangeKind::Delete];
+        send_subscribe(&mut sub, 1, &filter).await;
+
+        let id = create_user(&mut w, 1, "Doomed", 1).await; // create filtered out
+        let del = protocol::encode_query_payload(&format!("User.get({id}).delete()"));
+        protocol::write_frame(&mut w, 2, protocol::REQ_QUERY, &del).await.unwrap();
+        let _ = protocol::read_frame(&mut w).await.unwrap();
+
+        // The FIRST event is the delete (proving the create was filtered out).
+        let f = read_frame_timeout(&mut sub, 2000).await.expect("delete event");
+        assert_eq!(f.kind, protocol::RESP_EVENT);
+        let ev = protocol::decode_event_payload(&f.payload).unwrap();
+        assert_eq!(ev.kind, "delete");
+        assert_eq!(ev.id, id.to_string());
+        assert!(ev.fields.is_none(), "delete carries no fields");
+        // Nothing else.
+        assert!(read_frame_timeout(&mut sub, 200).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsubscribe_stops_delivery_and_cleans_hub() {
+        let state = test_state();
+        let (mut sub, _s, _sh) = spawn_conn(state.clone(), 64 * 1024);
+        let (mut w, _w, _wh) = spawn_conn(state.clone(), 8 * 1024);
+
+        send_subscribe(&mut sub, 5, &SubscriptionFilter::all()).await;
+        assert_eq!(state.network_subs.load(Ordering::SeqCst), 1);
+
+        // Unsubscribe handle 5 (the unsubscribe frame carries its own req_id 99).
+        let payload = protocol::encode_unsubscribe_payload(5);
+        protocol::write_frame(&mut sub, 99, protocol::REQ_UNSUBSCRIBE, &payload).await.unwrap();
+        let resp = read_frame_timeout(&mut sub, 2000).await.expect("unsubscribe ack");
+        assert_eq!(resp.kind, protocol::RESP_DONE);
+        assert_eq!(resp.req_id, 99);
+        assert_eq!(state.network_subs.load(Ordering::SeqCst), 0);
+
+        // A subsequent create produces no event.
+        let _ = create_user(&mut w, 1, "Nobody", 1).await;
+        assert!(read_frame_timeout(&mut sub, 300).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscription_mode_rejects_queries() {
+        let state = test_state();
+        let (mut sub, _s, _sh) = spawn_conn(state.clone(), 64 * 1024);
+        send_subscribe(&mut sub, 100, &SubscriptionFilter::all()).await;
+
+        // A normal query on a subscription connection is refused.
+        let q = protocol::encode_query_payload("User.all()");
+        protocol::write_frame(&mut sub, 5, protocol::REQ_QUERY, &q).await.unwrap();
+        let resp = read_frame_timeout(&mut sub, 2000).await.expect("error reply");
+        assert_eq!(resp.kind, protocol::RESP_ERROR);
+        assert_eq!(resp.req_id, 5);
+        let msg = protocol::decode_error_payload(&resp.payload).unwrap();
+        assert!(msg.contains("separate connection"), "{msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_unregisters_subscriptions() {
+        let state = test_state();
+        let (mut sub, _s, sub_h) = spawn_conn(state.clone(), 64 * 1024);
+        send_subscribe(&mut sub, 1, &SubscriptionFilter::all()).await;
+        assert_eq!(state.db().subscriptions().subscription_count(), 1);
+        assert_eq!(state.network_subs.load(Ordering::SeqCst), 1);
+
+        // Drop the client → handler hits EOF → RAII guard unregisters everything.
+        drop(sub);
+        let _ = sub_h.await;
+        assert_eq!(state.db().subscriptions().subscription_count(), 0);
+        assert_eq!(state.network_subs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_subscriptions_demux_by_handle() {
+        let state = test_state();
+        let (mut sub, _s, _sh) = spawn_conn(state.clone(), 64 * 1024);
+        let (mut w, _w, _wh) = spawn_conn(state.clone(), 8 * 1024);
+
+        send_subscribe(&mut sub, 100, &SubscriptionFilter::all()).await;
+        send_subscribe(&mut sub, 200, &SubscriptionFilter::for_type("User")).await;
+
+        let _ = create_user(&mut w, 1, "Alice", 30).await;
+
+        // One create matches both subs → two events, one per handle.
+        let mut handles = std::collections::HashSet::new();
+        for _ in 0..2 {
+            let f = read_frame_timeout(&mut sub, 2000).await.expect("event");
+            assert_eq!(f.kind, protocol::RESP_EVENT);
+            handles.insert(f.req_id);
+        }
+        assert_eq!(handles, [100, 200].into_iter().collect());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_consumer_drops_events_and_signals_lag() {
+        let state = test_state();
+        // Tiny duplex so server writes back up almost immediately once the client
+        // stops reading — forcing the bounded channel to overflow.
+        let (mut sub, _s, _sh) = spawn_conn(state.clone(), 256);
+        let (mut w, _w, _wh) = spawn_conn(state.clone(), 8 * 1024);
+
+        send_subscribe(&mut sub, 7, &SubscriptionFilter::all()).await;
+
+        // Commit far more than EVENT_CHANNEL_CAP events without reading `sub`.
+        let n = (EVENT_CHANNEL_CAP + 200) as u32;
+        for i in 0..n {
+            let _ = create_user(&mut w, i + 1, "U", i).await;
+        }
+        // deliver() bumps the drop counter synchronously, so it is already set.
+        assert!(
+            state.events_dropped.load(Ordering::Relaxed) > 0,
+            "expected dropped events under backpressure"
+        );
+
+        // Draining `sub` must surface at least one SubLagged.
+        let mut saw_lagged = false;
+        for _ in 0..(n as usize + 16) {
+            match read_frame_timeout(&mut sub, 1000).await {
+                Some(f) if f.kind == protocol::RESP_SUBLAGGED => {
+                    saw_lagged = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert!(saw_lagged, "expected a SubLagged notice for the slow consumer");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unsubscribe_race_no_event_after_done_no_panic() {
+        let state = test_state();
+        let (mut sub, _s, sub_h) = spawn_conn(state.clone(), 8 * 1024);
+        let (mut w, _w, _wh) = spawn_conn(state.clone(), 8 * 1024);
+
+        send_subscribe(&mut sub, 9, &SubscriptionFilter::all()).await;
+
+        // Queue a burst of matching events, then immediately unsubscribe. Buffered
+        // pushes for the now-removed handle must be dropped, never panic, and no
+        // Event may follow the unsubscribe Done.
+        for i in 0..50u32 {
+            let _ = create_user(&mut w, i + 1, "U", i).await;
+        }
+        let payload = protocol::encode_unsubscribe_payload(9);
+        protocol::write_frame(&mut sub, 1000, protocol::REQ_UNSUBSCRIBE, &payload).await.unwrap();
+
+        // Read until the unsubscribe Done; everything before may be Event/SubLagged.
+        let mut saw_done = false;
+        for _ in 0..200 {
+            let f = read_frame_timeout(&mut sub, 2000).await.expect("a frame before Done");
+            if f.kind == protocol::RESP_DONE && f.req_id == 1000 {
+                saw_done = true;
+                break;
+            }
+            assert!(
+                matches!(f.kind, protocol::RESP_EVENT | protocol::RESP_SUBLAGGED),
+                "unexpected pre-Done frame kind 0x{:02x}",
+                f.kind
+            );
+        }
+        assert!(saw_done, "expected the unsubscribe Done");
+
+        // After Done, no further Event (the handle was removed → pushes dropped).
+        while let Some(f) = read_frame_timeout(&mut sub, 200).await {
+            assert_ne!(f.kind, protocol::RESP_EVENT, "no Event may follow unsubscribe Done");
+        }
+        assert_eq!(state.network_subs.load(Ordering::SeqCst), 0);
+
+        drop(sub);
+        let _ = sub_h.await;
     }
 }

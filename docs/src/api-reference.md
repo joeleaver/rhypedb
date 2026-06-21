@@ -48,11 +48,16 @@ Liveness check. `200 OK` with a short status string.
 
 #### `GET /status`
 
-Operational snapshot.
+Operational snapshot. `subscriptions` is the total change-feed subscriptions
+(in-process + network); `network_subscriptions` is the binary-protocol subset;
+`events_dropped` is the cumulative count of change events dropped to slow
+subscribers (each paired with a `SubLagged` push — see [Subscriptions](#subscriptions)).
 
 ```json
 {
   "subscriptions": 2,
+  "network_subscriptions": 2,
+  "events_dropped": 0,
   "vectorizer": { "pending": 0, "indexes": [ { "name": "Post.embedding", "vectors": 12000 } ] }
 }
 ```
@@ -251,6 +256,8 @@ For high-throughput clients, the server speaks a length-prefixed binary protocol
 | `0x03` | VectorBatch | bulk vector ingest for one `Vector` field |
 | `0x04` | Prepare | `[ q_len: u32 BE ][ utf-8 query ]` (same as Query) |
 | `0x05` | Execute | `[ stmt_id: u64 BE ]` |
+| `0x06` | Subscribe | filter (see [Subscriptions](#subscriptions)) |
+| `0x07` | Unsubscribe | `[ sub_req_id: u32 BE ]` |
 
 ### Server response types
 
@@ -262,6 +269,9 @@ For high-throughput clients, the server speaks a length-prefixed binary protocol
 | `0x83` | Error | `[ msg_len: u32 BE ][ utf-8 message ]` |
 | `0x84` | Pong | *(empty)* |
 | `0x85` | Prepared | `[ stmt_id: u64 BE ]` |
+| `0x86` | Subscribed | *(empty; ack of a Subscribe, correlated by `req_id`)* |
+| `0x87` | Event | UTF-8 JSON `WireEvent` (**server-pushed**) |
+| `0x88` | SubLagged | *(empty; **server-pushed** lag notice)* |
 
 `VectorBatch` (`0x03`) bulk-ingests caller-supplied `f32` vectors for one type's `Vector` field — the path used by `rhypedb-import` and the recommended way to load precomputed vectors at scale.
 
@@ -280,3 +290,74 @@ parameters yet (the query is fixed at `Prepare` time).
 Pins are bounded per connection by both a count (1024 statements) and aggregate
 query-text size (1 MiB); exceeding either returns an `Error`. There is no
 per-statement deallocate message yet — reclaim slots by closing the connection.
+
+### Subscriptions
+
+`Subscribe` (`0x06`) registers a live change-event stream on the connection and
+replies with `Subscribed` (`0x86`). Thereafter the server **pushes** `Event`
+(`0x87`) and `SubLagged` (`0x88`) frames for that subscription. The subscribe
+frame's `req_id` is the subscription **handle**: every pushed frame echoes it,
+and `Unsubscribe` (`0x07`) carries it to cancel (replying `Done`).
+
+Subscriptions are the network transport for the engine's change feed — created,
+updated and deleted objects, matching an optional filter. The subscriber is a
+**trusted backend** (a tenant app server or jkbase-internal consumer); like
+`POST /query`, the path is open, so network-level access control is the
+deployment's responsibility.
+
+**Pushes are unsolicited.** An `Event`/`SubLagged` can arrive at any time —
+including between a request and its reply — so a subscribing client MUST
+demultiplex frames by **kind first** and never assume "the next frame answers my
+last request". To keep simple synchronous clients safe, **a connection that
+issues a `Subscribe` becomes a subscription connection**: it serves only
+`Subscribe`/`Unsubscribe`/`Ping` and rejects `Query`/`Prepare`/`Execute`/
+`VectorBatch` with an `Error`. Run queries on a separate connection. A connection
+that never subscribes never receives a push, so existing request/response clients
+are unaffected. (An old server replies `Error` to a `Subscribe` — treat that as
+"subscriptions unsupported".)
+
+#### Subscribe filter payload
+
+```text
+[ flags: u8 ]            bit0 = has type, bit1 = has object id (other bits must be 0)
+[ if has type:   type_len: u16 BE, type utf-8 ]   (zero length is rejected)
+[ if has object: object_id: u64 BE ]
+[ kinds: u8 ]            bitmask bit0=create bit1=update bit2=delete; 0 = all kinds
+```
+
+Clearing the type flag matches all types; an all-zero `kinds` byte matches all
+kinds. The decoder is strict (reserved bits, an empty type name, truncation, and
+trailing bytes are all rejected) so a malformed filter fails loudly.
+
+#### `WireEvent` (the `Event` JSON payload)
+
+```json
+{ "v": "rhypedb-event-v1", "kind": "create", "type": "User",
+  "id": "42", "version": "7", "fields": { "name": "Alice", "age": 30 } }
+```
+
+`id` and `version` are **decimal strings** so 64-bit values survive a JavaScript
+`JSON.parse` (which would coerce a bare number to a float and lose precision past
+2^53). The `Event` is a **notification**, not a faithful snapshot: `fields` are
+best-effort (`Bytes` values arrive as a `"<N bytes>"` placeholder, and `delete`
+events carry no `fields`) — **re-query for authoritative state**.
+
+#### Backpressure & lag
+
+Each connection has a **bounded** event buffer. A merely-slow consumer absorbs
+bursts; on overflow the server **drops** events and pushes a `SubLagged` for the
+affected subscription (delivered eagerly — you get it even if no further event
+ever arrives). `SubLagged` means "you missed events — reconcile by re-querying".
+There is no unbounded server-side buffering. The buffer is shared across a
+connection's subscriptions, so a high-volume subscription can cause a `SubLagged`
+on the connection's other subscriptions — put a firehose on its own connection.
+The server also pushes a best-effort `SubLagged` to each live subscription on
+graceful shutdown, so a backend reconciles across a deploy. Subscriptions are
+capped per connection (64) and per process (512); `/status` reports the live
+`network_subscriptions` count and a cumulative `events_dropped` counter.
+
+A reference Rust client lives at `crates/rhypedb-server/examples/subscribe.rs`:
+
+```bash
+cargo run -p rhypedb-server --example subscribe -- 127.0.0.1:4201 --type User
+```

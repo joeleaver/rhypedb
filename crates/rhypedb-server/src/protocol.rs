@@ -19,6 +19,8 @@
 //! | 0x03 | VectorBatch | see `decode_vector_batch_payload`        |
 //! | 0x04 | Prepare     | `[q_len: u32 BE][utf8 query]` (same as Query) |
 //! | 0x05 | Execute     | `[stmt_id: u64 BE]`                      |
+//! | 0x06 | Subscribe   | filter (see `decode_subscribe_filter`)   |
+//! | 0x07 | Unsubscribe | `[sub_req_id: u32 BE]`                    |
 //!
 //! A `Prepare` parses + caches the query for the LIFETIME OF THE CONNECTION and
 //! returns a `Prepared(stmt_id)`; subsequent `Execute(stmt_id)` re-run it with no
@@ -27,15 +29,47 @@
 //!
 //! # Server response types
 //!
-//! | byte | name     | payload                                            |
-//! |------|----------|----------------------------------------------------|
-//! | 0x80 | Objects  | `[count: u32 BE]` then `count` encoded objects     |
-//! | 0x81 | Single   | one encoded object                                 |
-//! | 0x82 | Done     | empty                                              |
-//! | 0x83 | Error    | `[msg_len: u32 BE][utf8 msg]`                      |
-//! | 0x84 | Pong     | empty                                              |
-//! | 0x85 | Prepared | `[stmt_id: u64 BE]`                                |
+//! | byte | name      | payload                                            |
+//! |------|-----------|----------------------------------------------------|
+//! | 0x80 | Objects   | `[count: u32 BE]` then `count` encoded objects     |
+//! | 0x81 | Single    | one encoded object                                 |
+//! | 0x82 | Done      | empty                                              |
+//! | 0x83 | Error     | `[msg_len: u32 BE][utf8 msg]`                      |
+//! | 0x84 | Pong      | empty                                              |
+//! | 0x85 | Prepared  | `[stmt_id: u64 BE]`                                |
+//! | 0x86 | Subscribed| empty (reply to Subscribe; ack by `req_id`)        |
+//! | 0x87 | Event     | UTF-8 JSON of a `WireEvent` (server-PUSHED)        |
+//! | 0x88 | SubLagged | empty (server-PUSHED; see Subscriptions)           |
 //!
+//! # Subscriptions (server-initiated pushes)
+//!
+//! A `Subscribe(req_id=R, filter)` registers a change-event stream on this
+//! connection and is acked with `Subscribed` echoing `R`. Thereafter the server
+//! PUSHES `Event` / `SubLagged` frames tagged with `req_id=R` — these are
+//! **unsolicited**: they may arrive at any time, interleaved with request acks.
+//!
+//! Therefore a client on a subscribed connection MUST demultiplex frames by
+//! **kind first**, never assume "the next frame answers my last request", and
+//! route `Event`/`SubLagged` (0x87/0x88) by `req_id` to the originating
+//! subscription. To keep the simple synchronous clients safe, a connection that
+//! has issued a `Subscribe` becomes a **subscription connection**: it serves
+//! only `Subscribe`/`Unsubscribe`/`Ping`, and rejects `Query`/`Prepare`/
+//! `Execute`/`VectorBatch` with an `Error`. Run queries on a separate connection.
+//! A connection that never subscribes NEVER receives a push, so existing
+//! request/response clients are unaffected. An old server replies `Error` to a
+//! `Subscribe` (unknown kind) — a new client treats that as "subscriptions
+//! unsupported".
+//!
+//! `Unsubscribe(target=R)` removes the subscription whose handle is `R`; it is
+//! acked with `Done`. `SubLagged(R)` means the bounded per-connection buffer
+//! overflowed and ≥1 event for `R` was dropped — the client must reconcile by
+//! re-querying. The server also pushes a best-effort `SubLagged(R)` to each live
+//! subscription on graceful shutdown, so a backend reconciles across a deploy.
+//!
+//! `Event` payload is a format-tagged JSON `WireEvent` (`object_id`/`version` as
+//! decimal strings so 64-bit ids survive a JS `JSON.parse`). Its `fields` are
+//! **best-effort / a notification**: `Bytes` values are elided to a placeholder,
+//! and `Delete` events carry no fields — re-query for authoritative state.
 //! # Object encoding
 //!
 //! ```text
@@ -44,11 +78,14 @@
 //! [fields: same format as engine::serialize_fields]
 //! ```
 
+use std::collections::HashMap;
 use std::io;
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use rhypedb_engine::object::{deserialize_fields, serialize_fields_into, Object};
+use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionFilter};
 
 /// Maximum payload size per frame (16 MB). Defensive limit to prevent
 /// runaway allocations from malformed clients.
@@ -63,6 +100,11 @@ pub const REQ_VECTOR_BATCH: u8 = 0x03;
 pub const REQ_PREPARE: u8 = 0x04;
 /// Run a previously-prepared statement by id; replies like `Query`.
 pub const REQ_EXECUTE: u8 = 0x05;
+/// Open a change-event subscription on this connection (payload = filter).
+/// The frame's `req_id` becomes the subscription handle; replies `Subscribed`.
+pub const REQ_SUBSCRIBE: u8 = 0x06;
+/// Close a subscription (payload = `[sub_req_id: u32 BE]`); replies `Done`.
+pub const REQ_UNSUBSCRIBE: u8 = 0x07;
 
 // Response types
 pub const RESP_OBJECTS: u8 = 0x80;
@@ -72,6 +114,18 @@ pub const RESP_ERROR: u8 = 0x83;
 pub const RESP_PONG: u8 = 0x84;
 /// Reply to `Prepare`: the assigned per-connection statement id.
 pub const RESP_PREPARED: u8 = 0x85;
+/// Reply to `Subscribe`: ack (empty payload; correlated by the subscribe req_id).
+pub const RESP_SUBSCRIBED: u8 = 0x86;
+/// Server-PUSHED change event: `req_id` = the subscription handle; payload =
+/// UTF-8 JSON of a [`WireEvent`].
+pub const RESP_EVENT: u8 = 0x87;
+/// Server-PUSHED lag notice: `req_id` = the subscription handle; empty payload.
+/// At least one event for that subscription was dropped — reconcile by re-query.
+pub const RESP_SUBLAGGED: u8 = 0x88;
+
+/// Format tag stamped into every [`WireEvent`] so a consumer can detect the
+/// envelope version (mirrors the logical-export `FORMAT_TAG` convention).
+pub const EVENT_FORMAT_TAG: &str = "rhypedb-event-v1";
 
 /// A parsed inbound frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -508,6 +562,219 @@ pub fn decode_error_payload(data: &[u8]) -> io::Result<String> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("error utf8: {e}")))
 }
 
+// ---------------------------------------------------------------------------
+// Subscriptions
+// ---------------------------------------------------------------------------
+
+const FILTER_FLAG_TYPE: u8 = 0x01;
+const FILTER_FLAG_OBJECT: u8 = 0x02;
+/// Bits beyond the two defined flags must be zero (forward-compat fail-closed).
+const FILTER_FLAG_RESERVED: u8 = !(FILTER_FLAG_TYPE | FILTER_FLAG_OBJECT);
+
+const KIND_BIT_CREATE: u8 = 0x01;
+const KIND_BIT_UPDATE: u8 = 0x02;
+const KIND_BIT_DELETE: u8 = 0x04;
+const KIND_BITS_RESERVED: u8 = !(KIND_BIT_CREATE | KIND_BIT_UPDATE | KIND_BIT_DELETE);
+
+fn kind_bit(kind: ChangeKind) -> u8 {
+    match kind {
+        ChangeKind::Create => KIND_BIT_CREATE,
+        ChangeKind::Update => KIND_BIT_UPDATE,
+        ChangeKind::Delete => KIND_BIT_DELETE,
+    }
+}
+
+/// Encode a `Subscribe` filter payload:
+/// `[flags:u8 bit0=has_type bit1=has_object_id]`
+/// `[if has_type: type_len:u16 BE, type utf8]`
+/// `[if has_object_id: object_id:u64 BE]`
+/// `[kinds:u8 bitmask bit0=Create bit1=Update bit2=Delete; 0 = all kinds]`.
+///
+/// Two "match-all" encodings to keep distinct: clearing `has_type` matches all
+/// types (vs. an empty type name, which is rejected on decode); a `0` kinds
+/// bitmask matches all kinds (vs. naming specific bits).
+pub fn encode_subscribe_filter(filter: &SubscriptionFilter) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut flags = 0u8;
+    if filter.type_name.is_some() {
+        flags |= FILTER_FLAG_TYPE;
+    }
+    if filter.object_id.is_some() {
+        flags |= FILTER_FLAG_OBJECT;
+    }
+    out.push(flags);
+    if let Some(tn) = &filter.type_name {
+        let b = tn.as_bytes();
+        out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+        out.extend_from_slice(b);
+    }
+    if let Some(oid) = filter.object_id {
+        out.extend_from_slice(&oid.to_be_bytes());
+    }
+    let mut kinds = 0u8;
+    for k in &filter.kinds {
+        kinds |= kind_bit(*k);
+    }
+    out.push(kinds);
+    out
+}
+
+/// Decode a `Subscribe` filter payload. STRICT: rejects reserved flag/kind bits,
+/// a `has_type` flag with a zero-length name, truncation, and trailing bytes —
+/// so a malformed or forward-incompatible filter fails loud rather than silently
+/// subscribing to the wrong (or empty) stream.
+pub fn decode_subscribe_filter(data: &[u8]) -> io::Result<SubscriptionFilter> {
+    fn err(m: impl Into<String>) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, m.into())
+    }
+    let mut pos = 0usize;
+    if data.is_empty() {
+        return Err(err("subscribe: flags byte missing"));
+    }
+    let flags = data[pos];
+    pos += 1;
+    if flags & FILTER_FLAG_RESERVED != 0 {
+        return Err(err("subscribe: reserved flag bits set"));
+    }
+
+    let type_name = if flags & FILTER_FLAG_TYPE != 0 {
+        if pos + 2 > data.len() {
+            return Err(err("subscribe: type length missing"));
+        }
+        let n = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if n == 0 {
+            return Err(err("subscribe: has_type set but type name is empty"));
+        }
+        if pos + n > data.len() {
+            return Err(err("subscribe: type name truncated"));
+        }
+        let s = std::str::from_utf8(&data[pos..pos + n])
+            .map_err(|e| err(format!("subscribe: type utf8: {e}")))?
+            .to_string();
+        pos += n;
+        Some(s)
+    } else {
+        None
+    };
+
+    let object_id = if flags & FILTER_FLAG_OBJECT != 0 {
+        if pos + 8 > data.len() {
+            return Err(err("subscribe: object_id missing"));
+        }
+        let oid = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        Some(oid)
+    } else {
+        None
+    };
+
+    if pos + 1 > data.len() {
+        return Err(err("subscribe: kinds byte missing"));
+    }
+    let kinds_byte = data[pos];
+    pos += 1;
+    if kinds_byte & KIND_BITS_RESERVED != 0 {
+        return Err(err("subscribe: reserved kind bits set"));
+    }
+    let mut kinds = Vec::new();
+    if kinds_byte & KIND_BIT_CREATE != 0 {
+        kinds.push(ChangeKind::Create);
+    }
+    if kinds_byte & KIND_BIT_UPDATE != 0 {
+        kinds.push(ChangeKind::Update);
+    }
+    if kinds_byte & KIND_BIT_DELETE != 0 {
+        kinds.push(ChangeKind::Delete);
+    }
+
+    if pos != data.len() {
+        return Err(err("subscribe: trailing bytes after filter"));
+    }
+
+    Ok(SubscriptionFilter {
+        type_name,
+        object_id,
+        kinds,
+    })
+}
+
+/// Encode an `Unsubscribe` request payload: `[sub_req_id: u32 BE]`.
+pub fn encode_unsubscribe_payload(sub_req_id: u32) -> Vec<u8> {
+    sub_req_id.to_be_bytes().to_vec()
+}
+
+/// Decode an `Unsubscribe` request payload into the target subscription handle.
+pub fn decode_unsubscribe_payload(data: &[u8]) -> io::Result<u32> {
+    if data.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsubscribe: subscription handle missing",
+        ));
+    }
+    Ok(u32::from_be_bytes(data[0..4].try_into().unwrap()))
+}
+
+/// The wire form of a [`ChangeEvent`] (the `RESP_EVENT` JSON payload).
+///
+/// It is a NOTIFICATION envelope, not a faithful state snapshot:
+/// - `id`/`version` are decimal STRINGS so 64-bit values survive a JS
+///   `JSON.parse` (which would coerce a bare number to an f64 and lose
+///   precision past 2^53) — `id` is the key you re-query by, so it must be exact.
+/// - `fields` are BEST-EFFORT: `Bytes` values arrive as a `"<N bytes>"`
+///   placeholder (from the engine's `value_to_json`), large ints may lose
+///   precision in JS, and `Delete` events carry no fields. For authoritative
+///   values, re-query.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WireEvent {
+    /// Format tag, [`EVENT_FORMAT_TAG`].
+    pub v: String,
+    /// `"create"` | `"update"` | `"delete"`.
+    pub kind: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    /// The object id, as a decimal string.
+    pub id: String,
+    /// The commit version, as a decimal string.
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<HashMap<String, serde_json::Value>>,
+}
+
+impl WireEvent {
+    pub fn from_change_event(ev: &ChangeEvent) -> Self {
+        let kind = match ev.kind {
+            ChangeKind::Create => "create",
+            ChangeKind::Update => "update",
+            ChangeKind::Delete => "delete",
+        };
+        WireEvent {
+            v: EVENT_FORMAT_TAG.to_string(),
+            kind: kind.to_string(),
+            type_name: ev.type_name.clone(),
+            id: ev.object_id.to_string(),
+            version: ev.version.to_string(),
+            fields: ev.fields.clone(),
+        }
+    }
+}
+
+/// Encode a `RESP_EVENT` payload (JSON of a [`WireEvent`]) into `out`.
+pub fn encode_event_payload_into(ev: &ChangeEvent, out: &mut Vec<u8>) {
+    // Serialization of a well-formed WireEvent cannot fail (all fields are
+    // plain JSON-representable); fall back to an empty object defensively.
+    match serde_json::to_vec(&WireEvent::from_change_event(ev)) {
+        Ok(bytes) => out.extend_from_slice(&bytes),
+        Err(_) => out.extend_from_slice(b"{}"),
+    }
+}
+
+/// Decode a `RESP_EVENT` payload.
+pub fn decode_event_payload(data: &[u8]) -> io::Result<WireEvent> {
+    serde_json::from_slice(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("event json: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,6 +897,101 @@ mod tests {
         let payload = encode_error_payload(msg);
         let decoded = decode_error_payload(&payload).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn subscribe_filter_roundtrip_all_shapes() {
+        let cases = vec![
+            SubscriptionFilter::all(),
+            SubscriptionFilter::for_type("User"),
+            SubscriptionFilter::for_object("Post", 12345678901234567u64),
+            SubscriptionFilter {
+                type_name: Some("User".into()),
+                object_id: None,
+                kinds: vec![ChangeKind::Create, ChangeKind::Delete],
+            },
+            SubscriptionFilter {
+                type_name: None,
+                object_id: None,
+                kinds: vec![ChangeKind::Update],
+            },
+        ];
+        for f in cases {
+            let bytes = encode_subscribe_filter(&f);
+            let back = decode_subscribe_filter(&bytes).unwrap();
+            assert_eq!(back.type_name, f.type_name);
+            assert_eq!(back.object_id, f.object_id);
+            assert_eq!(back.kinds, f.kinds);
+        }
+    }
+
+    #[test]
+    fn subscribe_filter_strict_rejections() {
+        // has_type set but zero-length name.
+        assert!(decode_subscribe_filter(&[FILTER_FLAG_TYPE, 0, 0, 0]).is_err());
+        // reserved flag bit set.
+        assert!(decode_subscribe_filter(&[0x80, 0]).is_err());
+        // reserved kind bit set (bit3 = 0x08).
+        assert!(decode_subscribe_filter(&[0x00, 0x08]).is_err());
+        // empty payload.
+        assert!(decode_subscribe_filter(&[]).is_err());
+        // missing kinds byte (flags only).
+        assert!(decode_subscribe_filter(&[0x00]).is_err());
+        // truncated type.
+        assert!(decode_subscribe_filter(&[FILTER_FLAG_TYPE, 0, 4, b'U', b's']).is_err());
+        // trailing bytes after a valid all-filter.
+        assert!(decode_subscribe_filter(&[0x00, 0x00, 0xFF]).is_err());
+    }
+
+    #[test]
+    fn unsubscribe_payload_roundtrip() {
+        for id in [0u32, 1, 42, u32::MAX] {
+            assert_eq!(
+                decode_unsubscribe_payload(&encode_unsubscribe_payload(id)).unwrap(),
+                id
+            );
+        }
+        assert!(decode_unsubscribe_payload(&[0u8; 3]).is_err());
+    }
+
+    #[test]
+    fn wire_event_roundtrip_and_lossless_ids() {
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), serde_json::json!("Alice"));
+        let ev = ChangeEvent {
+            version: 9_007_199_254_740_993, // 2^53 + 1: would lose precision as a JS number
+            kind: ChangeKind::Update,
+            type_name: "User".into(),
+            object_id: 18_446_744_073_709_551_615, // u64::MAX
+            fields: Some(fields),
+        };
+        let mut buf = Vec::new();
+        encode_event_payload_into(&ev, &mut buf);
+        let wire = decode_event_payload(&buf).unwrap();
+        assert_eq!(wire.v, EVENT_FORMAT_TAG);
+        assert_eq!(wire.kind, "update");
+        assert_eq!(wire.type_name, "User");
+        // Ids are decimal strings, exact even past 2^53.
+        assert_eq!(wire.id, "18446744073709551615");
+        assert_eq!(wire.version, "9007199254740993");
+        assert_eq!(
+            wire.fields.unwrap().get("name"),
+            Some(&serde_json::json!("Alice"))
+        );
+
+        // A delete event omits fields entirely.
+        let del = ChangeEvent {
+            version: 7,
+            kind: ChangeKind::Delete,
+            type_name: "User".into(),
+            object_id: 5,
+            fields: None,
+        };
+        let mut dbuf = Vec::new();
+        encode_event_payload_into(&del, &mut dbuf);
+        let json = String::from_utf8(dbuf.clone()).unwrap();
+        assert!(!json.contains("fields"), "delete event must omit fields: {json}");
+        assert_eq!(decode_event_payload(&dbuf).unwrap().kind, "delete");
     }
 
     #[tokio::test]

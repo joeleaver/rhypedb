@@ -1405,6 +1405,8 @@ mod tests {
             default_rerank: None,
             graceful_drain: std::time::Duration::from_secs(20),
             worker_quiesce_budget: std::time::Duration::from_secs(10),
+            network_subs: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            events_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
         let app = Router::new()
             .merge(admin_router(state.clone()))
