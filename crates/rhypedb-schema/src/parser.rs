@@ -93,19 +93,18 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                     type_def.name, field.name
                 )));
             }
-            // `DateTime`/`Json` have a value layer but no zone/index encoder yet,
-            // so the secondary index would silently build nothing — reject up
-            // front. (`@unique` still works for exact-match; `DateTime` remains
-            // filterable/orderable via a full scan.)
+            // `Json` has a value layer but no ordered zone/index encoder
+            // (there is no total order over arbitrary JSON), so a secondary
+            // index would silently build nothing — reject up front. (`@unique`
+            // still works for exact-match; equality filtering goes through a
+            // full scan.) `DateTime` IS ordered-indexable (shares the I64
+            // encoding) and is allowed.
             if field.is_indexed()
-                && matches!(
-                    field.field_type,
-                    FieldType::Scalar(ScalarType::DateTime | ScalarType::Json)
-                )
+                && matches!(field.field_type, FieldType::Scalar(ScalarType::Json))
             {
                 return Err(SchemaError::Validation(format!(
-                    "@indexed is not yet supported on '{}.{}' (DateTime/Json); use @unique for \
-                     exact-match, or filter without a secondary index",
+                    "@indexed is not supported on '{}.{}' (Json has no total order); use \
+                     @unique for an exact-match constraint, or filter without a secondary index",
                     type_def.name, field.name
                 )));
             }
@@ -848,18 +847,22 @@ mod tests {
     }
 
     #[test]
-    fn reject_indexed_on_datetime_and_json() {
-        // DateTime/Json have no zone/index encoder yet, so @indexed is rejected
-        // up front (rather than silently building no index). @unique is fine.
-        for ty in ["DateTime", "Json"] {
-            let err = parse_schema(&format!("type Event {{ f: {ty} @indexed }}")).unwrap_err();
-            assert!(
-                format!("{err}").contains("@indexed is not yet supported"),
-                "expected an @indexed rejection for {ty}, got: {err}"
-            );
-            // @unique on the same type still parses.
-            parse_schema(&format!("type Event {{ f: {ty} @unique }}")).unwrap();
-        }
+    fn reject_indexed_on_json_but_allow_datetime() {
+        // Json has no total order, so @indexed builds no ordered index — reject
+        // up front. @unique (exact-match) is still fine.
+        let err = parse_schema("type Event { f: Json @indexed }").unwrap_err();
+        assert!(
+            format!("{err}").contains("@indexed is not supported")
+                && format!("{err}").contains("Json"),
+            "expected an @indexed rejection for Json, got: {err}"
+        );
+        parse_schema("type Event { f: Json @unique }").unwrap();
+
+        // DateTime IS ordered-indexable (shares the I64 encoding) — @indexed,
+        // @unique, and both together all parse.
+        parse_schema("type Event { f: DateTime @indexed }").unwrap();
+        parse_schema("type Event { f: DateTime @unique }").unwrap();
+        parse_schema("type Event { f: DateTime @indexed @unique }").unwrap();
     }
 
     #[test]

@@ -1173,6 +1173,10 @@ impl Database {
                         FieldType::Scalar(ScalarType::Bytes) => IndexedKind::Bytes,
                         FieldType::Scalar(ScalarType::Bool) => IndexedKind::Bool,
                         FieldType::Scalar(ScalarType::F32 | ScalarType::F64) => IndexedKind::Float,
+                        // DateTime indexes through the Integer path — it shares
+                        // the I64 MSB-flip ordered encoding in
+                        // `encode_int_for_zone` / `build_field_index_key`.
+                        FieldType::Scalar(ScalarType::DateTime) => IndexedKind::Integer,
                         _ => IndexedKind::Integer,
                     };
                     list.push(IndexedField {
@@ -4476,6 +4480,10 @@ impl Database {
                 Value::I32(target as i32)
             }
             FieldType::Scalar(ScalarType::I64) => Value::I64(target),
+            // DateTime is i64 epoch-millis; the caller (executor) has already
+            // coerced an RFC 3339 / int literal to millis, so `target` IS the
+            // millis to compare. Encodes like I64 via `encode_int_for_zone`.
+            FieldType::Scalar(ScalarType::DateTime) => Value::DateTime(target),
             // Non-integer field, or an integer field whose declared type can't
             // represent `target` (out of range). The typed index/zone fast
             // path doesn't apply — compare per row so the answer stays correct
@@ -4487,6 +4495,11 @@ impl Database {
                     Value::U64(n) => Some(compare_partial(*n as i128, op, target as i128)),
                     Value::I32(n) => Some(compare_partial(*n as i128, op, target as i128)),
                     Value::I64(n) => Some(compare_partial(*n as i128, op, target as i128)),
+                    // Defensive: a DateTime value can only reach here under a
+                    // non-DateTime declared field (impossible via the schema),
+                    // but compare it as its i64 millis to keep parity rather
+                    // than silently dropping it.
+                    Value::DateTime(ms) => Some(compare_partial(*ms as i128, op, target as i128)),
                     Value::F64(f) => Some(compare_partial(*f, op, target as f64)),
                     Value::F32(f) => Some(compare_partial(*f as f64, op, target as f64)),
                     _ => Some(false),
@@ -7496,9 +7509,9 @@ fn validate_value(field_def: &rhypedb_schema::FieldDef, value: &Value) -> Engine
 pub(crate) type ZoneFieldIdLookup = HashMap<u64, Vec<(String, u32)>>;
 
 /// Build the zone-field lookup table from the loaded catalog. One entry per
-/// type that has at least one integer scalar field; the engine never enrolls
-/// non-integer fields in zone maps (`encode_int_for_zone` returns `None`
-/// for them).
+/// type that has at least one zone-eligible scalar field (the integer scalars
+/// plus `DateTime`); the engine never enrolls the others in zone maps
+/// (`encode_int_for_zone` returns `None` for them).
 pub(crate) fn build_zone_field_id_lookup(
     schema: &Schema,
     type_ids: &HashMap<String, u64>,
@@ -7532,12 +7545,17 @@ pub(crate) fn build_zone_field_id_lookup(
 }
 
 /// Whether a field is eligible to be enrolled in an SST zone map. Mirrors
-/// `encode_int_for_zone`'s match arms.
+/// `encode_int_for_zone`'s match arms (the integer scalars plus `DateTime`,
+/// which shares the I64 ordered encoding).
 fn field_is_zone_eligible(field: &rhypedb_schema::FieldDef) -> bool {
     matches!(
         &field.field_type,
         FieldType::Scalar(
-            ScalarType::U32 | ScalarType::U64 | ScalarType::I32 | ScalarType::I64
+            ScalarType::U32
+                | ScalarType::U64
+                | ScalarType::I32
+                | ScalarType::I64
+                | ScalarType::DateTime
         )
     )
 }
@@ -7602,9 +7620,10 @@ pub(crate) fn value_passes_int_predicate(
 
 /// Encode an integer-typed `Value` into 8 bytes whose lexicographic order
 /// matches numeric order. Signed types flip the MSB so negatives sort below
-/// positives; narrow types widen to 64 bits first. Returns `None` for non-
-/// integer values (strings, floats, bools, nulls, bytes) — those aren't
-/// zone-mapped.
+/// positives; narrow types widen to 64 bits first. `DateTime` encodes like
+/// `I64` (its i64 epoch-millis). Returns `None` for the value types with no
+/// ordered fixed-width slot here (strings, floats, bools, nulls, bytes, json)
+/// — those aren't zone-mapped.
 /// Sort-preserving variable-length encoding for `String` and `Bytes`
 /// secondary index entries.
 ///
@@ -7848,6 +7867,10 @@ pub(crate) fn encode_int_for_zone(value: &Value) -> Option<[u8; 8]> {
             (widened as u64) ^ 0x8000_0000_0000_0000
         }
         Value::I64(v) => (*v as u64) ^ 0x8000_0000_0000_0000,
+        // DateTime is i64 epoch-millis — same MSB-flip ordered encoding as
+        // I64, so an ordered secondary index / zone map sorts timestamps
+        // (including pre-epoch negatives) correctly.
+        Value::DateTime(v) => (*v as u64) ^ 0x8000_0000_0000_0000,
         _ => return None,
     };
     Some(bits.to_be_bytes())
@@ -15320,6 +15343,200 @@ mod tests {
             .filter_scan("Movie", "year", CompareOp::Le, 1952, None)
             .unwrap();
         assert_eq!(le.len(), 3, "years 1950..=1952 should match");
+    }
+
+    // -----------------------------------------------------------------
+    // DateTime ordered secondary index + range pushdown (card cmqn571cn)
+    // -----------------------------------------------------------------
+
+    fn datetime_indexed_schema() -> Schema {
+        parse_schema(r#"type Event { name: String  created: DateTime @indexed }"#).unwrap()
+    }
+
+    fn datetime_plain_schema() -> Schema {
+        // No @indexed -> exercises the zone-map fallback path of filter_scan.
+        parse_schema(r#"type Event { name: String  created: DateTime }"#).unwrap()
+    }
+
+    fn make_event(db: &Database, name: &str, ms: i64) {
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String(name.into()));
+        f.insert("created".into(), Value::DateTime(ms));
+        db.create("Event", f).unwrap();
+    }
+
+    #[test]
+    fn indexed_datetime_create_writes_index_entry() {
+        // @indexed DateTime now builds an `i:` secondary-index entry (previously
+        // it silently built nothing, which is why @indexed DateTime was rejected
+        // at the schema parser).
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(datetime_indexed_schema(), dir.path()).unwrap();
+        make_event(&db, "a", 1000);
+        assert_eq!(count_index_entries(&db), 1);
+    }
+
+    /// Run all six comparison ops against a DateTime field and return the set of
+    /// matching millis (sorted). Shared by the indexed and zone-map parity test.
+    fn datetime_op_results(db: &Database, target: i64) -> Vec<(rhypedb_storage::zone::CompareOp, Vec<i64>)> {
+        use rhypedb_storage::zone::CompareOp;
+        let ops = [
+            CompareOp::Eq,
+            CompareOp::Ne,
+            CompareOp::Lt,
+            CompareOp::Le,
+            CompareOp::Gt,
+            CompareOp::Ge,
+        ];
+        ops.into_iter()
+            .map(|op| {
+                let mut got: Vec<i64> = db
+                    .filter_scan("Event", "created", op, target, None)
+                    .unwrap()
+                    .iter()
+                    .map(|o| match o.fields.get("created") {
+                        Some(Value::DateTime(ms)) => *ms,
+                        other => panic!("missing/bad created: {other:?}"),
+                    })
+                    .collect();
+                got.sort_unstable();
+                (op, got)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn indexed_datetime_ordering_including_negative_millis() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(datetime_indexed_schema(), dir.path()).unwrap();
+
+        // Pre-epoch (negative), epoch, and post-epoch timestamps.
+        for (n, ms) in [("pre", -10_000i64), ("epoch", 0), ("post", 10_000)] {
+            make_event(&db, n, ms);
+        }
+
+        let results = datetime_op_results(&db, 0);
+        let expect = |op: CompareOp| {
+            results.iter().find(|(o, _)| *o == op).map(|(_, v)| v.clone()).unwrap()
+        };
+        // The MSB-flip encoding sorts negatives below positives.
+        assert_eq!(expect(CompareOp::Eq), vec![0]);
+        assert_eq!(expect(CompareOp::Ne), vec![-10_000, 10_000]);
+        assert_eq!(expect(CompareOp::Lt), vec![-10_000]);
+        assert_eq!(expect(CompareOp::Le), vec![-10_000, 0]);
+        assert_eq!(expect(CompareOp::Gt), vec![10_000]);
+        assert_eq!(expect(CompareOp::Ge), vec![0, 10_000]);
+
+        // Gt against a negative target picks up epoch + post.
+        let gt_neg = db
+            .filter_scan("Event", "created", CompareOp::Gt, -10_000, None)
+            .unwrap();
+        assert_eq!(gt_neg.len(), 2);
+    }
+
+    #[test]
+    fn indexed_datetime_gt_i64_max_is_empty() {
+        // i64::MAX encodes to u64::MAX; the Gt seek path guards against the
+        // `target_u64 + 1` overflow and returns empty.
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(datetime_indexed_schema(), dir.path()).unwrap();
+        make_event(&db, "a", 0);
+        make_event(&db, "b", 1_000_000);
+        // With a limit (triggers the seek-then-scan path) and without.
+        assert!(
+            db.filter_scan("Event", "created", CompareOp::Gt, i64::MAX, Some(10))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.filter_scan("Event", "created", CompareOp::Gt, i64::MAX, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn datetime_indexed_and_zone_map_paths_agree() {
+        // Same dataset + same queries on an @indexed DateTime field (secondary
+        // index path) and a plain DateTime field (zone-map fallback path) must
+        // return identical result sets.
+        let data = [-50_000i64, -1, 0, 1, 1000, 999_999, i64::MAX];
+        let target = 1000;
+
+        let dir_idx = tempfile::tempdir().unwrap();
+        let db_idx = Database::open(datetime_indexed_schema(), dir_idx.path()).unwrap();
+        let dir_plain = tempfile::tempdir().unwrap();
+        let db_plain = Database::open(datetime_plain_schema(), dir_plain.path()).unwrap();
+        for (i, ms) in data.iter().enumerate() {
+            make_event(&db_idx, &format!("e{i}"), *ms);
+            make_event(&db_plain, &format!("e{i}"), *ms);
+        }
+        // Sanity: the indexed DB actually built index entries; the plain one did not.
+        assert_eq!(count_index_entries(&db_idx), data.len());
+        assert_eq!(count_index_entries(&db_plain), 0);
+
+        assert_eq!(
+            datetime_op_results(&db_idx, target),
+            datetime_op_results(&db_plain, target),
+            "indexed and zone-map paths must agree"
+        );
+    }
+
+    #[test]
+    fn unique_datetime_still_works() {
+        // @unique DateTime uses the plain-BE `u:` keyspace, independent of the
+        // new sign-flipped `i:` index keyspace; duplicates are still rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let schema =
+            parse_schema(r#"type Event { name: String  created: DateTime @unique }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        make_event(&db, "first", 5000);
+        let mut dup = FieldMap::new();
+        dup.insert("name".into(), Value::String("second".into()));
+        dup.insert("created".into(), Value::DateTime(5000));
+        let res = db.create("Event", dup);
+        assert!(
+            matches!(res, Err(EngineError::UniqueViolation { .. })),
+            "duplicate @unique DateTime should be rejected, got {res:?}"
+        );
+        // A different timestamp is fine.
+        make_event(&db, "third", 6000);
+    }
+
+    #[test]
+    fn indexed_datetime_update_and_delete_maintain_index() {
+        use rhypedb_storage::zone::CompareOp;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(datetime_indexed_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("a".into()));
+        f.insert("created".into(), Value::DateTime(1000));
+        let ev = db.create("Event", f).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+
+        // Update the timestamp — the old index entry drops, a new one appears.
+        let mut upd = FieldMap::new();
+        upd.insert("created".into(), Value::DateTime(2000));
+        db.update("Event", ev.id, upd).unwrap();
+        assert_eq!(count_index_entries(&db), 1);
+        assert!(
+            db.filter_scan("Event", "created", CompareOp::Eq, 1000, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.filter_scan("Event", "created", CompareOp::Eq, 2000, None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Delete removes the index entry.
+        db.delete("Event", ev.id).unwrap();
+        assert_eq!(count_index_entries(&db), 0);
     }
 
     #[test]

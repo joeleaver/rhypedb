@@ -1151,17 +1151,6 @@ fn try_filter_scan(
     if field_path.contains('.') {
         return Ok(None);
     }
-    // DateTime/Json fields don't take the typed index/zone pushdown — their
-    // stored `Value` variant differs from the int/string/bool/float fast paths,
-    // so a pushdown would silently never match. Route both to the full scan,
-    // where `compare_values` handles DateTime ordering and Json equality. (Json
-    // ordering is already rejected up front by `validate_predicate_for_type`.)
-    if let Some(st) = field_scalar_type(db, type_name, field_path) {
-        use rhypedb_schema::ScalarType as ST;
-        if matches!(st, ST::DateTime | ST::Json) {
-            return Ok(None);
-        }
-    }
     // Alias to disambiguate from the query crate's CompareOp imported via
     // `use crate::ast::*`. The engine re-exports the storage enum so this
     // crate doesn't need to depend on storage directly.
@@ -1174,6 +1163,40 @@ fn try_filter_scan(
         CompareOp::Gt => StorageOp::Gt,
         CompareOp::Ge => StorageOp::Ge,
     };
+    // DateTime and Json fields don't fit the generic literal dispatch below
+    // (their stored `Value` variant isn't one of int/string/bool/float):
+    //   * Json — no total order; equality is handled by the full scan + the
+    //     engine's `json_eq`. (Ordering is already rejected up front by
+    //     `validate_predicate_for_type`.) Route to the full scan.
+    //   * DateTime — push down to the *integer* `filter_scan` after coercing
+    //     the literal to epoch-millis (DateTime shares the I64 ordered
+    //     index/zone encoding). An int literal IS millis; an RFC 3339 string
+    //     is parsed to millis. A malformed string — or any other literal kind
+    //     — routes to the full scan, so `compare_values` owns those semantics
+    //     (a malformed string matches nothing, identically) and there is one
+    //     source of truth.
+    if let Some(st) = field_scalar_type(db, type_name, field_path) {
+        use rhypedb_schema::ScalarType as ST;
+        match st {
+            ST::Json => return Ok(None),
+            ST::DateTime => {
+                let millis = match value {
+                    Literal::Int(i) => *i,
+                    Literal::String(s) => {
+                        match rhypedb_engine::object::datetime_millis_from_rfc3339(s) {
+                            Ok(ms) => ms,
+                            Err(_) => return Ok(None),
+                        }
+                    }
+                    _ => return Ok(None),
+                };
+                return Ok(Some(db.filter_scan(
+                    type_name, field_path, storage_op, millis, limit,
+                )?));
+            }
+            _ => {}
+        }
+    }
     // Every scalar-typed literal can route to a typed filter_scan; null
     // falls through. Bytes-indexed predicates don't have a query-language
     // form yet (no Bytes literal at the parser level) — engine API users
@@ -1192,8 +1215,9 @@ fn try_filter_scan(
             type_name, field_path, storage_op, *f, limit,
         )?)),
         // A raw JSON container literal has no typed pushdown; the full scan +
-        // `compare_values` handles Json equality (DateTime/Json fields were
-        // already routed to `Ok(None)` by the guard above).
+        // `compare_values` handles it. (DateTime fields were already pushed
+        // down, and Json fields routed to `Ok(None)`, by the field-type guard
+        // above; this arm only fires for a Json literal on some other field.)
         Literal::Json(_) => Ok(None),
         Literal::Null => Ok(None),
     }
@@ -1625,6 +1649,120 @@ mod tests {
         match run(r#"Doc.filter(.meta == { "k": 2 })"#).unwrap() {
             QueryOutput::Objects(objs) => assert!(objs.is_empty()),
             _ => panic!("expected Objects"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // DateTime range pushdown via try_filter_scan (card cmqn571cn)
+    // -----------------------------------------------------------------
+
+    fn datetime_event_db(dir: &std::path::Path, indexed: bool) -> std::sync::Arc<Database> {
+        let decl = if indexed {
+            "created: DateTime @indexed"
+        } else {
+            "created: DateTime"
+        };
+        let schema = parse_schema(&format!("type Event {{ name: String  {decl} }}")).unwrap();
+        let db = Database::open(schema, dir).unwrap();
+        for (i, ms) in [-10_000i64, 0, 500, 1000, 1500].iter().enumerate() {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(format!("e{i}")));
+            f.insert("created".into(), Value::DateTime(*ms));
+            db.create("Event", f).unwrap();
+        }
+        db
+    }
+
+    /// The sorted `created` millis returned by running `q` against `db`.
+    fn run_created(db: &Database, q: &str) -> Vec<i64> {
+        match execute(&ExecContext::new(db, None), &parse_query(q).unwrap()).unwrap() {
+            QueryOutput::Objects(objs) => {
+                let mut v: Vec<i64> = objs
+                    .iter()
+                    .map(|o| match o.fields.get("created") {
+                        Some(Value::DateTime(ms)) => *ms,
+                        other => panic!("missing/bad created: {other:?}"),
+                    })
+                    .collect();
+                v.sort_unstable();
+                v
+            }
+            other => panic!("expected Objects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_filter_scan_routes_datetime_literals() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = datetime_event_db(dir.path(), true);
+
+        let compare = |lit: Literal| Predicate::Compare {
+            field_path: "created".into(),
+            op: CompareOp::Gt,
+            value: lit,
+        };
+
+        // Int and RFC 3339 string literals push down (Some) and find the 3 rows > 0.
+        let pushed_int = try_filter_scan(&db, "Event", &compare(Literal::Int(0)), None).unwrap();
+        assert_eq!(pushed_int.as_ref().map(|v| v.len()), Some(3));
+        let pushed_str = try_filter_scan(
+            &db,
+            "Event",
+            &compare(Literal::String("1970-01-01T00:00:00Z".into())),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pushed_str.as_ref().map(|v| v.len()), Some(3));
+
+        // A malformed RFC 3339 string, and non-int/non-string literals, fall back
+        // to the full scan (None) so `compare_values` owns those semantics.
+        for lit in [
+            Literal::String("not-a-date".into()),
+            Literal::Float(1.0),
+            Literal::Bool(true),
+            Literal::Null,
+        ] {
+            assert!(
+                try_filter_scan(&db, "Event", &compare(lit.clone()), None)
+                    .unwrap()
+                    .is_none(),
+                "literal {lit:?} should fall back to the full scan"
+            );
+        }
+    }
+
+    #[test]
+    fn datetime_pushdown_matches_full_scan_and_is_literal_agnostic() {
+        let dir_idx = tempfile::tempdir().unwrap();
+        let dir_plain = tempfile::tempdir().unwrap();
+        let db_idx = datetime_event_db(dir_idx.path(), true);
+        let db_plain = datetime_event_db(dir_plain.path(), false);
+
+        // For every query, the @indexed (secondary-index pushdown) and the plain
+        // (zone-map) DB must return identical, correct result sets.
+        let cases: &[(&str, Vec<i64>)] = &[
+            (r#"Event.filter(.created > 0)"#, vec![500, 1000, 1500]),
+            (r#"Event.filter(.created >= 0)"#, vec![0, 500, 1000, 1500]),
+            (r#"Event.filter(.created < 1000)"#, vec![-10_000, 0, 500]),
+            (r#"Event.filter(.created <= 0)"#, vec![-10_000, 0]),
+            (r#"Event.filter(.created == 500)"#, vec![500]),
+            (r#"Event.filter(.created != 500)"#, vec![-10_000, 0, 1000, 1500]),
+            // RFC 3339 string literal == the equivalent int literal.
+            (
+                r#"Event.filter(.created > "1970-01-01T00:00:00Z")"#,
+                vec![500, 1000, 1500],
+            ),
+            // Sub-millisecond precision truncates to 1000ms (so < 1000.5 == < 1000).
+            (
+                r#"Event.filter(.created < "1970-01-01T00:00:01.0005Z")"#,
+                vec![-10_000, 0, 500],
+            ),
+            // Malformed RFC 3339 string matches nothing (full-scan semantics).
+            (r#"Event.filter(.created < "not-a-date")"#, vec![]),
+        ];
+        for (q, expect) in cases {
+            assert_eq!(&run_created(&db_idx, q), expect, "indexed: {q}");
+            assert_eq!(&run_created(&db_plain, q), expect, "zone-map: {q}");
         }
     }
 
