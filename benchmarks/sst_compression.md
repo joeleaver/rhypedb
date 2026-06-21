@@ -46,3 +46,59 @@ mostly point reads and is not page-cache-bound, `block_compression = "none"`
 keeps the zero-copy path. For the common case (working set larger than RAM, or a
 managed/scale-to-zero deployment where disk size and page-cache density matter),
 `lz4` is the better default.
+
+## End-to-end cost: compaction, traversal, string index (None vs Lz4)
+
+`cargo run --release -p rhypedb-engine --example compression_perf_bench [-- N]`
+runs the same workloads on both compression modes (storage-level KV for
+compaction; engine-level graph for reads). "Did we lose much by defaulting LZ4
+on?" — measured, release:
+
+### Compaction cost (storage KV, background OFF for clean timing)
+
+| Rows | compact (None) | compact (Lz4) | Δ | on-disk None | on-disk Lz4 | ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| 300k | 52 ms | 76 ms | 1.45× | 38.8 MB | 10.2 MB | 3.80× |
+| 1M | 158 ms | 241 ms | 1.52× | 130.2 MB | 34.6 MB | 3.76× |
+
+Compaction is ~1.5× more CPU under LZ4 (compress every merged block), but in
+absolute terms it's tiny (241 ms to merge 40 SSTs / 1M rows) and it runs in the
+background. Bulk-write throughput is ~5% lower (≈0.94M vs 0.99M rows/s). Disk is
+3.8× smaller.
+
+### Async compaction keeps the writer's tail flat (card cmq5gow93)
+
+Per-commit latency with a small memtable so flushes + the 4-SST compaction
+trigger fire often (LZ4):
+
+| Rows | mode | total | worst commit | commits >10 ms |
+| --- | --- | --- | --- | --- |
+| 333k | bg OFF | 1.21 s | **66.7 ms** | 22 |
+| 333k | bg ON | **0.58 s** | **18.5 ms** | 4 |
+
+Background compaction (the default) cuts the worst-case commit ~3.6× and, at this
+scale, halves total ingest time — because an inline compaction otherwise stalls
+the writer synchronously, and LZ4's extra compaction CPU makes that stall *worse*,
+so offloading it matters even more. The +50% compaction cost above is paid by a
+background thread the writer never blocks on.
+
+### Read paths (engine, data settled in compacted SSTs)
+
+10k users / 1k movies / 50k ratings:
+
+| Metric | None | Lz4 | Δ |
+| --- | --- | --- | --- |
+| 2-hop traversal (user→ratings→movies, 1000 users) | 14.1 ms | 14.6 ms | +4% |
+| `filter_scan_str` on `@indexed` String (city ==) | 15 µs | 16 µs | ~noise |
+| on-disk | 20.7 MB | 7.1 MB | 2.9× smaller |
+
+Warm-cache read cost is small (a few %): traversal reads cover blobs and the
+string filter reads covering-index entries, each one block decompress amortized
+over the block. The `@indexed` String path (`filter_scan_via_index_var`) performs
+like the u32 index — single-digit µs — confirming card cmq5gozng's expectation.
+
+**Bottom line:** defaulting LZ4 on costs ~1.5× compaction CPU (backgrounded, never
+on the writer's path) and a few % on warm reads, for 3.8× smaller files. We did
+not shoot ourselves; background compaction absorbs the cost and the tail stays
+flat. (A Postgres comparison for the 1M-traversal lead and the String index is a
+separate axis — needs the `benchmarks/docker-compose.yml` PG container.)
