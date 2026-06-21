@@ -215,7 +215,7 @@ pub fn resolve(
     let f_drain = file.and_then(|f| f.graceful_drain_secs);
     let f_quiesce = file.and_then(|f| f.worker_quiesce_budget_secs);
 
-    // Block compression: cli > env > file > default (Lz4). Each layer parses to
+    // Block compression: cli > env > file > default (None). Each layer parses to
     // an enum; an invalid value warns and falls through to the next layer.
     let block_compression = parse_compression("--block-compression", cli.block_compression.as_deref())
         .or_else(|| parse_compression("RHYPEDB_BLOCK_COMPRESSION", env.block_compression.as_deref()))
@@ -225,7 +225,7 @@ pub fn resolve(
                 file.and_then(|f| f.block_compression.as_deref()),
             )
         })
-        .unwrap_or(rhypedb_storage::SstCompression::Lz4);
+        .unwrap_or(rhypedb_storage::SstCompression::None);
 
     // ef / rerank: cli (none today) > env (parsed string) > file, validated ONCE
     // on the resolved value. A valid env value wins over the file.
@@ -345,6 +345,38 @@ mod tests {
         assert_eq!(c.cache_max_entries, DEFAULT_CACHE_MAX_ENTRIES);
         assert_eq!(c.graceful_drain, Duration::from_secs(DEFAULT_GRACEFUL_DRAIN_SECS));
         assert_eq!(c.schema, None);
+        // SST compression is OFF by default (the v6 LZ4 default was flipped back
+        // to None after a benchmark showed it cost ~3.7x on multi-hop traversal).
+        assert_eq!(c.block_compression, rhypedb_storage::SstCompression::None);
+    }
+
+    #[test]
+    fn block_compression_precedence() {
+        // File sets lz4; nothing above overrides -> lz4.
+        let f = file(r#"block_compression = "lz4""#);
+        assert_eq!(
+            resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f)).block_compression,
+            rhypedb_storage::SstCompression::Lz4
+        );
+        // Env "none" wins over a file "lz4".
+        let env = EnvLayer { block_compression: Some("none".into()), ..Default::default() };
+        assert_eq!(
+            resolve(&CliLayer::default(), &env, Some(&f)).block_compression,
+            rhypedb_storage::SstCompression::None
+        );
+        // CLI wins over both.
+        let cli = CliLayer { block_compression: Some("lz4".into()), ..Default::default() };
+        let env_none = EnvLayer { block_compression: Some("none".into()), ..Default::default() };
+        assert_eq!(
+            resolve(&cli, &env_none, Some(&f)).block_compression,
+            rhypedb_storage::SstCompression::Lz4
+        );
+        // An invalid value falls through to the default (None).
+        let bad = file(r#"block_compression = "zstd""#);
+        assert_eq!(
+            resolve(&CliLayer::default(), &EnvLayer::default(), Some(&bad)).block_compression,
+            rhypedb_storage::SstCompression::None
+        );
     }
 
     #[test]

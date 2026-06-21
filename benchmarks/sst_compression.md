@@ -92,13 +92,41 @@ background thread the writer never blocks on.
 | `filter_scan_str` on `@indexed` String (city ==) | 15 µs | 16 µs | ~noise |
 | on-disk | 20.7 MB | 7.1 MB | 2.9× smaller |
 
-Warm-cache read cost is small (a few %): traversal reads cover blobs and the
-string filter reads covering-index entries, each one block decompress amortized
-over the block. The `@indexed` String path (`filter_scan_via_index_var`) performs
-like the u32 index — single-digit µs — confirming card cmq5gozng's expectation.
+At this small, cache-resident scale the read cost looked tiny (a few %). **That
+estimate did not survive scale** — see below.
 
-**Bottom line:** defaulting LZ4 on costs ~1.5× compaction CPU (backgrounded, never
-on the writer's path) and a few % on warm reads, for 3.8× smaller files. We did
-not shoot ourselves; background compaction absorbs the cost and the tail stays
-flat. (A Postgres comparison for the 1M-traversal lead and the String index is a
-separate axis — needs the `benchmarks/docker-compose.yml` PG container.)
+### ⚠ At scale, LZ4 costs 3.7× on multi-hop traversal (vs Postgres, 1M rows)
+
+Running the real harness (`benchmarks/suite1/scenario_08_3hop.py`, rhypedb-tcp vs
+Postgres) at **1M ratings** (100k users × 10k movies × 1k directors × 10
+ratings/user), 3-hop traversal, mean per-op:
+
+| 1M 3-hop traversal | mean op | vs PG-optimal (69 µs) | vs PG-idiomatic (139 µs) |
+| --- | --- | --- | --- |
+| rhypedb **None** (v5) | **42.9 µs** | **1.6× faster** | **3.2× faster** |
+| rhypedb **Lz4** (v6) | **157.7 µs** | 2.3× slower | 1.13× slower |
+
+Same data, same queries, only the compression flag differs: **LZ4 is 3.67×
+slower than None** here, and it flips a decisive win over even hand-tuned
+Postgres into a loss. Why so much worse than the micro-bench's "+4%"? A graph
+traversal does **many scattered, point-like cover-blob reads** (each `get_links`
+hop reads rev-edge / forward-edge entries spread across the keyspace), and each
+one decompresses a whole 16-entry block to extract a *single* entry — the
+opposite of a sequential scan, where the block decompress amortizes over 16
+entries. The micro-bench graph was small and cache-resident, hiding this.
+
+**Not everything regresses:** the 100k `@indexed` filter scan with LZ4 still beat
+Postgres (82.8 µs vs 94.6 µs) — a range scan reads many entries per decompressed
+block. The damage is concentrated in scatter-read workloads (traversal, point
+lookups).
+
+**Decision (2026-06-21): default flipped to `None`.** A 3.7× regression on a core
+read workload, by default, is the wrong trade — especially against the project's
+"don't trade function for memory" rule. LZ4 is now **opt-in** for deployments
+where disk size / cold-cache density dominates and reads are scan-heavy or rare. A
+future thread-safe decompressed-block cache could make LZ4 viable as a default by
+amortizing repeated hot-block reads within a traversal (deferred).
+
+**Background compaction still earns its keep regardless** (and absorbs LZ4's
+~1.5× compaction CPU when it is enabled): worst-case commit 66.7→18.5 ms,
+total ingest halved at 1M. See the async-compaction section above.

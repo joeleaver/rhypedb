@@ -48,10 +48,11 @@
 # graceful_drain_secs = 20           # in-flight drain budget on shutdown
 # worker_quiesce_budget_secs = 10    # vectorizer-worker stop budget on shutdown
 
-# Per-block SST compression for newly written files: "lz4" (default) or "none".
-# "lz4" makes SST files ~3-4x smaller (denser page cache, fewer cold reads) at
-# the cost of a per-block decompress on read; "none" keeps the uncompressed
-# zero-copy layout. Both formats are always readable; changing this migrates
-# files over time via compaction. Also settable via --block-compression /
-# RHYPEDB_BLOCK_COMPRESSION.
-# block_compression = "lz4"
+# Per-block SST compression for newly written files: "none" (default) or "lz4".
+# "lz4" makes SST files ~3.8x smaller (denser page cache) BUT costs ~3.7x on
+# multi-hop graph traversals at scale (scattered cover-blob reads each decompress
+# a whole block), so it is opt-in: enable it where disk size matters and reads
+# are scan-heavy or rare. "none" keeps the uncompressed zero-copy layout. Both
+# formats are always readable; changing this migrates files over time via
+# compaction. Also settable via --block-compression / RHYPEDB_BLOCK_COMPRESSION.
+# block_compression = "none"

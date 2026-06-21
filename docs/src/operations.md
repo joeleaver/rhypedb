@@ -30,7 +30,7 @@ rhypedb-server --schema schema.rhype --data-dir /var/lib/rhypedb
 | `RHYPEDB_RESTORE_FROM` | Snapshot directory to restore on boot (same as `--restore-from`; the flag wins if both are set). |
 | `RHYPEDB_RESTORE_FROM_FORCE` | `1`/`true`/`yes`/`on` ⇒ same as `--restore-force`. |
 | `RHYPEDB_CONFIG` | Path to a TOML config file (same as `--config`; the flag wins if both are set). |
-| `RHYPEDB_BLOCK_COMPRESSION` | `lz4` (default) or `none` — per-block SST compression for new files (same as `--block-compression`). |
+| `RHYPEDB_BLOCK_COMPRESSION` | `none` (default) or `lz4` — per-block SST compression for new files (same as `--block-compression`). |
 
 ## Configuration file
 
@@ -64,18 +64,24 @@ The keys map one-to-one to the flags/env vars (flat, `snake_case`):
 | `cache_max_entries` | int ≥ 1 | `256` | *(file only)* |
 | `graceful_drain_secs` | int ≥ 1 | `20` | *(file only)* |
 | `worker_quiesce_budget_secs` | int ≥ 1 | `10` | *(file only)* |
-| `block_compression` | `"lz4"` \| `"none"` | `"lz4"` | `--block-compression` / `RHYPEDB_BLOCK_COMPRESSION` |
+| `block_compression` | `"none"` \| `"lz4"` | `"none"` | `--block-compression` / `RHYPEDB_BLOCK_COMPRESSION` |
 
 **SST block compression.** `block_compression` controls how newly written SST
-files (memtable flushes and compactions) store their data region. `"lz4"` (the
-default) compresses each ~16-entry block with LZ4 — roughly 3-4× smaller files,
-so more of the working set fits in the OS page cache, at the cost of a small
-per-block decompress on read. `"none"` keeps the older uncompressed layout, whose
-reads are zero-copy views into the memory-mapped file. **Both formats are always
-readable regardless of this setting** — it only affects new writes — so a data
-directory can hold a mix, and changing the value lets natural compaction migrate
-files to the new format over time (no offline rewrite needed). An unrecognized
-value is warned about and ignored (falls back to the lower layer / the default).
+files (memtable flushes and compactions) store their data region. `"none"` (the
+default) keeps the uncompressed layout, whose reads are zero-copy views into the
+memory-mapped file. `"lz4"` compresses each ~16-entry block with LZ4 — roughly
+3.8× smaller files, so more of the working set fits in the OS page cache — but it
+is **opt-in** because a benchmark showed it costs ~3.7× on a 1M-row multi-hop
+graph traversal: each scattered cover-blob read decompresses a whole block to
+pull a single entry, which doesn't amortize the way a sequential scan does. Turn
+`"lz4"` on where **disk size / cold-cache density matters and reads are
+scan-heavy or rare** (range/filter scans amortize the block decompress well);
+keep `"none"` for point-lookup- and traversal-heavy workloads. **Both formats are
+always readable regardless of this setting** — it only affects new writes — so a
+data directory can hold a mix, and changing the value lets natural compaction
+migrate files to the new format over time (no offline rewrite needed). An
+unrecognized value is warned about and ignored (falls back to the lower layer /
+the default).
 
 **Validation.** A typo'd or unknown key, invalid TOML, a wrong-typed value (e.g.
 `ef = "x"`), or an unreadable `--config` path is a **fatal startup error** (exit 1)

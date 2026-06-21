@@ -580,10 +580,12 @@ pub struct OpenOptions {
     /// breaking API change. Defaults to `false`.
     pub allow_schema_shrink: bool,
     /// Per-block compression for newly written SST files (flush + compaction).
-    /// Defaults to `Lz4` (v6 format): ~3-4x smaller files at the cost of a
-    /// per-block decompress on read. Existing v5/older SSTs keep opening and
-    /// migrate to v6 via natural compaction. Set to `SstCompression::None` to
-    /// keep writing the v5 zero-copy layout.
+    /// Defaults to `None` (v5 zero-copy layout). `Lz4` (v6) gives ~3.8x smaller
+    /// files but a benchmark showed it costs ~3.7x on a 1M-row multi-hop graph
+    /// traversal (each scattered cover-blob read decompresses a whole block for
+    /// one entry), so it is opt-in: enable it where disk size / cold-cache
+    /// density matters and reads are scan-heavy or rare. Both formats are always
+    /// readable; compaction migrates files to whichever is set.
     pub block_compression: rhypedb_storage::SstCompression,
 }
 
@@ -593,7 +595,7 @@ impl Default for OpenOptions {
             sync_on_commit: true,
             background_cover_refresh: true,
             allow_schema_shrink: false,
-            block_compression: rhypedb_storage::SstCompression::Lz4,
+            block_compression: rhypedb_storage::SstCompression::None,
         }
     }
 }

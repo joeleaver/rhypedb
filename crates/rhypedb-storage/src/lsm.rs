@@ -46,10 +46,13 @@ pub struct LsmConfig {
     /// way (they serialize against the worker via the compaction mutex).
     pub background_compaction: bool,
     /// Per-block SST compression for newly written SSTs (flush + compaction).
-    /// Defaults to `Lz4` (v6 format) — ~3-4x smaller files at the cost of a
-    /// per-block decompress on read. Existing v5 (and older) SSTs keep opening
-    /// and are migrated to v6 by natural compaction. Set to
-    /// `SstCompression::None` to keep writing the v5 zero-copy layout.
+    /// Defaults to `None` (v5 zero-copy layout). `Lz4` (v6) makes files ~3.8x
+    /// smaller, but a benchmark showed it costs ~3.7x on a 1M-row multi-hop
+    /// graph traversal — each scattered cover-blob read decompresses a whole
+    /// 16-entry block for ONE entry — which flips a Postgres win into a loss on
+    /// the read-heavy default. So compression is opt-in: enable `Lz4` where disk
+    /// size / cold-cache density matters and reads are scan-heavy or rare. Both
+    /// formats are always readable; compaction migrates files to whichever is set.
     pub block_compression: crate::sst::SstCompression,
 }
 
@@ -62,7 +65,7 @@ impl LsmConfig {
             zone_extractor: None,
             sync_on_commit: true,
             background_compaction: true,
-            block_compression: SstCompression::Lz4,
+            block_compression: SstCompression::None,
         }
     }
 }

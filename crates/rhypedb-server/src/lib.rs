@@ -86,11 +86,13 @@ struct Cli {
     #[arg(long)]
     no_sync: bool,
 
-    /// Per-block SST compression for newly written files: `lz4` (default) or
-    /// `none`. `lz4` (v6 format) makes SSTs ~3-4x smaller at the cost of a
-    /// per-block decompress on read; `none` keeps the v5 zero-copy layout.
-    /// Existing files of either format are always readable; compaction migrates
-    /// them to the chosen format over time.
+    /// Per-block SST compression for newly written files: `none` (default) or
+    /// `lz4`. `lz4` (v6) makes SSTs ~3.8x smaller but costs ~3.7x on multi-hop
+    /// graph traversals at scale (scattered cover-blob reads each decompress a
+    /// whole block), so it is opt-in — turn it on where disk size / cold-cache
+    /// density matters and reads are scan-heavy or rare. `none` keeps the v5
+    /// zero-copy layout. Both formats are always readable; compaction migrates
+    /// files to the chosen format over time.
     #[arg(long)]
     block_compression: Option<String>,
 }
