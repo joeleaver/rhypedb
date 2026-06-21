@@ -348,7 +348,10 @@ Each connection has a **bounded** event buffer. A merely-slow consumer absorbs
 bursts; on overflow the server **drops** events and pushes a `SubLagged` for the
 affected subscription (delivered eagerly — you get it even if no further event
 ever arrives). `SubLagged` means "you missed events — reconcile by re-querying".
-There is no unbounded server-side buffering. The buffer is shared across a
+There is no unbounded server-side buffering. An `Event` whose JSON would exceed
+the 16 MiB frame cap (e.g. a very wide `String` field) is likewise downgraded to
+a `SubLagged` instead of being shipped as a frame the peer would reject. The
+buffer is shared across a
 connection's subscriptions, so a high-volume subscription can cause a `SubLagged`
 on the connection's other subscriptions — put a firehose on its own connection.
 The server also pushes a best-effort `SubLagged` to each live subscription on
