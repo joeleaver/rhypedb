@@ -70,11 +70,11 @@ Because JSON numbers are IEEE-754 doubles in most clients, an id above 2⁵³ ca
 
 > Note the casing: the named types (`String`, `Bool`, `DateTime`, `Bytes`, `Json`) are capitalized, while the numeric primitives (`i64`, `u32`, `f64`, …) are lowercase. This matches how you refer to them in queries and migrations.
 
-**`DateTime`** is stored as a 64-bit epoch-millisecond timestamp (UTC); sub-millisecond precision in an RFC 3339 input is truncated. It is **filterable and orderable** (`.filter(.created > "2026-01-01T00:00:00Z")` works against either an RFC 3339 string or an integer epoch-millis).
+**`DateTime`** is stored as a 64-bit epoch-millisecond timestamp (UTC); sub-millisecond precision in an RFC 3339 input is truncated. It is **filterable and orderable** (`.filter(.created > "2026-01-01T00:00:00Z")` works against either an RFC 3339 string or an integer epoch-millis), via a full scan — `@indexed` is not yet supported on `DateTime` (use `@unique` for an exact-match constraint).
 
 **`Bytes`** is an arbitrary byte blob, written and read as standard base64. It supports equality/ordering filtering (by byte value) when `@indexed`.
 
-**`Json`** holds an arbitrary JSON value. It supports **equality** filtering only (`==`/`!=`); ordering comparisons (`<`, `>`, …) on a `Json` field are rejected, since there is no total order over arbitrary JSON.
+**`Json`** holds an arbitrary JSON value. It supports **equality** filtering only (`==`/`!=`); ordering comparisons (`<`, `>`, …) on a `Json` field are rejected, since there is no total order over arbitrary JSON. `@indexed` is not supported on `Json` (use `@unique` for an exact-match constraint).
 
 ### Relations
 

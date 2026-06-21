@@ -2579,11 +2579,14 @@ fn validate_field_type_change(
             },
         ));
     }
-    // Refuse targets the engine has no writable `Value` for (DateTime /
-    // Json): a converter could never return a value whose kind byte matches,
-    // so the migration would fail every row. Also closes the latent
-    // offline-path bug where, with zero objects, this would vacuously flip
-    // the catalog to an unrepresentable kind.
+    // Refuse a target kind the engine has no writable `Value` for. Every scalar
+    // (including DateTime/Json) now has a variant, so this only fires for a
+    // non-scalar / unset target — a converter could never return a value whose
+    // kind byte matches, so the migration would fail every row. (A converter
+    // that targets DateTime/Json must actually produce that Value variant; the
+    // per-row contract check still enforces that.) Also closes the latent
+    // offline-path bug where, with zero objects, this would vacuously flip the
+    // catalog to an unrepresentable kind.
     if !is_representable_target_kind(target_kind) {
         return Err(EngineError::Catalog(
             CatalogError::FieldTypeChangeUnrepresentableTarget {

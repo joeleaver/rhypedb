@@ -82,14 +82,30 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                 }
             }
 
-            // Validate @indexed is on a scalar field. All scalar types have
-            // sort-preserving encoders — ints (fixed-width), strings/bytes
+            // Validate @indexed is on a scalar field with a sort-preserving
+            // zone/index encoder — ints (fixed-width), strings/bytes
             // (variable-length escape + terminator), bools (1 byte padded
             // to 8), floats (IEEE-754 sortable). Relation / Vector / Edge
             // fields can't carry a value to index.
             if field.is_indexed() && !matches!(field.field_type, FieldType::Scalar(_)) {
                 return Err(SchemaError::Validation(format!(
                     "@indexed on '{}.{}' requires a scalar field",
+                    type_def.name, field.name
+                )));
+            }
+            // `DateTime`/`Json` have a value layer but no zone/index encoder yet,
+            // so the secondary index would silently build nothing — reject up
+            // front. (`@unique` still works for exact-match; `DateTime` remains
+            // filterable/orderable via a full scan.)
+            if field.is_indexed()
+                && matches!(
+                    field.field_type,
+                    FieldType::Scalar(ScalarType::DateTime | ScalarType::Json)
+                )
+            {
+                return Err(SchemaError::Validation(format!(
+                    "@indexed is not yet supported on '{}.{}' (DateTime/Json); use @unique for \
+                     exact-match, or filter without a secondary index",
                     type_def.name, field.name
                 )));
             }
@@ -828,6 +844,21 @@ mod tests {
         let movie = schema.types.get("Movie").unwrap();
         for f in &movie.fields {
             assert!(f.is_indexed(), "{} should carry @indexed", f.name);
+        }
+    }
+
+    #[test]
+    fn reject_indexed_on_datetime_and_json() {
+        // DateTime/Json have no zone/index encoder yet, so @indexed is rejected
+        // up front (rather than silently building no index). @unique is fine.
+        for ty in ["DateTime", "Json"] {
+            let err = parse_schema(&format!("type Event {{ f: {ty} @indexed }}")).unwrap_err();
+            assert!(
+                format!("{err}").contains("@indexed is not yet supported"),
+                "expected an @indexed rejection for {ty}, got: {err}"
+            );
+            // @unique on the same type still parses.
+            parse_schema(&format!("type Event {{ f: {ty} @unique }}")).unwrap();
         }
     }
 

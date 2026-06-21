@@ -142,6 +142,9 @@ fn execute_source(
             type_name,
             predicate,
         } => {
+            // Reject unsupported comparisons (e.g. Json ordering) up front, for
+            // any predicate shape — before either the pushdown or the full scan.
+            validate_predicate_for_type(db, type_name, predicate)?;
             // Index / zone-map fast path: single integer comparison gets
             // pushed down to storage along with an effective limit (if the
             // next step is a bare `.limit(N)` we can stop scanning once N
@@ -412,6 +415,12 @@ fn execute_step(
         }
 
         Step::Filter { predicate } => {
+            // Reject unsupported comparisons (e.g. Json ordering) for the current
+            // type before materializing, so the contract holds for a chained
+            // `.filter()` after a traversal too.
+            if let Some(tn) = output_type_name(&current, source) {
+                validate_predicate_for_type(db, &tn, predicate)?;
+            }
             // Filter is the one step that genuinely needs field data, so an
             // IdSet input must materialize here. Subsequent traversals will
             // re-collapse to IdSet via ids_from_output.
@@ -949,6 +958,42 @@ fn field_scalar_type(
         })
 }
 
+/// Validate every leaf comparison in a filter predicate against `type_name`'s
+/// schema, independent of `And`/`Or` nesting and of whether the comparison takes
+/// the index pushdown. Currently rejects an ORDERING comparison on a `Json`
+/// field (no total order over arbitrary JSON) — so the rule holds for a nested
+/// or post-traversal filter, not only a single top-level comparison.
+fn validate_predicate_for_type(
+    db: &Database,
+    type_name: &str,
+    predicate: &Predicate,
+) -> QueryResult<()> {
+    match predicate {
+        Predicate::Compare { field_path, op, .. } => {
+            if !field_path.contains('.')
+                && matches!(
+                    field_scalar_type(db, type_name, field_path),
+                    Some(rhypedb_schema::ScalarType::Json)
+                )
+                && matches!(
+                    op,
+                    CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+                )
+            {
+                return Err(QueryError::Type(
+                    "ordering comparisons are not supported on Json fields".into(),
+                ));
+            }
+            Ok(())
+        }
+        Predicate::And(l, r) | Predicate::Or(l, r) => {
+            validate_predicate_for_type(db, type_name, l)?;
+            validate_predicate_for_type(db, type_name, r)
+        }
+    }
+}
+
+
 fn compare_ord<T: PartialOrd>(a: T, op: &CompareOp, b: T) -> bool {
     match op {
         CompareOp::Eq => a == b,
@@ -1108,23 +1153,13 @@ fn try_filter_scan(
     }
     // DateTime/Json fields don't take the typed index/zone pushdown — their
     // stored `Value` variant differs from the int/string/bool/float fast paths,
-    // so a pushdown would silently never match. Route DateTime to the full scan,
-    // where `compare_values` handles its ordering; allow Json equality there too,
-    // but reject Json ordering (there is no total order over arbitrary JSON)
-    // rather than silently returning nothing.
+    // so a pushdown would silently never match. Route both to the full scan,
+    // where `compare_values` handles DateTime ordering and Json equality. (Json
+    // ordering is already rejected up front by `validate_predicate_for_type`.)
     if let Some(st) = field_scalar_type(db, type_name, field_path) {
         use rhypedb_schema::ScalarType as ST;
-        match st {
-            ST::DateTime => return Ok(None),
-            ST::Json => {
-                return match op {
-                    CompareOp::Eq | CompareOp::Ne => Ok(None),
-                    _ => Err(QueryError::Type(
-                        "ordering comparisons are not supported on Json fields".into(),
-                    )),
-                };
-            }
-            _ => {}
+        if matches!(st, ST::DateTime | ST::Json) {
+            return Ok(None);
         }
     }
     // Alias to disambiguate from the query crate's CompareOp imported via
@@ -1550,6 +1585,47 @@ mod tests {
         assert!(execute(&ExecContext::new(&db, None), &bad_dt).is_err());
         let bad_b64 = parse_query(r#"Event.create({ blob: "@@@@" })"#).unwrap();
         assert!(execute(&ExecContext::new(&db, None), &bad_b64).is_err());
+    }
+
+    #[test]
+    fn json_ordering_is_rejected_everywhere_equality_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Author { name: String  docs: [Doc] @inverse(Doc.author) }
+            type Doc { name: String  meta: Json  author: Author }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let run = |q: &str| execute(&ExecContext::new(&db, None), &parse_query(q).unwrap());
+
+        let a = match run(r#"Author.create({ name: "ada" })"#).unwrap() {
+            QueryOutput::Single(o) => o.id,
+            _ => panic!(),
+        };
+        run(&format!(
+            r#"Doc.create({{ name: "d", meta: {{ "k": 1 }}, author: {a} }})"#
+        ))
+        .unwrap();
+
+        // Ordering on a Json field is a hard error — NOT a silent empty result —
+        // as a single comparison, inside a compound predicate, AND in a
+        // post-traversal `.filter()` step.
+        assert!(run(r#"Doc.filter(.meta > 5)"#).is_err());
+        assert!(run(r#"Doc.filter(.meta > 5 && .name == "d")"#).is_err());
+        assert!(run(r#"Doc.filter(.name == "d" || .meta >= 1)"#).is_err());
+        assert!(run(&format!(r#"Author.get({a}).docs.filter(.meta >= 1)"#)).is_err());
+
+        // Equality on a Json field is allowed (and matches the stored value).
+        match run(r#"Doc.filter(.meta == { "k": 1 })"#).unwrap() {
+            QueryOutput::Objects(objs) => assert_eq!(objs.len(), 1),
+            _ => panic!("expected Objects"),
+        }
+        match run(r#"Doc.filter(.meta == { "k": 2 })"#).unwrap() {
+            QueryOutput::Objects(objs) => assert!(objs.is_empty()),
+            _ => panic!("expected Objects"),
+        }
     }
 
     #[test]
