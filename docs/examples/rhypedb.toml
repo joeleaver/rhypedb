@@ -47,3 +47,11 @@
 # cache_max_entries = 256            # parsed-query cache size
 # graceful_drain_secs = 20           # in-flight drain budget on shutdown
 # worker_quiesce_budget_secs = 10    # vectorizer-worker stop budget on shutdown
+
+# Per-block SST compression for newly written files: "lz4" (default) or "none".
+# "lz4" makes SST files ~3-4x smaller (denser page cache, fewer cold reads) at
+# the cost of a per-block decompress on read; "none" keeps the uncompressed
+# zero-copy layout. Both formats are always readable; changing this migrates
+# files over time via compaction. Also settable via --block-compression /
+# RHYPEDB_BLOCK_COMPRESSION.
+# block_compression = "lz4"

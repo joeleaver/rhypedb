@@ -8,6 +8,10 @@ ahash = "0.8"
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 crossbeam-skiplist = { workspace = true }
+# Pure-Rust LZ4 for per-block SST compression (v6). Block API only —
+# `default-features = false` drops the `frame` feature (and its twox-hash dep);
+# `safe-encode`/`safe-decode` keep it free of internal `unsafe`.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 memmap2 = "0.9"
 parking_lot = { workspace = true }
 rand = { workspace = true }

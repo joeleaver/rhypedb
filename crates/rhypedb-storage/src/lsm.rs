@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 
 use crate::memtable::MemTable;
 use crate::mvcc::{Transaction, TransactionManager};
-use crate::sst::{SstReader, SstWriter};
+use crate::sst::{SstCompression, SstReader, SstWriter};
 use crate::wal::{RecordType, Wal};
 use crate::{Error, Result};
 
@@ -45,6 +45,12 @@ pub struct LsmConfig {
     /// Explicit `LsmTree::compact()` calls are always synchronous either
     /// way (they serialize against the worker via the compaction mutex).
     pub background_compaction: bool,
+    /// Per-block SST compression for newly written SSTs (flush + compaction).
+    /// Defaults to `Lz4` (v6 format) — ~3-4x smaller files at the cost of a
+    /// per-block decompress on read. Existing v5 (and older) SSTs keep opening
+    /// and are migrated to v6 by natural compaction. Set to
+    /// `SstCompression::None` to keep writing the v5 zero-copy layout.
+    pub block_compression: crate::sst::SstCompression,
 }
 
 impl LsmConfig {
@@ -56,6 +62,7 @@ impl LsmConfig {
             zone_extractor: None,
             sync_on_commit: true,
             background_compaction: true,
+            block_compression: SstCompression::Lz4,
         }
     }
 }
@@ -1018,9 +1025,10 @@ impl LsmTree {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sst_path = self.config.data_dir.join("sst").join(format!("{sst_id:08}.sst"));
 
-        let mut writer = SstWriter::new_with_zone_extractor(
+        let mut writer = SstWriter::new_with_options(
             &sst_path,
             self.config.zone_extractor.clone(),
+            self.config.block_compression,
         )?;
         for (key, value) in old_memtable.iter() {
             writer.add(&key, &value)?;
@@ -1184,9 +1192,10 @@ impl LsmTree {
             .join("sst")
             .join(format!("{sst_id:08}.sst"));
 
-        let mut writer = SstWriter::new_with_zone_extractor(
+        let mut writer = SstWriter::new_with_options(
             &sst_path,
             self.config.zone_extractor.clone(),
+            self.config.block_compression,
         )?;
         let mut prev_user_key: Option<Vec<u8>> = None;
         // Entries arrive newest-version-first within each user key (version is
@@ -1394,6 +1403,7 @@ mod tests {
             // immediately after `compact()` stay deterministic. Targeted
             // tests below opt this back on to exercise the worker.
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         }
     }
 
@@ -1622,6 +1632,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: true,
+            block_compression: SstCompression::Lz4,
         };
         let tree = LsmTree::open(cfg).unwrap();
 
@@ -1681,6 +1692,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         })
         .unwrap();
         let snap = reopened.read_snapshot();
@@ -1719,6 +1731,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: true,
+            block_compression: SstCompression::Lz4,
         };
         let tree = LsmTree::open(cfg).unwrap();
 
@@ -1815,6 +1828,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         })
         .unwrap();
         let (misses, wrong) = check_all_present(&reopened);
@@ -1847,6 +1861,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: true,
+            block_compression: SstCompression::Lz4,
         };
         let tree = LsmTree::open(cfg).unwrap();
 
@@ -1917,6 +1932,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         };
         let tree = LsmTree::open(cfg).unwrap();
 
@@ -1959,6 +1975,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         };
         let tree = LsmTree::open(cfg).unwrap();
 
@@ -2002,6 +2019,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         };
         let tree = LsmTree::open(cfg).unwrap();
         let k: &[u8] = b"k:dup";
@@ -2043,6 +2061,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: true,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         };
         let tree = LsmTree::open(cfg).unwrap();
         let k: &[u8] = b"k:multi";
@@ -2065,6 +2084,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: true,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         })
         .unwrap();
         let snap = reopened.read_snapshot();
@@ -2088,6 +2108,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: true,
+            block_compression: SstCompression::Lz4,
         };
         let tree = LsmTree::open(cfg).unwrap();
 
@@ -2120,6 +2141,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         })
         .unwrap();
         let snap = reopened.read_snapshot();
@@ -2169,6 +2191,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: true,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         };
         let tree = LsmTree::open(cfg).unwrap();
         // Legacy records recovered.
@@ -2197,6 +2220,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: true,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         })
         .unwrap();
         let snap = reopened.read_snapshot();
@@ -2241,6 +2265,7 @@ mod tests {
             zone_extractor: None,
             sync_on_commit: false,
             background_compaction: false,
+            block_compression: SstCompression::Lz4,
         })
         .unwrap();
 

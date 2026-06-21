@@ -29,7 +29,54 @@ const SST_MAGIC: &[u8; 4] = b"RSST";
 ///   marker. v4 files keep opening for read but their zone map is
 ///   discarded (block pruning falls back to full scan) — natural
 ///   compaction rewrites them as v5.
-const SST_VERSION: u32 = 5;
+/// - v6: per-block LZ4 compression of the data region. Each 16-entry
+///   sparse-index block is written as a self-describing frame
+///   (`[flag u8][uncomp_len u32][payload_len u32][payload]`); the sparse
+///   index `offset` now addresses the frame start. Everything after the
+///   data region (index/zone/bloom/footer) is byte-for-byte identical to
+///   v5, so reads dispatch on the version only when decoding a data block.
+///   v1-v5 stay zero-copy; v6 reads decompress one block at a time into a
+///   transient owned buffer. The compression algorithm/granularity is a
+///   write-time choice ([`SstCompression`]); a tree may hold a mix of
+///   v5 and v6 files and natural compaction migrates them.
+const SST_VERSION_UNCOMPRESSED: u32 = 5;
+
+/// SST version written when per-block LZ4 compression is enabled. See the
+/// [`SST_VERSION_UNCOMPRESSED`] doc comment for the format history.
+const SST_VERSION_COMPRESSED: u32 = 6;
+
+/// Highest SST version this build can read.
+const SST_VERSION_MAX: u32 = 6;
+
+/// v6 per-block frame header: `[flag u8][uncomp_len u32 BE][payload_len u32 BE]`.
+/// Fixed width whether the block is stored raw or LZ4 — keeps the writer offset
+/// math and the reader decode branch-free.
+const BLOCK_FRAME_HEADER: usize = 1 + 4 + 4;
+
+/// Frame flag: the payload is the raw (uncompressed) entry bytes. Used when LZ4
+/// would expand an incompressible block, so a frame is never larger than
+/// `BLOCK_FRAME_HEADER + block_bytes`.
+const BLOCK_FLAG_RAW: u8 = 0;
+/// Frame flag: the payload is an LZ4 block, decompressing to `uncomp_len` bytes.
+const BLOCK_FLAG_LZ4: u8 = 1;
+
+/// Upper bound on a single decompressed block, enforced on read so a corrupt
+/// `uncomp_len` can't trigger an unbounded allocation. A 16-entry block of
+/// sane rows is far below this; the cap only fires on corruption.
+const MAX_BLOCK_UNCOMP_LEN: usize = 64 * 1024 * 1024;
+
+/// Per-block SST compression algorithm, chosen at write time and recorded in
+/// the file version. Readers detect it from the version, so this only affects
+/// the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SstCompression {
+    /// No compression — v5 layout, fully zero-copy reads.
+    #[default]
+    None,
+    /// Per-16-entry-block LZ4 — v6 layout. ~3-4x smaller files; reads
+    /// decompress one block at a time.
+    Lz4,
+}
 
 /// v1 footer: [index_offset: 8][index_count: 4][magic: 4]
 const FOOTER_V1_SIZE: usize = 8 + 4 + 4;
@@ -79,6 +126,15 @@ pub struct SstWriter {
     /// Accumulator for per-block min/max bounds. Mirrors the sparse-index
     /// block layout: a new block starts every 16 entries.
     zone_builder: ZoneBuilder,
+    /// Compression applied to each data block (v6) — or `None` for the v5
+    /// layout.
+    compression: SstCompression,
+    /// Buffered entry bytes for the block currently being filled. Flushed
+    /// (raw or LZ4-framed) to `writer` at each 16-entry boundary and in
+    /// `finish()`. Even the uncompressed path buffers here so both formats
+    /// share one code path; for `None` the buffer is written verbatim, which
+    /// is byte-identical to the old streaming writer.
+    block_buf: BytesMut,
 }
 
 /// Sparse-index block size (entries per block). Used both to decide when to
@@ -87,20 +143,36 @@ const ENTRIES_PER_BLOCK: usize = 16;
 
 impl SstWriter {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
-        Self::new_with_zone_extractor(path, None)
+        Self::new_with_options(path, None, SstCompression::None)
     }
 
     pub fn new_with_zone_extractor(
         path: impl AsRef<Path>,
         zone_extractor: Option<ZoneFieldExtractor>,
     ) -> Result<Self> {
+        Self::new_with_options(path, zone_extractor, SstCompression::None)
+    }
+
+    /// Full constructor: a zone extractor (or `None`) and a compression choice.
+    /// `SstCompression::None` writes the v5 layout (byte-identical to the legacy
+    /// writer); `Lz4` writes the v6 per-block-compressed layout.
+    pub fn new_with_options(
+        path: impl AsRef<Path>,
+        zone_extractor: Option<ZoneFieldExtractor>,
+        compression: SstCompression,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path)?;
         let mut writer = BufWriter::new(file);
 
-        // Write file header.
+        // Write file header. The version records the data-region format so the
+        // reader knows whether to decompress.
+        let version = match compression {
+            SstCompression::None => SST_VERSION_UNCOMPRESSED,
+            SstCompression::Lz4 => SST_VERSION_COMPRESSED,
+        };
         writer.write_all(SST_MAGIC)?;
-        writer.write_all(&SST_VERSION.to_be_bytes())?;
+        writer.write_all(&version.to_be_bytes())?;
 
         Ok(Self {
             writer,
@@ -111,6 +183,8 @@ impl SstWriter {
             user_keys: Vec::new(),
             zone_extractor,
             zone_builder: ZoneBuilder::new(),
+            compression,
+            block_buf: BytesMut::new(),
         })
     }
 
@@ -122,8 +196,13 @@ impl SstWriter {
             None => (TOMBSTONE_MARKER, &[]),
         };
 
-        // Record index entry for every Nth entry (sparse index).
+        // At every 16-entry block boundary, flush the block we just filled —
+        // which advances `current_offset` to the next frame start — and record a
+        // sparse-index entry pointing at that frame start. (At entry 0 the
+        // buffer is empty, so the flush is a no-op and the offset is the
+        // post-header position, matching the legacy writer.)
         if self.entry_count.is_multiple_of(ENTRIES_PER_BLOCK) {
+            self.flush_block()?;
             self.index.push(IndexEntry {
                 key: Bytes::copy_from_slice(internal_key),
                 offset: self.current_offset,
@@ -154,22 +233,66 @@ impl SstWriter {
             }
         }
 
-        let entry_size = 4 + 4 + internal_key.len() + value_bytes.len();
-        let mut buf = BytesMut::with_capacity(entry_size);
-        buf.put_u32(key_len);
-        buf.put_u32(value_len);
-        buf.put_slice(internal_key);
-        buf.put_slice(value_bytes);
-
-        self.writer.write_all(&buf)?;
-        self.current_offset += entry_size as u64;
+        // Buffer the entry into the current block. The block is written to the
+        // file (raw for `None`, LZ4-framed for v6) at the next 16-entry boundary
+        // or in `finish()`. `current_offset` is advanced by `flush_block`, not
+        // here, so the sparse-index offsets track on-disk (compressed) positions.
+        self.block_buf.put_u32(key_len);
+        self.block_buf.put_u32(value_len);
+        self.block_buf.put_slice(internal_key);
+        self.block_buf.put_slice(value_bytes);
         self.entry_count += 1;
 
         Ok(())
     }
 
+    /// Write the buffered block to the file and advance `current_offset`.
+    /// No-op when the buffer is empty. For `SstCompression::None` the bytes are
+    /// written verbatim (byte-identical to the legacy streaming writer); for
+    /// `Lz4` they are wrapped in a v6 frame, falling back to a raw frame when
+    /// LZ4 would expand an incompressible block.
+    fn flush_block(&mut self) -> Result<()> {
+        if self.block_buf.is_empty() {
+            return Ok(());
+        }
+        match self.compression {
+            SstCompression::None => {
+                self.writer.write_all(&self.block_buf)?;
+                self.current_offset += self.block_buf.len() as u64;
+            }
+            SstCompression::Lz4 => {
+                let uncomp_len = self.block_buf.len();
+                let compressed = lz4_flex::compress(&self.block_buf);
+                let mut hdr = [0u8; BLOCK_FRAME_HEADER];
+                hdr[1..5].copy_from_slice(&(uncomp_len as u32).to_be_bytes());
+                let payload_len = if compressed.len() < uncomp_len {
+                    hdr[0] = BLOCK_FLAG_LZ4;
+                    hdr[5..9].copy_from_slice(&(compressed.len() as u32).to_be_bytes());
+                    self.writer.write_all(&hdr)?;
+                    self.writer.write_all(&compressed)?;
+                    compressed.len()
+                } else {
+                    // Incompressible block — store raw so the frame can never be
+                    // larger than the header + the block bytes.
+                    hdr[0] = BLOCK_FLAG_RAW;
+                    hdr[5..9].copy_from_slice(&(uncomp_len as u32).to_be_bytes());
+                    self.writer.write_all(&hdr)?;
+                    // `self.writer` and `self.block_buf` are disjoint fields.
+                    self.writer.write_all(&self.block_buf)?;
+                    uncomp_len
+                };
+                self.current_offset += (BLOCK_FRAME_HEADER + payload_len) as u64;
+            }
+        }
+        self.block_buf.clear();
+        Ok(())
+    }
+
     /// Finalize the SST file by writing the index, zone map, bloom filter, and footer.
     pub fn finish(mut self) -> Result<SstMeta> {
+        // Flush the final (partial) block so the data region is complete before
+        // the index region begins.
+        self.flush_block()?;
         let index_offset = self.current_offset;
 
         // Write index entries.
@@ -272,6 +395,11 @@ pub struct SstReader {
     /// files. v4 files always carry one (possibly with `num_fields=0` if no
     /// extractor was configured at write time).
     zone_map: Option<ZoneMap>,
+    /// On-disk format version. v1-v5 store the data region uncompressed (block
+    /// reads are zero-copy mmap slices); v6 stores each block as an LZ4 frame
+    /// (block reads decompress into a transient owned buffer). All the read
+    /// paths funnel through [`SstReader::block`], which branches on this.
+    version: u32,
     path: PathBuf,
 }
 
@@ -306,13 +434,17 @@ impl SstReader {
             return Err(Error::SstCorrupted("bad magic".into()));
         }
         let version = u32::from_be_bytes(data[4..8].try_into().unwrap());
-        if !(1..=5).contains(&version) {
+        if !(1..=SST_VERSION_MAX).contains(&version) {
             return Err(Error::SstCorrupted(format!("unsupported version: {version}")));
         }
 
-        let (index_offset, index_count, bloom, zone_map) = if version == 4 || version == 5 {
+        // v4/v5/v6 share an identical footer + index + zone + bloom layout. Only
+        // the data region differs (v6 is per-block LZ4-framed), which the reader
+        // handles in `block()`, so the footer parsing below is version-agnostic
+        // across 4/5/6.
+        let (index_offset, index_count, bloom, zone_map) = if version >= 4 {
             if data.len() < SST_MAGIC.len() + 4 + FOOTER_V4_SIZE {
-                return Err(Error::SstCorrupted("v4/v5 footer truncated".into()));
+                return Err(Error::SstCorrupted("v4/v5/v6 footer truncated".into()));
             }
             let footer_start = data.len() - FOOTER_V4_SIZE;
             // Magic check: footer_start + 36 (zonemap u64+u32 + bloom u64+u32 + index u64+u32 = 36).
@@ -341,14 +473,14 @@ impl SstReader {
             if zonemap_offset + zonemap_size > footer_start {
                 return Err(Error::SstCorrupted("zonemap extends past footer".into()));
             }
-            // v5 columns are keyed by stable field_id; v4 columns are keyed
+            // v5/v6 columns are keyed by stable field_id; v4 columns are keyed
             // by FNV-1a(field_name) and would be miskeyed under the new
             // convention (zero pruning hits, or worse, false matches if a
             // hash happens to collide with a field_id). The zone map block
             // is still parsed/skipped over for layout consistency, but only
-            // wired into the reader for v5. v4 SSTs serve correct results
+            // wired into the reader for v5/v6. v4 SSTs serve correct results
             // without block pruning until natural compaction rewrites them.
-            let zone_map = if version == 5 {
+            let zone_map = if version >= 5 {
                 let zone_slice = &data[zonemap_offset..zonemap_offset + zonemap_size];
                 Some(ZoneMap::read_from(&mut &zone_slice[..])?)
             } else {
@@ -454,51 +586,120 @@ impl SstReader {
             }
         });
 
-        // Last user key: walk the FINAL data block (sparse index only knows
-        // each block's first key, not its last). One-time cost at open();
-        // gives an exact upper bound for the per-batch range-pruning check.
-        let last_user_key = if let Some(last_index) = index.last() {
-            let block_start = last_index.offset as usize;
-            let mut pos = block_start;
-            let mut last_uk: Option<Bytes> = None;
-            while pos < data_end {
-                if pos + 8 > data_end {
-                    break;
-                }
-                let key_len =
-                    u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                let value_len_raw =
-                    u32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-                let key_start = pos + 8;
-                let key_end = key_start + key_len;
-                if key_end > data_end {
-                    break;
-                }
-                if key_len >= 8 {
-                    last_uk = Some(data.slice(key_start..key_end - 8));
-                }
-                let val_len = if value_len_raw == TOMBSTONE_MARKER {
-                    0
-                } else {
-                    value_len_raw as usize
-                };
-                pos = key_end + val_len;
-            }
-            last_uk
-        } else {
-            None
-        };
-
-        Ok(Self {
+        // Last user key is computed after construction (it walks the final
+        // data block, which for v6 must go through `block()` to decompress).
+        let mut reader = Self {
             data,
             index,
             bloom,
             data_end,
             first_user_key,
-            last_user_key,
+            last_user_key: None,
             zone_map,
+            version,
             path,
-        })
+        };
+        reader.last_user_key = reader.compute_last_user_key()?;
+        Ok(reader)
+    }
+
+    /// Walk the FINAL data block (the sparse index only records each block's
+    /// first key, not its last) to find the largest user key. One-time cost at
+    /// `open()`; gives an exact upper bound for the per-batch range-pruning
+    /// check. Goes through `block()` so it decompresses for v6.
+    fn compute_last_user_key(&self) -> Result<Option<Bytes>> {
+        if self.index.is_empty() {
+            return Ok(None);
+        }
+        let blk = self.block(self.index.len() - 1)?;
+        let mut pos = 0usize;
+        let mut last_uk: Option<Bytes> = None;
+        while pos + 8 <= blk.len() {
+            let key_len = u32::from_be_bytes(blk[pos..pos + 4].try_into().unwrap()) as usize;
+            let value_len_raw = u32::from_be_bytes(blk[pos + 4..pos + 8].try_into().unwrap());
+            let key_start = pos + 8;
+            let key_end = key_start + key_len;
+            if key_end > blk.len() {
+                break;
+            }
+            if key_len >= 8 {
+                last_uk = Some(blk.slice(key_start..key_end - 8));
+            }
+            let val_len = if value_len_raw == TOMBSTONE_MARKER {
+                0
+            } else {
+                value_len_raw as usize
+            };
+            pos = key_end + val_len;
+        }
+        Ok(last_uk)
+    }
+
+    /// Decompressed bytes for sparse-index block `block_idx`. For v1-v5 this is
+    /// a zero-copy mmap slice; for v6 it decompresses the block's LZ4 frame into
+    /// an owned buffer (or returns a zero-copy slice for a raw-stored frame).
+    ///
+    /// There is intentionally NO shared decompressed-block cache: `SstReader` is
+    /// read concurrently under `Arc<RwLock<Vec<SstReader>>>` and must stay
+    /// `Sync`, which interior mutability would break. Multi-block read paths walk
+    /// monotonically and hold the current block in a local, so each block is
+    /// decompressed at most once per call regardless.
+    fn block(&self, block_idx: usize) -> Result<Bytes> {
+        let start = self.index[block_idx].offset as usize;
+        let end = self.block_end_offset(block_idx);
+        if start > end || end > self.data_end {
+            return Err(Error::SstCorrupted("block bounds out of range".into()));
+        }
+        if self.version < SST_VERSION_COMPRESSED {
+            // v1-v5: the data region is the raw entry stream; a block is a
+            // contiguous zero-copy slice.
+            return Ok(self.data.slice(start..end));
+        }
+        self.decompress_frame(start, end)
+    }
+
+    /// Decode one v6 block frame `[flag][uncomp_len][payload_len][payload]` in
+    /// `self.data[start..end]`. Fully bounds-checked: corruption returns
+    /// `SstCorrupted` rather than panicking or allocating unboundedly.
+    fn decompress_frame(&self, start: usize, end: usize) -> Result<Bytes> {
+        if start + BLOCK_FRAME_HEADER > end {
+            return Err(Error::SstCorrupted("v6 block frame header truncated".into()));
+        }
+        let flag = self.data[start];
+        let uncomp_len =
+            u32::from_be_bytes(self.data[start + 1..start + 5].try_into().unwrap()) as usize;
+        let payload_len =
+            u32::from_be_bytes(self.data[start + 5..start + 9].try_into().unwrap()) as usize;
+        let payload_start = start + BLOCK_FRAME_HEADER;
+        if payload_start + payload_len > end {
+            return Err(Error::SstCorrupted("v6 block payload past frame end".into()));
+        }
+        if uncomp_len > MAX_BLOCK_UNCOMP_LEN {
+            return Err(Error::SstCorrupted(format!(
+                "v6 block uncompressed length {uncomp_len} exceeds cap"
+            )));
+        }
+        let payload = &self.data[payload_start..payload_start + payload_len];
+        match flag {
+            BLOCK_FLAG_RAW => {
+                if payload_len != uncomp_len {
+                    return Err(Error::SstCorrupted("v6 raw block length mismatch".into()));
+                }
+                // A raw-stored frame stays zero-copy even in v6.
+                Ok(self.data.slice(payload_start..payload_start + payload_len))
+            }
+            BLOCK_FLAG_LZ4 => {
+                let out = lz4_flex::decompress(payload, uncomp_len)
+                    .map_err(|e| Error::SstCorrupted(format!("v6 block lz4 decode: {e}")))?;
+                if out.len() != uncomp_len {
+                    return Err(Error::SstCorrupted(
+                        "v6 block decompressed length mismatch".into(),
+                    ));
+                }
+                Ok(Bytes::from(out))
+            }
+            other => Err(Error::SstCorrupted(format!("v6 block unknown flag {other}"))),
+        }
     }
 
     /// Borrow the optional zone map (v4 SSTs only).
@@ -594,41 +795,39 @@ impl SstReader {
             Err(i) => i - 1,
         };
 
-        let start = self.index[block_idx].offset as usize;
-        let end = if block_idx + 1 < self.index.len() {
-            self.index[block_idx + 1].offset as usize
-        } else {
-            self.data_end
-        };
-
-        // Linear scan through the data block.
-        let mut pos = start;
-        while pos < end {
-            let key_len =
-                u32::from_be_bytes(self.data[pos..pos + 4].try_into().unwrap()) as usize;
-            let value_len_raw =
-                u32::from_be_bytes(self.data[pos + 4..pos + 8].try_into().unwrap());
-            pos += 8;
-
-            let key = &self.data[pos..pos + key_len];
-            pos += key_len;
+        // Decode the (possibly decompressed) block and scan it. The target key
+        // lives entirely within one sparse-index block.
+        let blk = self.block(block_idx)?;
+        let mut pos = 0usize;
+        while pos + 8 <= blk.len() {
+            let key_len = u32::from_be_bytes(blk[pos..pos + 4].try_into().unwrap()) as usize;
+            let value_len_raw = u32::from_be_bytes(blk[pos + 4..pos + 8].try_into().unwrap());
+            let key_start = pos + 8;
+            let key_end = key_start + key_len;
+            if key_end > blk.len() {
+                break;
+            }
+            let key = &blk[key_start..key_end];
 
             let is_tombstone = value_len_raw == TOMBSTONE_MARKER;
             let value_len = if is_tombstone { 0 } else { value_len_raw as usize };
-            let value_start = pos;
-            pos += value_len;
+            let value_start = key_end;
+            let value_end = value_start + value_len;
+            if value_end > blk.len() {
+                break;
+            }
 
             if key == target_key {
                 return if is_tombstone {
                     Ok(Some(None))
                 } else {
-                    Ok(Some(Some(self.data.slice(value_start..value_start + value_len))))
+                    Ok(Some(Some(blk.slice(value_start..value_end))))
                 };
             }
-
             if key > target_key {
                 return Ok(None);
             }
+            pos = value_end;
         }
 
         Ok(None)
@@ -654,6 +853,18 @@ impl SstReader {
         let n = sorted_user_keys.len();
         let mut out: Vec<Option<MemValue>> = vec![None; n];
         if n == 0 || self.index.is_empty() {
+            return Ok(out);
+        }
+
+        // v6: the single-walk + threshold-gallop cursor below addresses the
+        // uncompressed data region by absolute byte offset, which a compressed
+        // file doesn't have. Use per-needle `get_versioned` (block-aware, bloom-
+        // gated). This trades the batch's single-walk amortization for v6 only;
+        // a block-aware batch walk is a possible follow-up optimization.
+        if self.version >= SST_VERSION_COMPRESSED {
+            for (i, needle) in sorted_user_keys.iter().enumerate() {
+                out[i] = self.get_versioned(needle, version)?;
+            }
             return Ok(out);
         }
 
@@ -847,6 +1058,17 @@ impl SstReader {
             return out;
         }
 
+        // v6: same reasoning as `multi_get_versioned` — the absolute-offset
+        // single-walk doesn't apply to a compressed file. `scan_prefix` is
+        // block-aware (it drives the block-walking iterator), and the prefixes
+        // are disjoint, so a per-prefix scan returns identical results.
+        if self.version >= SST_VERSION_COMPRESSED {
+            for (i, prefix) in sorted_prefixes.iter().enumerate() {
+                out[i] = self.scan_prefix(prefix, version);
+            }
+            return out;
+        }
+
         let data_end = self.data_end;
         let mut i = 0usize;
         let mut pos = 0usize;
@@ -982,50 +1204,55 @@ impl SstReader {
             }
         };
 
-        // Scan from the found block through all remaining data, since
-        // entries for one user key may span multiple sparse index blocks.
-        let start = self.index[block_idx].offset as usize;
-        let data_end = self.data_end;
-
-        let mut pos = start;
-        while pos < data_end {
-            let key_len =
-                u32::from_be_bytes(self.data[pos..pos + 4].try_into().unwrap()) as usize;
-            let value_len_raw =
-                u32::from_be_bytes(self.data[pos + 4..pos + 8].try_into().unwrap());
-            pos += 8;
-
-            let key = &self.data[pos..pos + key_len];
-            pos += key_len;
-
-            let is_tombstone = value_len_raw == TOMBSTONE_MARKER;
-            let value_len = if is_tombstone { 0 } else { value_len_raw as usize };
-            let value_start = pos;
-            pos += value_len;
-
-            if key.len() < 8 {
-                continue;
-            }
-            let entry_user_key = &key[..key.len() - 8];
-
-            if entry_user_key != user_key {
-                if entry_user_key > user_key {
-                    return Ok(None);
+        // Scan forward from the found block. Entries for one user key may span
+        // multiple sparse-index blocks, so we walk block-by-block via `block()`
+        // (decompressing on demand for v6). The seek above used the sparse
+        // INDEX, which is uncompressed and identical across v5/v6, so the
+        // straddle-block correctness fix is preserved: we land on the same
+        // block and scan every block forward. Unlike the scan iterators this is
+        // a `Result`-returning point read, so a corrupt block PROPAGATES as
+        // `SstCorrupted` (matching `get`) rather than silently ending.
+        let mut bi = block_idx;
+        while bi < self.index.len() {
+            let blk = self.block(bi)?;
+            let mut pos = 0usize;
+            while pos + 8 <= blk.len() {
+                let key_len = u32::from_be_bytes(blk[pos..pos + 4].try_into().unwrap()) as usize;
+                let value_len_raw =
+                    u32::from_be_bytes(blk[pos + 4..pos + 8].try_into().unwrap());
+                let key_start = pos + 8;
+                let key_end = key_start + key_len;
+                if key_end > blk.len() {
+                    break;
                 }
-                continue;
-            }
+                let is_tombstone = value_len_raw == TOMBSTONE_MARKER;
+                let value_len = if is_tombstone { 0 } else { value_len_raw as usize };
+                let value_start = key_end;
+                let value_end = value_start + value_len;
+                if value_end > blk.len() {
+                    break;
+                }
 
-            // Same user key — decode the version.
-            let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-            let entry_version = !u64::from_be_bytes(ver_bytes);
-
-            if entry_version <= version {
-                return if is_tombstone {
-                    Ok(Some(None))
-                } else {
-                    Ok(Some(Some(self.data.slice(value_start..value_start + value_len))))
-                };
+                if key_len >= 8 {
+                    let entry_user_key = &blk[key_start..key_end - 8];
+                    if entry_user_key == user_key {
+                        let ver_bytes: [u8; 8] = blk[key_end - 8..key_end].try_into().unwrap();
+                        let entry_version = !u64::from_be_bytes(ver_bytes);
+                        if entry_version <= version {
+                            return if is_tombstone {
+                                Ok(Some(None))
+                            } else {
+                                Ok(Some(Some(blk.slice(value_start..value_end))))
+                            };
+                        }
+                    } else if entry_user_key > user_key {
+                        // Sorted past the target — it isn't in this SST.
+                        return Ok(None);
+                    }
+                }
+                pos = value_end;
             }
+            bi += 1;
         }
 
         Ok(None)
@@ -1066,6 +1293,13 @@ impl SstReader {
         version: u64,
         predicate: &crate::zone::FieldPredicate,
     ) -> Vec<(Bytes, Option<Bytes>)> {
+        // v6 walks block-by-block (the absolute-offset cursor below has no
+        // compressed-file analogue). The block-aware path additionally skips
+        // decompressing any zone-pruned block.
+        if self.version >= SST_VERSION_COMPRESSED {
+            return self.scan_prefix_filtered_v6(prefix, version, predicate);
+        }
+
         let Some(zone_map) = &self.zone_map else {
             return self.scan_prefix(prefix, version);
         };
@@ -1164,6 +1398,101 @@ impl SstReader {
             {
                 block_idx += 1;
             }
+        }
+
+        results
+    }
+
+    /// v6 (per-block-compressed) implementation of `scan_prefix_filtered`. Walks
+    /// whole sparse-index blocks: the zone check is per-block, so a pruned block
+    /// is skipped WITHOUT decompressing it. Semantics match the v5 path exactly
+    /// — including resetting the cross-block dedup key when a block is skipped —
+    /// so a v5 SST and a v6 SST of the same data return identical results.
+    fn scan_prefix_filtered_v6(
+        &self,
+        prefix: &[u8],
+        version: u64,
+        predicate: &crate::zone::FieldPredicate,
+    ) -> Vec<(Bytes, Option<Bytes>)> {
+        let Some(zone_map) = &self.zone_map else {
+            return self.scan_prefix(prefix, version);
+        };
+
+        let mut results = Vec::new();
+        let mut last_user_key: Option<Vec<u8>> = None;
+        let start_block = self.block_idx_for_offset(self.prefix_start_offset(prefix));
+
+        let mut bi = start_block;
+        'blocks: while bi < self.index.len() {
+            // Per-block zone check. A pruned block is skipped without a
+            // decompress; matching v5, the dedup key resets across a skip.
+            if !zone_map.block_could_match(
+                bi,
+                predicate.field_id,
+                predicate.op,
+                predicate.target,
+            ) {
+                bi += 1;
+                last_user_key = None;
+                continue;
+            }
+
+            let blk = match self.block(bi) {
+                Ok(b) => b,
+                Err(_) => break, // corrupt block: stop cleanly (scans can't error)
+            };
+            let mut pos = 0usize;
+            while pos + 8 <= blk.len() {
+                let key_len = u32::from_be_bytes(blk[pos..pos + 4].try_into().unwrap()) as usize;
+                let value_len_raw =
+                    u32::from_be_bytes(blk[pos + 4..pos + 8].try_into().unwrap());
+                let key_start = pos + 8;
+                let key_end = key_start + key_len;
+                if key_end > blk.len() {
+                    break;
+                }
+                let is_tomb = value_len_raw == TOMBSTONE_MARKER;
+                let val_len = if is_tomb { 0 } else { value_len_raw as usize };
+                let val_end = key_end + val_len;
+                if val_end > blk.len() {
+                    break;
+                }
+                if key_len < 8 {
+                    pos = val_end;
+                    continue;
+                }
+
+                let user_key = &blk[key_start..key_end - 8];
+                if user_key < prefix {
+                    pos = val_end;
+                    continue;
+                }
+                if !user_key.starts_with(prefix) {
+                    break 'blocks; // past the prefix range — done entirely
+                }
+
+                let ver_bytes: [u8; 8] = blk[key_end - 8..key_end].try_into().unwrap();
+                let entry_version = !u64::from_be_bytes(ver_bytes);
+                if entry_version > version {
+                    pos = val_end;
+                    continue;
+                }
+
+                let same_key = last_user_key
+                    .as_ref()
+                    .is_some_and(|prev| prev.as_slice() == user_key);
+                if !same_key {
+                    last_user_key = Some(user_key.to_vec());
+                    let value = if is_tomb {
+                        None
+                    } else {
+                        Some(blk.slice(key_end..val_end))
+                    };
+                    results.push((blk.slice(key_start..key_end - 8), value));
+                }
+                pos = val_end;
+            }
+            bi += 1;
         }
 
         results
@@ -1385,52 +1714,122 @@ impl SstReader {
         self.iter_from(header_size)
     }
 
-    /// Iterate entries starting at the given byte offset. The offset must
-    /// point to the start of an entry header.
+    /// Iterate entries starting at the given byte offset. The offset MUST point
+    /// at a sparse-index block boundary (every caller passes one — the header
+    /// position for `iter()`, or a `prefix_start_offset` / `user_key_start_offset`
+    /// result). Block-aware: it decodes the block containing `start` and steps to
+    /// the next block when the current one is exhausted, decompressing on demand
+    /// for v6. For v1-v5 each block is a zero-copy slice, so emitted keys/values
+    /// stay zero-copy exactly as before.
     pub fn iter_from(&self, start: usize) -> SstIterator<'_> {
-        SstIterator {
-            data: &self.data,
-            pos: start,
-            end: self.data_end,
+        if self.index.is_empty() || start >= self.data_end {
+            return SstIterator {
+                reader: self,
+                block_idx: self.index.len(),
+                block: Bytes::new(),
+                pos: 0,
+                done: true,
+            };
+        }
+        let block_idx = self.block_idx_for_offset(start);
+        let block_start = self.index[block_idx].offset as usize;
+        match self.block(block_idx) {
+            Ok(block) => SstIterator {
+                reader: self,
+                block_idx,
+                // `start` is a block boundary for every caller, so this is 0;
+                // computed defensively (only meaningful for v1-v5 contiguous data).
+                pos: start.saturating_sub(block_start),
+                block,
+                done: false,
+            },
+            // A corrupt first block yields an empty iterator (scans can't return
+            // a Result; point reads use the Result-returning paths instead).
+            Err(_) => SstIterator {
+                reader: self,
+                block_idx: self.index.len(),
+                block: Bytes::new(),
+                pos: 0,
+                done: true,
+            },
         }
     }
 }
 
-/// Iterator over SST entries. Holds a reference to the `Bytes` owner so each
-/// emitted key/value is a zero-copy `data.slice(...)` instead of an allocating
-/// `Bytes::copy_from_slice`.
+/// Iterator over SST entries in sorted order. Walks block-by-block via
+/// [`SstReader::block`], so each emitted key/value is a zero-copy `block.slice`
+/// — into the mmap for v1-v5, or into the transient decompressed block for v6
+/// (where the single decompress is amortized across the whole block's entries).
 pub struct SstIterator<'a> {
-    data: &'a Bytes,
+    reader: &'a SstReader,
+    /// Sparse-index block currently being decoded.
+    block_idx: usize,
+    /// Decompressed bytes of `block_idx` (zero-copy slice for v1-v5).
+    block: Bytes,
+    /// Position within `block`.
     pos: usize,
-    end: usize,
+    done: bool,
 }
 
 impl<'a> Iterator for SstIterator<'a> {
     type Item = (Bytes, MemValue);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.end {
+        if self.done {
             return None;
         }
 
-        let key_len =
-            u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap()) as usize;
-        let value_len_raw =
-            u32::from_be_bytes(self.data[self.pos + 4..self.pos + 8].try_into().unwrap());
-        self.pos += 8;
+        // Advance to the next non-empty block once the current one is consumed.
+        while self.pos >= self.block.len() {
+            self.block_idx += 1;
+            if self.block_idx >= self.reader.index.len() {
+                self.done = true;
+                return None;
+            }
+            match self.reader.block(self.block_idx) {
+                Ok(b) => {
+                    self.block = b;
+                    self.pos = 0;
+                }
+                // Corrupt block mid-scan: stop cleanly rather than panic.
+                Err(_) => {
+                    self.done = true;
+                    return None;
+                }
+            }
+        }
 
-        let key = self.data.slice(self.pos..self.pos + key_len);
-        self.pos += key_len;
+        // Decode the entry at `pos` within the current block. Any inconsistency
+        // ends iteration without panicking.
+        if self.pos + 8 > self.block.len() {
+            self.done = true;
+            return None;
+        }
+        let key_len =
+            u32::from_be_bytes(self.block[self.pos..self.pos + 4].try_into().unwrap()) as usize;
+        let value_len_raw =
+            u32::from_be_bytes(self.block[self.pos + 4..self.pos + 8].try_into().unwrap());
+        let key_start = self.pos + 8;
+        let key_end = key_start + key_len;
+        if key_end > self.block.len() {
+            self.done = true;
+            return None;
+        }
+        let key = self.block.slice(key_start..key_end);
 
         let is_tombstone = value_len_raw == TOMBSTONE_MARKER;
         let value_len = if is_tombstone { 0 } else { value_len_raw as usize };
-
+        let val_end = key_end + value_len;
+        if val_end > self.block.len() {
+            self.done = true;
+            return None;
+        }
         let value = if is_tombstone {
             None
         } else {
-            Some(self.data.slice(self.pos..self.pos + value_len))
+            Some(self.block.slice(key_end..val_end))
         };
-        self.pos += value_len;
+        self.pos = val_end;
 
         Some((key, value))
     }
@@ -1551,6 +1950,304 @@ mod tests {
         let reader = SstReader::open(&sst_path).unwrap();
         let entries: Vec<_> = reader.iter().collect();
         assert_eq!(entries.len(), 50);
+    }
+
+    // -----------------------------------------------------------------
+    // v6 per-block LZ4 compression: v5-vs-v6 parity (card cmpzqwhse)
+    // -----------------------------------------------------------------
+
+    /// Write `entries` (already in sorted internal-key order) to `path` with the
+    /// given compression.
+    fn write_entries(path: &Path, entries: &[(Vec<u8>, MemValue)], compression: SstCompression) {
+        let mut w = SstWriter::new_with_options(path, None, compression).unwrap();
+        for (k, v) in entries {
+            w.add(k, v).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    /// Build the same data as v5 (uncompressed) and v6 (LZ4) and assert every
+    /// read API returns identical results. v5 is the trusted oracle.
+    fn assert_v5_v6_parity(
+        entries: &[(Vec<u8>, MemValue)],
+        probe_user_keys: &[Vec<u8>],
+        prefixes: &[Vec<u8>],
+        versions: &[u64],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let p5 = dir.path().join("v5.sst");
+        let p6 = dir.path().join("v6.sst");
+        write_entries(&p5, entries, SstCompression::None);
+        write_entries(&p6, entries, SstCompression::Lz4);
+        let r5 = SstReader::open(&p5).unwrap();
+        let r6 = SstReader::open(&p6).unwrap();
+
+        // Sanity: the v6 header records version 6, v5 records 5.
+        assert_eq!(r5.version, 5);
+        assert_eq!(r6.version, 6);
+
+        // Full iteration order + values.
+        let i5: Vec<_> = r5.iter().collect();
+        let i6: Vec<_> = r6.iter().collect();
+        assert_eq!(i5, i6, "iter() mismatch");
+
+        assert_eq!(r5.max_version(), r6.max_version(), "max_version mismatch");
+        assert_eq!(r5.first_user_key, r6.first_user_key, "first_user_key");
+        assert_eq!(r5.last_user_key, r6.last_user_key, "last_user_key");
+
+        // Exact-key get for every entry.
+        for (k, _) in entries {
+            assert_eq!(r5.get(k).unwrap(), r6.get(k).unwrap(), "get({k:?})");
+        }
+
+        // get_versioned across snapshots.
+        for uk in probe_user_keys {
+            for &ver in versions {
+                assert_eq!(
+                    r5.get_versioned(uk, ver).unwrap(),
+                    r6.get_versioned(uk, ver).unwrap(),
+                    "get_versioned({uk:?}, {ver})"
+                );
+            }
+        }
+
+        // Batched point lookups (needles must be sorted ascending).
+        let needles: Vec<&[u8]> = probe_user_keys.iter().map(|k| k.as_slice()).collect();
+        for &ver in versions {
+            assert_eq!(
+                r5.multi_get_versioned(&needles, ver).unwrap(),
+                r6.multi_get_versioned(&needles, ver).unwrap(),
+                "multi_get_versioned @ {ver}"
+            );
+        }
+
+        // Prefix scans (single + batched) across snapshots.
+        let pref_refs: Vec<&[u8]> = prefixes.iter().map(|p| p.as_slice()).collect();
+        for p in prefixes {
+            for &ver in versions {
+                assert_eq!(
+                    r5.scan_prefix(p, ver),
+                    r6.scan_prefix(p, ver),
+                    "scan_prefix({p:?}, {ver})"
+                );
+                assert_eq!(
+                    r5.scan_prefix_max(p, ver, 3),
+                    r6.scan_prefix_max(p, ver, 3),
+                    "scan_prefix_max({p:?}, {ver})"
+                );
+            }
+        }
+        for &ver in versions {
+            assert_eq!(
+                r5.multi_scan_prefix_versioned(&pref_refs, ver),
+                r6.multi_scan_prefix_versioned(&pref_refs, ver),
+                "multi_scan_prefix_versioned @ {ver}"
+            );
+        }
+    }
+
+    /// Generate `count` single-version objects under `type_id`, values chosen to
+    /// be compressible (repetitive) so v6 actually compresses.
+    fn gen_objects(type_id: u64, count: u64, version: u64) -> Vec<(Vec<u8>, MemValue)> {
+        (0..count)
+            .map(|i| {
+                let key = InternalKey::new(&KeyBuilder::object(type_id, i), version);
+                let val = Bytes::from(format!("the-quick-brown-fox-value-number-{}", i % 7));
+                (key.as_bytes().to_vec(), Some(val))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v6_parity_single_block() {
+        let entries = gen_objects(1, 10, 1); // < 16 entries = one block
+        let probes: Vec<Vec<u8>> = (0..12).map(|i| KeyBuilder::object(1, i).to_vec()).collect();
+        assert_v5_v6_parity(
+            &entries,
+            &probes,
+            &[KeyBuilder::object_prefix(1).to_vec()],
+            &[0, 1, 2],
+        );
+    }
+
+    #[test]
+    fn v6_parity_multi_block() {
+        // 100 entries across multiple types -> many 16-entry blocks.
+        let mut entries = gen_objects(1, 100, 1);
+        entries.extend(gen_objects(2, 100, 1));
+        let mut probes: Vec<Vec<u8>> =
+            (0..100).map(|i| KeyBuilder::object(1, i).to_vec()).collect();
+        probes.extend((0..100).map(|i| KeyBuilder::object(2, i).to_vec()));
+        // A miss past the end.
+        probes.push(KeyBuilder::object(2, 999).to_vec());
+        assert_v5_v6_parity(
+            &entries,
+            &probes,
+            &[
+                KeyBuilder::object_prefix(1).to_vec(),
+                KeyBuilder::object_prefix(2).to_vec(),
+            ],
+            &[0, 1, 2],
+        );
+    }
+
+    #[test]
+    fn v6_parity_straddle_block_versions() {
+        // One user key carries many versions so they straddle the 16-entry
+        // sparse-index block boundary (the documented data-loss class). Pad with
+        // single-version neighbors so the multi-version key lands across 15->16.
+        let mut entries: Vec<(Vec<u8>, MemValue)> = Vec::new();
+        // 14 filler keys (ids 0..14), one version each.
+        for i in 0..14u64 {
+            let k = InternalKey::new(&KeyBuilder::object(1, i), 1);
+            entries.push((k.as_bytes().to_vec(), Some(Bytes::from(format!("f{i}")))));
+        }
+        // Key id=14 with 6 descending versions (10,8,6,4,2,1) -> spans the
+        // block-0/block-1 boundary (entry index 14..20).
+        for ver in [10u64, 8, 6, 4, 2, 1] {
+            let k = InternalKey::new(&KeyBuilder::object(1, 14), ver);
+            entries.push((k.as_bytes().to_vec(), Some(Bytes::from(format!("v{ver}")))));
+        }
+        // Trailing keys after the multi-version run.
+        for i in 15..40u64 {
+            let k = InternalKey::new(&KeyBuilder::object(1, i), 1);
+            entries.push((k.as_bytes().to_vec(), Some(Bytes::from(format!("t{i}")))));
+        }
+        let probes: Vec<Vec<u8>> = (0..40).map(|i| KeyBuilder::object(1, i).to_vec()).collect();
+        // Snapshots that select different versions of key 14.
+        assert_v5_v6_parity(
+            &entries,
+            &probes,
+            &[KeyBuilder::object_prefix(1).to_vec()],
+            &[0, 1, 2, 3, 5, 7, 9, 10, 11],
+        );
+    }
+
+    #[test]
+    fn v6_parity_tombstones() {
+        let mut entries: Vec<(Vec<u8>, MemValue)> = Vec::new();
+        for i in 0..30u64 {
+            let k = InternalKey::new(&KeyBuilder::object(1, i), 1);
+            // Every 5th key is a tombstone, including across block boundaries.
+            let v: MemValue = if i % 5 == 0 {
+                None
+            } else {
+                Some(Bytes::from(format!("v{i}")))
+            };
+            entries.push((k.as_bytes().to_vec(), v));
+        }
+        let probes: Vec<Vec<u8>> = (0..30).map(|i| KeyBuilder::object(1, i).to_vec()).collect();
+        assert_v5_v6_parity(
+            &entries,
+            &probes,
+            &[KeyBuilder::object_prefix(1).to_vec()],
+            &[0, 1],
+        );
+    }
+
+    #[test]
+    fn v6_parity_empty_and_single() {
+        // Empty SST.
+        let dir = tempfile::tempdir().unwrap();
+        let pe = dir.path().join("empty.sst");
+        write_entries(&pe, &[], SstCompression::Lz4);
+        let re = SstReader::open(&pe).unwrap();
+        assert_eq!(re.version, 6);
+        assert_eq!(re.iter().count(), 0);
+        assert_eq!(re.max_version(), 0);
+        assert!(re.get(b"anything........").unwrap().is_none());
+        assert!(re.get_versioned(b"x", 1).unwrap().is_none());
+
+        // Single-entry SST.
+        let entries = gen_objects(1, 1, 7);
+        let probes = vec![
+            KeyBuilder::object(1, 0).to_vec(),
+            KeyBuilder::object(1, 1).to_vec(),
+        ];
+        assert_v5_v6_parity(
+            &entries,
+            &probes,
+            &[KeyBuilder::object_prefix(1).to_vec()],
+            &[0, 7, 8],
+        );
+    }
+
+    #[test]
+    fn v6_incompressible_block_round_trips_via_raw_fallback() {
+        // Random-ish, high-entropy values so LZ4 would expand -> raw frame
+        // fallback. Must still round-trip exactly.
+        let mut entries: Vec<(Vec<u8>, MemValue)> = Vec::new();
+        for i in 0..40u64 {
+            let k = InternalKey::new(&KeyBuilder::object(1, i), 1);
+            // Pseudo-random bytes from a splitmix-ish hash.
+            let mut v = Vec::with_capacity(32);
+            let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for _ in 0..32 {
+                x ^= x >> 30;
+                x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                v.push((x >> 24) as u8);
+            }
+            entries.push((k.as_bytes().to_vec(), Some(Bytes::from(v))));
+        }
+        let probes: Vec<Vec<u8>> = (0..40).map(|i| KeyBuilder::object(1, i).to_vec()).collect();
+        assert_v5_v6_parity(
+            &entries,
+            &probes,
+            &[KeyBuilder::object_prefix(1).to_vec()],
+            &[0, 1],
+        );
+    }
+
+    #[test]
+    fn v6_compresses_repetitive_data() {
+        // Sanity: a v6 file of compressible data is meaningfully smaller than v5.
+        let entries: Vec<(Vec<u8>, MemValue)> = (0..500u64)
+            .map(|i| {
+                let k = InternalKey::new(&KeyBuilder::object(1, i), 1);
+                (
+                    k.as_bytes().to_vec(),
+                    Some(Bytes::from(
+                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    )),
+                )
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let p5 = dir.path().join("v5.sst");
+        let p6 = dir.path().join("v6.sst");
+        write_entries(&p5, &entries, SstCompression::None);
+        write_entries(&p6, &entries, SstCompression::Lz4);
+        let s5 = std::fs::metadata(&p5).unwrap().len();
+        let s6 = std::fs::metadata(&p6).unwrap().len();
+        assert!(s6 * 2 < s5, "v6 ({s6}) should be <half v5 ({s5}) here");
+        // And it still reads back correctly.
+        let r6 = SstReader::open(&p6).unwrap();
+        assert_eq!(r6.iter().count(), 500);
+    }
+
+    #[test]
+    fn v6_corrupt_block_errors_without_panic() {
+        // Build a >=2-block v6 SST, corrupt block 0's uncomp_len so it exceeds
+        // the cap, and confirm a read into block 0 returns SstCorrupted (not a
+        // panic). open() succeeds because last_user_key only walks the LAST block.
+        let entries = gen_objects(1, 40, 1); // ~3 blocks
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.sst");
+        write_entries(&path, &entries, SstCompression::Lz4);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Block 0 frame starts at offset 8 (after MAGIC+version). uncomp_len is
+        // bytes [9..13]; set the high byte huge.
+        bytes[9] = 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let r = SstReader::open(&path).unwrap(); // last block intact
+        let k0 = InternalKey::new(&KeyBuilder::object(1, 0), 1);
+        assert!(matches!(r.get(k0.as_bytes()), Err(Error::SstCorrupted(_))));
+        assert!(matches!(
+            r.get_versioned(&KeyBuilder::object(1, 0), 1),
+            Err(Error::SstCorrupted(_))
+        ));
     }
 
     /// Build an SST where each type_id (1..type_count) has `per_type` objects.

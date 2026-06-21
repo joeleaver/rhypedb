@@ -10,3 +10,4 @@ pub mod mvcc;
 pub mod zone;
 
 pub use error::{Error, Result};
+pub use sst::SstCompression;

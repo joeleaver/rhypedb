@@ -52,6 +52,9 @@ pub struct FileConfig {
     // consistent with the other tuning knobs, instead of being a fatal type error.
     pub graceful_drain_secs: Option<i64>,
     pub worker_quiesce_budget_secs: Option<i64>,
+    /// `"lz4"` (default) or `"none"`. Per-block SST compression for newly
+    /// written files. An unrecognized value warns and falls through.
+    pub block_compression: Option<String>,
 }
 
 /// A snapshot of the relevant env vars (raw, unparsed). Built once via
@@ -65,6 +68,7 @@ pub struct EnvLayer {
     // the original run() did.
     pub restore_from: Option<PathBuf>,
     pub restore_from_force: Option<String>,
+    pub block_compression: Option<String>,
 }
 
 impl EnvLayer {
@@ -75,6 +79,7 @@ impl EnvLayer {
             rerank: std::env::var("RHYPEDB_RERANK").ok(),
             restore_from: std::env::var_os("RHYPEDB_RESTORE_FROM").map(PathBuf::from),
             restore_from_force: std::env::var("RHYPEDB_RESTORE_FROM_FORCE").ok(),
+            block_compression: std::env::var("RHYPEDB_BLOCK_COMPRESSION").ok(),
         }
     }
 }
@@ -93,6 +98,7 @@ pub struct CliLayer {
     pub no_sync: bool,
     pub restore_from: Option<PathBuf>,
     pub restore_force: bool,
+    pub block_compression: Option<String>,
 }
 
 /// The effective, resolved configuration the server runs with.
@@ -111,6 +117,8 @@ pub struct ServerConfig {
     pub cache_max_entries: usize,
     pub graceful_drain: Duration,
     pub worker_quiesce_budget: Duration,
+    /// Per-block SST compression for newly written files (flush + compaction).
+    pub block_compression: rhypedb_storage::SstCompression,
 }
 
 fn env_truthy(v: &str) -> bool {
@@ -150,6 +158,27 @@ fn finalize_rerank(raw: Option<i64>) -> Option<usize> {
     }
 }
 
+/// Parse a block-compression setting (`"lz4"`/`"none"`, case-insensitive). An
+/// empty/whitespace value is treated as unset (`None` → fall through to the
+/// lower layer); an unrecognized value warns and falls through.
+fn parse_compression(
+    source: &str,
+    raw: Option<&str>,
+) -> Option<rhypedb_storage::SstCompression> {
+    let s = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match s.to_ascii_lowercase().as_str() {
+        "lz4" => Some(rhypedb_storage::SstCompression::Lz4),
+        "none" | "off" => Some(rhypedb_storage::SstCompression::None),
+        other => {
+            eprintln!(
+                "WARNING: {source}=\"{other}\" is not a valid block compression \
+                 (expected \"lz4\" or \"none\"); ignoring it."
+            );
+            None
+        }
+    }
+}
+
 /// A positive-or-default knob (cache size, drain/quiesce seconds): warn + use the
 /// default if the file value is < 1.
 fn positive_or_default(name: &str, v: Option<i64>, default: u64) -> u64 {
@@ -185,6 +214,18 @@ pub fn resolve(
     let f_cache = file.and_then(|f| f.cache_max_entries);
     let f_drain = file.and_then(|f| f.graceful_drain_secs);
     let f_quiesce = file.and_then(|f| f.worker_quiesce_budget_secs);
+
+    // Block compression: cli > env > file > default (Lz4). Each layer parses to
+    // an enum; an invalid value warns and falls through to the next layer.
+    let block_compression = parse_compression("--block-compression", cli.block_compression.as_deref())
+        .or_else(|| parse_compression("RHYPEDB_BLOCK_COMPRESSION", env.block_compression.as_deref()))
+        .or_else(|| {
+            parse_compression(
+                "block_compression (config file)",
+                file.and_then(|f| f.block_compression.as_deref()),
+            )
+        })
+        .unwrap_or(rhypedb_storage::SstCompression::Lz4);
 
     // ef / rerank: cli (none today) > env (parsed string) > file, validated ONCE
     // on the resolved value. A valid env value wins over the file.
@@ -244,6 +285,7 @@ pub fn resolve(
             f_quiesce,
             DEFAULT_WORKER_QUIESCE_SECS,
         )),
+        block_compression,
     }
 }
 

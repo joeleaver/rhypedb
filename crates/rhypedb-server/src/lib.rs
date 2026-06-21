@@ -85,6 +85,14 @@ struct Cli {
     /// harness). Off by default for safety.
     #[arg(long)]
     no_sync: bool,
+
+    /// Per-block SST compression for newly written files: `lz4` (default) or
+    /// `none`. `lz4` (v6 format) makes SSTs ~3-4x smaller at the cost of a
+    /// per-block decompress on read; `none` keeps the v5 zero-copy layout.
+    /// Existing files of either format are always readable; compaction migrates
+    /// them to the chosen format over time.
+    #[arg(long)]
+    block_compression: Option<String>,
 }
 
 pub(crate) struct AppState {
@@ -543,6 +551,7 @@ fn cli_layer(cli: &Cli, matches: &clap::ArgMatches) -> config::CliLayer {
         no_sync: cli.no_sync,
         restore_from: cli.restore_from.clone(),
         restore_force: cli.restore_force,
+        block_compression: cli.block_compression.clone(),
     }
 }
 
@@ -571,6 +580,13 @@ fn log_effective_config(cfg: &config::ServerConfig, schema_path: &std::path::Pat
     println!("  cache_max      = {}", cfg.cache_max_entries);
     println!("  graceful_drain = {:?}", cfg.graceful_drain);
     println!("  worker_quiesce = {:?}", cfg.worker_quiesce_budget);
+    println!(
+        "  sst_compress   = {}",
+        match cfg.block_compression {
+            rhypedb_storage::SstCompression::Lz4 => "lz4",
+            rhypedb_storage::SstCompression::None => "none",
+        }
+    );
 }
 
 /// Read + parse an SDL schema file, exiting the process with a legible message on
@@ -685,6 +701,7 @@ pub async fn run() {
         &cfg.data_dir,
         rhypedb_engine::database::OpenOptions {
             sync_on_commit: !cfg.no_sync,
+            block_compression: cfg.block_compression,
             ..Default::default()
         },
     )

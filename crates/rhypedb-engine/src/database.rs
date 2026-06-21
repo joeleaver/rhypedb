@@ -579,6 +579,12 @@ pub struct OpenOptions {
     /// config today and the gate flips when phase 2 ships, without a
     /// breaking API change. Defaults to `false`.
     pub allow_schema_shrink: bool,
+    /// Per-block compression for newly written SST files (flush + compaction).
+    /// Defaults to `Lz4` (v6 format): ~3-4x smaller files at the cost of a
+    /// per-block decompress on read. Existing v5/older SSTs keep opening and
+    /// migrate to v6 via natural compaction. Set to `SstCompression::None` to
+    /// keep writing the v5 zero-copy layout.
+    pub block_compression: rhypedb_storage::SstCompression,
 }
 
 impl Default for OpenOptions {
@@ -587,6 +593,7 @@ impl Default for OpenOptions {
             sync_on_commit: true,
             background_cover_refresh: true,
             allow_schema_shrink: false,
+            block_compression: rhypedb_storage::SstCompression::Lz4,
         }
     }
 }
@@ -937,6 +944,7 @@ impl Database {
             do_extract_zone_fields(&snapshot, internal_key, value)
         }));
         config.sync_on_commit = options.sync_on_commit;
+        config.block_compression = options.block_compression;
         let storage = LsmTree::open(config)?;
         Self::rebuild_with_arc_storage(
             storage,
