@@ -215,7 +215,10 @@ impl LsmTree {
             // serving stale reads. Ordering by max version restores true age (and
             // matches the in-memory order `compact_inner` maintains: merged
             // oldest-first, concurrently-flushed newer SSTs after).
-            let mut with_id: Vec<(u64, SstReader)> = Vec::with_capacity(entries.len());
+            // Precompute each SST's max version ONCE (it's a full-file walk, and
+            // it's now fallible). Carry it in the tuple so the sort comparator
+            // stays a pure value compare.
+            let mut with_id: Vec<(u64, u64, SstReader)> = Vec::with_capacity(entries.len());
             for entry in entries {
                 let id = entry
                     .path()
@@ -225,15 +228,12 @@ impl LsmTree {
                     .unwrap_or(0);
                 max_sst_id = max_sst_id.max(id);
                 let reader = SstReader::open(entry.path())?;
-                max_version = max_version.max(reader.max_version());
-                with_id.push((id, reader));
+                let sst_max_version = reader.max_version()?;
+                max_version = max_version.max(sst_max_version);
+                with_id.push((id, sst_max_version, reader));
             }
-            with_id.sort_by(|a, b| {
-                a.1.max_version()
-                    .cmp(&b.1.max_version())
-                    .then(a.0.cmp(&b.0))
-            });
-            sst_readers = with_id.into_iter().map(|(_, r)| r).collect();
+            with_id.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            sst_readers = with_id.into_iter().map(|(_, _, r)| r).collect();
         }
 
         // Replay WAL into a memtable, tracking max version.
@@ -1112,7 +1112,7 @@ impl LsmTree {
                     std::fs::copy(src, &dest)?;
                 }
                 sst_names.push(name.to_string_lossy().into_owned());
-                max_version = max_version.max(reader.max_version());
+                max_version = max_version.max(reader.max_version()?);
             }
         }
 
@@ -1173,9 +1173,12 @@ impl LsmTree {
 
         let mut all_entries: Vec<(Bytes, Option<Bytes>)> = Vec::new();
         for sst in ssts.iter() {
-            for entry in sst.iter() {
-                all_entries.push(entry);
-            }
+            // Fallible walk: a corrupt block ABORTS the compaction (propagated
+            // up) BEFORE the merged SST is written and the inputs are deleted —
+            // preserving the inputs, exactly as the old v5 iterator's panic did.
+            // The silent-stopping `iter()` would truncate the merge and then the
+            // inputs would be unlinked = permanent data loss.
+            sst.try_for_each_entry(|key, value| all_entries.push((key, value)))?;
         }
         drop(ssts);
 
@@ -2428,6 +2431,49 @@ mod tests {
             let val = tree.get(&txn, key.as_bytes()).unwrap();
             assert!(val.is_some(), "key {key} missing after compaction");
         }
+    }
+
+    #[test]
+    fn open_fails_loudly_on_a_corrupt_sst_block() {
+        // A corrupt SST block must surface as an Err at open (via the fallible
+        // max_version walk) rather than silently restoring a too-low version
+        // counter. Pre-fix, the v6 iterator silently stopped on a bad block.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let tree = LsmTree::open(test_config(dir.path())).unwrap();
+            for i in 0..40u64 {
+                let mut txn = tree.begin_txn();
+                let key = format!("key-{i:04}");
+                let value = format!("value-{i}-some-compressible-padding-aaaaaaaa");
+                tree.put(&mut txn, key.as_bytes(), Bytes::from(value)).unwrap();
+                tree.commit(&mut txn).unwrap();
+            }
+            tree.flush().unwrap();
+        } // drop the tree -> releases the mmap + the data-dir flock.
+
+        // Corrupt the first SST's block-0 frame header (uncomp_len MSB -> over
+        // the cap). The data region starts at byte 8; uncomp_len is bytes [9..13].
+        let sst_dir = dir.path().join("sst");
+        let mut sst_path = None;
+        for e in std::fs::read_dir(&sst_dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) == Some("sst") {
+                sst_path = Some(p);
+                break;
+            }
+        }
+        let sst_path = sst_path.expect("at least one SST file");
+        let mut bytes = std::fs::read(&sst_path).unwrap();
+        bytes[9] = 0xFF;
+        std::fs::write(&sst_path, &bytes).unwrap();
+
+        // Reopen: the corrupt block must make open() fail, not silently proceed.
+        let result = LsmTree::open(test_config(dir.path()));
+        assert!(
+            matches!(result, Err(Error::SstCorrupted(_))),
+            "open should fail with SstCorrupted on a corrupt block, got {:?}",
+            result.map(|_| "Ok")
+        );
     }
 
     #[test]

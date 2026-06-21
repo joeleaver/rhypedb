@@ -1262,18 +1262,59 @@ impl SstReader {
         &self.path
     }
 
-    /// Find the maximum version stored in this SST file.
-    /// Used during recovery to restore the transaction version counter.
-    pub fn max_version(&self) -> u64 {
-        let mut max_ver = 0u64;
-        for (key, _) in self.iter() {
-            if key.len() >= 8 {
-                let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-                let version = !u64::from_be_bytes(ver_bytes);
-                max_ver = max_ver.max(version);
+    /// Walk EVERY entry in sorted order, calling `f`. Unlike [`SstReader::iter`],
+    /// a corrupt block (v6 decompress failure, or an in-block length
+    /// inconsistency) surfaces as `Err(SstCorrupted)` instead of silently ending
+    /// the walk. Use this on correctness-sensitive paths — compaction (which
+    /// deletes its inputs) and version-counter recovery — where a silent
+    /// truncation would lose data or restore a too-low version. The scan APIs
+    /// keep the infallible iterator (a `Vec`-returning method can't propagate).
+    pub fn try_for_each_entry<F: FnMut(Bytes, MemValue)>(&self, mut f: F) -> Result<()> {
+        for bi in 0..self.index.len() {
+            let blk = self.block(bi)?;
+            let mut pos = 0usize;
+            while pos + 8 <= blk.len() {
+                let key_len =
+                    u32::from_be_bytes(blk[pos..pos + 4].try_into().unwrap()) as usize;
+                let value_len_raw =
+                    u32::from_be_bytes(blk[pos + 4..pos + 8].try_into().unwrap());
+                let key_start = pos + 8;
+                let key_end = key_start + key_len;
+                if key_end > blk.len() {
+                    return Err(Error::SstCorrupted(
+                        "entry key extends past block end".into(),
+                    ));
+                }
+                let key = blk.slice(key_start..key_end);
+                let is_tomb = value_len_raw == TOMBSTONE_MARKER;
+                let value_len = if is_tomb { 0 } else { value_len_raw as usize };
+                let val_end = key_end + value_len;
+                if val_end > blk.len() {
+                    return Err(Error::SstCorrupted(
+                        "entry value extends past block end".into(),
+                    ));
+                }
+                let value = if is_tomb { None } else { Some(blk.slice(key_end..val_end)) };
+                f(key, value);
+                pos = val_end;
             }
         }
-        max_ver
+        Ok(())
+    }
+
+    /// Find the maximum version stored in this SST file.
+    /// Used during recovery to restore the transaction version counter.
+    /// Fallible: a corrupt block must NOT silently undercount the version (which
+    /// would let later commits reuse versions) — it surfaces as `SstCorrupted`.
+    pub fn max_version(&self) -> Result<u64> {
+        let mut max_ver = 0u64;
+        self.try_for_each_entry(|key, _| {
+            if key.len() >= 8 {
+                let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+                max_ver = max_ver.max(!u64::from_be_bytes(ver_bytes));
+            }
+        })?;
+        Ok(max_ver)
     }
 
     /// Like `scan_prefix`, but additionally accepts a `FieldPredicate` whose
@@ -1991,7 +2032,11 @@ mod tests {
         let i6: Vec<_> = r6.iter().collect();
         assert_eq!(i5, i6, "iter() mismatch");
 
-        assert_eq!(r5.max_version(), r6.max_version(), "max_version mismatch");
+        assert_eq!(
+            r5.max_version().unwrap(),
+            r6.max_version().unwrap(),
+            "max_version mismatch"
+        );
         assert_eq!(r5.first_user_key, r6.first_user_key, "first_user_key");
         assert_eq!(r5.last_user_key, r6.last_user_key, "last_user_key");
 
@@ -2154,7 +2199,7 @@ mod tests {
         let re = SstReader::open(&pe).unwrap();
         assert_eq!(re.version, 6);
         assert_eq!(re.iter().count(), 0);
-        assert_eq!(re.max_version(), 0);
+        assert_eq!(re.max_version().unwrap(), 0);
         assert!(re.get(b"anything........").unwrap().is_none());
         assert!(re.get_versioned(b"x", 1).unwrap().is_none());
 
@@ -3104,6 +3149,90 @@ mod tests {
         // set was correctly narrowed to entries in blocks 2 & 3 = 32 entries
         // (the filter doesn't apply the predicate itself).
         assert_eq!(results.len(), 32, "should include entries from blocks 2+3 only");
+    }
+
+    /// Build the movie SST (one int field "year" + a zone extractor) with a
+    /// chosen compression, so the v6 `scan_prefix_filtered` path can be compared
+    /// against the v5 oracle.
+    fn build_movie_sst_with(
+        path: &Path,
+        entries: &[(u64, u32)],
+        compression: SstCompression,
+    ) -> SstReader {
+        use crate::zone::ZoneFieldExtractor;
+        let extractor: ZoneFieldExtractor = std::sync::Arc::new(
+            move |_k: &[u8], value: &[u8]| -> Vec<(u32, [u8; 8])> {
+                if value.len() != 4 {
+                    return Vec::new();
+                }
+                let year = u32::from_be_bytes(value.try_into().unwrap()) as u64;
+                vec![(YEAR_FIELD_ID, year.to_be_bytes())]
+            },
+        );
+        let mut writer =
+            SstWriter::new_with_options(path, Some(extractor), compression).unwrap();
+        for &(id, year) in entries {
+            let user_key = KeyBuilder::object(1, id);
+            let internal_key = InternalKey::new(&user_key, 1);
+            writer
+                .add(internal_key.as_bytes(), &Some(Bytes::copy_from_slice(&year.to_be_bytes())))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        SstReader::open(path).unwrap()
+    }
+
+    #[test]
+    fn v6_scan_prefix_filtered_matches_v5() {
+        use crate::zone::{CompareOp, FieldPredicate};
+        let dir = tempfile::tempdir().unwrap();
+        // 64 entries / 4 blocks, years tightly clustered per block so the zone
+        // map prunes some blocks. The v6 path must skip pruned blocks WITHOUT
+        // decompressing them, yet return the same candidate set as v5.
+        let entries: Vec<(u64, u32)> = (0u64..64).map(|i| (i, 1900 + i as u32)).collect();
+        let r5 = build_movie_sst_with(&dir.path().join("v5.sst"), &entries, SstCompression::None);
+        let r6 = build_movie_sst_with(&dir.path().join("v6.sst"), &entries, SstCompression::Lz4);
+        assert_eq!(r5.version, 5);
+        assert_eq!(r6.version, 6);
+
+        let prefix = KeyBuilder::object_prefix(1);
+        for (op, target) in [
+            (CompareOp::Gt, 1940u64),
+            (CompareOp::Ge, 1916),
+            (CompareOp::Lt, 1920),
+            (CompareOp::Le, 1963),
+            (CompareOp::Eq, 1950),
+            (CompareOp::Ne, 1900),
+        ] {
+            let pred = FieldPredicate { field_id: YEAR_FIELD_ID, op, target };
+            assert_eq!(
+                r5.scan_prefix_filtered(&prefix, u64::MAX, &pred),
+                r6.scan_prefix_filtered(&prefix, u64::MAX, &pred),
+                "scan_prefix_filtered mismatch for {op:?} {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn v6_corrupt_block_fails_fallible_walks() {
+        // The fallible paths (try_for_each_entry, max_version) — used by
+        // compaction and version recovery — must ERROR on a corrupt block, not
+        // silently truncate (which would lose data on a compaction rewrite or
+        // restore a too-low version counter).
+        let entries = gen_objects(1, 40, 1); // ~3 blocks
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.sst");
+        write_entries(&path, &entries, SstCompression::Lz4);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[9] = 0xFF; // block 0 uncomp_len MSB -> exceeds the cap
+        std::fs::write(&path, &bytes).unwrap();
+
+        let r = SstReader::open(&path).unwrap(); // last block intact
+        assert!(matches!(
+            r.try_for_each_entry(|_, _| {}),
+            Err(Error::SstCorrupted(_))
+        ));
+        assert!(matches!(r.max_version(), Err(Error::SstCorrupted(_))));
     }
 
     #[test]
