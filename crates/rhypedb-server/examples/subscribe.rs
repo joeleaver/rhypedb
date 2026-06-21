@@ -15,8 +15,9 @@
 //! Each printed line is the canonical `WireEvent` JSON, e.g.
 //! `{"v":"rhypedb-event-v1","kind":"create","type":"User","id":"42","version":"7","fields":{...}}`.
 //! `id`/`version` are decimal strings (lossless even past 2^53); `fields` are
-//! best-effort (Bytes elided, no fields on delete) — re-query for authoritative
-//! state, and treat a `[lagged]` notice as "reconcile by re-query".
+//! best-effort (Bytes as base64) and present on `delete` too (the deleted
+//! object's last-known scalars; only edge-only cascade rows omit them) — re-query
+//! for authoritative state, and treat a `[lagged]` notice as "reconcile by re-query".
 
 use std::env;
 

@@ -340,8 +340,12 @@ trailing bytes are all rejected) so a malformed filter fails loudly.
 `JSON.parse` (which would coerce a bare number to a float and lose precision past
 2^53). The `Event` is a **notification**, not a faithful snapshot: `fields` use
 the `/query` read form (`Bytes` as base64, `DateTime` as RFC 3339, `Json` inline),
-but large 64-bit scalar field values may lose precision in a JS `JSON.parse`, and
-`delete` events carry no `fields` — **re-query for authoritative state**.
+but large 64-bit scalar field values may lose precision in a JS `JSON.parse` —
+**re-query for authoritative state**. `create`, `update`, and `delete` events all
+carry the object's scalar `fields`; a `delete` reports the deleted object's
+last-known values (so you can tell *which* object — by `slug`/identifier — went
+away). The sole exception: a cascade-deleted pure edge-only join row (a type with
+no scalar fields) carries no `fields`.
 
 #### Backpressure & lag
 

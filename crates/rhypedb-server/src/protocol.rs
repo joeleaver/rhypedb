@@ -69,9 +69,13 @@
 //! `Event` payload is a format-tagged JSON `WireEvent` (`object_id`/`version` as
 //! decimal strings so 64-bit ids survive a JS `JSON.parse`). Its `fields` are
 //! **best-effort / a notification**: large 64-bit scalar field values may lose
-//! precision in a JS `JSON.parse`, and `Delete` events carry no fields —
-//! re-query for authoritative state. (`Bytes` fields arrive as base64, `DateTime`
-//! as RFC 3339, `Json` inline, matching the `/query` read form.)
+//! precision in a JS `JSON.parse` — re-query for authoritative state. `Create`,
+//! `Update`, AND `Delete` events all carry the object's scalar fields (a `Delete`
+//! reports the deleted object's last-known values, so a subscriber learns *which*
+//! object — by slug/identifier — went away). The one exception: a cascade-deleted
+//! pure edge-only join row (a type with no scalar fields) carries no `fields`.
+//! (`Bytes` fields arrive as base64, `DateTime` as RFC 3339, `Json` inline,
+//! matching the `/query` read form.)
 //! # Object encoding
 //!
 //! ```text
@@ -819,8 +823,10 @@ pub fn decode_unsubscribe_payload(data: &[u8]) -> io::Result<u32> {
 ///   precision past 2^53) — `id` is the key you re-query by, so it must be exact.
 /// - `fields` are BEST-EFFORT: they use the `/query` read form (`Bytes` as
 ///   base64, `DateTime` as RFC 3339, `Json` inline), but large 64-bit scalar
-///   values may lose precision in a JS `JSON.parse`, and `Delete` events carry no
-///   fields. For authoritative values, re-query.
+///   values may lose precision in a JS `JSON.parse`. `Delete` events carry the
+///   deleted object's last-known scalar fields (same shape as create/update);
+///   only a cascade-deleted pure edge-only join row (no scalar fields) omits
+///   them. For authoritative values, re-query.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WireEvent {
     /// Format tag, [`EVENT_FORMAT_TAG`].
@@ -1171,8 +1177,9 @@ mod tests {
             Some(&serde_json::json!("Alice"))
         );
 
-        // A delete event omits fields entirely.
-        let del = ChangeEvent {
+        // An event with no captured fields (e.g. a cascade-deleted edge-only
+        // join row) omits the `fields` key entirely (`skip_serializing_if`).
+        let del_no_fields = ChangeEvent {
             version: 7,
             kind: ChangeKind::Delete,
             type_name: "User".into(),
@@ -1180,10 +1187,32 @@ mod tests {
             fields: None,
         };
         let mut dbuf = Vec::new();
-        encode_event_payload_into(&del, &mut dbuf);
+        encode_event_payload_into(&del_no_fields, &mut dbuf);
         let json = String::from_utf8(dbuf.clone()).unwrap();
-        assert!(!json.contains("fields"), "delete event must omit fields: {json}");
+        assert!(!json.contains("fields"), "fields-less event must omit fields: {json}");
         assert_eq!(decode_event_payload(&dbuf).unwrap().kind, "delete");
+
+        // A delete event WITH captured scalar fields carries them on the wire,
+        // exactly like create/update — a subscriber learns which object went.
+        let del_with_fields = ChangeEvent {
+            version: 8,
+            kind: ChangeKind::Delete,
+            type_name: "User".into(),
+            object_id: 5,
+            fields: Some({
+                let mut m = HashMap::new();
+                m.insert("name".into(), serde_json::json!("Alice"));
+                m
+            }),
+        };
+        let mut dbuf2 = Vec::new();
+        encode_event_payload_into(&del_with_fields, &mut dbuf2);
+        let decoded = decode_event_payload(&dbuf2).unwrap();
+        assert_eq!(decoded.kind, "delete");
+        assert_eq!(
+            decoded.fields.unwrap().get("name"),
+            Some(&serde_json::json!("Alice"))
+        );
     }
 
     #[tokio::test]

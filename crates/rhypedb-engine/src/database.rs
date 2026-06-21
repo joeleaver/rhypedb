@@ -210,6 +210,15 @@ struct CascadeMeta {
     type_name: String,
     has_unique: bool,
     has_indexed: bool,
+    /// True when the type declares at least one scalar field — i.e. its
+    /// `o:` blob carries identifying data worth surfacing on a Delete
+    /// change event. Used to decide whether `delete_inner` should read the
+    /// object payload for a cascade-deleted row: scalar-bearing types get a
+    /// read (so the Delete event carries the same scalar fields create/update
+    /// emit), while pure edge-only join rows skip it and keep the zero-read
+    /// cascade fast path. `has_scalar` is a superset of `has_unique` /
+    /// `has_indexed` (those are always scalar fields).
+    has_scalar: bool,
     /// Forward (non-inverse) relations on this type, with rel_id pre-
     /// resolved. Used by the outbound-tombstone walk.
     forward_relations: Vec<ForwardRelMeta>,
@@ -1163,6 +1172,10 @@ impl Database {
                     type_name: name.clone(),
                     has_unique: types_with_unique.contains(name),
                     has_indexed: type_def.fields.iter().any(|f| f.is_indexed()),
+                    has_scalar: type_def
+                        .fields
+                        .iter()
+                        .any(|f| matches!(f.field_type, FieldType::Scalar(_))),
                     forward_relations,
                 },
             );
@@ -5434,9 +5447,16 @@ impl Database {
         let mut txn = self.storage.begin_txn();
         // type_id keyed instead of (String, u64) — drops a String alloc
         // per cascaded object. At K=100 that's 100 fewer allocations per
-        // User delete.
-        let mut deleted: std::collections::HashSet<(u64, u64)> =
-            std::collections::HashSet::with_capacity(128);
+        // User delete. The value is the deleted object's scalar fields,
+        // captured by `delete_inner` for the Delete change event (so a
+        // subscriber learns *which* object went away — esp. its slug/
+        // identifying fields — the same way create/update report them).
+        // `None` means no scalar payload: a pure edge-only join row (no
+        // scalar fields — capture is skipped even on a top-level delete that
+        // read the blob for its existence check), or an object already gone
+        // in a circular cascade.
+        let mut deleted: HashMap<(u64, u64), Option<HashMap<String, serde_json::Value>>> =
+            HashMap::with_capacity(128);
         // Arena instead of `Vec<Bytes>` — every tombstone key lives in one
         // pre-sized buffer; `into_keys` produces refcount-only slices
         // when we hand them to `delete_batch`. At K=100 that's ~500
@@ -5467,11 +5487,11 @@ impl Database {
         // Drop the in-memory version-counter entries for everything the
         // commit just removed. The persisted `g:` keys were already
         // tombstoned inside the txn.
-        for (del_type_id, del_id) in &deleted {
+        for (del_type_id, del_id) in deleted.keys() {
             self.forget_version(*del_type_id, *del_id);
         }
 
-        for (del_type_id, del_id) in &deleted {
+        for ((del_type_id, del_id), fields) in &deleted {
             let type_name = self
                 .type_name_by_id
                 .get(del_type_id)
@@ -5482,7 +5502,7 @@ impl Database {
                 kind: ChangeKind::Delete,
                 type_name,
                 object_id: *del_id,
-                fields: None,
+                fields: fields.clone(),
             });
         }
 
@@ -5519,13 +5539,18 @@ impl Database {
         type_id: u64,
         object_id: u64,
         verify_exists: bool,
-        deleted: &mut std::collections::HashSet<(u64, u64)>,
+        deleted: &mut HashMap<(u64, u64), Option<HashMap<String, serde_json::Value>>>,
         arena: &mut TombstoneArena,
         cascade_ctx: Option<(u64, Bytes)>,
     ) -> EngineResult<()> {
-        if !deleted.insert((type_id, object_id)) {
+        if deleted.contains_key(&(type_id, object_id)) {
             return Ok(()); // already deleted in this cascade chain
         }
+        // Reserve the slot now (no payload yet); the blob read below fills it
+        // in when this type carries scalar fields. A plain insert here would
+        // clobber a prior capture on a circular-cascade re-hit — but the
+        // `contains_key` guard above already returned for that case.
+        deleted.insert((type_id, object_id), None);
 
         // One HashMap lookup → all the per-type schema info the cascade
         // walk needs. Saves repeated `schema.get_type` / `rel_ids.get` /
@@ -5544,11 +5569,16 @@ impl Database {
         // together with the rest of the object blob, so the migration stays
         // consistent (a deleted row simply never reaches cutover).
 
-        // Unique-index + secondary-index cleanup. Skipped entirely when the
-        // type has neither — for edge-only types (Rating in the bench) the
-        // cascade never touches the object payload.
+        // Read the object payload when we need it for: unique-index cleanup,
+        // secondary-index cleanup, the top-level existence check, OR capturing
+        // the deleted object's scalar fields for the Delete change event
+        // (`has_scalar`). It's skipped entirely for pure edge-only join rows
+        // (Rating in the bench) — they carry no scalar payload to clean up or
+        // report, so the cascade never touches their object blob. `has_scalar`
+        // is a superset of `has_unique`/`has_indexed`, so this gate is
+        // effectively "scalar-bearing type OR a verify".
         let type_idx_fields = self.indexed_fields.get(&meta.type_name);
-        if meta.has_unique || meta.has_indexed || verify_exists {
+        if meta.has_unique || meta.has_indexed || meta.has_scalar || verify_exists {
             let obj_key = KeyBuilder::object(type_id, object_id);
             let obj_data = self.storage.get(txn, &obj_key)?;
             if obj_data.is_none() && verify_exists {
@@ -5560,7 +5590,7 @@ impl Database {
             // Cascade-recursive call against an object that's already
             // gone (e.g. a circular cascade chain). Continue silently.
             if let Some(data) = &obj_data {
-                let fields = deserialize_fields(data);
+                let mut fields = deserialize_fields(data);
                 if meta.has_unique
                     && let Some(type_def) = self.schema.get_type(&meta.type_name)
                 {
@@ -5638,6 +5668,29 @@ impl Database {
                                 }
                             }
                         }
+                    }
+                }
+
+                // Capture the deleted object's scalar fields for the Delete
+                // change event — the same payload create/update emit, so a
+                // subscriber learns *which* object went away (esp. its
+                // slug/identifying fields), not just an opaque id. Strip the
+                // migration shadow siblings and retired-field names first: they
+                // live in the on-disk blob but must NEVER reach a caller (a
+                // reserved namespace / a name the current schema doesn't know).
+                // `fields` is otherwise scalar-only — relations are edges, not
+                // blob entries — so this mirrors create/update's scalar set.
+                //
+                // Gated on `has_scalar` (NOT just "the blob was read"): a
+                // top-level delete reads the blob for the existence check even
+                // for an edge-only type, but such a type has no identifying
+                // scalar data — leave its slot `None` so a DIRECT delete of an
+                // edge-only row agrees with a CASCADE delete of the same type
+                // (both `None`) instead of emitting an empty `Some({})`.
+                if meta.has_scalar {
+                    self.strip_tombstoned_fields(&meta.type_name, &mut fields);
+                    if let Some(slot) = deleted.get_mut(&(type_id, object_id)) {
+                        *slot = Some(fields_to_json(&fields));
                     }
                 }
             }
@@ -15168,6 +15221,13 @@ mod tests {
         let event = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Delete);
         assert_eq!(event.object_id, user.id);
+        // The Delete event now carries the deleted object's scalar fields,
+        // the same payload create/update emit — a subscriber learns *which*
+        // object went away, not just an opaque id.
+        let fields = event
+            .fields
+            .expect("delete event carries the deleted object's scalar fields");
+        assert_eq!(fields.get("name").and_then(|v| v.as_str()), Some("Alice"));
     }
 
     #[test]
@@ -15202,14 +15262,145 @@ mod tests {
         db.delete("User", alice.id).unwrap();
 
         // Should receive delete events for both User and Post.
-        let mut deleted_types = Vec::new();
+        let mut by_type: std::collections::HashMap<
+            String,
+            Option<std::collections::HashMap<String, serde_json::Value>>,
+        > = std::collections::HashMap::new();
         for _ in 0..2 {
             if let Ok(event) = rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                deleted_types.push(event.type_name.clone());
+                by_type.insert(event.type_name.clone(), event.fields.clone());
             }
         }
+        let mut deleted_types: Vec<String> = by_type.keys().cloned().collect();
         deleted_types.sort();
         assert_eq!(deleted_types, vec!["Post", "User"]);
+
+        // The directly-deleted User carries its scalar fields...
+        let user_fields = by_type
+            .get("User")
+            .unwrap()
+            .as_ref()
+            .expect("User delete carries fields");
+        assert_eq!(
+            user_fields.get("name").and_then(|v| v.as_str()),
+            Some("Alice")
+        );
+        // ...and so does the CASCADE-deleted Post (Option B: scalar-bearing
+        // types get their blob read on the cascade path so the Delete event is
+        // as informative as a direct delete's).
+        let post_fields = by_type
+            .get("Post")
+            .unwrap()
+            .as_ref()
+            .expect("cascade-deleted Post carries fields");
+        assert_eq!(
+            post_fields.get("title").and_then(|v| v.as_str()),
+            Some("Post 1")
+        );
+    }
+
+    #[test]
+    fn cascade_delete_event_for_edge_only_type_has_no_fields() {
+        // An edge-only join row (only relation fields, no scalars) keeps the
+        // zero-read cascade fast path: its blob is never read, so its Delete
+        // event carries `fields: None`. This is the deliberate Option-B
+        // boundary — there's no identifying scalar data to report anyway.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User { name: String }
+            type Membership {
+                user: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+
+        let membership = db.create("Membership", FieldMap::new()).unwrap();
+        db.link("Membership", membership.id, "user", alice.id, None)
+            .unwrap();
+
+        let mut filter = rhypedb_subscribe::SubscriptionFilter::all();
+        filter.kinds = vec![rhypedb_subscribe::ChangeKind::Delete];
+        let (_id, rx) = db.subscriptions().subscribe(filter);
+
+        db.delete("User", alice.id).unwrap();
+
+        let mut by_type: std::collections::HashMap<
+            String,
+            Option<std::collections::HashMap<String, serde_json::Value>>,
+        > = std::collections::HashMap::new();
+        for _ in 0..2 {
+            if let Ok(event) = rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                by_type.insert(event.type_name.clone(), event.fields.clone());
+            }
+        }
+
+        // User (scalar-bearing, direct) carries fields.
+        assert_eq!(
+            by_type
+                .get("User")
+                .unwrap()
+                .as_ref()
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("Alice")
+        );
+        // Membership (edge-only, cascade) carries NO fields — blob never read.
+        assert_eq!(
+            *by_type
+                .get("Membership")
+                .expect("Membership delete event delivered"),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_delete_event_for_edge_only_type_has_no_fields() {
+        // A TOP-LEVEL delete of an edge-only type must agree with the cascade
+        // case: `fields: None`. The top-level path reads the blob for the
+        // existence check even though the type has no scalar fields, so the
+        // capture is gated on `has_scalar` (not merely "the blob was read") to
+        // avoid emitting an empty `Some({})` that would disagree with a cascade
+        // delete of the same type.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User { name: String }
+            type Membership {
+                user: User @on_delete(cascade)
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create("User", uf).unwrap();
+        let membership = db.create("Membership", FieldMap::new()).unwrap();
+        db.link("Membership", membership.id, "user", alice.id, None)
+            .unwrap();
+
+        let (_id, rx) = db
+            .subscriptions()
+            .subscribe(rhypedb_subscribe::SubscriptionFilter::for_type("Membership"));
+
+        // Delete the Membership DIRECTLY (top-level, verify_exists=true).
+        db.delete("Membership", membership.id).unwrap();
+
+        let event = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(event.kind, rhypedb_subscribe::ChangeKind::Delete);
+        assert_eq!(event.object_id, membership.id);
+        assert_eq!(
+            event.fields, None,
+            "a direct delete of an edge-only type must carry no fields (not Some({{}}))"
+        );
     }
 
     #[test]

@@ -2289,7 +2289,7 @@ mod tcp_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subscribe_kind_filter_only_delete_and_no_fields() {
+    async fn subscribe_kind_filter_only_delete_carries_fields() {
         let state = test_state();
         let (mut sub, _s, _sh) = spawn_conn(state.clone(), 64 * 1024);
         let (mut w, _w, _wh) = spawn_conn(state.clone(), 8 * 1024);
@@ -2309,7 +2309,11 @@ mod tcp_tests {
         let ev = protocol::decode_event_payload(&f.payload).unwrap();
         assert_eq!(ev.kind, "delete");
         assert_eq!(ev.id, id.to_string());
-        assert!(ev.fields.is_none(), "delete carries no fields");
+        // The delete event carries the deleted object's scalar fields, exactly
+        // like create/update — a subscriber learns *which* User went away.
+        let fields = ev.fields.expect("delete carries the deleted object's fields");
+        assert_eq!(fields.get("name").and_then(|v| v.as_str()), Some("Doomed"));
+        assert_eq!(fields.get("age").and_then(|v| v.as_u64()), Some(1));
         // Nothing else.
         assert!(read_frame_timeout(&mut sub, 200).await.is_none());
     }
