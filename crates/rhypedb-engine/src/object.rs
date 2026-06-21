@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bytes::{BufMut, Bytes, BytesMut};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 /// A dynamically-typed value for object fields.
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +17,12 @@ pub enum Value {
     F64(f64),
     Bool(bool),
     Bytes(Bytes),
+    /// A timestamp, stored as epoch milliseconds (UTC). Written/read at the
+    /// query boundary as an RFC 3339 string (or an integer epoch-millis literal).
+    DateTime(i64),
+    /// Arbitrary JSON. Written as a raw JSON literal (or coerced scalar) and
+    /// read back inline; stored as compact JSON text.
+    Json(serde_json::Value),
     Null,
 }
 
@@ -29,6 +38,8 @@ impl Value {
             Value::F64(_) => "f64",
             Value::Bool(_) => "Bool",
             Value::Bytes(_) => "Bytes",
+            Value::DateTime(_) => "DateTime",
+            Value::Json(_) => "Json",
             Value::Null => "Null",
         }
     }
@@ -46,8 +57,55 @@ impl std::fmt::Display for Value {
             Value::F64(v) => write!(f, "{v}"),
             Value::Bool(v) => write!(f, "{v}"),
             Value::Bytes(b) => write!(f, "<{} bytes>", b.len()),
+            Value::DateTime(ms) => write!(f, "{}", rfc3339_from_millis(*ms)),
+            Value::Json(v) => write!(f, "{v}"),
             Value::Null => write!(f, "null"),
         }
+    }
+}
+
+/// Decode an RFC 3339 timestamp string to epoch milliseconds (UTC). Sub-millis
+/// precision is truncated. Returns a human-readable error on a malformed string.
+pub fn datetime_millis_from_rfc3339(s: &str) -> Result<i64, String> {
+    let odt = OffsetDateTime::parse(s, &Rfc3339)
+        .map_err(|e| format!("invalid RFC 3339 datetime {s:?}: {e}"))?;
+    Ok((odt.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
+/// Format epoch milliseconds (UTC) back to an RFC 3339 string. Falls back to the
+/// raw integer rendering if the value is outside the representable range.
+pub fn rfc3339_from_millis(millis: i64) -> String {
+    match OffsetDateTime::from_unix_timestamp_nanos((millis as i128) * 1_000_000) {
+        Ok(odt) => odt.format(&Rfc3339).unwrap_or_else(|_| millis.to_string()),
+        Err(_) => millis.to_string(),
+    }
+}
+
+/// Decode a base64 (standard alphabet) string into bytes.
+pub fn bytes_from_base64(s: &str) -> Result<Bytes, String> {
+    B64.decode(s)
+        .map(Bytes::from)
+        .map_err(|e| format!("invalid base64 bytes: {e}"))
+}
+
+/// Render a `Value` as the faithful, round-trippable JSON used by the `/query`
+/// response and the change-event feed: `DateTime` → RFC 3339 string,
+/// `Bytes` → base64 string, `Json` → the value inline, everything else natural.
+/// (The lossless on-disk/export form lives in `logical::value_to_json`.)
+pub fn value_to_query_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::U32(n) => serde_json::json!(n),
+        Value::U64(n) => serde_json::json!(n),
+        Value::I32(n) => serde_json::json!(n),
+        Value::I64(n) => serde_json::json!(n),
+        Value::F32(n) => serde_json::json!(n),
+        Value::F64(n) => serde_json::json!(n),
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Bytes(b) => serde_json::Value::String(B64.encode(b)),
+        Value::DateTime(ms) => serde_json::Value::String(rfc3339_from_millis(*ms)),
+        Value::Json(j) => j.clone(),
+        Value::Null => serde_json::Value::Null,
     }
 }
 
@@ -112,6 +170,8 @@ enum ValueTag {
     F64 = 7,
     Bool = 8,
     Bytes = 9,
+    DateTime = 10,
+    Json = 11,
 }
 
 /// Serialize a FieldMap to bytes for storage. Convenience wrapper around
@@ -182,6 +242,16 @@ fn serialize_fields_into_bytesmut(fields: &FieldMap, buf: &mut BytesMut) {
                 buf.put_u32(b.len() as u32);
                 buf.put_slice(b);
             }
+            Value::DateTime(ms) => {
+                buf.put_u8(ValueTag::DateTime as u8);
+                buf.put_i64(*ms);
+            }
+            Value::Json(j) => {
+                let bytes = serde_json::to_vec(j).unwrap_or_else(|_| b"null".to_vec());
+                buf.put_u8(ValueTag::Json as u8);
+                buf.put_u32(bytes.len() as u32);
+                buf.put_slice(&bytes);
+            }
         }
     }
 }
@@ -227,6 +297,16 @@ fn write_value_into(value: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&(b.len() as u32).to_be_bytes());
             out.extend_from_slice(b);
         }
+        Value::DateTime(ms) => {
+            out.push(ValueTag::DateTime as u8);
+            out.extend_from_slice(&ms.to_be_bytes());
+        }
+        Value::Json(j) => {
+            let bytes = serde_json::to_vec(j).unwrap_or_else(|_| b"null".to_vec());
+            out.push(ValueTag::Json as u8);
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&bytes);
+        }
     }
 }
 
@@ -242,9 +322,10 @@ fn estimate_fields_size(fields: &FieldMap) -> usize {
         total += match value {
             Value::String(s) => 4 + s.len(),
             Value::Bytes(b) => 4 + b.len(),
+            Value::Json(_) => 4 + 16, // length prefix + a rough small-object guess
             Value::Null | Value::Bool(_) => 0,
             Value::U32(_) | Value::I32(_) | Value::F32(_) => 4,
-            Value::U64(_) | Value::I64(_) | Value::F64(_) => 8,
+            Value::U64(_) | Value::I64(_) | Value::F64(_) | Value::DateTime(_) => 8,
         };
     }
     total
@@ -299,6 +380,14 @@ pub fn find_bytes_field_in_raw(data: &Bytes, field_name: &str) -> Option<Bytes> 
             7 => 8,
             8 => 1,
             9 => {
+                if pos + 4 > data.len() { return None; }
+                let l = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+                pos += 4;
+                l
+            }
+            10 => 8, // DateTime
+            11 => {
+                // Json
                 if pos + 4 > data.len() { return None; }
                 let l = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
                 pos += 4;
@@ -375,6 +464,14 @@ pub fn find_u64_field_in_raw(data: &[u8], field_name: &str) -> Option<u64> {
                 pos += 4;
                 l
             }
+            10 => 8, // DateTime
+            11 => {
+                // Json
+                if pos + 4 > data.len() { return None; }
+                let l = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+                pos += 4;
+                l
+            }
             _ => return None,
         };
 
@@ -438,10 +535,10 @@ pub fn extract_field(data: &Bytes, field_name: &str) -> Option<Value> {
         let value_len = match tag {
             0 => 0,        // Null
             2 | 4 | 6 => 4, // U32 / I32 / F32
-            3 | 5 | 7 => 8, // U64 / I64 / F64
+            3 | 5 | 7 | 10 => 8, // U64 / I64 / F64 / DateTime
             8 => 1,        // Bool
-            1 | 9 => {
-                // String / Bytes
+            1 | 9 | 11 => {
+                // String / Bytes / Json
                 if pos + 4 > data.len() {
                     return None;
                 }
@@ -467,6 +564,8 @@ pub fn extract_field(data: &Bytes, field_name: &str) -> Option<Value> {
                 7 => Value::F64(f64::from_be_bytes(data[pos..pos + 8].try_into().ok()?)),
                 8 => Value::Bool(data[pos] != 0),
                 9 => Value::Bytes(data.slice(pos..pos + value_len)),
+                10 => Value::DateTime(i64::from_be_bytes(data[pos..pos + 8].try_into().ok()?)),
+                11 => Value::Json(serde_json::from_slice(&data[pos..pos + value_len]).ok()?),
                 _ => return None,
             };
             return Some(val);
@@ -515,9 +614,9 @@ pub fn deserialize_fields_projected(data: &Bytes, wanted: &[&str]) -> FieldMap {
         let value_len = match tag {
             0 => 0,
             2 | 4 | 6 => 4,
-            3 | 5 | 7 => 8,
+            3 | 5 | 7 | 10 => 8,
             8 => 1,
-            1 | 9 => {
+            1 | 9 | 11 => {
                 if pos + 4 > data.len() {
                     break;
                 }
@@ -554,6 +653,11 @@ pub fn deserialize_fields_projected(data: &Bytes, wanted: &[&str]) -> FieldMap {
                 7 => Value::F64(f64::from_be_bytes(data[pos..pos + 8].try_into().unwrap())),
                 8 => Value::Bool(data[pos] != 0),
                 9 => Value::Bytes(data.slice(pos..pos + value_len)),
+                10 => Value::DateTime(i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap())),
+                11 => Value::Json(
+                    serde_json::from_slice(&data[pos..pos + value_len])
+                        .unwrap_or(serde_json::Value::Null),
+                ),
                 _ => Value::Null,
             };
             fields.insert(name, value);
@@ -643,6 +747,19 @@ pub fn deserialize_fields(data: &[u8]) -> FieldMap {
                 pos += len;
                 Value::Bytes(b)
             }
+            10 => {
+                let v = i64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+                pos += 8;
+                Value::DateTime(v)
+            }
+            11 => {
+                let len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                let v = serde_json::from_slice(&data[pos..pos + len])
+                    .unwrap_or(serde_json::Value::Null);
+                pos += len;
+                Value::Json(v)
+            }
             _ => Value::Null,
         };
 
@@ -680,6 +797,82 @@ mod tests {
         let encoded = serialize_fields(&fields);
         let decoded = deserialize_fields(&encoded);
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn datetime_json_bytes_roundtrip() {
+        let mut fields = FieldMap::new();
+        fields.insert("name".into(), Value::String("Alice".into()));
+        fields.insert("created".into(), Value::DateTime(1_781_841_600_123));
+        fields.insert("blob".into(), Value::Bytes(Bytes::from_static(b"\x00\xff\x10raw")));
+        fields.insert(
+            "meta".into(),
+            Value::Json(serde_json::json!({"k": 1, "tags": ["a", "b"], "nested": {"x": true}})),
+        );
+
+        // Full round-trip through both serialize paths.
+        let decoded = deserialize_fields(&serialize_fields(&fields));
+        assert_eq!(decoded, fields);
+        let mut into = Vec::new();
+        serialize_fields_into(&fields, &mut into);
+        assert_eq!(deserialize_fields(&into), fields);
+
+        // Single-field projection (the column-projection primitive) must also
+        // skip past + materialize the new tags correctly.
+        let bytes = serialize_fields(&fields);
+        assert_eq!(extract_field(&bytes, "created"), Some(Value::DateTime(1_781_841_600_123)));
+        assert_eq!(
+            extract_field(&bytes, "meta"),
+            Some(Value::Json(serde_json::json!({"k": 1, "tags": ["a", "b"], "nested": {"x": true}})))
+        );
+        assert_eq!(extract_field(&bytes, "name"), Some(Value::String("Alice".into())));
+        // Projected deserialize of a field AFTER the new tags must land correctly,
+        // proving the skip path advances past DateTime/Json.
+        let proj = deserialize_fields_projected(&bytes, &["name", "blob"]);
+        assert_eq!(proj.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(proj.get("blob"), Some(&Value::Bytes(Bytes::from_static(b"\x00\xff\x10raw"))));
+    }
+
+    #[test]
+    fn value_to_query_json_is_faithful() {
+        // Bytes → base64, DateTime → RFC 3339, Json → inline.
+        assert_eq!(
+            value_to_query_json(&Value::Bytes(Bytes::from_static(b"hello"))),
+            serde_json::json!("aGVsbG8=")
+        );
+        assert_eq!(
+            value_to_query_json(&Value::DateTime(0)),
+            serde_json::json!("1970-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            value_to_query_json(&Value::Json(serde_json::json!({"a": [1, 2]}))),
+            serde_json::json!({"a": [1, 2]})
+        );
+    }
+
+    #[test]
+    fn datetime_rfc3339_roundtrip() {
+        // Anchored conversions.
+        assert_eq!(datetime_millis_from_rfc3339("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(datetime_millis_from_rfc3339("1970-01-01T00:00:00.500Z").unwrap(), 500);
+        assert_eq!(rfc3339_from_millis(0), "1970-01-01T00:00:00Z");
+
+        // millis → string → millis is stable for a spread of inputs.
+        for s in [
+            "2026-06-20T12:00:00Z",
+            "2000-01-01T00:00:00.123Z",
+            "1969-12-31T23:59:59Z", // pre-epoch (negative millis)
+        ] {
+            let ms = datetime_millis_from_rfc3339(s).unwrap();
+            let back = rfc3339_from_millis(ms);
+            assert_eq!(
+                datetime_millis_from_rfc3339(&back).unwrap(),
+                ms,
+                "round-trip for {s}"
+            );
+        }
+        // Malformed input is a clean error, not a panic.
+        assert!(datetime_millis_from_rfc3339("not-a-date").is_err());
     }
 
     #[test]

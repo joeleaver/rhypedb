@@ -2712,25 +2712,9 @@ fn is_scalar_kind(k: u8) -> bool {
 }
 
 /// Target kinds a converter can actually PRODUCE — exactly the kinds
-/// `value_to_kind_byte` can emit. `SCALAR_DATETIME` and `SCALAR_JSON` are
-/// scalar (so `is_scalar_kind` admits them) but the `Value` enum has no
-/// variant for them, so no converter could ever return a value whose kind
-/// byte matches — a migration targeting them would fail every row. A
-/// field-type change MUST refuse them as a target up front.
+/// `value_to_kind_byte` can emit (every scalar kind now has a `Value` variant).
 fn is_representable_target_kind(k: u8) -> bool {
-    use kind_byte::*;
-    matches!(
-        k,
-        SCALAR_STRING
-            | SCALAR_U32
-            | SCALAR_U64
-            | SCALAR_I32
-            | SCALAR_I64
-            | SCALAR_F32
-            | SCALAR_F64
-            | SCALAR_BOOL
-            | SCALAR_BYTES
-    )
+    is_scalar_kind(k)
 }
 
 fn value_to_kind_byte(v: &crate::object::Value) -> u8 {
@@ -2745,7 +2729,9 @@ fn value_to_kind_byte(v: &crate::object::Value) -> u8 {
         V::F32(_) => SCALAR_F32,
         V::F64(_) => SCALAR_F64,
         V::Bool(_) => SCALAR_BOOL,
+        V::DateTime(_) => SCALAR_DATETIME,
         V::Bytes(_) => SCALAR_BYTES,
+        V::Json(_) => SCALAR_JSON,
         V::Null => UNSET,
     }
 }

@@ -144,7 +144,7 @@ const write = User.create({ name: "Ann", age: 30 }).build();   // typed create
 const rows: Array<Row<User>> = parseResponse<User>(responseJson);   // { id, data }
 ```
 
-The builder is transport-agnostic — bring your own HTTP client. Relations and vector fields are documented per type but are not scalar columns. Typed `create` sets a row's scalar fields (strings escaped, numbers/bools coerced); `DateTime`/`Bytes`/`Json` fields have no query-literal form and are skipped.
+The builder is transport-agnostic — bring your own HTTP client. Relations and vector fields are documented per type but are not scalar columns. Typed `create` sets a row's scalar fields: strings escaped, numbers/bools coerced, `DateTime` (RFC 3339 string) and `Bytes` (base64 string) emitted as quoted strings, and `Json` (a `serde_json::Value` / `unknown`) emitted as a raw JSON literal.
 
 ### Admin plane (gated by `RHYPEDB_ADMIN_TOKEN`)
 
@@ -338,9 +338,10 @@ trailing bytes are all rejected) so a malformed filter fails loudly.
 
 `id` and `version` are **decimal strings** so 64-bit values survive a JavaScript
 `JSON.parse` (which would coerce a bare number to a float and lose precision past
-2^53). The `Event` is a **notification**, not a faithful snapshot: `fields` are
-best-effort (`Bytes` values arrive as a `"<N bytes>"` placeholder, and `delete`
-events carry no `fields`) — **re-query for authoritative state**.
+2^53). The `Event` is a **notification**, not a faithful snapshot: `fields` use
+the `/query` read form (`Bytes` as base64, `DateTime` as RFC 3339, `Json` inline),
+but large 64-bit scalar field values may lose precision in a JS `JSON.parse`, and
+`delete` events carry no `fields` — **re-query for authoritative state**.
 
 #### Backpressure & lag
 

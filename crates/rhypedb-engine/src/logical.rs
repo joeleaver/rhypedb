@@ -59,6 +59,10 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::F64(x) => env("f64", Json::String(format!("{:016x}", x.to_bits()))),
         Value::Bool(b) => env("bool", Json::Bool(*b)),
         Value::Bytes(b) => env("bytes", Json::String(B64.encode(b))),
+        // Epoch-millis as a decimal string (lossless i64, like the int tags).
+        Value::DateTime(ms) => env("datetime", Json::String(ms.to_string())),
+        // The JSON value inline — already lossless.
+        Value::Json(j) => env("json", j.clone()),
     }
 }
 
@@ -93,6 +97,8 @@ pub fn value_from_json(j: &Json) -> LResult<Value> {
                 .map_err(|e| malformed(format!("invalid base64 `bytes`: {e}")))?;
             Ok(Value::Bytes(bytes::Bytes::from(bytes)))
         }
+        "datetime" => Ok(Value::DateTime(parse_int(v, tag)?)),
+        "json" => Ok(Value::Json(v.clone())),
         other => Err(malformed(format!("unknown value tag `{other}`"))),
     }
 }
@@ -277,6 +283,14 @@ mod tests {
             Value::F64(f64::NAN),
             Value::Bytes(bytes::Bytes::new()),
             Value::Bytes(bytes::Bytes::from_static(&[0, 1, 2, 255, 254, 0, 128])),
+            Value::DateTime(0),
+            Value::DateTime(i64::MIN),
+            Value::DateTime(i64::MAX),
+            Value::DateTime(1_781_956_800_123),
+            Value::Json(serde_json::json!(null)),
+            Value::Json(serde_json::json!(42)),
+            Value::Json(serde_json::json!("a string")),
+            Value::Json(serde_json::json!({"k": 1, "arr": [true, null, "x"], "nested": {"y": 2.5}})),
         ] {
             assert_round_trips(v);
         }

@@ -256,6 +256,8 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         match self.peek() {
             Some('"') => Ok(Literal::String(self.parse_string_literal()?)),
+            // A raw JSON container literal (object/array) for a `Json` field.
+            Some('{') | Some('[') => Ok(Literal::Json(self.parse_json_container()?)),
             Some(ch) if ch.is_ascii_digit() || ch == '-' => self.parse_number(),
             Some('t') => {
                 self.expect_str("true")?;
@@ -271,6 +273,48 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.error("expected literal value")),
         }
+    }
+
+    /// Parse a raw JSON container (`{ … }` or `[ … ]`) in value position. Scans a
+    /// balanced span (tracking string state + escapes so braces/brackets inside
+    /// strings don't count), then hands the substring to `serde_json` for full
+    /// validation. Only containers reach here; scalar JSON values are written
+    /// with the ordinary string/number/bool literals and coerced by field type.
+    fn parse_json_container(&mut self) -> QueryResult<serde_json::Value> {
+        self.skip_ws();
+        let start = self.pos;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        loop {
+            let Some(ch) = self.advance() else {
+                return Err(self.error("unterminated JSON literal"));
+            };
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' | '[' => depth += 1,
+                '}' | ']' => {
+                    // depth is ≥ 1 here (the first char opened a container).
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let text = &self.input[start..self.pos];
+        serde_json::from_str(text).map_err(|e| self.error(format!("invalid JSON literal: {e}")))
     }
 
     fn parse_object(&mut self) -> QueryResult<HashMap<String, Literal>> {
@@ -817,6 +861,34 @@ mod tests {
             }
             _ => panic!("expected Create source"),
         }
+    }
+
+    #[test]
+    fn parse_raw_json_literal() {
+        // A `{ … }` / `[ … ]` in value position parses as a raw JSON literal,
+        // even with nested containers and braces/brackets inside strings.
+        let q = parse_query(
+            r#"Doc.create({ meta: { "k": 1, "s": "a}b]c", "arr": [1, {"x": true}] }, tags: ["a", "b"] })"#,
+        )
+        .unwrap();
+        match &q.source {
+            Source::Create { fields, .. } => {
+                assert_eq!(
+                    fields.get("meta"),
+                    Some(&Literal::Json(
+                        serde_json::json!({"k": 1, "s": "a}b]c", "arr": [1, {"x": true}]})
+                    ))
+                );
+                assert_eq!(
+                    fields.get("tags"),
+                    Some(&Literal::Json(serde_json::json!(["a", "b"])))
+                );
+            }
+            _ => panic!("expected Create source"),
+        }
+        // A malformed JSON literal is a clean parse error, not a panic.
+        assert!(parse_query(r#"Doc.create({ meta: { "k": } })"#).is_err());
+        assert!(parse_query(r#"Doc.create({ meta: { "k": 1 )"#).is_err());
     }
 
     #[test]

@@ -68,8 +68,10 @@
 //!
 //! `Event` payload is a format-tagged JSON `WireEvent` (`object_id`/`version` as
 //! decimal strings so 64-bit ids survive a JS `JSON.parse`). Its `fields` are
-//! **best-effort / a notification**: `Bytes` values are elided to a placeholder,
-//! and `Delete` events carry no fields — re-query for authoritative state.
+//! **best-effort / a notification**: large 64-bit scalar field values may lose
+//! precision in a JS `JSON.parse`, and `Delete` events carry no fields —
+//! re-query for authoritative state. (`Bytes` fields arrive as base64, `DateTime`
+//! as RFC 3339, `Json` inline, matching the `/query` read form.)
 //! # Object encoding
 //!
 //! ```text
@@ -414,6 +416,8 @@ fn scan_fields_end(data: &[u8], start: usize) -> io::Result<usize> {
             7 => 8,                                       // F64
             8 => 1,                                       // Bool
             9 => read_u32_len(data, &mut pos)?,           // Bytes
+            10 => 8,                                      // DateTime (i64 epoch-millis)
+            11 => read_u32_len(data, &mut pos)?,          // Json (compact JSON text)
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -813,10 +817,10 @@ pub fn decode_unsubscribe_payload(data: &[u8]) -> io::Result<u32> {
 /// - `id`/`version` are decimal STRINGS so 64-bit values survive a JS
 ///   `JSON.parse` (which would coerce a bare number to an f64 and lose
 ///   precision past 2^53) — `id` is the key you re-query by, so it must be exact.
-/// - `fields` are BEST-EFFORT: `Bytes` values arrive as a `"<N bytes>"`
-///   placeholder (from the engine's `value_to_json`), large ints may lose
-///   precision in JS, and `Delete` events carry no fields. For authoritative
-///   values, re-query.
+/// - `fields` are BEST-EFFORT: they use the `/query` read form (`Bytes` as
+///   base64, `DateTime` as RFC 3339, `Json` inline), but large 64-bit scalar
+///   values may lose precision in a JS `JSON.parse`, and `Delete` events carry no
+///   fields. For authoritative values, re-query.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WireEvent {
     /// Format tag, [`EVENT_FORMAT_TAG`].

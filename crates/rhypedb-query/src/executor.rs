@@ -897,6 +897,23 @@ fn compare_values(field_val: &Value, op: &CompareOp, literal: &Literal) -> bool 
             CompareOp::Ne => a != b,
             _ => false,
         },
+        // DateTime compares as its i64 epoch-millis — against an int literal or
+        // an RFC 3339 string (a malformed string never matches).
+        (Value::DateTime(a), Literal::Int(b)) => compare_ord(*a, op, *b),
+        (Value::DateTime(a), Literal::String(b)) => {
+            match rhypedb_engine::object::datetime_millis_from_rfc3339(b) {
+                Ok(bms) => compare_ord(*a, op, bms),
+                Err(_) => false,
+            }
+        }
+        // Json supports equality only (ordering is rejected before pushdown).
+        (Value::Json(a), Literal::Json(b)) => json_eq(a, b, op),
+        (Value::Json(a), Literal::String(b)) => {
+            json_eq(a, &serde_json::Value::String(b.clone()), op)
+        }
+        (Value::Json(a), Literal::Int(b)) => json_eq(a, &serde_json::json!(b), op),
+        (Value::Json(a), Literal::Float(b)) => json_eq(a, &serde_json::json!(b), op),
+        (Value::Json(a), Literal::Bool(b)) => json_eq(a, &serde_json::Value::Bool(*b), op),
         (_, Literal::Null) => match op {
             CompareOp::Eq => matches!(field_val, Value::Null),
             CompareOp::Ne => !matches!(field_val, Value::Null),
@@ -904,6 +921,32 @@ fn compare_values(field_val: &Value, op: &CompareOp, literal: &Literal) -> bool 
         },
         _ => false,
     }
+}
+
+/// Json equality (`==`/`!=`); any ordering op is `false` (no total order).
+fn json_eq(a: &serde_json::Value, b: &serde_json::Value, op: &CompareOp) -> bool {
+    match op {
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
+        _ => false,
+    }
+}
+
+/// The declared scalar type of `type_name.field`, if it is a scalar field.
+fn field_scalar_type(
+    db: &Database,
+    type_name: &str,
+    field: &str,
+) -> Option<rhypedb_schema::ScalarType> {
+    db.schema()
+        .get_type(type_name)?
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .and_then(|f| match &f.field_type {
+            rhypedb_schema::FieldType::Scalar(s) => Some(s.clone()),
+            _ => None,
+        })
 }
 
 fn compare_ord<T: PartialOrd>(a: T, op: &CompareOp, b: T) -> bool {
@@ -998,6 +1041,7 @@ fn literal_to_value(lit: &Literal, target: Option<rhypedb_schema::ScalarType>) -
             Literal::Int(i) => Value::I64(*i),
             Literal::Float(f) => Value::F32(*f as f32),
             Literal::Bool(b) => Value::Bool(*b),
+            Literal::Json(v) => Value::Json(v.clone()),
             Literal::Null => Value::Null,
         });
     };
@@ -1017,6 +1061,21 @@ fn literal_to_value(lit: &Literal, target: Option<rhypedb_schema::ScalarType>) -
         // Integer literals widen into float fields (`score: 5` for an `f64`).
         (ST::F32, Literal::Int(i)) => Value::F32(*i as f32),
         (ST::F64, Literal::Int(i)) => Value::F64(*i as f64),
+        // Bytes: a base64 string literal decodes to raw bytes.
+        (ST::Bytes, Literal::String(s)) => {
+            Value::Bytes(rhypedb_engine::object::bytes_from_base64(s).map_err(QueryError::Type)?)
+        }
+        // DateTime: an RFC 3339 string, or an integer epoch-millis literal.
+        (ST::DateTime, Literal::String(s)) => Value::DateTime(
+            rhypedb_engine::object::datetime_millis_from_rfc3339(s).map_err(QueryError::Type)?,
+        ),
+        (ST::DateTime, Literal::Int(i)) => Value::DateTime(*i),
+        // Json: a raw JSON container, or any scalar literal wrapped as JSON.
+        (ST::Json, Literal::Json(v)) => Value::Json(v.clone()),
+        (ST::Json, Literal::String(s)) => Value::Json(serde_json::Value::String(s.clone())),
+        (ST::Json, Literal::Int(i)) => Value::Json(serde_json::json!(i)),
+        (ST::Json, Literal::Float(f)) => Value::Json(serde_json::json!(f)),
+        (ST::Json, Literal::Bool(b)) => Value::Json(serde_json::Value::Bool(*b)),
         _ => return Err(mismatch()),
     })
 }
@@ -1047,6 +1106,27 @@ fn try_filter_scan(
     if field_path.contains('.') {
         return Ok(None);
     }
+    // DateTime/Json fields don't take the typed index/zone pushdown — their
+    // stored `Value` variant differs from the int/string/bool/float fast paths,
+    // so a pushdown would silently never match. Route DateTime to the full scan,
+    // where `compare_values` handles its ordering; allow Json equality there too,
+    // but reject Json ordering (there is no total order over arbitrary JSON)
+    // rather than silently returning nothing.
+    if let Some(st) = field_scalar_type(db, type_name, field_path) {
+        use rhypedb_schema::ScalarType as ST;
+        match st {
+            ST::DateTime => return Ok(None),
+            ST::Json => {
+                return match op {
+                    CompareOp::Eq | CompareOp::Ne => Ok(None),
+                    _ => Err(QueryError::Type(
+                        "ordering comparisons are not supported on Json fields".into(),
+                    )),
+                };
+            }
+            _ => {}
+        }
+    }
     // Alias to disambiguate from the query crate's CompareOp imported via
     // `use crate::ast::*`. The engine re-exports the storage enum so this
     // crate doesn't need to depend on storage directly.
@@ -1076,6 +1156,10 @@ fn try_filter_scan(
         Literal::Float(f) => Ok(Some(db.filter_scan_float(
             type_name, field_path, storage_op, *f, limit,
         )?)),
+        // A raw JSON container literal has no typed pushdown; the full scan +
+        // `compare_values` handles Json equality (DateTime/Json fields were
+        // already routed to `Ok(None)` by the guard above).
+        Literal::Json(_) => Ok(None),
         Literal::Null => Ok(None),
     }
 }
@@ -1419,6 +1503,53 @@ mod tests {
             }
             _ => panic!("expected Objects"),
         }
+    }
+
+    #[test]
+    fn create_and_read_datetime_bytes_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"type Event { name: String  created: DateTime  blob: Bytes  meta: Json }"#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        // RFC 3339 datetime, base64 bytes, and a raw JSON object literal.
+        let q = parse_query(
+            r#"Event.create({ name: "launch", created: "1970-01-01T00:00:00.500Z", blob: "aGVsbG8=", meta: { "k": 1, "tags": ["a", "b"] } })"#,
+        )
+        .unwrap();
+        let id = match execute(&ExecContext::new(&db, None), &q).unwrap() {
+            QueryOutput::Single(o) => o.id,
+            _ => panic!("expected Single"),
+        };
+        let obj = db.get("Event", id).unwrap();
+        assert_eq!(obj.fields.get("created"), Some(&Value::DateTime(500)));
+        assert_eq!(
+            obj.fields.get("blob"),
+            Some(&Value::Bytes(bytes::Bytes::from_static(b"hello")))
+        );
+        assert_eq!(
+            obj.fields.get("meta"),
+            Some(&Value::Json(serde_json::json!({"k": 1, "tags": ["a", "b"]})))
+        );
+
+        // An integer epoch-millis literal also coerces to DateTime.
+        let q2 = parse_query(r#"Event.create({ name: "x", created: 1234 })"#).unwrap();
+        let id2 = match execute(&ExecContext::new(&db, None), &q2).unwrap() {
+            QueryOutput::Single(o) => o.id,
+            _ => panic!(),
+        };
+        assert_eq!(
+            db.get("Event", id2).unwrap().fields.get("created"),
+            Some(&Value::DateTime(1234))
+        );
+
+        // A malformed datetime / base64 is a clean type error, not a panic.
+        let bad_dt = parse_query(r#"Event.create({ created: "not-a-date" })"#).unwrap();
+        assert!(execute(&ExecContext::new(&db, None), &bad_dt).is_err());
+        let bad_b64 = parse_query(r#"Event.create({ blob: "@@@@" })"#).unwrap();
+        assert!(execute(&ExecContext::new(&db, None), &bad_b64).is_err());
     }
 
     #[test]

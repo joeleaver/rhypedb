@@ -7378,6 +7378,10 @@ fn value_to_index_bytes(value: &Value) -> Vec<u8> {
         Value::F64(v) => v.to_be_bytes().to_vec(),
         Value::Bool(v) => vec![u8::from(*v)],
         Value::Bytes(b) => b.to_vec(),
+        // DateTime indexes by its i64 epoch-millis (big-endian, like I64).
+        Value::DateTime(ms) => ms.to_be_bytes().to_vec(),
+        // Json indexes by its compact serialized bytes (exact-match only).
+        Value::Json(j) => serde_json::to_vec(j).unwrap_or_default(),
         Value::Null => vec![],
     }
 }
@@ -7385,21 +7389,7 @@ fn value_to_index_bytes(value: &Value) -> Vec<u8> {
 fn fields_to_json(fields: &FieldMap) -> HashMap<String, serde_json::Value> {
     fields
         .iter()
-        .map(|(k, v)| {
-            let json_val = match v {
-                Value::String(s) => serde_json::Value::String(s.clone()),
-                Value::U32(n) => serde_json::json!(n),
-                Value::U64(n) => serde_json::json!(n),
-                Value::I32(n) => serde_json::json!(n),
-                Value::I64(n) => serde_json::json!(n),
-                Value::F32(n) => serde_json::json!(n),
-                Value::F64(n) => serde_json::json!(n),
-                Value::Bool(b) => serde_json::Value::Bool(*b),
-                Value::Bytes(b) => serde_json::json!(format!("<{} bytes>", b.len())),
-                Value::Null => serde_json::Value::Null,
-            };
-            (k.clone(), json_val)
-        })
+        .map(|(k, v)| (k.clone(), crate::object::value_to_query_json(v)))
         .collect()
 }
 
@@ -7424,6 +7414,8 @@ fn validate_edge_value(
             | (ScalarType::F64, Value::F64(_))
             | (ScalarType::Bool, Value::Bool(_))
             | (ScalarType::Bytes, Value::Bytes(_))
+            | (ScalarType::DateTime, Value::DateTime(_))
+            | (ScalarType::Json, Value::Json(_))
     );
     if !ok {
         return Err(EngineError::TypeMismatch {
@@ -7453,6 +7445,8 @@ fn validate_value(field_def: &rhypedb_schema::FieldDef, value: &Value) -> Engine
                     | (ScalarType::F64, Value::F64(_))
                     | (ScalarType::Bool, Value::Bool(_))
                     | (ScalarType::Bytes, Value::Bytes(_))
+                    | (ScalarType::DateTime, Value::DateTime(_))
+                    | (ScalarType::Json, Value::Json(_))
             );
             if !ok {
                 return Err(EngineError::TypeMismatch {
@@ -14714,25 +14708,29 @@ mod tests {
     }
 
     #[test]
-    fn change_field_type_refuses_unrepresentable_target() {
-        // DateTime/Json have no writable Value variant, so no converter could
-        // ever produce a matching value — refuse the target up front (also
-        // covers the chunked create path, which shares this validation).
+    fn change_field_type_accepts_datetime_target() {
+        // DateTime/Json now have writable `Value` variants, so they are
+        // representable migration targets — the up-front "unrepresentable target"
+        // refusal no longer applies, and a converter that yields a DateTime value
+        // is accepted.
         let dir = tempfile::tempdir().unwrap();
         let schema = parse_schema("type User { age: i64 }").unwrap();
         let db = Database::open(schema, dir.path()).unwrap();
-        let err = db
-            .change_field_type(
-                "User",
-                "age",
-                rhypedb_schema::FieldType::Scalar(rhypedb_schema::ScalarType::DateTime),
-                |_id, v| Ok(v.clone()),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            EngineError::Catalog(crate::CatalogError::FieldTypeChangeUnrepresentableTarget { .. })
-        ));
+        let res = db.change_field_type(
+            "User",
+            "age",
+            rhypedb_schema::FieldType::Scalar(rhypedb_schema::ScalarType::DateTime),
+            |_id, v| {
+                Ok(match v {
+                    Value::I64(ms) => Value::DateTime(*ms),
+                    other => other.clone(),
+                })
+            },
+        );
+        assert!(
+            res.is_ok(),
+            "DateTime is now a representable migration target: {res:?}"
+        );
     }
 
     #[test]

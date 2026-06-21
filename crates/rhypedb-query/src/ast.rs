@@ -155,5 +155,8 @@ pub enum Literal {
     Int(i64),
     Float(f64),
     Bool(bool),
+    /// A raw JSON value literal (`{ … }` / `[ … ]`) for a `Json` field. Scalar
+    /// JSON values reuse `String`/`Int`/`Float`/`Bool`; this carries containers.
+    Json(serde_json::Value),
     Null,
 }

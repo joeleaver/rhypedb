@@ -195,18 +195,9 @@ impl From<Object> for ObjectJson {
 }
 
 fn value_to_json(v: Value) -> serde_json::Value {
-    match v {
-        Value::String(s) => serde_json::Value::String(s),
-        Value::U32(n) => serde_json::json!(n),
-        Value::U64(n) => serde_json::json!(n),
-        Value::I32(n) => serde_json::json!(n),
-        Value::I64(n) => serde_json::json!(n),
-        Value::F32(n) => serde_json::json!(n),
-        Value::F64(n) => serde_json::json!(n),
-        Value::Bool(b) => serde_json::Value::Bool(b),
-        Value::Bytes(b) => serde_json::json!(format!("<{} bytes>", b.len())),
-        Value::Null => serde_json::Value::Null,
-    }
+    // Faithful, round-trippable read form (DateTime → RFC 3339, Bytes → base64,
+    // Json → inline); shared with the engine's change-event renderer.
+    rhypedb_engine::object::value_to_query_json(&v)
 }
 
 async fn handle_query(

@@ -132,6 +132,24 @@ Apply `offset` **before** `limit`. Writing `.limit(N).offset(M)` is rejected —
 | Bool | `true`, `false` |
 | Null | `null` |
 | Vector | `[1.0, 2.0, 3.0]` |
+| JSON | `{ "k": 1, "tags": ["a", "b"] }` |
+
+How a literal is interpreted depends on the field's **declared type** — the
+language has no inline type annotations. A string literal becomes a `DateTime`
+when written to a `DateTime` field, base64-decodes into a `Bytes` field, and a
+raw JSON object/array literal is stored in a `Json` field:
+
+```text
+Event.create({
+  created: "2026-06-20T12:00:00Z",   # DateTime  (RFC 3339; or an integer epoch-millis)
+  blob:    "aGVsbG8=",               # Bytes     (base64)
+  meta:    { "k": 1, "tags": ["a"] } # Json      (raw JSON value)
+})
+```
+
+These read back faithfully — `created` as an RFC 3339 string, `blob` as base64,
+`meta` as inline JSON. A malformed value (a non-RFC-3339 `DateTime`, invalid
+base64, or unparseable JSON) is a clear error, not a silent default.
 
 ## Examples
 

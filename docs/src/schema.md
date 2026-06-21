@@ -57,18 +57,24 @@ Because JSON numbers are IEEE-754 doubles in most clients, an id above 2⁵³ ca
 
 ### Scalars
 
-| Type | Meaning |
-| --- | --- |
-| `String` | UTF-8 text |
-| `Bool` | boolean |
-| `i32`, `i64` | signed integers |
-| `u32`, `u64` | unsigned integers |
-| `f32`, `f64` | floating point |
-| `DateTime` | timestamp |
-| `Bytes` | raw byte blob |
-| `Json` | arbitrary JSON value |
+| Type | Meaning | Written as | Reads back as |
+| --- | --- | --- | --- |
+| `String` | UTF-8 text | `"text"` | string |
+| `Bool` | boolean | `true` / `false` | boolean |
+| `i32`, `i64` | signed integers | `42` | number |
+| `u32`, `u64` | unsigned integers | `42` | number |
+| `f32`, `f64` | floating point | `1.5` | number |
+| `DateTime` | timestamp (epoch-millis UTC) | RFC 3339 string `"2026-06-20T12:00:00Z"`, or an integer epoch-millis | RFC 3339 string |
+| `Bytes` | raw byte blob | base64 string `"aGVsbG8="` | base64 string |
+| `Json` | arbitrary JSON value | a raw JSON literal `{ "k": 1 }` (or any scalar) | inline JSON |
 
 > Note the casing: the named types (`String`, `Bool`, `DateTime`, `Bytes`, `Json`) are capitalized, while the numeric primitives (`i64`, `u32`, `f64`, …) are lowercase. This matches how you refer to them in queries and migrations.
+
+**`DateTime`** is stored as a 64-bit epoch-millisecond timestamp (UTC); sub-millisecond precision in an RFC 3339 input is truncated. It is **filterable and orderable** (`.filter(.created > "2026-01-01T00:00:00Z")` works against either an RFC 3339 string or an integer epoch-millis).
+
+**`Bytes`** is an arbitrary byte blob, written and read as standard base64. It supports equality/ordering filtering (by byte value) when `@indexed`.
+
+**`Json`** holds an arbitrary JSON value. It supports **equality** filtering only (`==`/`!=`); ordering comparisons (`<`, `>`, …) on a `Json` field are rejected, since there is no total order over arbitrary JSON.
 
 ### Relations
 
