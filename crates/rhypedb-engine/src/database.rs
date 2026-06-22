@@ -4442,6 +4442,20 @@ impl Database {
         })
     }
 
+    /// True if `type_name.field_name` has a secondary (`@indexed`) index — i.e.
+    /// a `filter_scan` on it takes the real index fast path (`filter_scan_via_index`)
+    /// rather than the zone-map-pruned full prefix scan. This reads the same
+    /// `indexed_fields` map `filter_scan` consults, so it is authoritative.
+    ///
+    /// The query planner uses it to decide whether pushing a predicate conjunct
+    /// down yields a genuinely sublinear scan (worth doing) versus a full scan
+    /// in disguise (better left to the in-memory residual filter).
+    pub fn is_field_indexed(&self, type_name: &str, field_name: &str) -> bool {
+        self.indexed_fields
+            .get(type_name)
+            .is_some_and(|fields| fields.iter().any(|f| f.name == field_name))
+    }
+
     /// Filtered scan: pushes a single-field integer comparison down to storage.
     ///
     /// Two fast paths are layered:

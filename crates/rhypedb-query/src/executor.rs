@@ -145,13 +145,13 @@ fn execute_source(
             // Reject unsupported comparisons (e.g. Json ordering) up front, for
             // any predicate shape — before either the pushdown or the full scan.
             validate_predicate_for_type(db, type_name, predicate)?;
-            // Index / zone-map fast path: single integer comparison gets
-            // pushed down to storage along with an effective limit (if the
-            // next step is a bare `.limit(N)` we can stop scanning once N
-            // matches land). Complex predicates (And/Or, string compares,
-            // etc.) fall through to the full scan.
+            // Rule-based access-path picker: a single comparison pushes straight
+            // to the index/zone fast path (with an effective limit if the next
+            // step is a bare `.limit(N)`); a top-level AND pushes its most
+            // selective indexed conjunct and filters the residual in memory.
+            // Anything it can't profitably narrow falls through to the full scan.
             let pushed_limit = leading_limit(steps);
-            if let Some(mut objects) = try_filter_scan(db, type_name, predicate, pushed_limit)? {
+            if let Some(mut objects) = plan_filter_scan(db, type_name, predicate, pushed_limit)? {
                 // Fast-path objects may carry `raw_fields` — if a downstream
                 // step inspects them via `obj.fields`, eagerly populate now.
                 // No-op when raw_fields is None.
@@ -1221,6 +1221,167 @@ fn try_filter_scan(
         Literal::Json(_) => Ok(None),
         Literal::Null => Ok(None),
     }
+}
+
+/// Rule-based access-path picker for a `Source::Filter`. Returns:
+///   * `Ok(Some(objects))` — served from a secondary index: either a single
+///     `Compare` pushdown (today's fast path, unchanged) or a top-level AND's
+///     most-selective indexed conjunct pushed down with an in-memory residual
+///     filter for the rest of the predicate.
+///   * `Ok(None)` — no profitable index path; the caller does the full scan.
+///
+/// Behavior-preserving by construction: the returned set always equals
+/// `scan_all_objects + evaluate_predicate(full predicate)`. The AND path also
+/// restores object-id order, so a trailing `.limit`/`.offset` selects exactly
+/// the rows the full-scan baseline would.
+fn plan_filter_scan(
+    db: &Database,
+    type_name: &str,
+    predicate: &Predicate,
+    pushed_limit: Option<usize>,
+) -> QueryResult<Option<Vec<Object>>> {
+    // A single comparison IS today's fast path — delegate unchanged so the
+    // existing limit-pushdown (and its value-ordered result) is preserved.
+    if matches!(predicate, Predicate::Compare { .. }) {
+        return try_filter_scan(db, type_name, predicate, pushed_limit);
+    }
+
+    // Only a top-level AND can be narrowed by a single conjunct: every conjunct
+    // is a NECESSARY condition, so any one of them yields a SUPERSET of the
+    // result that we can re-filter exactly. A top-level OR (or any non-AND
+    // shape) has no such conjunct → full scan. (`And` always flattens to ≥ 2
+    // conjuncts; a top-level `Or` flattens to 1, so this guard catches it.)
+    let mut conjuncts: Vec<&Predicate> = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return Ok(None);
+    }
+
+    // Pick the most-selective conjunct that drives a REAL secondary-index scan
+    // (Eq before range). If none qualifies, leave it to the full scan.
+    let Some(generator) = conjuncts
+        .iter()
+        .copied()
+        .filter_map(|c| conjunct_index_generator(db, type_name, c))
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, c)| c)
+    else {
+        return Ok(None);
+    };
+
+    // Push the generator down UNBOUNDED (limit `None`). This is deliberate: a
+    // *bounded* index scan counts tombstones against its row budget, so a long
+    // tombstone run at an indexed value can make it return FEWER live rows than
+    // actually match — and we'd have no sound way to tell "exhausted" from
+    // "capped". Unbounded, the scan is tombstone-sound and `candidates` is the
+    // COMPLETE set matching the generator (a superset of the result, since the
+    // generator is a necessary conjunct). With the covering index a non-selective
+    // scan costs ≈ a full scan anyway, so we trade no correctness for the cap.
+    let Some(mut candidates) = try_filter_scan(db, type_name, generator, None)? else {
+        // Defensive: e.g. a malformed RFC 3339 DateTime literal pushes nothing
+        // (matches nothing, identical to the full scan).
+        return Ok(None);
+    };
+
+    // `candidates` ⊇ result. Re-filter by the FULL predicate, then restore
+    // object-id order (the index yields value order) so the result is a drop-in
+    // for `scan_all_objects + evaluate_predicate`, incl. a trailing `.limit`.
+    for obj in &mut candidates {
+        obj.ensure_fields_deserialized();
+    }
+    let mut result: Vec<Object> = candidates
+        .into_iter()
+        .filter(|obj| evaluate_predicate(predicate, &obj.fields))
+        .collect();
+    result.sort_by_key(|obj| obj.id);
+    Ok(Some(result))
+}
+
+/// Collect the top-level AND conjuncts of `predicate`, flattening nested ANDs.
+/// A `Compare` or an `Or(..)` subtree is one opaque conjunct (the latter is
+/// never an index generator but is still enforced by the in-memory re-filter).
+fn flatten_and<'a>(predicate: &'a Predicate, out: &mut Vec<&'a Predicate>) {
+    match predicate {
+        Predicate::And(left, right) => {
+            flatten_and(left, out);
+            flatten_and(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// If `conjunct` is a `Compare` that can drive a genuine secondary-index probe,
+/// return `(selectivity_rank, conjunct)` — lower rank = likelier more selective
+/// (non-`Bool` `Eq` = 0, range = 1, `Bool` `Eq` = 2). Otherwise `None`. Excludes:
+///   * nested field paths (`a.b`) — no index pushdown form;
+///   * `Ne` — matches most rows, a poor narrowing term;
+///   * non-`@indexed` fields — `filter_scan` would do a zone/full scan, not an
+///     index scan, so pushing gains nothing over the residual filter;
+///   * `Null`/`Json`/`*` literals — no typed pushdown;
+///   * literal/field type mismatches and out-of-domain literals — `is_field_indexed`
+///     is membership-only, so a mismatched literal (e.g. an `Int` against an
+///     `@indexed String`) or an out-of-range int (e.g. a negative literal against
+///     a `u32`) would silently route `filter_scan` to its non-index fallback (a
+///     full scan). We admit a literal only when it matches the field's scalar
+///     type AND fits its domain the way `try_filter_scan`/`filter_scan` route it,
+///     guaranteeing the index path is actually taken;
+///   * float `Eq` — the index key for `-0.0` differs from `+0.0`, but
+///     `compare_values` treats them equal, so an Eq index probe would MISS a
+///     stored `-0.0` (a non-superset). Float ranges are sound (the `-0.0`/`+0.0`
+///     key order is consistent with `compare_values`, and the residual filter
+///     drops any extras), so only float Eq is excluded — it stays correct in the
+///     in-memory residual filter.
+fn conjunct_index_generator<'a>(
+    db: &Database,
+    type_name: &str,
+    conjunct: &'a Predicate,
+) -> Option<(u8, &'a Predicate)> {
+    let Predicate::Compare {
+        field_path,
+        op,
+        value,
+    } = conjunct
+    else {
+        return None;
+    };
+    if field_path.contains('.') || matches!(op, CompareOp::Ne) {
+        return None;
+    }
+    if !db.is_field_indexed(type_name, field_path) {
+        return None;
+    }
+    use rhypedb_schema::ScalarType as ST;
+    let st = field_scalar_type(db, type_name, field_path)?;
+    let hits_index = match (&st, value) {
+        // Integer fields: the literal must fit the declared width, or
+        // `filter_scan` takes its out-of-range fallback (a full scan).
+        (ST::U32, Literal::Int(i)) => (0..=u32::MAX as i64).contains(i),
+        (ST::U64, Literal::Int(i)) => *i >= 0,
+        (ST::I32, Literal::Int(i)) => (i32::MIN as i64..=i32::MAX as i64).contains(i),
+        (ST::I64, Literal::Int(_)) => true,
+        // DateTime shares the i64 ordered encoding; an int literal IS millis and
+        // an RFC 3339 string is coerced to millis by `try_filter_scan`.
+        (ST::DateTime, Literal::Int(_) | Literal::String(_)) => true,
+        (ST::String, Literal::String(_)) => true,
+        (ST::Bool, Literal::Bool(_)) => true,
+        // Float ranges are sound supersets; float Eq is excluded (see doc above).
+        (ST::F32 | ST::F64, Literal::Float(_)) => !matches!(op, CompareOp::Eq),
+        _ => false,
+    };
+    if !hits_index {
+        return None;
+    }
+    // Selectivity heuristic (no statistics yet): equality is usually the most
+    // selective, EXCEPT on a 2-valued `Bool` — rank that LAST so a sibling range
+    // or higher-cardinality equality is preferred when both are available. (Only
+    // a heuristic for *which* indexed conjunct to push; every choice is a correct
+    // superset, so this never affects results.)
+    let rank = match (op, &st) {
+        (CompareOp::Eq, ST::Bool) => 2,
+        (CompareOp::Eq, _) => 0,
+        _ => 1, // ranges Lt/Le/Gt/Ge (Ne already excluded above)
+    };
+    Some((rank, conjunct))
 }
 
 /// If the query's first step is `.limit(N)`, return `Some(N)` so the filter
@@ -2538,5 +2699,316 @@ mod tests {
             }
             _ => panic!("expected Objects"),
         }
+    }
+
+    // ===== Query plan picker (AND-conjunct index pushdown) =====
+    //
+    // The planner must be behavior-preserving: every query returns exactly the
+    // rows (and, for the AND path, the object-id order) that
+    // `scan_all_objects + evaluate_predicate` would. These tests compare the
+    // live `execute` path against an independent full-scan oracle across many
+    // predicate shapes — including the counterexamples the design review raised:
+    // value-order vs id-order under `.limit`, non-selective indexed conjuncts
+    // past the probe cap, absent/null fields, and `Ne` residuals.
+
+    fn planner_db(dir: &std::path::Path) -> std::sync::Arc<Database> {
+        let schema = parse_schema(
+            r#"
+            type Person {
+                name: String
+                age: u32 @indexed
+                score: f64 @indexed
+                active: Bool @indexed
+                country: String @indexed
+                nick: String
+                rank: i64
+            }
+            "#,
+        )
+        .unwrap();
+        Database::open(schema, dir).unwrap()
+    }
+
+    /// Insert a Person. `country`/`nick` = `None` omits the field entirely
+    /// (absent), exercising the null/absent comparison semantics. Returns its id.
+    #[allow(clippy::too_many_arguments)]
+    fn person(
+        db: &Database,
+        name: &str,
+        age: u32,
+        score: f64,
+        active: bool,
+        country: Option<&str>,
+        nick: Option<&str>,
+        rank: i64,
+    ) -> u64 {
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String(name.into()));
+        f.insert("age".into(), Value::U32(age));
+        f.insert("score".into(), Value::F64(score));
+        f.insert("active".into(), Value::Bool(active));
+        if let Some(c) = country {
+            f.insert("country".into(), Value::String(c.into()));
+        }
+        if let Some(n) = nick {
+            f.insert("nick".into(), Value::String(n.into()));
+        }
+        f.insert("rank".into(), Value::I64(rank));
+        db.create("Person", f).unwrap().id
+    }
+
+    fn seed_people(db: &Database) {
+        // Insertion (= id) order deliberately DIFFERS from age order, so an
+        // index (value-ordered) scan that forgot to restore id order would be
+        // caught by the `.limit` parity test below.
+        // name, age, score, active, country,    nick,     rank
+        person(db, "Ann", 50, 1.5, true, Some("US"), Some("a"), 10);
+        person(db, "Bob", 20, 2.5, true, Some("US"), None, 20);
+        person(db, "Cy", 60, 3.5, true, Some("CA"), Some("c"), 30);
+        person(db, "Dee", 30, 4.5, true, Some("US"), Some("d"), 40);
+        person(db, "Eve", 70, 5.5, false, Some("CA"), None, 50);
+        person(db, "Fay", 30, 2.5, true, None, Some("f"), 60); // country absent
+        person(db, "Gus", 40, 9.9, false, Some("UK"), Some("g"), 70);
+        person(db, "Hal", 20, 1.5, true, Some("US"), Some("h"), 80);
+    }
+
+    /// Full-scan oracle: ids (ascending) where `evaluate_predicate` holds —
+    /// exactly the baseline the planner must reproduce.
+    fn oracle_ids(db: &Database, predicate: &Predicate) -> Vec<u64> {
+        let mut all = scan_all_objects(db, "Person").unwrap();
+        for o in &mut all {
+            o.ensure_fields_deserialized();
+        }
+        let mut ids: Vec<u64> = all
+            .into_iter()
+            .filter(|o| evaluate_predicate(predicate, &o.fields))
+            .map(|o| o.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn predicate_of(filter_query: &str) -> Predicate {
+        match parse_query(filter_query).unwrap().source {
+            Source::Filter { predicate, .. } => predicate,
+            other => panic!("expected a filter source, got {other:?}"),
+        }
+    }
+
+    fn exec_ids(ctx: &ExecContext<'_>, query: &str) -> Vec<u64> {
+        match execute(ctx, &parse_query(query).unwrap()).unwrap() {
+            QueryOutput::Objects(objs) => objs.into_iter().map(|o| o.id).collect(),
+            other => panic!("expected Objects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn planner_result_set_parity_across_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+        seed_people(&db);
+        let ctx = ExecContext::new(&db, None);
+
+        let queries = [
+            r#"Person.filter(.age > 25)"#,
+            r#"Person.filter(.country == "US")"#,
+            r#"Person.filter(.age > 25 && .country == "US")"#,
+            r#"Person.filter(.country == "US" && .age > 25)"#,
+            r#"Person.filter(.active == true && .age >= 30)"#,
+            r#"Person.filter(.age >= 20 && .age <= 40)"#,
+            r#"Person.filter(.country == "US" && .nick == "h")"#, // 2nd term non-indexed
+            r#"Person.filter(.age > 25 && .rank < 45)"#,          // 2nd term non-indexed
+            r#"Person.filter(.age > 100 && .country == "US")"#,   // empty result
+            r#"Person.filter(.age != 20 && .country == "US")"#,   // Ne residual
+            r#"Person.filter(.score > 2.0 && .active == true)"#,
+            r#"Person.filter(.country == "US" || .country == "CA")"#, // OR → full scan
+            r#"Person.filter(.age > 25 && (.country == "US" || .country == "CA"))"#, // nested OR
+            r#"Person.filter(.age > 25 && .country == "US" && .active == true)"#, // 3-way AND
+            r#"Person.filter(.nick == "a" && .rank > 5)"#, // no indexed term → full scan
+        ];
+        for q in queries {
+            let want = oracle_ids(&db, &predicate_of(q));
+            let mut got = exec_ids(&ctx, q);
+            got.sort_unstable();
+            assert_eq!(got, want, "set parity failed for `{q}`");
+        }
+    }
+
+    #[test]
+    fn planner_and_path_preserves_id_order_and_limit() {
+        // Design-review counterexample: the AND path pushes a RANGE conjunct on
+        // an @indexed field, whose index scan yields rows in value (age) order,
+        // NOT id order. The planner must restore id order so `.limit(N)` returns
+        // the same rows the full-scan baseline would.
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+        seed_people(&db);
+        let ctx = ExecContext::new(&db, None);
+
+        // `.rank < 1000` is true for everyone and is NON-indexed, so the only
+        // generator is the @indexed RANGE `.age > 18` — forcing value-order.
+        let base = r#"Person.filter(.age > 18 && .rank < 1000)"#;
+        let pred = predicate_of(base);
+        assert!(
+            plan_filter_scan(&db, "Person", &pred, None)
+                .unwrap()
+                .is_some(),
+            "planner should engage by pushing the @indexed range conjunct"
+        );
+
+        let want = oracle_ids(&db, &pred); // id-ascending
+        assert_eq!(exec_ids(&ctx, base), want, "unbounded AND must be id-order");
+        for k in 0..=want.len() + 1 {
+            let got = exec_ids(&ctx, &format!("{base}.limit({k})"));
+            let expect: Vec<u64> = want.iter().copied().take(k).collect();
+            assert_eq!(got, expect, "limit({k}) parity failed");
+        }
+    }
+
+    #[test]
+    fn planner_null_and_ne_residual_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+        seed_people(&db); // Fay has country absent
+        let ctx = ExecContext::new(&db, None);
+
+        for q in [
+            r#"Person.filter(.age > 25 && .country != "US")"#, // absent country excluded by Ne
+            r#"Person.filter(.country != "CA" && .age > 25)"#,
+            r#"Person.filter(.age >= 30 && .country == "US")"#,
+        ] {
+            let want = oracle_ids(&db, &predicate_of(q));
+            let mut got = exec_ids(&ctx, q);
+            got.sort_unstable();
+            assert_eq!(got, want, "null/Ne parity failed for `{q}`");
+        }
+    }
+
+    #[test]
+    fn planner_engages_or_falls_back_appropriately() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+        seed_people(&db);
+        let engages = |q: &str| {
+            plan_filter_scan(&db, "Person", &predicate_of(q), None)
+                .unwrap()
+                .is_some()
+        };
+
+        // Engages: AND with a selective @indexed conjunct (Eq or range).
+        assert!(engages(r#"Person.filter(.country == "US" && .rank < 50)"#));
+        assert!(engages(r#"Person.filter(.age > 18 && .nick == "a")"#));
+        // Single Compare → existing fast path (delegated), still Some.
+        assert!(engages(r#"Person.filter(.age > 18)"#));
+        // Falls back (Ok(None) → full scan): top-level OR.
+        assert!(!engages(r#"Person.filter(.country == "US" || .age > 10)"#));
+        // Falls back: no @indexed conjunct at all.
+        assert!(!engages(r#"Person.filter(.nick == "a" && .rank > 5)"#));
+        // Falls back: the only @indexed conjunct is `Ne` (excluded as generator).
+        assert!(!engages(r#"Person.filter(.age != 20 && .nick == "x")"#));
+
+        // Selectivity ranking: string Eq (0) < range (1) < bool Eq (2).
+        let rank = |q: &str| {
+            conjunct_index_generator(&db, "Person", &predicate_of(q))
+                .unwrap()
+                .0
+        };
+        let country_eq = rank(r#"Person.filter(.country == "US")"#);
+        let age_range = rank(r#"Person.filter(.age > 18)"#);
+        let active_eq = rank(r#"Person.filter(.active == true)"#);
+        assert!(
+            country_eq < age_range && age_range < active_eq,
+            "expected string Eq < range < bool Eq, got {country_eq}/{age_range}/{active_eq}"
+        );
+    }
+
+    #[test]
+    fn planner_correct_across_index_tombstone_run() {
+        // Regression for the bounded-probe blocker: a *bounded* index scan counts
+        // tombstones against its row budget, so a long tombstone run at an indexed
+        // value could make the AND-path probe under-return live rows and silently
+        // drop results. The planner now scans the generator UNBOUNDED, which is
+        // tombstone-sound. Build a tombstone run larger than any plausible probe
+        // cap, then query a range that spans it plus a non-indexed residual.
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+
+        // Insert many age==1 rows, then delete them all → a long run of index
+        // tombstones at `i:Person:age:<1>:` (which sorts first in the keyspace).
+        let bulk = 9000usize;
+        let low: Vec<FieldMap> = (0..bulk)
+            .map(|_| {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String("low".into()));
+                f.insert("age".into(), Value::U32(1));
+                f.insert("score".into(), Value::F64(1.0));
+                f.insert("active".into(), Value::Bool(true));
+                f.insert("rank".into(), Value::I64(0));
+                f
+            })
+            .collect();
+        for o in db.create_batch("Person", low).unwrap() {
+            db.delete("Person", o.id).unwrap();
+        }
+        // Live rows at age==1000, sorting AFTER the age==1 tombstone run.
+        let n_live = 200usize;
+        let high: Vec<FieldMap> = (0..n_live)
+            .map(|i| {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String("high".into()));
+                f.insert("age".into(), Value::U32(1000));
+                f.insert("score".into(), Value::F64(1.0));
+                f.insert("active".into(), Value::Bool(true));
+                f.insert("rank".into(), Value::I64(i as i64));
+                f
+            })
+            .collect();
+        db.create_batch("Person", high).unwrap();
+        let ctx = ExecContext::new(&db, None);
+
+        // Generator is the @indexed range `age >= 1`; its scan must not be
+        // truncated by the age==1 tombstone run. `rank >= 0` is a non-indexed
+        // residual so the AND path (not the single-Compare path) is exercised.
+        let q = r#"Person.filter(.age >= 1 && .rank >= 0)"#;
+        let pred = predicate_of(q);
+        assert!(
+            plan_filter_scan(&db, "Person", &pred, None)
+                .unwrap()
+                .is_some(),
+            "planner should engage by pushing the @indexed range"
+        );
+        let want = oracle_ids(&db, &pred);
+        assert_eq!(want.len(), n_live, "only the live age==1000 rows match");
+        let mut got = exec_ids(&ctx, q);
+        got.sort_unstable();
+        assert_eq!(got, want, "tombstone-run parity failed (under-returned)");
+    }
+
+    #[test]
+    fn planner_float_eq_residual_matches_negative_zero() {
+        // `compare_values` treats -0.0 == 0.0, but the float index key for -0.0
+        // differs from +0.0 — so float Eq must NOT be an index generator (it would
+        // miss a stored -0.0). The planner pushes the @indexed range `age > 10`
+        // instead and catches the -0.0 row in the in-memory residual filter.
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+        let id_neg = person(&db, "Neg", 20, -0.0, true, Some("US"), None, 1);
+        person(&db, "Pos", 20, 1.0, true, Some("US"), None, 2);
+        let ctx = ExecContext::new(&db, None);
+
+        // Float Eq must not qualify as an index generator (would miss -0.0).
+        let score_eq = predicate_of(r#"Person.filter(.score == 0.0)"#);
+        assert!(
+            conjunct_index_generator(&db, "Person", &score_eq).is_none(),
+            "float Eq must not be an index generator"
+        );
+
+        let q = r#"Person.filter(.score == 0.0 && .age > 10)"#;
+        let pred = predicate_of(q);
+        let want = oracle_ids(&db, &pred);
+        assert_eq!(want, vec![id_neg], "only the -0.0 row matches score == 0.0");
+        let mut got = exec_ids(&ctx, q);
+        got.sort_unstable();
+        assert_eq!(got, want, "float Eq / -0.0 parity failed");
     }
 }
