@@ -4168,6 +4168,20 @@ impl Database {
     /// of a traversal, a missing target is "the edge pointed to a deleted
     /// object" and should drop silently, not abort the whole query.
     pub fn get_many(&self, type_name: &str, ids: &[u64]) -> EngineResult<Vec<Object>> {
+        self.get_many_at(self.storage.read_snapshot(), type_name, ids)
+    }
+
+    /// [`get_many`](Self::get_many) reading at a CALLER-supplied snapshot. Used
+    /// by the `filter_scan_*_at` legacy non-covering fallback so the per-id
+    /// materialization shares the scan's snapshot — keeping a planner
+    /// intersection / union a single point-in-time view even on pre-covering
+    /// index data.
+    pub fn get_many_at(
+        &self,
+        snapshot: u64,
+        type_name: &str,
+        ids: &[u64],
+    ) -> EngineResult<Vec<Object>> {
         let type_id = self.resolve_type_id(type_name)?;
 
         // Sort + dedup. Streaming traversal already dedups across hops;
@@ -4183,7 +4197,6 @@ impl Database {
             .collect();
         let key_refs: Vec<&[u8]> = key_bufs.iter().map(|k| k.as_ref()).collect();
 
-        let snapshot = self.storage.read_snapshot();
         let values = self.storage.multi_get_at(snapshot, &key_refs)?;
 
         // Public API: return Objects with `fields` populated. Callers that
@@ -4456,6 +4469,82 @@ impl Database {
             .is_some_and(|fields| fields.iter().any(|f| f.name == field_name))
     }
 
+    /// A read snapshot handle (MVCC version) for the current committed state.
+    /// Pass it to the `*_at` read methods so a sequence of reads observes ONE
+    /// point-in-time view — e.g. the query planner pins one per filter and
+    /// threads it through every scan in a multi-index intersection / union.
+    pub fn read_snapshot(&self) -> u64 {
+        self.storage.read_snapshot()
+    }
+
+    /// True if `type_name.field_name` carries a `@unique` constraint — i.e. an
+    /// exact `field == value` lookup can be served by [`find_by_unique`](Self::find_by_unique)
+    /// (a single `u:` point read yielding ≤1 object) rather than an index/zone
+    /// scan. Reads the schema, the same source the `u:` writer consults.
+    pub fn is_field_unique(&self, type_name: &str, field_name: &str) -> bool {
+        self.schema
+            .get_type(type_name)
+            .and_then(|td| td.get_field(field_name))
+            .is_some_and(|fd| fd.is_unique())
+    }
+
+    /// Exact lookup of the one object whose `@unique` `field_name` equals
+    /// `value`, or `None` when no row has that value (or the field isn't unique
+    /// / doesn't exist). See [`find_by_unique_at`](Self::find_by_unique_at).
+    pub fn find_by_unique(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        value: &Value,
+    ) -> EngineResult<Option<Object>> {
+        self.find_by_unique_at(self.storage.read_snapshot(), type_name, field_name, value)
+    }
+
+    /// [`find_by_unique`](Self::find_by_unique) at a CALLER-supplied snapshot, so
+    /// a planner OR-union mixing a unique probe with index scans reads them all
+    /// at one point-in-time. Reads the `u:<type>:<field>:<value>` entry for the
+    /// object id, then the object — both under the SAME snapshot. Shadow/retired
+    /// fields are stripped as on any other read.
+    ///
+    /// The query planner uses this as its most selective access path: an
+    /// equality on a unique field yields at most one candidate.
+    pub fn find_by_unique_at(
+        &self,
+        snapshot: u64,
+        type_name: &str,
+        field_name: &str,
+        value: &Value,
+    ) -> EngineResult<Option<Object>> {
+        let type_id = self.resolve_type_id(type_name)?;
+        let field_key = format!("{type_name}.{field_name}");
+        let Some(&field_id) = self.field_ids.get(&field_key) else {
+            return Ok(None);
+        };
+        let value_bytes = value_to_index_bytes(value);
+        let unique_key = KeyBuilder::unique_index(type_id, field_id, &value_bytes);
+        let Some(id_bytes) = self.storage.get_at(snapshot, &unique_key)? else {
+            return Ok(None);
+        };
+        if id_bytes.len() < 8 {
+            return Ok(None);
+        }
+        let object_id = u64::from_be_bytes(id_bytes[..8].try_into().unwrap());
+        let obj_key = KeyBuilder::object(type_id, object_id);
+        let Some(data) = self.storage.get_at(snapshot, &obj_key)? else {
+            // Dangling `u:` entry (object gone) — can't happen within one
+            // snapshot since both are written atomically, but stay defensive.
+            return Ok(None);
+        };
+        let mut fields = deserialize_fields(&data);
+        self.strip_tombstoned_fields(type_name, &mut fields);
+        Ok(Some(Object {
+            type_name: type_name.into(),
+            id: object_id,
+            fields,
+            raw_fields: None,
+        }))
+    }
+
     /// Filtered scan: pushes a single-field integer comparison down to storage.
     ///
     /// Two fast paths are layered:
@@ -4482,6 +4571,31 @@ impl Database {
     /// `scan_type` for non-integer field types.
     pub fn filter_scan(
         &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: i64,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        self.filter_scan_at(
+            self.storage.read_snapshot(),
+            type_name,
+            field_name,
+            op,
+            target,
+            limit,
+        )
+    }
+
+    /// [`filter_scan`](Self::filter_scan) reading at a CALLER-supplied snapshot
+    /// instead of taking its own. The query planner pins one snapshot per filter
+    /// and threads it through every scan in a multi-index intersection / union,
+    /// so the combined result is a single point-in-time view (rather than a blend
+    /// of several snapshots).
+    #[allow(clippy::too_many_arguments)]
+    pub fn filter_scan_at(
+        &self,
+        snapshot: u64,
         type_name: &str,
         field_name: &str,
         op: rhypedb_storage::zone::CompareOp,
@@ -4527,7 +4641,7 @@ impl Database {
             // (and empty for non-numeric fields) instead of returning the whole
             // table.
             _ => {
-                return self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+                return self.filter_scan_fallback(snapshot, type_name, field_name, limit, |v| match v {
                     Value::U32(n) => Some(compare_partial(*n as i128, op, target as i128)),
                     Value::U64(n) => Some(compare_partial(*n as i128, op, target as i128)),
                     Value::I32(n) => Some(compare_partial(*n as i128, op, target as i128)),
@@ -4552,6 +4666,7 @@ impl Database {
             && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
         {
             return self.filter_scan_via_index(
+                snapshot,
                 type_name,
                 type_id,
                 ifd.field_id,
@@ -4583,7 +4698,6 @@ impl Database {
         };
 
         let prefix = KeyBuilder::object_prefix(type_id);
-        let snapshot = self.storage.read_snapshot();
         let entries = self
             .storage
             .scan_prefix_filtered_at(snapshot, &prefix, &predicate)?;
@@ -4658,8 +4772,10 @@ impl Database {
     /// reads. Entries with empty values (legacy / non-covering) fall back to
     /// the historical id-collect + `get_many` path so older databases stay
     /// readable.
+    #[allow(clippy::too_many_arguments)]
     fn filter_scan_via_index(
         &self,
+        snapshot: u64,
         type_name: &str,
         type_id: u64,
         field_id: u64,
@@ -4669,7 +4785,6 @@ impl Database {
     ) -> EngineResult<Vec<Object>> {
         use rhypedb_storage::zone::CompareOp;
 
-        let snapshot = self.storage.read_snapshot();
         let cap = limit.unwrap_or(usize::MAX);
         let target_u64 = u64::from_be_bytes(*target_bytes);
 
@@ -4706,7 +4821,7 @@ impl Database {
                 }
             }
             if !fallback_ids.is_empty() {
-                out.extend(self.get_many(type_name, &fallback_ids)?);
+                out.extend(self.get_many_at(snapshot, type_name, &fallback_ids)?);
             }
             return Ok(out);
         }
@@ -4783,7 +4898,7 @@ impl Database {
         }
 
         if !fallback_ids.is_empty() {
-            out.extend(self.get_many(type_name, &fallback_ids)?);
+            out.extend(self.get_many_at(snapshot, type_name, &fallback_ids)?);
         }
         Ok(out)
     }
@@ -4793,6 +4908,28 @@ impl Database {
     /// comparison.
     pub fn filter_scan_bool(
         &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: bool,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        self.filter_scan_bool_at(
+            self.storage.read_snapshot(),
+            type_name,
+            field_name,
+            op,
+            target,
+            limit,
+        )
+    }
+
+    /// [`filter_scan_bool`](Self::filter_scan_bool) at a caller-supplied
+    /// snapshot. See [`filter_scan_at`](Self::filter_scan_at).
+    #[allow(clippy::too_many_arguments)]
+    pub fn filter_scan_bool_at(
+        &self,
+        snapshot: u64,
         type_name: &str,
         field_name: &str,
         op: rhypedb_storage::zone::CompareOp,
@@ -4821,6 +4958,7 @@ impl Database {
         {
             let encoded = encode_bool_for_index(&Value::Bool(target)).unwrap();
             return self.filter_scan_via_index(
+                snapshot,
                 type_name,
                 type_id,
                 ifd.field_id,
@@ -4829,7 +4967,7 @@ impl Database {
                 limit,
             );
         }
-        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+        self.filter_scan_fallback(snapshot, type_name, field_name, limit, |v| match v {
             Value::Bool(b) => Some(compare_bool(*b, op, target)),
             _ => Some(false),
         })
@@ -4840,6 +4978,28 @@ impl Database {
     /// (`f32` values widen on write).
     pub fn filter_scan_float(
         &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: f64,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        self.filter_scan_float_at(
+            self.storage.read_snapshot(),
+            type_name,
+            field_name,
+            op,
+            target,
+            limit,
+        )
+    }
+
+    /// [`filter_scan_float`](Self::filter_scan_float) at a caller-supplied
+    /// snapshot. See [`filter_scan_at`](Self::filter_scan_at).
+    #[allow(clippy::too_many_arguments)]
+    pub fn filter_scan_float_at(
+        &self,
+        snapshot: u64,
         type_name: &str,
         field_name: &str,
         op: rhypedb_storage::zone::CompareOp,
@@ -4871,6 +5031,7 @@ impl Database {
         {
             let encoded = encode_f64_for_index(target);
             return self.filter_scan_via_index(
+                snapshot,
                 type_name,
                 type_id,
                 ifd.field_id,
@@ -4883,7 +5044,7 @@ impl Database {
         // target, so an int field compared to a float literal filters
         // correctly. Non-numeric fields never match — an empty result, not the
         // whole table.
-        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+        self.filter_scan_fallback(snapshot, type_name, field_name, limit, |v| match v {
             Value::F64(f) => Some(compare_partial(*f, op, target)),
             Value::F32(f) => Some(compare_partial(*f as f64, op, target)),
             Value::U32(n) => Some(compare_partial(*n as f64, op, target)),
@@ -4921,11 +5082,13 @@ impl Database {
                 })
         })?;
 
+        let snapshot = self.storage.read_snapshot();
         if let Some(idx_fields) = self.indexed_fields.get(type_name)
             && let Some(ifd) = idx_fields.iter().find(|f| f.name == field_name)
             && ifd.kind == IndexedKind::Bytes
         {
             return self.filter_scan_via_index_var(
+                snapshot,
                 type_name,
                 type_id,
                 ifd.field_id,
@@ -4934,7 +5097,7 @@ impl Database {
                 limit,
             );
         }
-        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+        self.filter_scan_fallback(snapshot, type_name, field_name, limit, |v| match v {
             Value::Bytes(b) => Some(compare_ord(b.as_ref(), op, target)),
             _ => Some(false),
         })
@@ -4951,6 +5114,28 @@ impl Database {
     /// acceleration today, so the non-indexed path is a full scan.
     pub fn filter_scan_str(
         &self,
+        type_name: &str,
+        field_name: &str,
+        op: rhypedb_storage::zone::CompareOp,
+        target: &str,
+        limit: Option<usize>,
+    ) -> EngineResult<Vec<Object>> {
+        self.filter_scan_str_at(
+            self.storage.read_snapshot(),
+            type_name,
+            field_name,
+            op,
+            target,
+            limit,
+        )
+    }
+
+    /// [`filter_scan_str`](Self::filter_scan_str) at a caller-supplied snapshot.
+    /// See [`filter_scan_at`](Self::filter_scan_at).
+    #[allow(clippy::too_many_arguments)]
+    pub fn filter_scan_str_at(
+        &self,
+        snapshot: u64,
         type_name: &str,
         field_name: &str,
         op: rhypedb_storage::zone::CompareOp,
@@ -4979,6 +5164,7 @@ impl Database {
             && ifd.kind == IndexedKind::String
         {
             return self.filter_scan_via_index_var(
+                snapshot,
                 type_name,
                 type_id,
                 ifd.field_id,
@@ -4989,7 +5175,7 @@ impl Database {
         }
 
         // === Non-indexed fallback: full type scan, post-filter ===
-        self.filter_scan_fallback(type_name, field_name, limit, |v| match v {
+        self.filter_scan_fallback(snapshot, type_name, field_name, limit, |v| match v {
             Value::String(s) => Some(compare_ord(s.as_str(), op, target)),
             _ => Some(false),
         })
@@ -5010,6 +5196,7 @@ impl Database {
     /// the post-strip value the old `scan_type` path saw.
     fn filter_scan_fallback<F>(
         &self,
+        snapshot: u64,
         type_name: &str,
         field_name: &str,
         limit: Option<usize>,
@@ -5020,7 +5207,6 @@ impl Database {
     {
         let type_id = self.resolve_type_id(type_name)?;
         let prefix = KeyBuilder::object_prefix(type_id);
-        let snapshot = self.storage.read_snapshot();
         let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
 
         let cap = limit.unwrap_or(usize::MAX);
@@ -5063,8 +5249,10 @@ impl Database {
     /// prefix and compare encoded value bytes (which preserve sort order).
     /// Covering payload semantics match the fixed-width variant — empty
     /// value falls back to per-id `get_many` for legacy entries.
+    #[allow(clippy::too_many_arguments)]
     fn filter_scan_via_index_var(
         &self,
+        snapshot: u64,
         type_name: &str,
         type_id: u64,
         field_id: u64,
@@ -5074,7 +5262,6 @@ impl Database {
     ) -> EngineResult<Vec<Object>> {
         use rhypedb_storage::zone::CompareOp;
 
-        let snapshot = self.storage.read_snapshot();
         let cap = limit.unwrap_or(usize::MAX);
 
         // === Eq fast path — narrow value-prefix scan ===
@@ -5111,7 +5298,7 @@ impl Database {
                 }
             }
             if !fallback_ids.is_empty() {
-                out.extend(self.get_many(type_name, &fallback_ids)?);
+                out.extend(self.get_many_at(snapshot, type_name, &fallback_ids)?);
             }
             return Ok(out);
         }
@@ -5183,7 +5370,7 @@ impl Database {
         }
 
         if !fallback_ids.is_empty() {
-            out.extend(self.get_many(type_name, &fallback_ids)?);
+            out.extend(self.get_many_at(snapshot, type_name, &fallback_ids)?);
         }
         Ok(out)
     }
@@ -14907,6 +15094,42 @@ mod tests {
         f2.insert("name".into(), Value::String("Bob".into()));
         f2.insert("email".into(), Value::String("bob@example.com".into()));
         db.create("User", f2).unwrap(); // should succeed
+    }
+
+    #[test]
+    fn find_by_unique_returns_matching_object_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        f.insert("email".into(), Value::String("alice@example.com".into()));
+        let alice = db.create("User", f).unwrap();
+
+        // Hit: the unique email resolves to exactly Alice.
+        let got = db
+            .find_by_unique("User", "email", &Value::String("alice@example.com".into()))
+            .unwrap();
+        assert_eq!(got.map(|o| o.id), Some(alice.id));
+
+        // Miss: no row with that email.
+        assert!(
+            db.find_by_unique("User", "email", &Value::String("nobody@example.com".into()))
+                .unwrap()
+                .is_none()
+        );
+
+        // After delete, the unique lookup no longer finds it.
+        db.delete("User", alice.id).unwrap();
+        assert!(
+            db.find_by_unique("User", "email", &Value::String("alice@example.com".into()))
+                .unwrap()
+                .is_none()
+        );
+
+        // is_field_unique reflects the schema.
+        assert!(db.is_field_unique("User", "email"));
+        assert!(!db.is_field_unique("User", "name"));
     }
 
     #[test]

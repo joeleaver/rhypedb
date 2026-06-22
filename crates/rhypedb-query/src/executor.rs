@@ -1140,6 +1140,7 @@ fn scan_all_objects(db: &Database, type_name: &str) -> QueryResult<Vec<Object>> 
 /// extracted from a trailing `.limit(N)` step). Best-effort.
 fn try_filter_scan(
     db: &Database,
+    snapshot: u64,
     type_name: &str,
     predicate: &Predicate,
     limit: Option<usize>,
@@ -1190,8 +1191,8 @@ fn try_filter_scan(
                     }
                     _ => return Ok(None),
                 };
-                return Ok(Some(db.filter_scan(
-                    type_name, field_path, storage_op, millis, limit,
+                return Ok(Some(db.filter_scan_at(
+                    snapshot, type_name, field_path, storage_op, millis, limit,
                 )?));
             }
             _ => {}
@@ -1202,17 +1203,17 @@ fn try_filter_scan(
     // form yet (no Bytes literal at the parser level) — engine API users
     // call `Database::filter_scan_bytes` directly.
     match value {
-        Literal::Int(i) => Ok(Some(db.filter_scan(
-            type_name, field_path, storage_op, *i, limit,
+        Literal::Int(i) => Ok(Some(db.filter_scan_at(
+            snapshot, type_name, field_path, storage_op, *i, limit,
         )?)),
-        Literal::String(s) => Ok(Some(db.filter_scan_str(
-            type_name, field_path, storage_op, s, limit,
+        Literal::String(s) => Ok(Some(db.filter_scan_str_at(
+            snapshot, type_name, field_path, storage_op, s, limit,
         )?)),
-        Literal::Bool(b) => Ok(Some(db.filter_scan_bool(
-            type_name, field_path, storage_op, *b, limit,
+        Literal::Bool(b) => Ok(Some(db.filter_scan_bool_at(
+            snapshot, type_name, field_path, storage_op, *b, limit,
         )?)),
-        Literal::Float(f) => Ok(Some(db.filter_scan_float(
-            type_name, field_path, storage_op, *f, limit,
+        Literal::Float(f) => Ok(Some(db.filter_scan_float_at(
+            snapshot, type_name, field_path, storage_op, *f, limit,
         )?)),
         // A raw JSON container literal has no typed pushdown; the full scan +
         // `compare_values` handles it. (DateTime fields were already pushed
@@ -1223,42 +1224,107 @@ fn try_filter_scan(
     }
 }
 
-/// Rule-based access-path picker for a `Source::Filter`. Returns:
-///   * `Ok(Some(objects))` — served from a secondary index: either a single
-///     `Compare` pushdown (today's fast path, unchanged) or a top-level AND's
-///     most-selective indexed conjunct pushed down with an in-memory residual
-///     filter for the rest of the predicate.
-///   * `Ok(None)` — no profitable index path; the caller does the full scan.
+/// Rule-based access-path picker for a `Source::Filter`. Returns
+/// `Ok(Some(objects))` when the filter can be served from a secondary / unique
+/// index, or `Ok(None)` when the caller should do a full scan.
 ///
-/// Behavior-preserving by construction: the returned set always equals
-/// `scan_all_objects + evaluate_predicate(full predicate)`. The AND path also
-/// restores object-id order, so a trailing `.limit`/`.offset` selects exactly
-/// the rows the full-scan baseline would.
+/// Strategies, most selective first:
+///   * **single `Compare`** — a `@unique` equality is a ≤1-row `u:` point lookup;
+///     otherwise the existing index/zone pushdown (`try_filter_scan`).
+///   * **top-level `AND`** — a `@unique`-equality conjunct (≤1 row) > intersection
+///     of two `@indexed` equality conjuncts > the single most-selective `@indexed`
+///     conjunct; the FULL predicate is then re-filtered in memory.
+///   * **top-level `OR`** — when EVERY disjunct is index-eligible, the union of
+///     each disjunct's matches (else a full scan).
+///
+/// Behavior-preserving by construction: every materialized branch produces a
+/// SUPERSET of the result, re-filters by the full predicate, and restores
+/// object-id order — so the output equals `scan_all_objects + evaluate_predicate`,
+/// incl. a trailing `.limit`/`.offset`. One snapshot is pinned for the whole
+/// filter, so a multi-scan intersection / union is a single point-in-time view.
 fn plan_filter_scan(
     db: &Database,
     type_name: &str,
     predicate: &Predicate,
     pushed_limit: Option<usize>,
 ) -> QueryResult<Option<Vec<Object>>> {
-    // A single comparison IS today's fast path — delegate unchanged so the
-    // existing limit-pushdown (and its value-ordered result) is preserved.
+    // Pin ONE snapshot: every scan/probe below reads at the same point-in-time,
+    // so an intersection / union can't blend several committed states.
+    let snapshot = db.read_snapshot();
+
+    // A single comparison: a @unique equality is the most selective path (≤1
+    // row); otherwise the existing index/zone fast path (limit preserved).
     if matches!(predicate, Predicate::Compare { .. }) {
-        return try_filter_scan(db, type_name, predicate, pushed_limit);
+        if let Some(objs) = unique_eq_probe(db, snapshot, type_name, predicate)? {
+            return Ok(Some(refilter_and_sort(predicate, objs)));
+        }
+        return try_filter_scan(db, snapshot, type_name, predicate, pushed_limit);
     }
 
-    // Only a top-level AND can be narrowed by a single conjunct: every conjunct
-    // is a NECESSARY condition, so any one of them yields a SUPERSET of the
-    // result that we can re-filter exactly. A top-level OR (or any non-AND
-    // shape) has no such conjunct → full scan. (`And` always flattens to ≥ 2
-    // conjuncts; a top-level `Or` flattens to 1, so this guard catches it.)
-    let mut conjuncts: Vec<&Predicate> = Vec::new();
-    flatten_and(predicate, &mut conjuncts);
-    if conjuncts.len() < 2 {
-        return Ok(None);
+    // Dispatch on the predicate ROOT so the OR path isn't swallowed by the AND
+    // flatten (and vice-versa).
+    match predicate {
+        Predicate::And(..) => {
+            let mut conjuncts: Vec<&Predicate> = Vec::new();
+            flatten_and(predicate, &mut conjuncts);
+            plan_and(db, snapshot, type_name, predicate, &conjuncts)
+        }
+        Predicate::Or(..) => {
+            let mut disjuncts: Vec<&Predicate> = Vec::new();
+            flatten_or(predicate, &mut disjuncts);
+            plan_or_union(db, snapshot, type_name, predicate, &disjuncts)
+        }
+        // `Compare` is handled above; no other predicate shapes exist.
+        Predicate::Compare { .. } => Ok(None),
+    }
+}
+
+/// Plan a top-level `AND` (its flattened `conjuncts`). Priority: a `@unique`
+/// equality conjunct (≤1 candidate) > an intersection of two `@indexed` equality
+/// conjuncts > the single most-selective `@indexed` conjunct. Each conjunct is a
+/// NECESSARY condition, so any one (or the intersection) yields a SUPERSET of the
+/// result that the full re-filter narrows exactly.
+fn plan_and(
+    db: &Database,
+    snapshot: u64,
+    type_name: &str,
+    predicate: &Predicate,
+    conjuncts: &[&Predicate],
+) -> QueryResult<Option<Vec<Object>>> {
+    // 1) A @unique-equality conjunct yields ≤1 candidate — unbeatable.
+    for c in conjuncts {
+        if let Some(objs) = unique_eq_probe(db, snapshot, type_name, c)? {
+            return Ok(Some(refilter_and_sort(predicate, objs)));
+        }
     }
 
-    // Pick the most-selective conjunct that drives a REAL secondary-index scan
-    // (Eq before range). If none qualifies, leave it to the full scan.
+    // 2) Intersection of the first two @indexed EQUALITY conjuncts (rank 0:
+    //    non-Bool, non-float Eq). Each Eq scan is a narrow per-value range, so
+    //    intersecting two is cheap and yields a much smaller candidate set than
+    //    pushing one. Bool/range conjuncts stay residual — poor narrowing terms,
+    //    still enforced by the re-filter.
+    let eq_generators: Vec<&Predicate> = conjuncts
+        .iter()
+        .copied()
+        .filter(|c| conjunct_index_generator(db, type_name, c).is_some_and(|(rank, _)| rank == 0))
+        .take(2)
+        .collect();
+    if eq_generators.len() == 2 {
+        let mut sets: Vec<Vec<Object>> = Vec::with_capacity(2);
+        for g in &eq_generators {
+            if let Some(objs) = try_filter_scan(db, snapshot, type_name, g, None)? {
+                sets.push(objs);
+            }
+        }
+        if sets.len() == 2 {
+            let intersected = intersect_by_id(sets);
+            return Ok(Some(refilter_and_sort(predicate, intersected)));
+        }
+    }
+
+    // 3) Single most-selective @indexed generator (v1), pushed UNBOUNDED so the
+    //    candidate set is tombstone-sound and complete (a *bounded* index scan
+    //    counts tombstones against its budget and could under-return).
     let Some(generator) = conjuncts
         .iter()
         .copied()
@@ -1268,24 +1334,121 @@ fn plan_filter_scan(
     else {
         return Ok(None);
     };
-
-    // Push the generator down UNBOUNDED (limit `None`). This is deliberate: a
-    // *bounded* index scan counts tombstones against its row budget, so a long
-    // tombstone run at an indexed value can make it return FEWER live rows than
-    // actually match — and we'd have no sound way to tell "exhausted" from
-    // "capped". Unbounded, the scan is tombstone-sound and `candidates` is the
-    // COMPLETE set matching the generator (a superset of the result, since the
-    // generator is a necessary conjunct). With the covering index a non-selective
-    // scan costs ≈ a full scan anyway, so we trade no correctness for the cap.
-    let Some(mut candidates) = try_filter_scan(db, type_name, generator, None)? else {
-        // Defensive: e.g. a malformed RFC 3339 DateTime literal pushes nothing
-        // (matches nothing, identical to the full scan).
+    let Some(candidates) = try_filter_scan(db, snapshot, type_name, generator, None)? else {
+        // Defensive: e.g. a malformed RFC 3339 DateTime literal pushes nothing.
         return Ok(None);
     };
+    Ok(Some(refilter_and_sort(predicate, candidates)))
+}
 
-    // `candidates` ⊇ result. Re-filter by the FULL predicate, then restore
-    // object-id order (the index yields value order) so the result is a drop-in
-    // for `scan_all_objects + evaluate_predicate`, incl. a trailing `.limit`.
+/// Plan a top-level `OR` (its flattened `disjuncts`) as a UNION of per-disjunct
+/// index scans — but only when EVERY disjunct is index-eligible. If any disjunct
+/// would need a full scan (non-indexed field, nested And/Or, Ne, float/Json/Null,
+/// etc.), a row matching ONLY that disjunct could be missed, so we bail to the
+/// full scan (`Ok(None)`).
+fn plan_or_union(
+    db: &Database,
+    snapshot: u64,
+    type_name: &str,
+    predicate: &Predicate,
+    disjuncts: &[&Predicate],
+) -> QueryResult<Option<Vec<Object>>> {
+    if disjuncts.len() < 2 {
+        return Ok(None);
+    }
+    let mut unioned: Vec<Object> = Vec::new();
+    for d in disjuncts {
+        // A @unique-equality disjunct (≤1 row).
+        if let Some(objs) = unique_eq_probe(db, snapshot, type_name, d)? {
+            unioned.extend(objs);
+            continue;
+        }
+        // An @indexed-generator disjunct (Eq / range).
+        if conjunct_index_generator(db, type_name, d).is_some() {
+            match try_filter_scan(db, snapshot, type_name, d, None)? {
+                Some(objs) => unioned.extend(objs),
+                None => return Ok(None), // defensive: eligible but unpushable
+            }
+            continue;
+        }
+        // Ineligible disjunct → can't union soundly.
+        return Ok(None);
+    }
+    // `unioned` ⊇ result (the union of each disjunct's matches). Re-filter the
+    // full predicate, dedup by id (an object can match several disjuncts), sort.
+    Ok(Some(refilter_and_sort(predicate, unioned)))
+}
+
+/// If `compare` is `field == value` on a `@unique`, non-float, non-Json field
+/// whose literal coerces to a non-null Value, return the ≤1 matching object via
+/// the `u:` index. `Ok(None)` when it's not a usable unique-equality probe
+/// (wrong op/type, not unique, Null/uncoercible literal).
+///
+/// The CALLER must still re-filter the full predicate over the returned object:
+/// a `@unique` field updated to Null leaves a stale `u:` entry, and the probe is
+/// often only one conjunct/disjunct of a larger predicate.
+fn unique_eq_probe(
+    db: &Database,
+    snapshot: u64,
+    type_name: &str,
+    compare: &Predicate,
+) -> QueryResult<Option<Vec<Object>>> {
+    let Predicate::Compare { field_path, op, value } = compare else {
+        return Ok(None);
+    };
+    if !matches!(op, CompareOp::Eq) || field_path.contains('.') {
+        return Ok(None);
+    }
+    if !db.is_field_unique(type_name, field_path) {
+        return Ok(None);
+    }
+    use rhypedb_schema::ScalarType as ST;
+    let Some(st) = field_scalar_type(db, type_name, field_path) else {
+        return Ok(None);
+    };
+    // Float Eq: the `u:` bytes for -0.0 differ from +0.0, but `compare_values`
+    // treats them equal → a probe could MISS a stored -0.0. Json: serialized-byte
+    // equality may diverge from `json_eq`. Both stay on the full-scan path.
+    if !matches!(
+        &st,
+        ST::String | ST::U32 | ST::U64 | ST::I32 | ST::I64 | ST::DateTime | ST::Bool
+    ) {
+        return Ok(None);
+    }
+    // Coerce the literal to the field's declared Value so the probe's index bytes
+    // match what was written. A coercion error (type mismatch) or a Null value
+    // means "not a usable unique probe".
+    let Ok(coerced) = literal_to_value(value, Some(st)) else {
+        return Ok(None);
+    };
+    if matches!(coerced, Value::Null) {
+        return Ok(None);
+    }
+    let found = db.find_by_unique_at(snapshot, type_name, field_path, &coerced)?;
+    Ok(Some(found.into_iter().collect()))
+}
+
+/// Intersect candidate object sets BY id, returning the objects present in ALL
+/// sets (taken from the smallest set to minimize work). Every input was scanned
+/// at one snapshot, so an id present in every set denotes one consistent object.
+fn intersect_by_id(mut sets: Vec<Vec<Object>>) -> Vec<Object> {
+    sets.sort_by_key(|s| s.len()); // smallest base = least filtering work
+    let mut iter = sets.into_iter();
+    let Some(base) = iter.next() else {
+        return Vec::new();
+    };
+    let id_sets: Vec<std::collections::HashSet<u64>> =
+        iter.map(|s| s.iter().map(|o| o.id).collect()).collect();
+    base.into_iter()
+        .filter(|o| id_sets.iter().all(|ids| ids.contains(&o.id)))
+        .collect()
+}
+
+/// Re-filter `candidates` (a superset of the result) by the FULL predicate, then
+/// restore object-id order and dedup by id. Shared by every materialized planner
+/// branch so each is a drop-in for `scan_all_objects + evaluate_predicate` (the
+/// index yields value order, and a union can repeat an object across disjuncts).
+fn refilter_and_sort(predicate: &Predicate, mut candidates: Vec<Object>) -> Vec<Object> {
     for obj in &mut candidates {
         obj.ensure_fields_deserialized();
     }
@@ -1294,7 +1457,8 @@ fn plan_filter_scan(
         .filter(|obj| evaluate_predicate(predicate, &obj.fields))
         .collect();
     result.sort_by_key(|obj| obj.id);
-    Ok(Some(result))
+    result.dedup_by_key(|obj| obj.id);
+    result
 }
 
 /// Collect the top-level AND conjuncts of `predicate`, flattening nested ANDs.
@@ -1305,6 +1469,18 @@ fn flatten_and<'a>(predicate: &'a Predicate, out: &mut Vec<&'a Predicate>) {
         Predicate::And(left, right) => {
             flatten_and(left, out);
             flatten_and(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Collect the top-level OR disjuncts of `predicate`, flattening nested ORs.
+/// A `Compare` or an `And(..)` subtree is one opaque disjunct.
+fn flatten_or<'a>(predicate: &'a Predicate, out: &mut Vec<&'a Predicate>) {
+    match predicate {
+        Predicate::Or(left, right) => {
+            flatten_or(left, out);
+            flatten_or(right, out);
         }
         other => out.push(other),
     }
@@ -1863,11 +2039,14 @@ mod tests {
             value: lit,
         };
 
+        let snap = db.read_snapshot();
         // Int and RFC 3339 string literals push down (Some) and find the 3 rows > 0.
-        let pushed_int = try_filter_scan(&db, "Event", &compare(Literal::Int(0)), None).unwrap();
+        let pushed_int =
+            try_filter_scan(&db, snap, "Event", &compare(Literal::Int(0)), None).unwrap();
         assert_eq!(pushed_int.as_ref().map(|v| v.len()), Some(3));
         let pushed_str = try_filter_scan(
             &db,
+            snap,
             "Event",
             &compare(Literal::String("1970-01-01T00:00:00Z".into())),
             None,
@@ -1884,7 +2063,7 @@ mod tests {
             Literal::Null,
         ] {
             assert!(
-                try_filter_scan(&db, "Event", &compare(lit.clone()), None)
+                try_filter_scan(&db, snap, "Event", &compare(lit.clone()), None)
                     .unwrap()
                     .is_none(),
                 "literal {lit:?} should fall back to the full scan"
@@ -2716,6 +2895,7 @@ mod tests {
             r#"
             type Person {
                 name: String
+                slug: String @unique
                 age: u32 @indexed
                 score: f64 @indexed
                 active: Bool @indexed
@@ -2744,6 +2924,8 @@ mod tests {
     ) -> u64 {
         let mut f = FieldMap::new();
         f.insert("name".into(), Value::String(name.into()));
+        // slug = name (the names in each test dataset are unique).
+        f.insert("slug".into(), Value::String(name.into()));
         f.insert("age".into(), Value::U32(age));
         f.insert("score".into(), Value::F64(score));
         f.insert("active".into(), Value::Bool(active));
@@ -2900,8 +3082,11 @@ mod tests {
         assert!(engages(r#"Person.filter(.age > 18 && .nick == "a")"#));
         // Single Compare → existing fast path (delegated), still Some.
         assert!(engages(r#"Person.filter(.age > 18)"#));
-        // Falls back (Ok(None) → full scan): top-level OR.
-        assert!(!engages(r#"Person.filter(.country == "US" || .age > 10)"#));
+        // v2 OR-union: engages when EVERY disjunct is index-eligible.
+        assert!(engages(r#"Person.filter(.country == "US" || .age > 10)"#));
+        // Falls back: an OR with a non-indexed disjunct (a row matching only it
+        // would be missed by a union of index scans).
+        assert!(!engages(r#"Person.filter(.country == "US" || .nick == "x")"#));
         // Falls back: no @indexed conjunct at all.
         assert!(!engages(r#"Person.filter(.nick == "a" && .rank > 5)"#));
         // Falls back: the only @indexed conjunct is `Ne` (excluded as generator).
@@ -3010,5 +3195,151 @@ mod tests {
         let mut got = exec_ids(&ctx, q);
         got.sort_unstable();
         assert_eq!(got, want, "float Eq / -0.0 parity failed");
+    }
+
+    // ===== v2: unique-Eq probe + multi-index intersection + OR-union =====
+
+    #[test]
+    fn planner_unique_eq_probe_parity_and_engages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+        seed_people(&db); // slug == name, @unique
+        let ctx = ExecContext::new(&db, None);
+
+        // A @unique equality engages the unique probe and returns the one row.
+        let q = r#"Person.filter(.slug == "Cy")"#;
+        assert!(
+            plan_filter_scan(&db, "Person", &predicate_of(q), None)
+                .unwrap()
+                .is_some(),
+            "unique-eq should engage"
+        );
+        let want = oracle_ids(&db, &predicate_of(q));
+        assert_eq!(want.len(), 1);
+        let mut got = exec_ids(&ctx, q);
+        got.sort_unstable();
+        assert_eq!(got, want, "unique-eq parity failed");
+
+        // A unique-equality CONJUNCT in an AND yields ≤1 candidate, re-filtered.
+        for q in [
+            r#"Person.filter(.slug == "Dee" && .age > 25)"#, // Dee age 30 → matches
+            r#"Person.filter(.slug == "Bob" && .age > 25)"#, // Bob age 20 → residual drops it
+            r#"Person.filter(.slug == "nope" && .age > 0)"#, // no such slug → empty
+        ] {
+            let want = oracle_ids(&db, &predicate_of(q));
+            let mut got = exec_ids(&ctx, q);
+            got.sort_unstable();
+            assert_eq!(got, want, "unique-conjunct parity failed for `{q}`");
+        }
+    }
+
+    #[test]
+    fn planner_unique_probe_drops_stale_entry_after_update_to_null() {
+        // A @unique field updated to Null leaves a stale `u:` entry pointing at
+        // the (now null) object. The probe's re-filter must drop it, matching the
+        // full-scan oracle (which sees the live null field). Without the re-filter
+        // the planner would over-return the stale row.
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+        let id = person(&db, "Zed", 33, 1.0, true, Some("US"), None, 1);
+        let ctx = ExecContext::new(&db, None);
+
+        let mut upd = FieldMap::new();
+        upd.insert("slug".into(), Value::Null);
+        db.update("Person", id, upd).unwrap();
+
+        let q = r#"Person.filter(.slug == "Zed")"#;
+        assert!(
+            oracle_ids(&db, &predicate_of(q)).is_empty(),
+            "no live row has slug == Zed"
+        );
+        assert!(
+            exec_ids(&ctx, q).is_empty(),
+            "planner must drop the stale u: entry via the re-filter"
+        );
+    }
+
+    #[test]
+    fn planner_unique_probe_excludes_non_eq_and_non_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+        seed_people(&db);
+        let snap = db.read_snapshot();
+        // Non-Eq on a @unique field is not a point lookup.
+        assert!(
+            unique_eq_probe(&db, snap, "Person", &predicate_of(r#"Person.filter(.slug > "a")"#))
+                .unwrap()
+                .is_none()
+        );
+        // A non-unique field is not a unique probe.
+        assert!(
+            unique_eq_probe(
+                &db,
+                snap,
+                "Person",
+                &predicate_of(r#"Person.filter(.country == "US")"#)
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn planner_unique_probe_excludes_float_eq_negative_zero() {
+        // A float @unique field: -0.0 and +0.0 hash to different `u:` bytes but
+        // compare equal, so the probe must be excluded (it would MISS a stored
+        // -0.0). The full-scan path stays correct via compare_values.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type M { ratio: f64 @unique }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("ratio".into(), Value::F64(-0.0));
+        let id = db.create("M", f).unwrap().id;
+        let ctx = ExecContext::new(&db, None);
+
+        let q = r#"M.filter(.ratio == 0.0)"#;
+        assert!(
+            unique_eq_probe(&db, db.read_snapshot(), "M", &predicate_of(q))
+                .unwrap()
+                .is_none(),
+            "float @unique Eq must be excluded from the unique probe"
+        );
+        // The full-scan path finds the -0.0 row (compare_values: -0.0 == 0.0).
+        assert_eq!(exec_ids(&ctx, q), vec![id]);
+    }
+
+    #[test]
+    fn planner_intersection_and_union_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = planner_db(dir.path());
+        seed_people(&db);
+        let ctx = ExecContext::new(&db, None);
+
+        for q in [
+            // AND of two @indexed equality conjuncts → intersection.
+            r#"Person.filter(.country == "US" && .age == 20)"#,
+            r#"Person.filter(.age == 30 && .country == "US")"#,
+            // country Eq is the only rank-0 generator; active Eq (Bool) stays residual.
+            r#"Person.filter(.country == "CA" && .active == true)"#,
+            // Top-level OR of @indexed disjuncts → union (+ dedup where they overlap).
+            r#"Person.filter(.country == "CA" || .age == 70)"#,
+            r#"Person.filter(.age == 20 || .country == "CA")"#,
+            // OR mixing a @unique disjunct with an @indexed disjunct.
+            r#"Person.filter(.slug == "Ann" || .country == "CA")"#,
+            // Nested OR inside an AND: the inner OR stays a residual conjunct
+            // (NOT routed to the union path).
+            r#"Person.filter(.active == true && (.country == "US" || .country == "CA"))"#,
+        ] {
+            assert!(
+                plan_filter_scan(&db, "Person", &predicate_of(q), None)
+                    .unwrap()
+                    .is_some(),
+                "planner should engage for `{q}`"
+            );
+            let want = oracle_ids(&db, &predicate_of(q));
+            let mut got = exec_ids(&ctx, q);
+            got.sort_unstable();
+            assert_eq!(got, want, "intersection/union parity failed for `{q}`");
+        }
     }
 }
