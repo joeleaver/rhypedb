@@ -19,13 +19,15 @@
 //! server parses + caches it for the connection's lifetime) and re-run it with
 //! [`fetch_prepared`](Client::fetch_prepared) / friends — no re-parse, no
 //! re-sent query text. Precomputed vectors are bulk-loaded with
-//! [`ingest_vectors`](Client::ingest_vectors).
+//! [`ingest_vectors`](Client::ingest_vectors). Live change events stream from
+//! [`subscribe`](Client::subscribe), which returns a blocking [`Subscription`]
+//! iterator over its own dedicated connection.
 //!
 //! A native async client (sharing this protocol core) will be added behind a
 //! feature in a later increment — sync is the substrate, async is additive.
 
 use std::marker::PhantomData;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -35,7 +37,12 @@ use rhypedb_wire::protocol::{self, sync as wire_sync};
 use serde::de::DeserializeOwned;
 
 mod query;
+mod subscription;
 pub use query::{Query, Row};
+pub use subscription::{ChangeNotification, Notification, Subscription, SubscriptionStopper};
+// Re-export the filter model so callers can build subscriptions without naming
+// `rhypedb-subscribe` (which is tokio-free, so the client stays runtime-free).
+pub use rhypedb_subscribe::{ChangeKind, SubscriptionFilter};
 // `Prepared` is a `pub` item in this crate root (it is branded with the issuing
 // client), so it is exported as `rhypedb_client::Prepared` directly.
 
@@ -207,6 +214,11 @@ pub struct Client {
     conn: Mutex<Connection>,
     /// This client's brand, stamped into every [`Prepared`] it issues.
     client_id: u64,
+    /// The resolved server address this client connected to, so
+    /// [`subscribe`](Client::subscribe) can dial a fresh dedicated connection.
+    peer_addr: SocketAddr,
+    /// The configured write timeout, reused for subscription connections.
+    write_timeout: Option<Duration>,
 }
 
 impl Client {
@@ -251,6 +263,7 @@ impl Client {
         stream
             .set_write_timeout(config.write_timeout)
             .map_err(Error::Connect)?;
+        let peer_addr = stream.peer_addr().map_err(Error::Connect)?;
         Ok(Client {
             conn: Mutex::new(Connection {
                 stream,
@@ -258,6 +271,8 @@ impl Client {
                 dead: false,
             }),
             client_id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
+            peer_addr,
+            write_timeout: config.write_timeout,
         })
     }
 
@@ -373,6 +388,16 @@ impl Client {
         }
     }
 
+    /// Open a change-event [`Subscription`] on a **dedicated** connection to the
+    /// same server. It is independent of this client's query connection — the
+    /// server makes a subscribed connection refuse queries, so pushed events
+    /// never race query replies — and is a blocking iterator of [`Notification`]s.
+    /// Each call opens its own connection; reconcile a [`Notification::Lagged`]
+    /// by re-querying with this client.
+    pub fn subscribe(&self, filter: SubscriptionFilter) -> Result<Subscription> {
+        Subscription::open(self.peer_addr, self.write_timeout, &filter)
+    }
+
     /// Verify a [`Prepared`] belongs to this client (statement ids are
     /// per-connection), then round-trip an `Execute`. Branding is checked before
     /// any I/O, so a foreign handle never touches the wire.
@@ -410,7 +435,7 @@ fn decode_query_frame(frame: &protocol::Frame) -> Result<QueryResult> {
 
 /// Decode a `RESP_ERROR` payload into [`Error::Server`] (falling back if the
 /// message itself is malformed — still surface it as a server error, not I/O).
-fn server_error(payload: &[u8]) -> Error {
+pub(crate) fn server_error(payload: &[u8]) -> Error {
     match protocol::decode_error_payload(payload) {
         Ok(msg) => Error::Server(msg),
         Err(_) => Error::Server(String::from_utf8_lossy(payload).into_owned()),

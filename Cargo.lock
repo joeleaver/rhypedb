@@ -2476,6 +2476,7 @@ dependencies = [
 name = "rhypedb-client"
 version = "0.1.0"
 dependencies = [
+ "rhypedb-subscribe",
  "rhypedb-wire",
  "serde",
  "serde_json",

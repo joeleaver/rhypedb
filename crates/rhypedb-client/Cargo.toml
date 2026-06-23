@@ -11,6 +11,9 @@ license.workspace = true
 
 [dependencies]
 rhypedb-wire = { workspace = true }
+# Tokio-free (parking_lot + serde only): supplies the SubscriptionFilter /
+# ChangeKind model used by subscriptions; the client stays runtime-free.
+rhypedb-subscribe = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
