@@ -36,6 +36,15 @@ pub mod protocol;
 mod query_cache;
 mod restore;
 
+// The increment-5 acceptance test: the official sync `rhypedb-client` (+ its
+// codegen-generated typed seeds) driven against a REAL in-process server over a
+// real socket. In-crate (not in `tests/`) so it can reach the private server
+// internals — `AppState`, `handle_connection_stream`, `Vectorizer` — to stand the
+// server up; `rhypedb-client`/`rhypedb-codegen` are dev-deps, so this never
+// touches the server's runtime dependency set.
+#[cfg(test)]
+mod client_e2e;
+
 use query_cache::QueryCache;
 
 #[derive(Parser)]

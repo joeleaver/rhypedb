@@ -54,3 +54,8 @@ tar = "0.4"
 [dev-dependencies]
 tempfile = { workspace = true }
 ureq = { workspace = true }
+# The official sync client + codegen, exercised against a real in-process server
+# in the client_e2e test module (the increment-5 acceptance test). Dev-only, so
+# the client/codegen stay out of the server's runtime dependency set.
+rhypedb-client = { workspace = true }
+rhypedb-codegen = { workspace = true }

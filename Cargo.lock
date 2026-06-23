@@ -2552,6 +2552,8 @@ dependencies = [
  "libmimalloc-sys",
  "mimalloc",
  "parking_lot",
+ "rhypedb-client",
+ "rhypedb-codegen",
  "rhypedb-embed",
  "rhypedb-engine",
  "rhypedb-query",
