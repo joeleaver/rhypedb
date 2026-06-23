@@ -18,11 +18,10 @@ rhypedb-schema = { workspace = true }
 rhypedb-vector = { workspace = true }
 rhypedb-embed = { workspace = true }
 rhypedb-subscribe = { workspace = true }
+rhypedb-wire = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
-# RFC3339 parse/format for the DateTime scalar (epoch-millis i64 <-> string).
-time = { version = "0.3", features = ["parsing", "formatting"] }
 parking_lot = { workspace = true }
 arc-swap = { workspace = true }
 thiserror = { workspace = true }

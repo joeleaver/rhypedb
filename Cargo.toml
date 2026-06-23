@@ -20,6 +20,7 @@ rhypedb-vector = { path = "crates/rhypedb-vector" }
 rhypedb-query = { path = "crates/rhypedb-query", default-features = false }
 rhypedb-embed = { path = "crates/rhypedb-embed", default-features = false }
 rhypedb-subscribe = { path = "crates/rhypedb-subscribe" }
+rhypedb-wire = { path = "crates/rhypedb-wire" }
 base64 = "0.22"
 bytes = "1"
 tokio = { version = "1", features = ["full"] }

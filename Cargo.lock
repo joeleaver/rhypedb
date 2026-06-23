@@ -2503,11 +2503,11 @@ dependencies = [
  "rhypedb-storage",
  "rhypedb-subscribe",
  "rhypedb-vector",
+ "rhypedb-wire",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
- "time",
 ]
 
 [[package]]
@@ -2548,6 +2548,7 @@ dependencies = [
  "rhypedb-storage",
  "rhypedb-subscribe",
  "rhypedb-vector",
+ "rhypedb-wire",
  "serde",
  "serde_json",
  "tar",
@@ -2593,6 +2594,19 @@ dependencies = [
  "parking_lot",
  "rand",
  "thiserror",
+]
+
+[[package]]
+name = "rhypedb-wire"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "rhypedb-subscribe",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
 ]
 
 [[package]]

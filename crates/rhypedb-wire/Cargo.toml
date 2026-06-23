@@ -1,0 +1,30 @@
+[package]
+name = "rhypedb-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The transport- and runtime-agnostic wire layer shared by the server and the
+# official client: the value model (`object`) + the binary protocol constants
+# and payload codecs (`protocol`). Pure sync code over buffers by default — no
+# async runtime, no engine dependency — so a sync client links zero of tokio.
+#
+# The async framing (read_frame/write_frame/FrameReader over tokio's
+# AsyncRead/AsyncWrite) lives behind the optional `tokio` feature, which only the
+# server enables. The sync framing (`protocol::sync`) is always available.
+
+[features]
+tokio = ["dep:tokio"]
+
+[dependencies]
+base64 = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# RFC3339 parse/format for the DateTime scalar (epoch-millis i64 <-> string).
+time = { version = "0.3", features = ["parsing", "formatting"] }
+rhypedb-subscribe = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
