@@ -22,12 +22,14 @@ pub trait Embedder: Send + Sync {
 }
 
 /// Embedder backed by fastembed (ONNX Runtime, CPU-only).
+#[cfg(feature = "fastembed")]
 pub struct FastEmbedder {
     model: fastembed::TextEmbedding,
     dimensions: usize,
     model_name: String,
 }
 
+#[cfg(feature = "fastembed")]
 impl FastEmbedder {
     pub fn new(model_name: &str) -> EmbedResult<Self> {
         let model_type = match model_name {
@@ -71,6 +73,7 @@ impl FastEmbedder {
     }
 }
 
+#[cfg(feature = "fastembed")]
 impl Embedder for FastEmbedder {
     fn embed(&mut self, texts: &[&str]) -> EmbedResult<Vec<Vec<f32>>> {
         let documents: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
@@ -118,10 +121,12 @@ pub trait Reranker: Send + Sync {
 }
 
 /// Cross-encoder reranker backed by fastembed.
+#[cfg(feature = "fastembed")]
 pub struct FastReranker {
     model: fastembed::TextRerank,
 }
 
+#[cfg(feature = "fastembed")]
 impl FastReranker {
     pub fn new() -> EmbedResult<Self> {
         // Reranker selection:
@@ -202,6 +207,7 @@ impl FastReranker {
     }
 }
 
+#[cfg(feature = "fastembed")]
 impl Reranker for FastReranker {
     fn rerank(
         &mut self,
@@ -228,7 +234,9 @@ impl Reranker for FastReranker {
     }
 }
 
-#[cfg(test)]
+// These tests exercise the fastembed-backed impls (they download/load ONNX
+// models), so they only build when the `fastembed` feature is on.
+#[cfg(all(test, feature = "fastembed"))]
 mod tests {
     use super::*;
 

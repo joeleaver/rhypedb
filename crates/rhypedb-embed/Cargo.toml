@@ -3,7 +3,15 @@ name = "rhypedb-embed"
 version.workspace = true
 edition.workspace = true
 
-# ONNX linking strategy is feature-gated so the same source builds two ways:
+# The fastembed/ONNX stack is OPTIONAL. The `Embedder`/`Reranker` traits,
+# `EmbedError`, and `RerankResult` always compile (pure-Rust, no deps); the
+# fastembed-backed `FastEmbedder`/`FastReranker` and the `fastembed` + `hf-hub`
+# dependencies are gated behind the `fastembed` feature. A consumer with no
+# vector fields can depend on this crate with `--no-default-features` and pull in
+# NO ONNX Runtime at all.
+#
+# When `fastembed` IS enabled, the ONNX linking strategy is picked by exactly one
+# of these arms (each implies the `fastembed` feature):
 #   onnx-download (default) — fastembed downloads + statically links ONNX Runtime
 #     at build time (needs network during `cargo build`). Matches prior behavior.
 #   onnx-static            — no build-time download; ort statically links a
@@ -12,11 +20,16 @@ edition.workspace = true
 #     in, no runtime .so). This is what the nlnwt buildpack uses.
 #   onnx-dynamic           — no build-time download/link; ONNX is dlopen'd at
 #     runtime (point ORT_DYLIB_PATH at a libonnxruntime.so). Also builds offline.
-# Exactly one should be active. `hf-hub-native-tls` + `image-models` are the rest
-# of fastembed's former defaults, re-added in every arm.
+# Exactly one linking arm should be active. `hf-hub-native-tls` + `image-models`
+# are the rest of fastembed's former defaults, re-added in every arm.
 [features]
 default = ["onnx-download"]
+# Compile the fastembed-backed Embedder/Reranker and pull in fastembed + hf-hub.
+# Does NOT by itself select an ONNX linking strategy — use one of the onnx-* arms
+# (which each imply this), or set fastembed's ort feature yourself.
+fastembed = ["dep:fastembed", "dep:hf-hub"]
 onnx-download = [
+    "fastembed",
     "fastembed/ort-download-binaries-native-tls",
     "fastembed/hf-hub-native-tls",
     "fastembed/image-models",
@@ -24,18 +37,20 @@ onnx-download = [
 # No ort linking feature: ort-sys static-links the lib at ORT_LIB_LOCATION
 # (ort-sys build/main.rs SYSTEM_LIB_PATH path, not gated on download-binaries).
 onnx-static = [
+    "fastembed",
     "fastembed/hf-hub-native-tls",
     "fastembed/image-models",
 ]
 onnx-dynamic = [
+    "fastembed",
     "fastembed/ort-load-dynamic",
     "fastembed/hf-hub-native-tls",
     "fastembed/image-models",
 ]
 
 [dependencies]
-fastembed = { workspace = true }
+fastembed = { workspace = true, optional = true }
 thiserror = { workspace = true }
 # Used to fetch the default int8 reranker (Xenova/bge-reranker-base) on first
 # use. Features matched to fastembed's hf-hub usage (sync ureq + native-tls).
-hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"], optional = true }
