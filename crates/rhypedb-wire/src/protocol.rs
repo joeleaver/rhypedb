@@ -1023,6 +1023,16 @@ mod tests {
         assert!(dec_empty.rows.is_empty());
         assert_eq!(dec_empty.type_name, "Doc");
 
+        // Rows of DIFFERING dimensions round-trip (each row carries its own dim),
+        // which is the documented guarantee and the one thing distinguishing this
+        // from a flat fixed-stride layout.
+        let mixed: Vec<(u64, Vec<f32>)> = vec![(1, vec![0.5, 1.0]), (2, vec![3.0, 4.0, 5.0])];
+        let dec_mixed = decode_vector_batch_payload(&encode_vector_batch_payload(
+            "Doc", "embedding", &mixed,
+        ))
+        .unwrap();
+        assert_eq!(dec_mixed.rows, mixed);
+
         // Truncated payloads are rejected, not panicked on.
         assert!(decode_vector_batch_payload(&payload[..payload.len() - 1]).is_err());
         assert!(decode_vector_batch_payload(&[0, 1]).is_err());

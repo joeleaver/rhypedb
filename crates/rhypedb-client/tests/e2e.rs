@@ -104,6 +104,12 @@ fn spawn_mock() -> (SocketAddr, JoinHandle<()>) {
                     if q == "PARSEFAIL" {
                         let p = protocol::encode_error_payload("parse error: PARSEFAIL");
                         wire_sync::write_frame(&mut stream, req, protocol::RESP_ERROR, &p).unwrap();
+                    } else if q == "SHORTPREP" {
+                        // A RESP_PREPARED whose stmt_id payload is truncated (< 8
+                        // bytes). The framing is intact, so the client must report
+                        // a decode error WITHOUT latching the connection dead.
+                        wire_sync::write_frame(&mut stream, req, protocol::RESP_PREPARED, &[0u8; 4])
+                            .unwrap();
                     } else {
                         let id = next_stmt_id;
                         next_stmt_id += 1;
@@ -359,7 +365,10 @@ fn ingest_vectors_roundtrip() {
         2
     );
 
-    // An empty batch still round-trips (the server validates the field exists).
+    // An empty batch is accepted and reports 0 ingested. NOTE: the real engine
+    // short-circuits `if rows.is_empty() { return Ok(0); }` BEFORE checking that
+    // the type/field exists, so an empty batch is a no-op even for a typo'd
+    // type/field — it does NOT validate. (A non-empty batch does validate.)
     let empty: Vec<(u64, Vec<f32>)> = Vec::new();
     assert_eq!(client.ingest_vectors("Doc", "embedding", &empty).unwrap(), 0);
 
@@ -396,6 +405,59 @@ fn ingest_vectors_rejects_oversized_batch_without_sending() {
     assert!(client.ping().is_ok());
     let small: Vec<(u64, Vec<f32>)> = vec![(1, vec![1.0, 2.0])];
     assert_eq!(client.ingest_vectors("Doc", "embedding", &small).unwrap(), 1);
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn torn_vector_batch_latches_connection_closed() {
+    // The dead-latch must apply to the increment's NEW request kinds too: a torn
+    // reply to a VECTOR_BATCH yields Error::Io, then the connection refuses every
+    // further call (any kind) as Closed — no mis-correlation across ops.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = wire_sync::read_frame(&mut stream); // consume the batch, then drop
+    });
+
+    let client = Client::connect(addr).unwrap();
+    let rows: Vec<(u64, Vec<f32>)> = vec![(1, vec![1.0, 2.0])];
+    assert!(matches!(
+        client.ingest_vectors("Doc", "embedding", &rows),
+        Err(Error::Io(_))
+    ));
+    // Latched: a subsequent op of a DIFFERENT kind also fails fast as Closed.
+    assert!(matches!(client.ping(), Err(Error::Closed)));
+    assert!(matches!(
+        client.prepare(&Query::<User>::all("User")),
+        Err(Error::Closed)
+    ));
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn malformed_prepared_reply_errors_without_latching() {
+    let (addr, handle) = spawn_mock();
+    let client = Client::connect(addr).unwrap();
+
+    // A RESP_PREPARED whose stmt_id payload is truncated: the framing is intact,
+    // so this is a payload-DECODE error (Error::Io) that must NOT latch the
+    // connection — only true I/O errors latch.
+    let err = client
+        .prepare(&Query::<User>::raw("SHORTPREP"))
+        .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "got: {err:?}");
+
+    // Frame boundaries intact → the connection is still usable.
+    let ok = client
+        .fetch_one::<User>(&Query::get("User", 1))
+        .unwrap()
+        .expect("a row");
+    assert_eq!(ok.id, 1);
 
     drop(client);
     handle.join().unwrap();
