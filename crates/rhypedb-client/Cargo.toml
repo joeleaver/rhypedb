@@ -1,0 +1,16 @@
+[package]
+name = "rhypedb-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The official synchronous rhypedb client. Speaks the binary TCP protocol via
+# the shared rhypedb-wire codecs (single source of truth for the wire format) —
+# no async runtime, no engine dependency. A native async variant will be added
+# behind a feature in a later increment.
+
+[dependencies]
+rhypedb-wire = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

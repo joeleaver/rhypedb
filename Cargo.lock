@@ -2473,6 +2473,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhypedb-client"
+version = "0.1.0"
+dependencies = [
+ "rhypedb-wire",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "rhypedb-codegen"
 version = "0.1.0"
 dependencies = [
