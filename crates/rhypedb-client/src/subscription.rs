@@ -54,6 +54,16 @@ pub struct ChangeNotification {
 
 impl ChangeNotification {
     fn from_wire(w: WireEvent) -> Result<Self> {
+        // Reject an unknown event-envelope version loudly rather than risk
+        // misinterpreting a future, differently-shaped format (the `v` tag exists
+        // precisely so a consumer can detect the format — see protocol docs).
+        if w.v != protocol::EVENT_FORMAT_TAG {
+            return Err(Error::Deserialize(format!(
+                "unsupported event format tag {:?} (expected {:?}) — upgrade the client",
+                w.v,
+                protocol::EVENT_FORMAT_TAG
+            )));
+        }
         let kind = match w.kind.as_str() {
             "create" => ChangeKind::Create,
             "update" => ChangeKind::Update,
@@ -89,8 +99,14 @@ impl ChangeNotification {
 /// `Subscription` is `Send`, so move it onto a worker thread. To stop a
 /// subscription whose thread is blocked in [`next_event`](Self::next_event),
 /// obtain a [`SubscriptionStopper`] first (it can close the connection from
-/// another thread). Dropping a `Subscription` closes its connection, which the
-/// server treats as an implicit unsubscribe.
+/// another thread).
+///
+/// Dropping a `Subscription` closes its connection, which the server treats as an
+/// implicit unsubscribe — **with one caveat**: a [`SubscriptionStopper`] holds a
+/// duplicated socket handle, so if one is still alive the OS keeps the connection
+/// open until it too is dropped. For deterministic teardown while a stopper
+/// exists, call [`SubscriptionStopper::stop`] (it actively shuts the connection
+/// down) or [`unsubscribe`](Self::unsubscribe).
 #[derive(Debug)]
 pub struct Subscription {
     stream: TcpStream,
@@ -106,15 +122,26 @@ impl Subscription {
     /// Dial a fresh connection, run the `SUBSCRIBE` handshake, and return the
     /// live subscription. (Crate-internal; reached via
     /// [`Client::subscribe`](crate::Client::subscribe).)
+    ///
+    /// `connect_timeout` bounds establishing the connection (like
+    /// [`Client::connect`](crate::Client::connect)). The configured `read_timeout`
+    /// is deliberately NOT applied: a subscription blocks waiting for sparse
+    /// server pushes, so a finite per-read deadline would tear it down between
+    /// events. Cancel a blocked read with a [`SubscriptionStopper`] instead.
     pub(crate) fn open(
         addr: SocketAddr,
+        connect_timeout: Option<Duration>,
         write_timeout: Option<Duration>,
         filter: &SubscriptionFilter,
     ) -> Result<Self> {
-        let mut stream = TcpStream::connect(addr).map_err(Error::Connect)?;
+        let mut stream = match connect_timeout {
+            Some(t) => TcpStream::connect_timeout(&addr, t).map_err(Error::Connect)?,
+            None => TcpStream::connect(addr).map_err(Error::Connect)?,
+        };
         stream.set_nodelay(true).map_err(Error::Connect)?;
         // The write timeout guards the SUBSCRIBE/UNSUBSCRIBE sends; the READ side
-        // stays blocking with no timeout — a subscription waits for events.
+        // stays blocking with no timeout — a subscription waits for events, and a
+        // blocked read is cancelled via a SubscriptionStopper, not a deadline.
         stream
             .set_write_timeout(write_timeout)
             .map_err(Error::Connect)?;
@@ -145,10 +172,12 @@ impl Subscription {
 
     /// Block until the next [`Notification`] arrives.
     ///
-    /// Returns [`Error::Io`] on end-of-stream or a socket error (and latches the
-    /// subscription ended); a malformed event payload also returns an error but
-    /// leaves the subscription live (framing intact). After the subscription has
-    /// ended, returns [`Error::Closed`].
+    /// This blocks **indefinitely** waiting for a server push (no read deadline —
+    /// see [`open`](Self::open)); to interrupt a blocked call from another thread,
+    /// use a [`SubscriptionStopper`]. Returns [`Error::Io`] on end-of-stream or a
+    /// socket error (and latches the subscription ended); a malformed event
+    /// payload also returns an error but leaves the subscription live (framing
+    /// intact). After the subscription has ended, returns [`Error::Closed`].
     pub fn next_event(&mut self) -> Result<Notification> {
         if self.ended {
             return Err(Error::Closed);
@@ -194,6 +223,10 @@ impl Subscription {
     /// acknowledgement. (Dropping the `Subscription` instead just closes the
     /// connection, which the server also treats as an unsubscribe — but without
     /// the explicit ack.)
+    ///
+    /// Like [`next_event`](Self::next_event), the drain reads block until the
+    /// server responds or closes the connection; on a hung server it blocks until
+    /// a [`SubscriptionStopper`] (obtained beforehand) closes the socket.
     pub fn unsubscribe(mut self) -> Result<()> {
         wire_sync::write_frame(
             &mut self.stream,

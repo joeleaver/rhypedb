@@ -217,7 +217,10 @@ pub struct Client {
     /// The resolved server address this client connected to, so
     /// [`subscribe`](Client::subscribe) can dial a fresh dedicated connection.
     peer_addr: SocketAddr,
-    /// The configured write timeout, reused for subscription connections.
+    /// Connect/write timeouts reused for subscription connections. (The
+    /// `read_timeout` is intentionally not reused — a subscription blocks waiting
+    /// for events; see [`subscribe`](Client::subscribe).)
+    connect_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
 }
 
@@ -272,6 +275,7 @@ impl Client {
             }),
             client_id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
             peer_addr,
+            connect_timeout: config.connect_timeout,
             write_timeout: config.write_timeout,
         })
     }
@@ -394,8 +398,14 @@ impl Client {
     /// never race query replies — and is a blocking iterator of [`Notification`]s.
     /// Each call opens its own connection; reconcile a [`Notification::Lagged`]
     /// by re-querying with this client.
+    ///
+    /// The subscription connection is dialed to the address this client resolved
+    /// to at connect time and honors the configured `connect_timeout`. The
+    /// configured `read_timeout` is intentionally NOT applied — a subscription
+    /// blocks waiting for sparse events; cancel a blocked read with a
+    /// [`SubscriptionStopper`](crate::SubscriptionStopper).
     pub fn subscribe(&self, filter: SubscriptionFilter) -> Result<Subscription> {
-        Subscription::open(self.peer_addr, self.write_timeout, &filter)
+        Subscription::open(self.peer_addr, self.connect_timeout, self.write_timeout, &filter)
     }
 
     /// Verify a [`Prepared`] belongs to this client (statement ids are
