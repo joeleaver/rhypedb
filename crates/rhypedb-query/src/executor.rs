@@ -960,29 +960,63 @@ fn field_scalar_type(
 
 /// Validate every leaf comparison in a filter predicate against `type_name`'s
 /// schema, independent of `And`/`Or` nesting and of whether the comparison takes
-/// the index pushdown. Currently rejects an ORDERING comparison on a `Json`
-/// field (no total order over arbitrary JSON) — so the rule holds for a nested
-/// or post-traversal filter, not only a single top-level comparison.
+/// the index pushdown — so each rule holds for a nested or post-traversal filter,
+/// not only a single top-level comparison. Rejecting up front (rather than
+/// letting the comparison fall through to a silent empty result) turns an
+/// unsupported filter into a clear error. Current rules, by the field's declared
+/// scalar type:
+///   * `Json` — ordering (`<`/`>`/…) is rejected (no total order over arbitrary
+///     JSON); descending into a key/path (`.meta.k`) is rejected (only
+///     whole-value `==`/`!=` is supported — JSON path querying is a future card).
+///   * `Bytes` — every comparison is rejected EXCEPT `== null` / `!= null`
+///     (a blob has no useful query-language equality/ordering form; an exact
+///     match would require base64-encoding the whole blob into the query, and
+///     ordering is meaningless).
 fn validate_predicate_for_type(
     db: &Database,
     type_name: &str,
     predicate: &Predicate,
 ) -> QueryResult<()> {
+    use rhypedb_schema::ScalarType as ST;
     match predicate {
-        Predicate::Compare { field_path, op, .. } => {
-            if !field_path.contains('.')
-                && matches!(
-                    field_scalar_type(db, type_name, field_path),
-                    Some(rhypedb_schema::ScalarType::Json)
-                )
-                && matches!(
-                    op,
-                    CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
-                )
-            {
-                return Err(QueryError::Type(
-                    "ordering comparisons are not supported on Json fields".into(),
-                ));
+        Predicate::Compare { field_path, op, value } => {
+            // For a dotted path the head segment names the field; a SCALAR head
+            // with a sub-path means descending into a scalar (e.g. a JSON key).
+            // A relation head returns `None` here, leaving relation traversals
+            // untouched.
+            let descends = field_path.contains('.');
+            let head = field_path.split('.').next().unwrap_or(field_path);
+            match field_scalar_type(db, type_name, head) {
+                Some(ST::Json) => {
+                    if descends {
+                        return Err(QueryError::Type(
+                            "querying into a Json field by key/path is not supported yet \
+                             (a Json field supports whole-value `==` / `!=` only)"
+                                .into(),
+                        ));
+                    }
+                    if matches!(
+                        op,
+                        CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge
+                    ) {
+                        return Err(QueryError::Type(
+                            "ordering comparisons are not supported on Json fields".into(),
+                        ));
+                    }
+                }
+                Some(ST::Bytes) => {
+                    let null_check = !descends
+                        && matches!(value, Literal::Null)
+                        && matches!(op, CompareOp::Eq | CompareOp::Ne);
+                    if !null_check {
+                        return Err(QueryError::Type(
+                            "comparisons on Bytes fields are not supported \
+                             (only `== null` / `!= null`)"
+                                .into(),
+                        ));
+                    }
+                }
+                _ => {}
             }
             Ok(())
         }
@@ -1985,6 +2019,49 @@ mod tests {
         }
         match run(r#"Doc.filter(.meta == { "k": 2 })"#).unwrap() {
             QueryOutput::Objects(objs) => assert!(objs.is_empty()),
+            _ => panic!("expected Objects"),
+        }
+    }
+
+    #[test]
+    fn bytes_comparisons_and_json_path_filters_are_rejected_loudly() {
+        // Two silent-empty footguns turned into hard errors:
+        //   * a value comparison on a Bytes field (only `== null` / `!= null`
+        //     is meaningful), and
+        //   * descending into a Json key/path (whole-value `==`/`!=` only;
+        //     real JSON path querying is a future card).
+        // Both used to fall through to an empty result with no error.
+        let dir = tempfile::tempdir().unwrap();
+        let schema =
+            parse_schema(r#"type Event { name: String  blob: Bytes  meta: Json }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let run = |q: &str| execute(&ExecContext::new(&db, None), &parse_query(q).unwrap());
+
+        run(r#"Event.create({ name: "a", blob: "aGVsbG8=", meta: { "k": 1 } })"#).unwrap();
+        run(r#"Event.create({ name: "b", meta: { "k": 2 } })"#).unwrap();
+
+        // Bytes value comparisons are a hard error — as a single comparison,
+        // inside a compound predicate, and for ordering ops.
+        assert!(run(r#"Event.filter(.blob == "aGVsbG8=")"#).is_err());
+        assert!(run(r#"Event.filter(.blob != "aGVsbG8=")"#).is_err());
+        assert!(run(r#"Event.filter(.blob > "aGVsbG8=")"#).is_err());
+        assert!(run(r#"Event.filter(.name == "a" && .blob == "aGVsbG8=")"#).is_err());
+        // Even a malformed-base64 literal errors at validation — as an
+        // unsupported Bytes comparison, before (and regardless of) any decode.
+        assert!(run(r#"Event.filter(.blob == "@@@")"#).is_err());
+
+        // Bytes null-checks remain allowed (the meaningful "is it set?").
+        assert!(run(r#"Event.filter(.blob == null)"#).is_ok());
+        assert!(run(r#"Event.filter(.blob != null)"#).is_ok());
+
+        // Descending into a Json key/path is a hard error — single, nested,
+        // and post-traversal-step shapes.
+        assert!(run(r#"Event.filter(.meta.k == 1)"#).is_err());
+        assert!(run(r#"Event.filter(.name == "a" || .meta.k == 1)"#).is_err());
+
+        // Whole-value Json equality still works (regression guard).
+        match run(r#"Event.filter(.meta == { "k": 1 })"#).unwrap() {
+            QueryOutput::Objects(objs) => assert_eq!(objs.len(), 1),
             _ => panic!("expected Objects"),
         }
     }

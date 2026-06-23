@@ -72,9 +72,9 @@ Because JSON numbers are IEEE-754 doubles in most clients, an id above 2⁵³ ca
 
 **`DateTime`** is stored as a 64-bit epoch-millisecond timestamp (UTC); sub-millisecond precision in an RFC 3339 input is truncated. It is **filterable and orderable** (`.filter(.created > "2026-01-01T00:00:00Z")` works against either an RFC 3339 string or an integer epoch-millis), including pre-epoch (negative) timestamps. Mark it `@indexed` to build an ordered secondary index so range queries skip the full scan; `@unique` enforces an exact-match uniqueness constraint.
 
-**`Bytes`** is an arbitrary byte blob, written and read as standard base64. It supports equality/ordering filtering (by byte value) when `@indexed`.
+**`Bytes`** is an arbitrary byte blob, written and read as standard base64. From the **query language** it is not filterable beyond presence checks (`== null` / `!= null`); any other comparison on a `Bytes` field is **rejected with an error** (the query syntax has no `Bytes` literal, and byte-ordering a blob is not a meaningful user query). Programmatic callers can still match exact or ranged byte values via the engine API `Database::filter_scan_bytes` (which uses a `@indexed` byte index when present).
 
-**`Json`** holds an arbitrary JSON value. It supports **equality** filtering only (`==`/`!=`); ordering comparisons (`<`, `>`, …) on a `Json` field are rejected, since there is no total order over arbitrary JSON. `@indexed` is not supported on `Json` (use `@unique` for an exact-match constraint).
+**`Json`** holds an arbitrary JSON value. It supports **whole-value equality** filtering only (`==`/`!=` against a complete JSON literal). Ordering comparisons (`<`, `>`, …) are rejected (no total order over arbitrary JSON), and **querying into a key or path** (e.g. `.meta.k == 1`) is **not supported yet** — both are rejected with an error rather than silently matching nothing. `@indexed` is not supported on `Json` (use `@unique` for an exact-match constraint).
 
 ### Relations
 
