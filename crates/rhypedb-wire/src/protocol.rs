@@ -584,6 +584,46 @@ pub fn decode_vector_batch_payload(data: &[u8]) -> io::Result<VectorBatch> {
     })
 }
 
+/// Encode a `REQ_VECTOR_BATCH` payload — the exact inverse of
+/// [`decode_vector_batch_payload`]:
+/// `[type_len:u16 BE][type utf8][field_len:u16 BE][field utf8][count:u32 BE]`
+/// then `count` rows of `[object_id:u64 BE][dim:u32 BE][f32 x dim, little-endian]`.
+///
+/// `rows` is generic over the per-row vector storage (`Vec<f32>`, `&[f32]`,
+/// `[f32; N]`, …) so callers need not clone into owned `Vec`s. The byte layout is
+/// identical regardless, so the server decodes any of them interchangeably.
+///
+/// Rows of differing dimensions still encode correctly (each row carries its own
+/// `dim`); a caller that wants a uniform-dimension guarantee must check first.
+pub fn encode_vector_batch_payload<V: AsRef<[f32]>>(
+    type_name: &str,
+    field_name: &str,
+    rows: &[(u64, V)],
+) -> Vec<u8> {
+    let t = type_name.as_bytes();
+    let f = field_name.as_bytes();
+    // Capacity is a hint; use the first row's dim as the per-row estimate and
+    // saturate so a pathological input can't overflow the size computation.
+    let est_dim = rows.first().map(|(_, v)| v.as_ref().len()).unwrap_or(0);
+    let per_row = 12usize.saturating_add(est_dim.saturating_mul(4));
+    let cap = (2 + t.len() + 2 + f.len() + 4).saturating_add(rows.len().saturating_mul(per_row));
+    let mut buf = Vec::with_capacity(cap);
+    buf.extend_from_slice(&(t.len() as u16).to_be_bytes());
+    buf.extend_from_slice(t);
+    buf.extend_from_slice(&(f.len() as u16).to_be_bytes());
+    buf.extend_from_slice(f);
+    buf.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+    for (object_id, vector) in rows {
+        let v = vector.as_ref();
+        buf.extend_from_slice(&object_id.to_be_bytes());
+        buf.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        for component in v {
+            buf.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+    buf
+}
+
 pub fn decode_query_payload(data: &[u8]) -> io::Result<String> {
     if data.len() < 4 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "query length missing"));
@@ -959,6 +999,29 @@ mod tests {
         assert_eq!(batch.type_name, "Doc");
         assert_eq!(batch.field_name, "embedding");
         assert_eq!(batch.rows, rows);
+
+        // The encoder must produce byte-identical output to the hand-built
+        // payload above (and round-trip through the decoder).
+        let encoded = encode_vector_batch_payload(type_name, field_name, &rows);
+        assert_eq!(encoded, payload, "encoder must match the canonical layout");
+        let back = decode_vector_batch_payload(&encoded).unwrap();
+        assert_eq!(back, batch);
+
+        // The encoder is generic over the vector storage: borrowed slices encode
+        // identically to owned Vecs.
+        let borrowed: Vec<(u64, &[f32])> =
+            rows.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+        assert_eq!(
+            encode_vector_batch_payload(type_name, field_name, &borrowed),
+            payload
+        );
+
+        // An empty batch encodes a well-formed zero-count payload.
+        let empty: Vec<(u64, Vec<f32>)> = Vec::new();
+        let enc_empty = encode_vector_batch_payload("Doc", "embedding", &empty);
+        let dec_empty = decode_vector_batch_payload(&enc_empty).unwrap();
+        assert!(dec_empty.rows.is_empty());
+        assert_eq!(dec_empty.type_name, "Doc");
 
         // Truncated payloads are rejected, not panicked on.
         assert!(decode_vector_batch_payload(&payload[..payload.len() - 1]).is_err());

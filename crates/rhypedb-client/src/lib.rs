@@ -15,10 +15,18 @@
 //! # Ok::<(), rhypedb_client::Error>(())
 //! ```
 //!
+//! For a query you run repeatedly, [`prepare`](Client::prepare) it once (the
+//! server parses + caches it for the connection's lifetime) and re-run it with
+//! [`fetch_prepared`](Client::fetch_prepared) / friends — no re-parse, no
+//! re-sent query text. Precomputed vectors are bulk-loaded with
+//! [`ingest_vectors`](Client::ingest_vectors).
+//!
 //! A native async client (sharing this protocol core) will be added behind a
 //! feature in a later increment — sync is the substrate, async is additive.
 
+use std::marker::PhantomData;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -28,6 +36,8 @@ use serde::de::DeserializeOwned;
 
 mod query;
 pub use query::{Query, Row};
+// `Prepared` is a `pub` item in this crate root (it is branded with the issuing
+// client), so it is exported as `rhypedb_client::Prepared` directly.
 
 /// An error from the client or the server.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +66,24 @@ pub enum Error {
     /// requests rather than risk returning a mis-correlated reply — reconnect.
     #[error("connection is closed after a previous I/O error; reconnect")]
     Closed,
+    /// A vector batch's encoded payload exceeds the protocol frame cap
+    /// ([`rhypedb_wire::protocol::MAX_FRAME_PAYLOAD`]). Split the rows across
+    /// multiple [`ingest_vectors`](Client::ingest_vectors) calls.
+    #[error(
+        "vector batch too large: {rows} rows encode to {bytes} bytes (frame cap {cap})",
+        cap = protocol::MAX_FRAME_PAYLOAD
+    )]
+    BatchTooLarge {
+        /// Number of rows in the offending batch.
+        rows: usize,
+        /// Encoded payload size in bytes.
+        bytes: usize,
+    },
+    /// A [`Prepared`] statement was used with a different [`Client`] than the one
+    /// that prepared it. Statement ids are per-connection, so prepare it on this
+    /// client first. (This is caught client-side before any I/O.)
+    #[error("prepared statement belongs to a different client; prepare it on this client first")]
+    ForeignStatement,
 }
 
 /// Convenience alias.
@@ -100,6 +128,21 @@ impl QueryResult {
             QueryResult::Done => "no result",
         }
     }
+
+    /// Materialize every object into `T` (`fetch`-shaped results).
+    fn into_typed_rows<T: DeserializeOwned>(self) -> Result<Vec<Row<T>>> {
+        self.into_objects().iter().map(Row::from_object).collect()
+    }
+
+    /// Materialize a result that must be exactly one object into `T`
+    /// (`create`/`update`-shaped results).
+    fn into_typed_single<T: DeserializeOwned>(self) -> Result<Row<T>> {
+        match self {
+            QueryResult::Single(o) => Row::from_object(&o),
+            QueryResult::Objects(mut v) if v.len() == 1 => Row::from_object(&v.remove(0)),
+            other => Err(Error::UnexpectedShape(other.shape())),
+        }
+    }
 }
 
 /// One persistent connection plus its request-id counter. Guarded by the
@@ -134,10 +177,36 @@ impl Connection {
     }
 }
 
+/// Process-wide source of per-`Client` identities, used to brand [`Prepared`]
+/// statements so one client can't run another's statement id (see [`Prepared`]).
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A statement prepared on a [`Client`]'s connection (see [`Client::prepare`]).
+///
+/// The server parses + caches the query once and hands back this handle; running
+/// it via [`Client::execute_prepared`] / [`Client::fetch_prepared`] / … re-runs
+/// it with **no re-parse** and **without re-sending the query text**. There are
+/// no bind parameters — a prepared statement is a *fixed* query, worthwhile when
+/// you run the exact same query many times.
+///
+/// Statement ids are scoped to the connection that created them and are released
+/// when that `Client` is dropped. A `Prepared` is branded with its originating
+/// client, so handing it to a *different* `Client` is rejected with
+/// [`Error::ForeignStatement`] rather than silently running that client's
+/// unrelated statement of the same id.
+#[derive(Debug, Clone, Copy)]
+pub struct Prepared<T> {
+    stmt_id: u64,
+    client_id: u64,
+    _row: PhantomData<fn() -> T>,
+}
+
 /// A connected rhypedb client. `Send + Sync` — share it behind an `Arc`; calls
 /// serialize on the single underlying connection.
 pub struct Client {
     conn: Mutex<Connection>,
+    /// This client's brand, stamped into every [`Prepared`] it issues.
+    client_id: u64,
 }
 
 impl Client {
@@ -188,6 +257,7 @@ impl Client {
                 next_req_id: 1,
                 dead: false,
             }),
+            client_id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -209,11 +279,7 @@ impl Client {
 
     /// Run a typed [`Query`] and materialize every row into `T`.
     pub fn fetch<T: DeserializeOwned>(&self, query: &Query<T>) -> Result<Vec<Row<T>>> {
-        self.query(query.as_str())?
-            .into_objects()
-            .iter()
-            .map(Row::from_object)
-            .collect()
+        self.query(query.as_str())?.into_typed_rows()
     }
 
     /// Run a typed [`Query`] and return the first row, if any.
@@ -224,17 +290,97 @@ impl Client {
     /// Run a typed write that returns the affected object (`create` / `update`),
     /// materializing it into `T`.
     pub fn create<T: DeserializeOwned>(&self, query: &Query<T>) -> Result<Row<T>> {
-        match self.query(query.as_str())? {
-            QueryResult::Single(o) => Row::from_object(&o),
-            QueryResult::Objects(mut v) if v.len() == 1 => Row::from_object(&v.remove(0)),
-            other => Err(Error::UnexpectedShape(other.shape())),
-        }
+        self.query(query.as_str())?.into_typed_single()
     }
 
     /// Run a query for its effect, discarding the result shape (`delete`,
     /// `link`, `unlink`, or a write whose returned object you don't need).
     pub fn execute<T>(&self, query: &Query<T>) -> Result<QueryResult> {
         self.query(query.as_str())
+    }
+
+    /// Prepare a typed [`Query`] for repeated execution on this connection. The
+    /// server parses + caches it and returns a [`Prepared`] handle; run it with
+    /// [`execute_prepared`](Self::execute_prepared) / [`fetch_prepared`](Self::fetch_prepared)
+    /// / friends with no re-parse and no re-sent query text. The handle is valid
+    /// until this client is dropped.
+    pub fn prepare<T>(&self, query: &Query<T>) -> Result<Prepared<T>> {
+        let frame =
+            self.round_trip(protocol::REQ_PREPARE, &protocol::encode_prepare_payload(query.as_str()))?;
+        match frame.kind {
+            protocol::RESP_PREPARED => {
+                let stmt_id = protocol::decode_prepared_payload(&frame.payload).map_err(Error::Io)?;
+                Ok(Prepared {
+                    stmt_id,
+                    client_id: self.client_id,
+                    _row: PhantomData,
+                })
+            }
+            protocol::RESP_ERROR => Err(server_error(&frame.payload)),
+            other => Err(Error::UnexpectedResponse(other)),
+        }
+    }
+
+    /// Run a [`Prepared`] statement, returning the untyped [`QueryResult`].
+    pub fn execute_prepared<T>(&self, stmt: &Prepared<T>) -> Result<QueryResult> {
+        decode_query_frame(&self.run_prepared(stmt)?)
+    }
+
+    /// Run a [`Prepared`] statement and materialize every row into `T`.
+    pub fn fetch_prepared<T: DeserializeOwned>(&self, stmt: &Prepared<T>) -> Result<Vec<Row<T>>> {
+        self.execute_prepared(stmt)?.into_typed_rows()
+    }
+
+    /// Run a [`Prepared`] statement and return the first row, if any.
+    pub fn fetch_one_prepared<T: DeserializeOwned>(
+        &self,
+        stmt: &Prepared<T>,
+    ) -> Result<Option<Row<T>>> {
+        Ok(self.fetch_prepared(stmt)?.into_iter().next())
+    }
+
+    /// Run a [`Prepared`] write that returns the affected object, materializing
+    /// it into `T`.
+    pub fn create_prepared<T: DeserializeOwned>(&self, stmt: &Prepared<T>) -> Result<Row<T>> {
+        self.execute_prepared(stmt)?.into_typed_single()
+    }
+
+    /// Bulk-load precomputed vectors into one `Vector` field. `rows` is a slice
+    /// of `(object_id, vector)`; the vector storage is generic (`Vec<f32>`,
+    /// `&[f32]`, …). The server validates and applies the whole batch atomically:
+    /// on success every row is ingested (returns the row count), otherwise
+    /// nothing is. Returns [`Error::BatchTooLarge`] if a single batch would
+    /// exceed the protocol frame cap — split it across calls (each call is its
+    /// own atomic batch).
+    pub fn ingest_vectors<V: AsRef<[f32]>>(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        rows: &[(u64, V)],
+    ) -> Result<usize> {
+        let payload = protocol::encode_vector_batch_payload(type_name, field_name, rows);
+        if payload.len() > protocol::MAX_FRAME_PAYLOAD {
+            return Err(Error::BatchTooLarge {
+                rows: rows.len(),
+                bytes: payload.len(),
+            });
+        }
+        let frame = self.round_trip(protocol::REQ_VECTOR_BATCH, &payload)?;
+        match frame.kind {
+            protocol::RESP_DONE => Ok(rows.len()),
+            protocol::RESP_ERROR => Err(server_error(&frame.payload)),
+            other => Err(Error::UnexpectedResponse(other)),
+        }
+    }
+
+    /// Verify a [`Prepared`] belongs to this client (statement ids are
+    /// per-connection), then round-trip an `Execute`. Branding is checked before
+    /// any I/O, so a foreign handle never touches the wire.
+    fn run_prepared<T>(&self, stmt: &Prepared<T>) -> Result<protocol::Frame> {
+        if stmt.client_id != self.client_id {
+            return Err(Error::ForeignStatement);
+        }
+        self.round_trip(protocol::REQ_EXECUTE, &protocol::encode_execute_payload(stmt.stmt_id))
     }
 
     fn round_trip(&self, kind: u8, payload: &[u8]) -> Result<protocol::Frame> {
