@@ -91,7 +91,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "tokio")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::object::{deserialize_fields, serialize_fields_into, Object};
+use crate::object::{serialize_fields_into, try_deserialize_fields, Object};
 use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionFilter};
 
 /// Maximum payload size per frame (16 MB). Defensive limit to prevent
@@ -434,12 +434,11 @@ pub fn decode_object(data: &[u8], mut pos: usize) -> io::Result<(Object, usize)>
     pos += 8;
 
     // The fields encoding is self-describing in length: count, then each field
-    // with its own length-prefixed name and tagged value. We walk it to know
-    // where it ends.
-    let fields_start = pos;
-    let fields_end = scan_fields_end(data, pos)?;
-    let fields = deserialize_fields(&data[fields_start..fields_end]);
-    pos = fields_end;
+    // with its own length-prefixed name and tagged value. `try_deserialize_fields`
+    // walks it fallibly (bounds- + UTF-8-checked) — so malformed wire bytes
+    // surface as `InvalidData`, never a panic — and returns the end offset.
+    let (fields, end) = try_deserialize_fields(data, pos)?;
+    pos = end;
 
     Ok((
         Object {
@@ -450,64 +449,6 @@ pub fn decode_object(data: &[u8], mut pos: usize) -> io::Result<(Object, usize)>
         },
         pos,
     ))
-}
-
-/// Walk through a fields encoding to find its end offset. The fields encoding
-/// (matching engine::serialize_fields) is:
-///   [count: u16][ (name_len: u16)(name)(tag: u8)(value...) ]*
-fn scan_fields_end(data: &[u8], start: usize) -> io::Result<usize> {
-    let mut pos = start;
-    if pos + 2 > data.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "fields count truncated"));
-    }
-    let count = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
-    pos += 2;
-
-    for _ in 0..count {
-        if pos + 2 > data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "field name truncated"));
-        }
-        let name_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
-        pos += 2 + name_len;
-
-        if pos + 1 > data.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "field tag missing"));
-        }
-        let tag = data[pos];
-        pos += 1;
-
-        let value_len = match tag {
-            0 => 0,                                       // Null
-            1 => read_u32_len(data, &mut pos)?,           // String
-            2 => 4,                                       // U32
-            3 => 8,                                       // U64
-            4 => 4,                                       // I32
-            5 => 8,                                       // I64
-            6 => 4,                                       // F32
-            7 => 8,                                       // F64
-            8 => 1,                                       // Bool
-            9 => read_u32_len(data, &mut pos)?,           // Bytes
-            10 => 8,                                      // DateTime (i64 epoch-millis)
-            11 => read_u32_len(data, &mut pos)?,          // Json (compact JSON text)
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown value tag {tag}"),
-                ))
-            }
-        };
-        pos += value_len;
-    }
-    Ok(pos)
-}
-
-fn read_u32_len(data: &[u8], pos: &mut usize) -> io::Result<usize> {
-    if *pos + 4 > data.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "length prefix truncated"));
-    }
-    let len = u32::from_be_bytes(data[*pos..*pos + 4].try_into().unwrap()) as usize;
-    *pos += 4;
-    Ok(len)
 }
 
 /// Encode an Objects response payload into `out`. Caller can pre-size the
@@ -538,7 +479,10 @@ pub fn decode_objects_payload(data: &[u8]) -> io::Result<Vec<Object>> {
     }
     let count = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
     let mut pos = 4;
-    let mut objects = Vec::with_capacity(count);
+    // Don't pre-allocate to a hostile `count` (it's an unbounded u32, while the
+    // payload is ≤ 16 MiB): cap the reservation and let the Vec grow. Each
+    // decode_object validates, so a bogus count fails fast when bytes run out.
+    let mut objects = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
         let (obj, new_pos) = decode_object(data, pos)?;
         objects.push(obj);

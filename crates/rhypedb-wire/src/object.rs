@@ -769,6 +769,108 @@ pub fn deserialize_fields(data: &[u8]) -> FieldMap {
     fields
 }
 
+/// Fallible field parser for **untrusted** bytes (the network decode path).
+///
+/// Mirrors [`deserialize_fields`] but bounds-checks every read and validates
+/// UTF-8, returning `Err(InvalidData)` on any malformation instead of panicking
+/// — so a malformed or stream-desynced wire object can never crash the reader.
+/// Returns the parsed map and the offset one past the last field. The infallible
+/// [`deserialize_fields`] is kept for the hot trusted on-disk LSM read path.
+pub fn try_deserialize_fields(data: &[u8], start: usize) -> std::io::Result<(FieldMap, usize)> {
+    use std::io::{Error, ErrorKind};
+    let bad = |m: &str| Error::new(ErrorKind::InvalidData, m.to_string());
+    // Bounds check with overflow safety (`pos + n` could wrap on a hostile len).
+    let need = |pos: usize, n: usize| -> std::io::Result<()> {
+        match pos.checked_add(n) {
+            Some(end) if end <= data.len() => Ok(()),
+            _ => Err(Error::new(ErrorKind::InvalidData, "fields truncated")),
+        }
+    };
+
+    let mut fields = HashMap::new();
+    let mut pos = start;
+
+    need(pos, 2)?;
+    let count = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+    pos += 2;
+
+    for _ in 0..count {
+        need(pos, 2)?;
+        let name_len = u16::from_be_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        need(pos, name_len)?;
+        let name = std::str::from_utf8(&data[pos..pos + name_len])
+            .map_err(|_| bad("field name not utf-8"))?
+            .to_string();
+        pos += name_len;
+
+        need(pos, 1)?;
+        let tag = data[pos];
+        pos += 1;
+
+        macro_rules! fixed {
+            ($n:expr, $ty:ty, $ctor:expr) => {{
+                need(pos, $n)?;
+                let v = <$ty>::from_be_bytes(data[pos..pos + $n].try_into().unwrap());
+                pos += $n;
+                $ctor(v)
+            }};
+        }
+
+        let value = match tag {
+            0 => Value::Null,
+            1 => {
+                need(pos, 4)?;
+                let len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                need(pos, len)?;
+                let s = std::str::from_utf8(&data[pos..pos + len])
+                    .map_err(|_| bad("string value not utf-8"))?
+                    .to_string();
+                pos += len;
+                Value::String(s)
+            }
+            2 => fixed!(4, u32, Value::U32),
+            3 => fixed!(8, u64, Value::U64),
+            4 => fixed!(4, i32, Value::I32),
+            5 => fixed!(8, i64, Value::I64),
+            6 => fixed!(4, f32, Value::F32),
+            7 => fixed!(8, f64, Value::F64),
+            8 => {
+                need(pos, 1)?;
+                let v = data[pos] != 0;
+                pos += 1;
+                Value::Bool(v)
+            }
+            9 => {
+                need(pos, 4)?;
+                let len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                need(pos, len)?;
+                let b = Bytes::copy_from_slice(&data[pos..pos + len]);
+                pos += len;
+                Value::Bytes(b)
+            }
+            10 => fixed!(8, i64, Value::DateTime),
+            11 => {
+                need(pos, 4)?;
+                let len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                need(pos, len)?;
+                let v: serde_json::Value = serde_json::from_slice(&data[pos..pos + len])
+                    .map_err(|_| bad("invalid json value"))?;
+                pos += len;
+                Value::Json(v)
+            }
+            other => return Err(bad(&format!("unknown value tag {other}"))),
+        };
+
+        fields.insert(name, value);
+    }
+
+    Ok((fields, pos))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,6 +899,48 @@ mod tests {
         let encoded = serialize_fields(&fields);
         let decoded = deserialize_fields(&encoded);
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn try_deserialize_fields_matches_serialize_and_reports_end() {
+        let mut fields = FieldMap::new();
+        fields.insert("name".into(), Value::String("Alice".into()));
+        fields.insert("age".into(), Value::U32(30));
+        fields.insert("blob".into(), Value::Bytes(Bytes::from_static(b"\x00\xff")));
+        fields.insert("when".into(), Value::DateTime(500));
+        let encoded = serialize_fields(&fields);
+        let (parsed, end) = try_deserialize_fields(&encoded[..], 0).unwrap();
+        assert_eq!(end, encoded.len());
+        assert_eq!(parsed, fields);
+    }
+
+    #[test]
+    fn try_deserialize_fields_rejects_malformed_without_panic() {
+        // Truncating a valid encoding by ANY number of trailing bytes errs.
+        let mut fields = FieldMap::new();
+        fields.insert("age".into(), Value::U64(42));
+        let good = serialize_fields(&fields);
+        for cut in 1..good.len() {
+            assert!(
+                try_deserialize_fields(&good[..good.len() - cut], 0).is_err(),
+                "truncation by {cut} must error, not panic"
+            );
+        }
+
+        // A non-UTF-8 field name → error (not a `from_utf8` panic). count=1,
+        // name_len=2, name=[0xff,0xff].
+        assert!(try_deserialize_fields(&[0, 1, 0, 2, 0xff, 0xff], 0).is_err());
+
+        // An unknown value tag → error. count=1, name_len=1, name="x", tag=99.
+        assert!(try_deserialize_fields(&[0, 1, 0, 1, b'x', 99], 0).is_err());
+
+        // A tag whose fixed value is missing → error (no out-of-range slice).
+        // count=1, name "x", tag=3 (U64 needs 8 value bytes) with none present.
+        assert!(try_deserialize_fields(&[0, 1, 0, 1, b'x', 3], 0).is_err());
+
+        // A String value with a length that runs off the buffer → error.
+        // count=1, name "x", tag=1, len=0x00000010 (16) but no value bytes.
+        assert!(try_deserialize_fields(&[0, 1, 0, 1, b'x', 1, 0, 0, 0, 16], 0).is_err());
     }
 
     #[test]

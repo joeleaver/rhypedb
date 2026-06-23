@@ -61,6 +61,20 @@ fn spawn_mock() -> (SocketAddr, JoinHandle<()>) {
                     let req = frame.req_id;
                     if q == "User.get(1)" {
                         single(&mut stream, req, user_obj(1, "Alice", 30));
+                    } else if q == "User.get(666)" {
+                        // A RESP_SINGLE whose object has a valid header but
+                        // truncated fields (tag 3 / U64 with no value bytes).
+                        // The client must surface an error, never panic.
+                        let mut bad = Vec::new();
+                        bad.extend_from_slice(&1u16.to_be_bytes()); // type_len
+                        bad.push(b'U'); // type "U"
+                        bad.extend_from_slice(&1u64.to_be_bytes()); // id
+                        bad.extend_from_slice(&1u16.to_be_bytes()); // fields count = 1
+                        bad.extend_from_slice(&1u16.to_be_bytes()); // name_len = 1
+                        bad.push(b'x'); // name
+                        bad.push(3); // tag U64 — needs 8 value bytes, none present
+                        wire_sync::write_frame(&mut stream, req, protocol::RESP_SINGLE, &bad)
+                            .unwrap();
                     } else if q == "User" {
                         objects(&mut stream, req, &[user_obj(1, "Alice", 30), user_obj(2, "Bob", 25)]);
                     } else if q == "User.get(99)" {
@@ -142,6 +156,52 @@ fn full_request_response_surface() {
         Err(Error::Server(msg)) => assert!(msg.contains("no such type"), "got: {msg}"),
         other => panic!("expected a server error, got {other:?}"),
     }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn malformed_reply_errors_without_panic_and_keeps_connection() {
+    let (addr, handle) = spawn_mock();
+    let client = Client::connect(addr).unwrap();
+
+    // A malformed object payload surfaces as an error — crucially NOT a panic
+    // (the framing was intact, so only the payload decode failed).
+    let err = client
+        .fetch_one::<User>(&Query::get("User", 666))
+        .unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "got: {err:?}");
+
+    // The frame boundaries were intact, so the connection is still usable.
+    let ok = client
+        .fetch_one::<User>(&Query::get("User", 1))
+        .unwrap()
+        .expect("a row");
+    assert_eq!(ok.id, 1);
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn io_error_latches_connection_closed() {
+    // A mock that reads one request then drops the connection without replying
+    // → the client's read sees EOF (an I/O error), which must latch the
+    // connection closed so the NEXT call fails fast instead of desyncing.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = wire_sync::read_frame(&mut stream); // consume one request, then drop
+    });
+
+    let client = Client::connect(addr).unwrap();
+    // First call: the peer hung up mid-exchange → an I/O error.
+    assert!(matches!(client.ping(), Err(Error::Io(_))));
+    // Subsequent calls fail fast as Closed (no silent mis-correlation).
+    assert!(matches!(client.ping(), Err(Error::Closed)));
+    assert!(matches!(client.query("User"), Err(Error::Closed)));
 
     drop(client);
     handle.join().unwrap();

@@ -51,6 +51,11 @@ pub enum Error {
     /// An object's fields could not be deserialized into the requested type.
     #[error("deserialize error: {0}")]
     Deserialize(String),
+    /// A previous request failed mid-flight (I/O error), so the connection's
+    /// request/response framing may be desynced. The connection refuses further
+    /// requests rather than risk returning a mis-correlated reply — reconnect.
+    #[error("connection is closed after a previous I/O error; reconnect")]
+    Closed,
 }
 
 /// Convenience alias.
@@ -103,15 +108,29 @@ impl QueryResult {
 struct Connection {
     stream: TcpStream,
     next_req_id: u32,
+    /// Set once an I/O error interrupts a round-trip: the stream may hold a
+    /// partial/unread reply, so reusing it could mis-correlate. Latches the
+    /// connection closed (fail-fast) instead of silently desyncing.
+    dead: bool,
 }
 
 impl Connection {
-    /// Send one request frame and read the one reply frame.
+    /// Send one request frame and read the one reply frame. On any I/O failure
+    /// the connection is marked dead (see [`Connection::dead`]).
     fn round_trip(&mut self, kind: u8, payload: &[u8]) -> Result<protocol::Frame> {
+        if self.dead {
+            return Err(Error::Closed);
+        }
         let req_id = self.next_req_id;
         self.next_req_id = self.next_req_id.wrapping_add(1);
-        wire_sync::write_frame(&mut self.stream, req_id, kind, payload).map_err(Error::Io)?;
-        wire_sync::read_frame(&mut self.stream).map_err(Error::Io)
+        // Any I/O error here can leave the stream framing desynced — latch dead.
+        let result = wire_sync::write_frame(&mut self.stream, req_id, kind, payload)
+            .map_err(Error::Io)
+            .and_then(|()| wire_sync::read_frame(&mut self.stream).map_err(Error::Io));
+        if result.is_err() {
+            self.dead = true;
+        }
+        result
     }
 }
 
@@ -167,6 +186,7 @@ impl Client {
             conn: Mutex::new(Connection {
                 stream,
                 next_req_id: 1,
+                dead: false,
             }),
         })
     }
