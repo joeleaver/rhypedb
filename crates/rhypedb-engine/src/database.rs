@@ -5426,16 +5426,28 @@ impl Database {
         let mut staged_unique: HashMap<Bytes, u64> = HashMap::new();
         for (field_name, value) in &updates {
             let field_def = type_def.get_field(field_name).unwrap();
-            if field_def.is_unique() && !matches!(value, Value::Null) {
-                // Remove old unique index entry if the field had a value.
+            if field_def.is_unique() {
+                // Remove the old `u:` entry whenever the field HELD a non-null
+                // value — independent of the new value. Gating the removal on
+                // the NEW value being non-null (as a single combined condition
+                // once did) skipped cleanup on an update-to-Null, dangling the
+                // `u:<type>:<field>:<old_value>` key → a false UniqueViolation
+                // when the freed value is later reused. This mirrors the
+                // keyspace contract create (insert-only) and delete
+                // (remove-if-stored-non-null) already honour.
                 if let Some(old_value) = fields.get(field_name)
                     && !matches!(old_value, Value::Null)
                 {
                     self.remove_unique_index(&mut txn, type_name, type_id, field_name, old_value)?;
                 }
-                self.check_unique_and_insert(
-                    &mut txn, type_name, type_id, field_name, value, object_id, &mut staged_unique,
-                )?;
+                // Claim the new value only when it is non-null (Null carries no
+                // uniqueness constraint — many rows may be Null at once).
+                if !matches!(value, Value::Null) {
+                    self.check_unique_and_insert(
+                        &mut txn, type_name, type_id, field_name, value, object_id,
+                        &mut staged_unique,
+                    )?;
+                }
             }
         }
 
@@ -15152,6 +15164,159 @@ mod tests {
         updates.insert("email".into(), Value::String("alice@example.com".into()));
         let result = db.update("User", bob.id, updates);
         assert!(matches!(result, Err(EngineError::UniqueViolation { .. })));
+    }
+
+    #[test]
+    fn update_unique_field_to_null_frees_value_for_reuse() {
+        // Regression: updating a `@unique` field FROM a value TO Null used to
+        // skip the `u:` removal entirely (the old guard gated removal on the
+        // NEW value being non-null), dangling `u:<type>:<field>:<old>` -> the
+        // freed value could no longer be re-created/re-assigned (false
+        // UniqueViolation) and a bare `find_by_unique` probe returned the stale
+        // row. After update-to-null the value must be fully released.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Alice".into()));
+        f.insert("email".into(), Value::String("alice@example.com".into()));
+        let alice = db.create("User", f).unwrap();
+
+        // Null out the unique field.
+        let mut updates = FieldMap::new();
+        updates.insert("email".into(), Value::Null);
+        db.update("User", alice.id, updates).unwrap();
+
+        // (b/c) The bare unique probe no longer resolves the freed value — i.e.
+        // the `u:` key is actually gone (find_by_unique does NOT re-filter, so a
+        // hit here would mean a dangling key still on disk).
+        assert!(
+            db.find_by_unique("User", "email", &Value::String("alice@example.com".into()))
+                .unwrap()
+                .is_none(),
+            "the old unique key must be removed when the field is set to Null"
+        );
+
+        // (a) The freed value can be claimed by a brand-new row.
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String("Bob".into()));
+        f2.insert("email".into(), Value::String("alice@example.com".into()));
+        let bob = db
+            .create("User", f2)
+            .expect("re-creating the freed unique value must succeed");
+
+        // ...and the probe now resolves to the NEW owner.
+        assert_eq!(
+            db.find_by_unique("User", "email", &Value::String("alice@example.com".into()))
+                .unwrap()
+                .map(|o| o.id),
+            Some(bob.id)
+        );
+
+        // The nulled row is still live, just no longer holding the value.
+        let alice_now = db.get("User", alice.id).unwrap();
+        assert_ne!(
+            alice_now.fields.get("email"),
+            Some(&Value::String("alice@example.com".into()))
+        );
+    }
+
+    #[test]
+    fn update_unique_field_can_be_claimed_again_via_update() {
+        // The freed value must also be reusable via UPDATE (not only create),
+        // and the uniqueness constraint must re-apply once it is re-claimed.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(test_schema(), dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("email".into(), Value::String("a@x.com".into()));
+        let a = db.create("User", f).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("email".into(), Value::String("b@x.com".into()));
+        let b = db.create("User", f).unwrap();
+
+        // a -> Null releases "a@x.com".
+        let mut up = FieldMap::new();
+        up.insert("email".into(), Value::Null);
+        db.update("User", a.id, up).unwrap();
+
+        // b can now take the freed value.
+        let mut up = FieldMap::new();
+        up.insert("email".into(), Value::String("a@x.com".into()));
+        db.update("User", b.id, up)
+            .expect("re-claiming the freed value via update must succeed");
+        assert_eq!(
+            db.find_by_unique("User", "email", &Value::String("a@x.com".into()))
+                .unwrap()
+                .map(|o| o.id),
+            Some(b.id)
+        );
+
+        // Constraint re-applies: a trying to re-take it now collides with b.
+        let mut up = FieldMap::new();
+        up.insert("email".into(), Value::String("a@x.com".into()));
+        assert!(matches!(
+            db.update("User", a.id, up),
+            Err(EngineError::UniqueViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn update_to_null_on_one_unique_field_leaves_a_sibling_unique_field_intact() {
+        // Two @unique fields on one type: nulling ONE in an update must free
+        // exactly that value and leave the other field's claim untouched (the
+        // per-field loop must not over-remove). Uses a local schema so the
+        // shared test_schema fixture stays single-unique.
+        let schema = parse_schema(
+            r#"
+            type Account {
+                email: String @unique
+                handle: String @unique
+            }
+            "#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+
+        let mut f = FieldMap::new();
+        f.insert("email".into(), Value::String("e@x.com".into()));
+        f.insert("handle".into(), Value::String("h1".into()));
+        let acc = db.create("Account", f).unwrap();
+
+        // Null ONLY email; handle is left as-is in the same update call.
+        let mut up = FieldMap::new();
+        up.insert("email".into(), Value::Null);
+        db.update("Account", acc.id, up).unwrap();
+
+        // email freed...
+        assert!(
+            db.find_by_unique("Account", "email", &Value::String("e@x.com".into()))
+                .unwrap()
+                .is_none()
+        );
+        let mut f2 = FieldMap::new();
+        f2.insert("email".into(), Value::String("e@x.com".into()));
+        db.create("Account", f2)
+            .expect("the nulled unique value must be reusable");
+
+        // ...but handle is STILL held by acc (not collaterally removed).
+        assert_eq!(
+            db.find_by_unique("Account", "handle", &Value::String("h1".into()))
+                .unwrap()
+                .map(|o| o.id),
+            Some(acc.id)
+        );
+        let mut f3 = FieldMap::new();
+        f3.insert("handle".into(), Value::String("h1".into()));
+        assert!(
+            matches!(
+                db.create("Account", f3),
+                Err(EngineError::UniqueViolation { .. })
+            ),
+            "the sibling unique value must remain claimed"
+        );
     }
 
     #[test]
