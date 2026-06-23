@@ -38,7 +38,10 @@ const HEADER: &str = "\
 // Use as a module, e.g. `mod client;`. Requires the `rhypedb-client`, `serde`
 // (with `derive`), and `serde_json` crates.
 
-#![allow(dead_code, unused_imports)]
+// Generated code: a type with no creatable scalar fields yields a `create()` that
+// never reads `row` or pushes to `parts`, so allow the unused-* lints too — the
+// output must be warning-free in a consumer build for ANY schema shape.
+#![allow(dead_code, unused_imports, unused_mut, unused_variables)]
 
 pub use rhypedb_client::{Query, Row};
 use serde::{Deserialize, Serialize};
@@ -111,8 +114,13 @@ fn emit_struct(out: &mut String, td: &TypeDef) {
         }
     }
 
+    // A type name that collides with a Rust keyword is escaped for the
+    // *identifier* positions (struct, impl, `Query<T>`, `&T`); the wire/string
+    // positions (`TYPE_NAME`, `Query::all("...")`, the query text) keep the
+    // original name. Mirrors the field-name escaping above.
+    let ti = ident_for(&td.name);
     out.push_str("#[derive(Debug, Clone, Default, Serialize, Deserialize)]\n");
-    out.push_str(&format!("pub struct {} {{\n", td.name));
+    out.push_str(&format!("pub struct {ti} {{\n"));
     for f in &td.fields {
         let FieldType::Scalar(s) = &f.field_type else {
             continue;
@@ -135,7 +143,7 @@ fn emit_struct(out: &mut String, td: &TypeDef) {
         .filter(|f| matches!(f.field_type, FieldType::Scalar(_)))
         .map(|f| format!("\"{}\"", f.name))
         .collect();
-    out.push_str(&format!("\nimpl {} {{\n", td.name));
+    out.push_str(&format!("\nimpl {ti} {{\n"));
     out.push_str(&format!(
         "    pub const TYPE_NAME: &'static str = \"{}\";\n",
         td.name
@@ -145,23 +153,24 @@ fn emit_struct(out: &mut String, td: &TypeDef) {
         scalar_fields.join(", ")
     ));
 
-    // Typed read-query seed constructors → `rhypedb_client::Query<Self>`.
+    // Typed read-query seed constructors → `rhypedb_client::Query<Self>`. The
+    // RETURN TYPE uses the escaped ident `{ti}`; the query string keeps `{t}`.
     let t = &td.name;
     out.push_str(&format!(
-        "\n    /// `{t}` — all objects of this type.\n    pub fn all() -> Query<{t}> {{ Query::all(\"{t}\") }}\n"
+        "\n    /// `{t}` — all objects of this type.\n    pub fn all() -> Query<{ti}> {{ Query::all(\"{t}\") }}\n"
     ));
     out.push_str(&format!(
-        "    /// `{t}.get(id)` — one object by id.\n    pub fn get(id: u64) -> Query<{t}> {{ Query::get(\"{t}\", id) }}\n"
+        "    /// `{t}.get(id)` — one object by id.\n    pub fn get(id: u64) -> Query<{ti}> {{ Query::get(\"{t}\", id) }}\n"
     ));
     out.push_str(&format!(
-        "    /// `{t}.filter(predicate)` — e.g. `{t}::filter(\".age > 18\")`.\n    pub fn filter(predicate: &str) -> Query<{t}> {{ Query::filter_on(\"{t}\", predicate) }}\n"
+        "    /// `{t}.filter(predicate)` — e.g. `{t}::filter(\".age > 18\")`.\n    pub fn filter(predicate: &str) -> Query<{ti}> {{ Query::filter_on(\"{t}\", predicate) }}\n"
     ));
 
     // Typed create from a row's set (`Some`) fields. Every scalar is settable: a
     // `DateTime` row field is an RFC 3339 string, `Bytes` a base64 string (both
     // coerce server-side), and `Json` emits a raw JSON literal.
     out.push_str(&format!(
-        "\n    /// `{t}.create({{ .. }})` from this row's set (`Some`) fields.\n    pub fn create(row: &{t}) -> Query<{t}> {{\n        let mut parts: Vec<String> = Vec::new();\n"
+        "\n    /// `{t}.create({{ .. }})` from this row's set (`Some`) fields.\n    pub fn create(row: &{ti}) -> Query<{ti}> {{\n        let mut parts: Vec<String> = Vec::new();\n"
     ));
     for f in td.fields.iter().filter(|f| matches!(&f.field_type, FieldType::Scalar(s) if is_creatable_scalar(s))) {
         let ident = ident_for(&f.name);
@@ -510,6 +519,41 @@ mod tests {
         assert!(code.contains("pub fn all() -> Query<User> { Query::all(\"User\") }"));
         assert!(code.contains("pub fn get(id: u64) -> Query<User> { Query::get(\"User\", id) }"));
         assert!(code.contains("pub fn filter(predicate: &str) -> Query<User> { Query::filter_on(\"User\", predicate) }"));
+    }
+
+    #[test]
+    fn header_allows_all_unused_lints_for_warning_free_output() {
+        // A type with no creatable scalar fields yields a `create()` whose `row`
+        // and `parts` are unused; generated code must still be warning-free.
+        let code = gen_rs(r#"type User { name: String }"#);
+        assert!(code.contains("#![allow(dead_code, unused_imports, unused_mut, unused_variables)]"));
+    }
+
+    #[test]
+    fn keyword_type_name_is_escaped_in_ident_positions_but_raw_on_the_wire() {
+        // A type whose name is a Rust keyword must produce compilable Rust: the
+        // identifier positions are raw-escaped, but the query/wire string keeps
+        // the original name.
+        let code = gen_rs(r#"type loop { name: String }  type fn { x: i64 }"#);
+        assert!(code.contains("pub struct r#loop {"));
+        assert!(code.contains("impl r#loop {"));
+        assert!(code.contains("pub struct r#fn {"));
+        // Return type escaped; the query string + TYPE_NAME keep the real name.
+        assert!(code.contains("pub fn all() -> Query<r#loop> { Query::all(\"loop\") }"));
+        assert!(code.contains("pub fn get(id: u64) -> Query<r#loop> { Query::get(\"loop\", id) }"));
+        assert!(code.contains("pub fn create(row: &r#loop) -> Query<r#loop> {"));
+        assert!(code.contains("pub const TYPE_NAME: &'static str = \"loop\";"));
+        // ...and it is valid Rust.
+        syn::parse_file(&code).expect("keyword-named types must generate valid Rust");
+    }
+
+    #[test]
+    fn scalar_less_type_generates_valid_create() {
+        // A relation-only (no scalar) type still generates a compilable create().
+        let code = gen_rs(r#"type Tag { owner: User }  type User { name: String }"#);
+        assert!(code.contains("pub struct Tag {"));
+        assert!(code.contains("pub fn create(row: &Tag) -> Query<Tag> {"));
+        syn::parse_file(&code).expect("scalar-less types must generate valid Rust");
     }
 
     #[test]

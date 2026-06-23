@@ -21,10 +21,13 @@ use rhypedb_client::{ChangeKind, Client, Notification, Query, QueryResult, Subsc
 // keeps the committed file byte-identical to the generator.
 #[path = "client_e2e_generated.rs"]
 mod generated;
-use generated::{Doc, User};
+use generated::{Doc, Thing, User};
 
 /// The schema the fixture was generated from. Kept byte-identical to the SDL fed
-/// to `rhypedb-codegen` (asserted by `generated_fixture_is_in_sync`).
+/// to `rhypedb-codegen` (asserted by `generated_fixture_is_in_sync`). `Thing`
+/// exercises DateTime/Bytes/Json round-trips; `Tag` is relation-only (its
+/// generated `create()` has no scalar fields — it proves that path compiles
+/// warning-free, exercised at compile time even though the test never builds a Tag).
 const E2E_SDL: &str = r#"type User {
   name: String @unique
   age: u32 @indexed
@@ -37,6 +40,15 @@ type Post {
 type Doc {
   label: String
   embedding: Vector<4>
+}
+type Thing {
+  created: DateTime
+  blob: Bytes
+  meta: Json
+  label: String
+}
+type Tag {
+  owner: User
 }
 "#;
 
@@ -165,6 +177,40 @@ fn run_client_flow(addr: SocketAddr) {
     let stmt = client.prepare(&User::all()).unwrap();
     assert_eq!(client.fetch_prepared(&stmt).unwrap().len(), 2);
     assert_eq!(client.fetch_prepared(&stmt).unwrap().len(), 2); // re-runs with no re-parse
+    // execute_prepared exposes the untyped result shape.
+    match client.execute_prepared(&stmt).unwrap() {
+        QueryResult::Objects(v) => assert_eq!(v.len(), 2),
+        other => panic!("expected a list, got {other:?}"),
+    }
+    // fetch_one_prepared (the Option path).
+    let get_ada = client.prepare(&User::get(ada.id)).unwrap();
+    assert_eq!(
+        client.fetch_one_prepared(&get_ada).unwrap().unwrap().id,
+        ada.id
+    );
+    // create_prepared (the into_typed_single path, distinct from fetch_prepared).
+    let mk_doc = client
+        .prepare(&Doc::create(&Doc { label: Some("prepared-doc".into()) }))
+        .unwrap();
+    let pd = client.create_prepared(&mk_doc).unwrap();
+    assert_eq!(pd.data.label.as_deref(), Some("prepared-doc"));
+
+    // --- DateTime / Bytes / Json typed create + read-back over the real socket ---
+    // (the silent-wrong-answer-prone path: create-literal escaping + server
+    // coercion + read rendering must all agree.)
+    let thing = client
+        .create(&Thing::create(&Thing {
+            created: Some("2021-01-01T00:00:00Z".into()), // RFC 3339
+            blob: Some("AAEC".into()),                    // base64 of [0,1,2]
+            meta: Some(serde_json::json!({ "k": 1, "tags": ["a", "b"] })),
+            label: Some("t1".into()),
+        }))
+        .unwrap();
+    let back = client.fetch_one(&Thing::get(thing.id)).unwrap().expect("a row");
+    assert_eq!(back.data.created.as_deref(), Some("2021-01-01T00:00:00Z"));
+    assert_eq!(back.data.blob.as_deref(), Some("AAEC"));
+    assert_eq!(back.data.meta, Some(serde_json::json!({ "k": 1, "tags": ["a", "b"] })));
+    assert_eq!(back.data.label.as_deref(), Some("t1"));
 
     // --- raw update, then confirm via a typed get ---
     client
@@ -201,7 +247,7 @@ fn run_client_flow(addr: SocketAddr) {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, d1.id, "nearest to [1,0,0,0] must be d1");
 
-    // --- live subscription: subscribe, mutate, receive the pushed event ---
+    // --- live subscription: cover Create / Update / Delete + the fields payload ---
     let mut sub = client.subscribe(SubscriptionFilter::for_type("User")).unwrap();
     let carol = client
         .create(&User::create(&User {
@@ -210,13 +256,44 @@ fn run_client_flow(addr: SocketAddr) {
             active: Some(true),
         }))
         .unwrap();
+    // Create — also assert the best-effort fields payload carries the scalar.
     match sub.next_event().unwrap() {
         Notification::Change(c) => {
             assert_eq!(c.kind, ChangeKind::Create);
             assert_eq!(c.type_name, "User");
             assert_eq!(c.id, carol.id);
+            assert_eq!(
+                c.fields.as_ref().and_then(|m| m.get("name")),
+                Some(&serde_json::json!("Carol")),
+                "create event must carry the scalar fields"
+            );
         }
         other => panic!("expected a User create event, got {other:?}"),
+    }
+    // Update.
+    client
+        .execute(&Query::<User>::raw(format!(
+            "User.get({}).update({{ age: 41 }})",
+            carol.id
+        )))
+        .unwrap();
+    match sub.next_event().unwrap() {
+        Notification::Change(c) => {
+            assert_eq!(c.kind, ChangeKind::Update);
+            assert_eq!(c.id, carol.id);
+        }
+        other => panic!("expected a User update event, got {other:?}"),
+    }
+    // Delete.
+    client
+        .execute(&Query::<User>::raw(format!("User.get({}).delete()", carol.id)))
+        .unwrap();
+    match sub.next_event().unwrap() {
+        Notification::Change(c) => {
+            assert_eq!(c.kind, ChangeKind::Delete);
+            assert_eq!(c.id, carol.id);
+        }
+        other => panic!("expected a User delete event, got {other:?}"),
     }
     sub.unsubscribe().unwrap();
 
@@ -229,8 +306,9 @@ fn run_client_flow(addr: SocketAddr) {
         remaining.iter().all(|r| r.id != ada.id),
         "Ada must be deleted"
     );
-    // Created Ada + Bob + Carol, deleted Ada → Bob + Carol remain.
-    assert_eq!(remaining.len(), 2);
+    // Created Ada + Bob + Carol; deleted Carol (in the subscription block) and
+    // Ada → only Bob remains.
+    assert_eq!(remaining.len(), 1);
 }
 
 #[test]
@@ -240,9 +318,12 @@ fn generated_fixture_is_in_sync_with_codegen() {
     // generator. Regenerate with `rhypedb-codegen` if this fails.
     let schema = parse_schema(E2E_SDL).unwrap();
     let regenerated = rhypedb_codegen::generate_rust(&schema);
+    // Normalize line endings: the generator emits `\n`, but a CRLF checkout (e.g.
+    // Windows autocrlf) would materialize the committed file with `\r\n`. Compare
+    // on content, not platform line-ending policy.
     assert_eq!(
-        regenerated,
-        include_str!("client_e2e_generated.rs"),
+        regenerated.replace("\r\n", "\n"),
+        include_str!("client_e2e_generated.rs").replace("\r\n", "\n"),
         "client_e2e_generated.rs is stale — regenerate it from E2E_SDL"
     );
 }

@@ -15,7 +15,10 @@
 // Use as a module, e.g. `mod client;`. Requires the `rhypedb-client`, `serde`
 // (with `derive`), and `serde_json` crates.
 
-#![allow(dead_code, unused_imports)]
+// Generated code: a type with no creatable scalar fields yields a `create()` that
+// never reads `row` or pushes to `parts`, so allow the unused-* lints too — the
+// output must be warning-free in a consumer build for ANY schema shape.
+#![allow(dead_code, unused_imports, unused_mut, unused_variables)]
 
 pub use rhypedb_client::{Query, Row};
 use serde::{Deserialize, Serialize};
@@ -99,6 +102,65 @@ impl Post {
         let mut parts: Vec<String> = Vec::new();
         if let Some(v) = &row.title { parts.push(format!("title: {}", rhypedb_str_lit(v))); }
         Query::raw(format!("Post.create({{ {} }})", parts.join(", ")))
+    }
+}
+
+/// Scalar fields of `type Tag`.
+/// - relation `owner` -> `User`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tag {
+}
+
+impl Tag {
+    pub const TYPE_NAME: &'static str = "Tag";
+    pub const FIELDS: &'static [&'static str] = &[];
+
+    /// `Tag` — all objects of this type.
+    pub fn all() -> Query<Tag> { Query::all("Tag") }
+    /// `Tag.get(id)` — one object by id.
+    pub fn get(id: u64) -> Query<Tag> { Query::get("Tag", id) }
+    /// `Tag.filter(predicate)` — e.g. `Tag::filter(".age > 18")`.
+    pub fn filter(predicate: &str) -> Query<Tag> { Query::filter_on("Tag", predicate) }
+
+    /// `Tag.create({ .. })` from this row's set (`Some`) fields.
+    pub fn create(row: &Tag) -> Query<Tag> {
+        let mut parts: Vec<String> = Vec::new();
+        Query::raw(format!("Tag.create({{ {} }})", parts.join(", ")))
+    }
+}
+
+/// Scalar fields of `type Thing`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Thing {
+    #[serde(default)]
+    pub created: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
+    #[serde(default)]
+    pub meta: Option<serde_json::Value>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+impl Thing {
+    pub const TYPE_NAME: &'static str = "Thing";
+    pub const FIELDS: &'static [&'static str] = &["created", "blob", "meta", "label"];
+
+    /// `Thing` — all objects of this type.
+    pub fn all() -> Query<Thing> { Query::all("Thing") }
+    /// `Thing.get(id)` — one object by id.
+    pub fn get(id: u64) -> Query<Thing> { Query::get("Thing", id) }
+    /// `Thing.filter(predicate)` — e.g. `Thing::filter(".age > 18")`.
+    pub fn filter(predicate: &str) -> Query<Thing> { Query::filter_on("Thing", predicate) }
+
+    /// `Thing.create({ .. })` from this row's set (`Some`) fields.
+    pub fn create(row: &Thing) -> Query<Thing> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(v) = &row.created { parts.push(format!("created: {}", rhypedb_str_lit(v))); }
+        if let Some(v) = &row.blob { parts.push(format!("blob: {}", rhypedb_str_lit(v))); }
+        if let Some(v) = &row.meta { parts.push(format!("meta: {}", rhypedb_json_lit(v))); }
+        if let Some(v) = &row.label { parts.push(format!("label: {}", rhypedb_str_lit(v))); }
+        Query::raw(format!("Thing.create({{ {} }})", parts.join(", ")))
     }
 }
 
