@@ -43,8 +43,13 @@
 #[repr(u16)]
 pub enum Site {
     /// `Wal::append_txn`: after the batch `write_all`, before the `BufWriter`
-    /// flush — the bytes are still in the user-space buffer and a crash here
-    /// loses the whole in-flight transaction.
+    /// flush. For a batch SMALLER than the `BufWriter` capacity (8 KiB) the
+    /// bytes are still in the user-space buffer, so a crash here loses the whole
+    /// in-flight transaction. A batch LARGER than the buffer is written straight
+    /// through to the OS page cache by `write_all`, so its footer may already be
+    /// durable and the txn can survive — still faithful to a real kill at this
+    /// instruction. The recovery oracle therefore predicts the outcome from the
+    /// on-disk WAL framing (is the footer present?), never from this site alone.
     WalAfterWriteBeforeFlush,
     /// `Wal::sync`: after the `BufWriter` flush (bytes now in the OS page
     /// cache), before `sync_all` — survives an in-process kill, lost only on a
@@ -131,6 +136,10 @@ mod imp {
     /// THIS THREAD (`after_hits` is clamped to `>= 1`, so `1` fires on the very
     /// next hit). Replaces any prior arm and resets this thread's hit counters.
     /// Idempotently installs the quiet panic hook.
+    ///
+    /// Arm INSIDE the [`catch_crash`] closure that drives the workload: an
+    /// injected crash that fires while no `catch_crash` is on the stack is an
+    /// uncaught panic (the quiet hook merely suppresses its message).
     pub fn arm(site: Site, after_hits: u64, mode: Mode) {
         install_quiet_hook();
         COUNTERS.with(|c| *c.borrow_mut() = [0; SITE_COUNT]);

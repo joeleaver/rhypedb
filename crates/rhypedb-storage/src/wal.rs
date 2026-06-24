@@ -227,8 +227,11 @@ impl Wal {
         encode_record_into(&mut buf, RecordType::Commit, commit_version, &[], &count);
 
         self.writer.write_all(&buf)?;
-        // CRASH BOUNDARY: bytes are in the BufWriter's user-space buffer but not
-        // yet in the OS page cache — a crash here loses the whole in-flight txn.
+        // CRASH BOUNDARY: a batch < the BufWriter capacity sits in the
+        // user-space buffer (lost on crash); a batch >= the capacity is written
+        // straight through to the OS page cache (footer may already be durable,
+        // so it can survive). Both are faithful to a real kill here — the oracle
+        // predicts the outcome from the on-disk WAL framing, not the payload.
         crash_inject::hit(Site::WalAfterWriteBeforeFlush);
         self.writer.flush()?;
         Ok(())

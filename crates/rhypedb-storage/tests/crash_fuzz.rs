@@ -74,8 +74,12 @@ fn smoke_crash_in_wal_append_loses_only_the_in_flight_txn() {
     db.discard_for_crash_recovery();
     drop(db);
 
-    // Cold reopen: the pre-crash commit survives; the in-flight txn is gone (its
-    // footer never reached the WAL, so framed replay discards it whole).
+    // Cold reopen: the pre-crash commit survives; the in-flight txn is gone. Its
+    // whole batch (a tiny payload, well under the 8 KiB BufWriter capacity) sat
+    // in the un-flushed buffer the teardown discarded, so its footer never
+    // reached the WAL and framed replay drops the txn whole. (A batch >= 8 KiB
+    // could instead be page-cache-durable and survive — see the Site docs; Inc 2's
+    // oracle predicts from framing, not payload size.)
     let recovered = LsmTree::open(harness_config(dir.path())).unwrap();
     assert_eq!(get(&recovered, b"a").as_deref(), Some(&b"1"[..]));
     assert_eq!(get(&recovered, b"b"), None, "in-flight txn must not survive");
