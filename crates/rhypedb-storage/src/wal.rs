@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
+use crate::crash_inject::{self, Site};
 use crate::{Error, Result};
 
 /// Record type tags for the WAL.
@@ -226,14 +227,42 @@ impl Wal {
         encode_record_into(&mut buf, RecordType::Commit, commit_version, &[], &count);
 
         self.writer.write_all(&buf)?;
+        // CRASH BOUNDARY: bytes are in the BufWriter's user-space buffer but not
+        // yet in the OS page cache — a crash here loses the whole in-flight txn.
+        crash_inject::hit(Site::WalAfterWriteBeforeFlush);
         self.writer.flush()?;
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<()> {
         self.writer.flush()?;
+        // CRASH BOUNDARY: bytes flushed to the OS page cache but not fsync'd —
+        // survive an in-process kill, lost only on a real power loss.
+        crash_inject::hit(Site::WalAfterFlushBeforeFsync);
         self.writer.get_ref().sync_all()?;
+        // CRASH BOUNDARY: the txn's WAL records are fully durable on the platter.
+        crash_inject::hit(Site::WalAfterFsync);
         Ok(())
+    }
+
+    /// Crash-fuzz teardown ONLY: drop the `BufWriter`'s un-flushed user-space
+    /// buffer WITHOUT flushing it, modelling a process that died with dirty
+    /// buffers. The file is reopened (append) so a subsequent normal `Drop`
+    /// closes a clean, empty-buffer writer; the old fd is closed without a flush
+    /// via `BufWriter::into_parts` (which, unlike `into_inner`, never flushes).
+    /// Bytes already `write`n by a completed `append_txn` remain in the OS page
+    /// cache, as they would across a SIGKILL.
+    #[cfg(feature = "crash-fuzz")]
+    pub fn forget_unflushed_buffer(&mut self) {
+        let fresh = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .expect("crash-fuzz: reopen WAL during simulated-crash teardown");
+        let old = std::mem::replace(&mut self.writer, BufWriter::new(fresh));
+        // `into_parts` returns the inner File + the buffered bytes WITHOUT
+        // flushing; both drop here, closing the old fd and discarding the buffer.
+        let _ = old.into_parts();
     }
 
     /// Replay all committed records from the WAL file. Used for crash recovery.

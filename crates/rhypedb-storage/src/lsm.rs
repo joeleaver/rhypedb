@@ -5,6 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::RwLock;
 
+use crate::crash_inject::{self, Site};
 use crate::memtable::MemTable;
 use crate::mvcc::{Transaction, TransactionManager};
 use crate::sst::{SstCompression, SstReader, SstWriter};
@@ -1021,6 +1022,9 @@ impl LsmTree {
         }
 
         self.immutable_memtables.write().push(old_memtable.clone());
+        // CRASH BOUNDARY: memtable rotated + staged in RAM; nothing durable has
+        // changed (no SST, WAL not truncated) — reopen recovers wholly from WAL.
+        crash_inject::hit(Site::FlushAfterMemtableRotate);
 
         // Write SST file.
         let sst_id = self
@@ -1037,18 +1041,32 @@ impl LsmTree {
             writer.add(&key, &value)?;
         }
         writer.finish()?;
+        // CRASH BOUNDARY: SST durable on disk, but NOT yet registered for reads
+        // and the WAL is still full — reopen must discover the orphan SST and
+        // reconcile it against the full WAL (idempotent double-presence).
+        crash_inject::hit(Site::FlushAfterSstFinish);
 
         // Open the new SST for reads and remove from immutable list.
         let reader = SstReader::open(&sst_path)?;
         self.sst_files.write().push(reader);
+        // CRASH BOUNDARY: SST registered in RAM, WAL still full. In-RAM
+        // registration is lost on reopen (rebuilt by the SST dir scan).
+        crash_inject::hit(Site::FlushAfterSstRegister);
 
         let mut immutables = self.immutable_memtables.write();
         immutables.retain(|mt| !Arc::ptr_eq(mt, &old_memtable));
 
         // Truncate the WAL — flushed data is now durable in the SST.
         let wal_path = self.config.data_dir.join("wal.log");
+        // CRASH BOUNDARY: the flush↔WAL-truncate race point. SST durable; WAL
+        // about to be recreated. A crash here leaves SST + full WAL = idempotent
+        // double-replay (the data-loss bug this ordering was fixed to prevent).
+        crash_inject::hit(Site::FlushBeforeWalTruncate);
         let new_wal = Wal::create_fresh(&wal_path)?;
         *self.wal.lock() = new_wal;
+        // CRASH BOUNDARY: WAL truncated to a fresh header; flushed data lives
+        // only in the SST now.
+        crash_inject::hit(Site::FlushAfterWalTruncate);
 
         Ok(())
     }
@@ -1310,6 +1328,18 @@ impl LsmTree {
 
     pub fn data_dir(&self) -> &Path {
         &self.config.data_dir
+    }
+
+    /// Crash-fuzz teardown ONLY: model process death by discarding the WAL's
+    /// un-flushed user-space buffer (see [`Wal::forget_unflushed_buffer`])
+    /// WITHOUT flushing it. The caller then drops this `LsmTree` normally —
+    /// which releases the data-dir lock and closes fds, but does NOT resurrect
+    /// the lost in-flight bytes. Cold-reopen the data dir afterwards to exercise
+    /// recovery. Only OS-page-cache-resident bytes (already `write`n by a
+    /// completed `append_txn`) survive, as across a SIGKILL.
+    #[cfg(feature = "crash-fuzz")]
+    pub fn discard_for_crash_recovery(&self) {
+        self.wal.lock().forget_unflushed_buffer();
     }
 }
 
