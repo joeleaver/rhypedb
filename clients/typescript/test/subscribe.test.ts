@@ -164,6 +164,26 @@ test("a malformed event rejects that next() but keeps the subscription live", as
   }
 });
 
+test("an unexpected terminal frame ends the stream and tears down the socket (no leak)", async () => {
+  // A post-ack frame that isn't EVENT/SUBLAGGED is terminal. The subscription
+  // must surface it once, then yield done, AND destroy its socket without an
+  // explicit close() — otherwise the process would not exit (this suite asserts
+  // a clean exit, so a leak here would hang it).
+  const { port, server } = await spawnSubServer((sub) => {
+    ackSubscribe(sub, { afterAck: () => sub.write(encodeFrame(1, Resp.Done, Buffer.alloc(0))) });
+  });
+  const client = await AsyncClient.connect({ host: "127.0.0.1", port });
+  try {
+    const sub = await client.subscribe(SubscriptionFilter.all());
+    await assert.rejects(sub.next(), (e: unknown) => e instanceof RhypedbError && e.code === "unexpected_response");
+    assert.deepEqual(await sub.next(), { value: undefined, done: true });
+    // deliberately NO sub.close() — the terminal frame must have torn it down.
+  } finally {
+    client.close();
+    server.close();
+  }
+});
+
 test("a server SUBSCRIBE rejection surfaces from open", async () => {
   const { port, server } = await spawnSubServer((sub) => {
     const parser = new FrameParser();

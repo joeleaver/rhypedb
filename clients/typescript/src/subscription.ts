@@ -263,6 +263,7 @@ export class AsyncSubscription implements AsyncIterableIterator<Notification> {
   }
 
   #classify(frame: Frame): void {
+    if (this.#terminated) return; // torn down — ignore any trailing frames in the batch
     if (this.#awaitingAck) {
       this.#awaitingAck = false;
       if (frame.kind === Resp.Subscribed) {
@@ -295,14 +296,16 @@ export class AsyncSubscription implements AsyncIterableIterator<Notification> {
           this.#unsub = null;
           this.#endClean();
         } else {
-          this.#fatal = new RhypedbError("unexpected_response", "unexpected DONE");
+          // A terminal frame tears the connection down (so the socket can't leak
+          // and the process can exit); already-queued items still drain first.
+          this.#terminate(new RhypedbError("unexpected_response", "unexpected DONE"));
         }
         break;
       case Resp.Error:
-        this.#fatal = serverErrorFrom(frame.payload);
+        this.#terminate(serverErrorFrom(frame.payload));
         break;
       default:
-        this.#fatal = new RhypedbError("unexpected_response", `unexpected frame 0x${frame.kind.toString(16)}`);
+        this.#terminate(new RhypedbError("unexpected_response", `unexpected frame 0x${frame.kind.toString(16)}`));
     }
   }
 

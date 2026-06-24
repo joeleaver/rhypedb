@@ -15,6 +15,8 @@ import {
   encodeQueryPayload,
   encodeExecutePayload,
   encodeVectorBatchPayload,
+  encodeSubscribeFilter,
+  encodeUnsubscribePayload,
   decodeObjectsPayload,
   decodeSinglePayload,
   decodePreparedPayload,
@@ -119,6 +121,29 @@ test("vector batch payload is byte-exact (BE header, LE f32 components)", () => 
     (() => { const b = Buffer.allocUnsafe(8); b.writeFloatLE(1.0, 0); b.writeFloatLE(0.0, 4); return b; })(),
   ]);
   assert.deepEqual(payload, expected);
+});
+
+test("subscribe filter + unsubscribe payloads are byte-exact (flags, type, objectId, kinds)", () => {
+  // all() → no flags, kinds=0 (all kinds).
+  assert.deepEqual(encodeSubscribeFilter({ kinds: [] }), Buffer.from([0x00, 0x00]));
+  // An empty type name is treated as "no type filter" (matches the server).
+  assert.deepEqual(encodeSubscribeFilter({ typeName: "", kinds: [] }), Buffer.from([0x00, 0x00]));
+  // forType("User") → flag bit0, [len:u16]"User", kinds=0.
+  assert.deepEqual(
+    encodeSubscribeFilter({ typeName: "User", kinds: [] }),
+    Buffer.from([0x01, 0x00, 0x04, 0x55, 0x73, 0x65, 0x72, 0x00]),
+  );
+  // forObject + withKinds(delete, create) → flags 0x03, type, [objectId:u64 BE], kinds 0x05.
+  assert.deepEqual(
+    encodeSubscribeFilter({ typeName: "User", objectId: 0x0102030405060708n, kinds: ["delete", "create"] }),
+    Buffer.from([
+      0x03, // has_type | has_object
+      0x00, 0x04, 0x55, 0x73, 0x65, 0x72, // "User"
+      0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // object_id
+      0x05, // kinds: create(0x01) | delete(0x04)
+    ]),
+  );
+  assert.deepEqual(encodeUnsubscribePayload(1), Buffer.from([0x00, 0x00, 0x00, 0x01]));
 });
 
 // ---- objects payload --------------------------------------------------------
