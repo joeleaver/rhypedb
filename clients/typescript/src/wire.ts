@@ -113,7 +113,14 @@ export type EncValue =
 // path produces.
 // ---------------------------------------------------------------------------
 export function rfc3339FromMillis(ms: bigint): string {
-  const iso = new Date(Number(ms)).toISOString(); // "2021-01-01T00:00:00.000Z"
+  const n = Number(ms);
+  // The server (Rust `time`, no `large-dates`) can only format years 0000-9999;
+  // anything else — beyond JS `Date`'s ±8.64e15 ms range, or an extended-year
+  // (`±YYYYYY`) `toISOString` — falls back to the raw decimal millis string, so
+  // mirror that exactly (and avoid a `RangeError` on out-of-range input).
+  if (!Number.isFinite(n) || Number.isNaN(new Date(n).getTime())) return ms.toString();
+  const iso = new Date(n).toISOString(); // "2021-01-01T00:00:00.000Z"
+  if (iso[0] === "+" || iso[0] === "-") return ms.toString(); // year outside 0000-9999
   return iso.replace(/\.(\d{3})Z$/, (_m, frac: string) => {
     const trimmed = frac.replace(/0+$/, "");
     return trimmed ? `.${trimmed}Z` : "Z";

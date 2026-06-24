@@ -68,6 +68,16 @@ test("DateTime decodes to RFC 3339 matching the server's variable-precision form
   assert.equal(rfc3339FromMillis(BigInt(Date.UTC(2021, 0, 1, 0, 0, 0, 100))), "2021-01-01T00:00:00.1Z");
 });
 
+test("DateTime outside year 0000-9999 falls back to the raw decimal millis (matching Rust)", () => {
+  // Year 9999 still renders as RFC 3339; year 10000 and beyond — including past
+  // JS Date's ±8.64e15 ms max — fall back to the decimal string the server emits
+  // (Rust `time` without `large-dates` can't format extended years), never a throw.
+  assert.match(rfc3339FromMillis(253402214400000n), /^9999-/); // year 9999, RFC 3339
+  assert.equal(rfc3339FromMillis(253402300800000n), "253402300800000"); // year 10000 → decimal
+  assert.equal(rfc3339FromMillis(8210298412800000n), "8210298412800000"); // extended year → decimal
+  assert.equal(rfc3339FromMillis(9_000_000_000_000_000n), "9000000000000000"); // beyond Date max → decimal, no RangeError
+});
+
 // ---- byte-exact fixtures (lock the wire format, not just self-consistency) --
 
 test("object encodes to the exact documented byte layout", () => {

@@ -53,20 +53,23 @@ function respondQuery(sock: Socket, reqId: number, q: string): void {
   }
 }
 
+/** Attach the wire-faithful frame loop to a mock connection. */
+function wireSocket(sock: Socket, onFrame: (sock: Socket, frame: Frame) => void): void {
+  const parser = new FrameParser();
+  sock.on("data", (chunk: Buffer) => {
+    parser.push(chunk);
+    try {
+      for (let f = parser.next(); f !== null; f = parser.next()) onFrame(sock, f);
+    } catch {
+      sock.destroy();
+    }
+  });
+  sock.on("error", () => {});
+}
+
 /** Start a mock server; `onFrame` drives each inbound frame. Returns its port. */
 async function startMock(onFrame: (sock: Socket, frame: Frame) => void): Promise<{ port: number; server: Server }> {
-  const server = createServer((sock) => {
-    const parser = new FrameParser();
-    sock.on("data", (chunk: Buffer) => {
-      parser.push(chunk);
-      try {
-        for (let f = parser.next(); f !== null; f = parser.next()) onFrame(sock, f);
-      } catch {
-        sock.destroy();
-      }
-    });
-    sock.on("error", () => {});
-  });
+  const server = createServer((sock) => wireSocket(sock, onFrame));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const addr = server.address();
   if (addr === null || typeof addr === "string") throw new Error("no port");
@@ -183,6 +186,23 @@ test("a peer hangup mid-request latches the connection closed", async () => {
   );
 
   server.close();
+});
+
+test("connects via a bracketed IPv6 address string", async () => {
+  const ipv6 = await new Promise<{ port: number; server: Server } | null>((resolve) => {
+    const server = createServer((sock) => wireSocket(sock, standardHandler));
+    server.once("error", () => resolve(null)); // host has no IPv6 loopback → skip
+    server.listen(0, "::1", () => {
+      const a = server.address();
+      if (a === null || typeof a === "string") return resolve(null);
+      resolve({ port: a.port, server });
+    });
+  });
+  if (ipv6 === null) return; // no IPv6 loopback available; nothing to assert
+  const client = await AsyncClient.connect(`[::1]:${ipv6.port}`);
+  await client.ping();
+  client.close();
+  ipv6.server.close();
 });
 
 test("connect to a closed port rejects with a connect error", async () => {

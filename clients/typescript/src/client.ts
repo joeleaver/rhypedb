@@ -43,10 +43,22 @@ interface Pending {
 /** Parse a `"host:port"` string or `{ host, port }` into connect options. */
 function parseAddr(addr: string | { host: string; port: number }): { host: string; port: number } {
   if (typeof addr !== "string") return addr;
-  const i = addr.lastIndexOf(":");
-  if (i < 0) throw new RhypedbError("connect", `invalid address ${JSON.stringify(addr)} (want host:port)`);
-  const host = addr.slice(0, i) || "127.0.0.1";
-  const port = Number(addr.slice(i + 1));
+  // Bracketed IPv6 literal: `[::1]:4201`. Split on the `]:` so the colons inside
+  // the address aren't mistaken for the port separator.
+  let host: string;
+  let portStr: string;
+  if (addr.startsWith("[")) {
+    const end = addr.indexOf("]:");
+    if (end < 0) throw new RhypedbError("connect", `invalid IPv6 address ${JSON.stringify(addr)} (want [host]:port)`);
+    host = addr.slice(1, end);
+    portStr = addr.slice(end + 2);
+  } else {
+    const i = addr.lastIndexOf(":");
+    if (i < 0) throw new RhypedbError("connect", `invalid address ${JSON.stringify(addr)} (want host:port)`);
+    host = addr.slice(0, i) || "127.0.0.1";
+    portStr = addr.slice(i + 1);
+  }
+  const port = Number(portStr);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new RhypedbError("connect", `invalid port in ${JSON.stringify(addr)}`);
   }
