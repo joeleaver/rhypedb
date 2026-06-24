@@ -7,6 +7,14 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+# In-process crash-fault injection for the crash-recovery fuzz harness.
+# OFF by default; the shipped binary is byte-identical without it (every
+# injection call site is an `#[inline(always)]` no-op when this is off, and the
+# arming API does not exist). Pulls in NO extra dependencies — the injector is
+# std-only. NEVER enable in a release artifact. See `crash_inject`.
+crash-fuzz = []
+
 [dependencies]
 ahash = "0.8"
 bytes = { workspace = true }

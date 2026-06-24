@@ -1,4 +1,5 @@
 pub mod bloom;
+pub mod crash_inject;
 pub mod key;
 pub mod lock;
 pub mod wal;
