@@ -7,27 +7,56 @@
 //! cargo test -p rhypedb-storage --features crash-fuzz --test crash_fuzz
 //! ```
 //!
-//! Inc 1 wires the injection sites and proves the simulated-crash → teardown →
-//! cold-reopen loop is faithful (this file's single smoke test). Inc 2 adds the
-//! seeded workload generator + the `verify_recovered` oracle on top of these
-//! same helpers.
+//! - Inc 1 wired the injection sites and proved the simulated-crash → teardown →
+//!   cold-reopen loop is faithful (`smoke_*`).
+//! - Inc 2 (this) adds the seeded deterministic workload generator + the
+//!   `verify_recovered` oracle, sweeps every WAL/flush boundary across seeds,
+//!   and a TornTail power-loss test.
+//!
+//! ## Oracle model
+//!
+//! A workload commits transactions over a small fixed keyspace, recording the
+//! last committed value per key in a SHADOW model (updated only after
+//! `commit()` returns `Ok`). One injected crash interrupts either a commit (WAL
+//! sites) or an explicit flush (flush sites). After teardown + cold reopen, the
+//! oracle asserts:
+//!
+//! - **Flush-site crash:** the recovered keyspace equals the shadow EXACTLY — a
+//!   flush is never allowed to lose, duplicate, or resurrect committed data.
+//! - **WAL-site crash:** the in-flight transaction is ATOMIC — the recovered
+//!   keyspace equals the shadow (txn reverted) OR the shadow with the in-flight
+//!   writes applied (txn survived). Any other result is a torn/partial write and
+//!   fails. We accept either outcome rather than predict which, because that is
+//!   exactly the crash-atomicity property (and survival is payload-dependent —
+//!   see `Site::WalAfterWriteBeforeFlush`).
+//!
+//! Plus: recovery is IDEMPOTENT (a second cold reopen yields the identical
+//! state, catching double-replay), the recovered tree is writable and its
+//! versioning advanced past recovery (a probe commit), and the data-dir lock was
+//! released (the reopens succeed at all).
 #![cfg(feature = "crash-fuzz")]
 
 use bytes::Bytes;
 use rhypedb_storage::crash_inject::{self, Caught, Mode, Site};
 use rhypedb_storage::lsm::{LsmConfig, LsmTree};
 use rhypedb_storage::SstCompression;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 
-/// Deterministic harness config: inline flush + no background compaction (the
-/// workload thread is the only actor, so a crash is reproducible), fsync on
-/// every commit (so "torn ⇒ discarded" is a deterministic outcome rather than
-/// depending on the kernel's writeback timing), and a small memtable so a short
-/// workload actually flushes.
+/// Keys are `k0000`..`k0031` — a small bounded keyspace so the oracle can read
+/// the entire recovered state by enumeration (catching lost AND resurrected
+/// keys), and so updates/tombstones/resurrection are all exercised.
+const KEYSPACE: u64 = 32;
+
+/// Deterministic harness config: NO auto-flush (`memtable_flush_size =
+/// usize::MAX`) and no background compaction — the workload drives commits and
+/// flushes explicitly, so the only actor is the test thread and the crash point
+/// is exactly controlled. fsync on every commit, so "torn ⇒ discarded" is a
+/// deterministic outcome rather than depending on kernel writeback timing.
 fn harness_config(dir: &Path) -> LsmConfig {
     LsmConfig {
         data_dir: dir.to_path_buf(),
-        memtable_flush_size: 1024,
+        memtable_flush_size: usize::MAX, // never auto-flush; flushes are explicit
         compact_trigger_ssts: usize::MAX, // no auto-compaction in Inc 1/2
         zone_extractor: None,
         sync_on_commit: true,
@@ -36,41 +65,323 @@ fn harness_config(dir: &Path) -> LsmConfig {
     }
 }
 
-fn put(db: &LsmTree, key: &[u8], val: &[u8]) {
+fn key(i: u64) -> Vec<u8> {
+    format!("k{i:04}").into_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic workload generator (SplitMix64 — reproducible forever, no dep
+// on an external RNG whose algorithm could change a stored corpus).
+// ---------------------------------------------------------------------------
+
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+}
+
+/// A transaction's writes: `(key index, Some(value) | None==tombstone)`.
+type Writes = Vec<(u64, Option<Bytes>)>;
+
+fn gen_writes(rng: &mut Rng) -> Writes {
+    let n = 1 + rng.below(3); // 1..=3 writes per txn
+    let mut out = Writes::new();
+    for _ in 0..n {
+        let idx = rng.below(KEYSPACE);
+        if rng.below(10) < 3 {
+            out.push((idx, None)); // tombstone
+        } else {
+            let v = Bytes::from(format!("v{}", rng.next_u64()));
+            out.push((idx, Some(v)));
+        }
+    }
+    out
+}
+
+fn apply_writes(db: &LsmTree, writes: &Writes) {
     let mut txn = db.begin_txn();
-    db.put(&mut txn, key, Bytes::copy_from_slice(val)).unwrap();
+    for (idx, val) in writes {
+        match val {
+            Some(v) => db.put(&mut txn, &key(*idx), v.clone()).unwrap(),
+            None => db.delete(&mut txn, &key(*idx)).unwrap(),
+        }
+    }
     db.commit(&mut txn).unwrap();
 }
 
-fn get(db: &LsmTree, key: &[u8]) -> Option<Bytes> {
-    db.get_at(db.read_snapshot(), key).unwrap()
+/// Apply a committed transaction's writes to the shadow (same-key last-write
+/// wins, matching the memtable + recovery semantics).
+fn apply_to_shadow(shadow: &mut [Option<Bytes>], writes: &Writes) {
+    for (idx, val) in writes {
+        shadow[*idx as usize] = val.clone();
+    }
 }
 
-/// The Inc-1 acceptance test: a crash injected mid-WAL-append unwinds the
-/// in-flight commit, the teardown faithfully discards the un-flushed bytes (it
-/// must NOT flush them — that would mask the data-loss class), the data-dir lock
-/// is released so a cold reopen succeeds, and recovery keeps everything
-/// committed before the crash while dropping the torn in-flight transaction.
+fn commit_random_txn(db: &LsmTree, rng: &mut Rng, shadow: &mut [Option<Bytes>]) {
+    let writes = gen_writes(rng);
+    apply_writes(db, &writes);
+    apply_to_shadow(shadow, &writes);
+}
+
+fn read_keyspace(db: &LsmTree) -> Vec<Option<Bytes>> {
+    let snap = db.read_snapshot();
+    (0..KEYSPACE).map(|i| db.get_at(snap, &key(i)).unwrap()).collect()
+}
+
+fn is_flush_site(s: Site) -> bool {
+    matches!(
+        s,
+        Site::FlushAfterMemtableRotate
+            | Site::FlushAfterSstFinish
+            | Site::FlushAfterSstRegister
+            | Site::FlushBeforeWalTruncate
+            | Site::FlushAfterWalTruncate
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Oracle
+// ---------------------------------------------------------------------------
+
+/// Cold-reopen the data dir and assert the recovery invariants. `in_flight` is
+/// `Some` for a WAL-site crash (the interrupted commit's writes) and `None` for
+/// a flush-site crash (a flush must not change committed state).
+fn verify_recovered(
+    dir: &Path,
+    shadow: &[Option<Bytes>],
+    in_flight: Option<&Writes>,
+    seed: u64,
+    site: Site,
+) {
+    let reverted = shadow.to_vec();
+    let survived = {
+        let mut s = shadow.to_vec();
+        if let Some(wf) = in_flight {
+            apply_to_shadow(&mut s, wf);
+        }
+        s
+    };
+
+    // First cold reopen (the reopen succeeding at all proves the data-dir lock
+    // was released by the simulated crash's teardown).
+    let db1 = LsmTree::open(harness_config(dir)).unwrap();
+    let rec = read_keyspace(&db1);
+
+    match in_flight {
+        None => assert_eq!(
+            rec, reverted,
+            "flush-site crash changed committed state (seed={seed} site={site:?})\n  rec={rec:?}\n  shadow={reverted:?}"
+        ),
+        Some(_) => assert!(
+            rec == reverted || rec == survived,
+            "in-flight txn left a torn/partial state (seed={seed} site={site:?})\n  rec={rec:?}\n  reverted={reverted:?}\n  survived={survived:?}"
+        ),
+    }
+    drop(db1);
+
+    // Second cold reopen: recovery must be idempotent (catches non-idempotent
+    // double-replay, e.g. an SST-durable-but-WAL-not-truncated crash).
+    let db2 = LsmTree::open(harness_config(dir)).unwrap();
+    let rec2 = read_keyspace(&db2);
+    assert_eq!(
+        rec2, rec,
+        "recovery is not idempotent across a second reopen (seed={seed} site={site:?})"
+    );
+
+    // The recovered tree is writable and its versioning advanced past recovery:
+    // a fresh commit succeeds and reads back. (`__probe__` sorts before the
+    // `k####` keyspace, so it never perturbs the enumeration above.)
+    let mut t = db2.begin_txn();
+    db2.put(&mut t, b"__probe__", Bytes::from_static(b"ok")).unwrap();
+    db2.commit(&mut t).unwrap();
+    assert_eq!(
+        db2.get_at(db2.read_snapshot(), b"__probe__").unwrap().as_deref(),
+        Some(&b"ok"[..]),
+        "recovered tree must accept new writes (seed={seed} site={site:?})"
+    );
+}
+
+/// One fuzz case: build a deterministic preamble of durable commits + flushes,
+/// then inject a crash at `site` during the next commit (WAL site) or flush
+/// (flush site), tear down, and verify recovery.
+fn run_case(seed: u64, site: Site) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shadow: Vec<Option<Bytes>> = vec![None; KEYSPACE as usize];
+    let mut rng = Rng::new(seed);
+
+    let db = LsmTree::open(harness_config(dir.path())).unwrap();
+
+    // Preamble: deterministic durable history. Explicit flushes (~20%) move data
+    // into SSTs and truncate the WAL, so recovery exercises SST+WAL reconciliation
+    // — not just a flat WAL replay.
+    let n_ops = 3 + rng.below(28);
+    for _ in 0..n_ops {
+        if rng.below(10) < 2 {
+            db.flush().unwrap();
+        } else {
+            commit_random_txn(&db, &mut rng, &mut shadow);
+        }
+    }
+
+    let in_flight: Option<Writes>;
+    let outcome = if is_flush_site(site) {
+        // Dirty the memtable so flush_locked gets past its is_empty short-circuit
+        // and reaches the armed site.
+        commit_random_txn(&db, &mut rng, &mut shadow);
+        in_flight = None;
+        crash_inject::arm(site, 1, Mode::Crash);
+        crash_inject::catch_crash(AssertUnwindSafe(|| {
+            let _ = db.flush();
+            unreachable!("flush must have crashed at the armed site");
+        }))
+    } else {
+        let writes = gen_writes(&mut rng);
+        in_flight = Some(writes.clone());
+        crash_inject::arm(site, 1, Mode::Crash);
+        crash_inject::catch_crash(AssertUnwindSafe(|| {
+            apply_writes(&db, &writes);
+            unreachable!("commit must have crashed at the armed site");
+        }))
+    };
+    assert_eq!(
+        outcome,
+        Caught::Crashed(site),
+        "expected a crash at {site:?} (seed={seed})"
+    );
+    crash_inject::disarm();
+
+    // Faithful teardown: discard the un-flushed WAL buffer (a no-op for flush
+    // sites), then drop (releases the data-dir lock + closes fds).
+    db.discard_for_crash_recovery();
+    drop(db);
+
+    verify_recovered(dir.path(), &shadow, in_flight.as_ref(), seed, site);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// The full boundary sweep: every WAL/flush injection site, across a seed
+/// corpus. A failing case prints its seed + site for exact replay.
+#[test]
+fn fuzz_wal_and_flush_boundaries_recover() {
+    const SITES: [Site; 8] = [
+        Site::WalAfterWriteBeforeFlush,
+        Site::WalAfterFlushBeforeFsync,
+        Site::WalAfterFsync,
+        Site::FlushAfterMemtableRotate,
+        Site::FlushAfterSstFinish,
+        Site::FlushAfterSstRegister,
+        Site::FlushBeforeWalTruncate,
+        Site::FlushAfterWalTruncate,
+    ];
+    for site in SITES {
+        for seed in 0..16u64 {
+            run_case(seed, site);
+        }
+    }
+}
+
+/// Power-loss: a transaction whose WAL bytes reached the OS page cache but were
+/// NOT yet fsync'd (crash at `WalAfterFlushBeforeFsync`) is lost if power fails
+/// before the kernel writes the tail to the platter. Model that by truncating
+/// the un-fsync'd tail, then assert framed replay discards the torn transaction
+/// WHOLE while every fsync'd commit before it survives.
+#[test]
+fn torn_tail_power_loss_discards_unfsynced_in_flight_txn() {
+    /// `Commit` footer record size: 21-byte header + 0-byte key + 8-byte count.
+    const FOOTER_BYTES: u64 = 21 + 8;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut shadow: Vec<Option<Bytes>> = vec![None; KEYSPACE as usize];
+    let mut rng = Rng::new(0x70726E); // "prn"
+
+    let db = LsmTree::open(harness_config(dir.path())).unwrap();
+    // Durable, fsync'd committed history.
+    for _ in 0..10 {
+        commit_random_txn(&db, &mut rng, &mut shadow);
+    }
+
+    let wal_path = dir.path().join("wal.log");
+    let len_before = std::fs::metadata(&wal_path).unwrap().len();
+
+    // Crash after the in-flight txn's full batch reached the page cache (the
+    // append_txn write_all + flush ran) but before sync_all.
+    let writes = gen_writes(&mut rng);
+    crash_inject::arm(Site::WalAfterFlushBeforeFsync, 1, Mode::Crash);
+    let outcome = crash_inject::catch_crash(AssertUnwindSafe(|| {
+        apply_writes(&db, &writes);
+        unreachable!("commit must have crashed before fsync");
+    }));
+    assert_eq!(outcome, Caught::Crashed(Site::WalAfterFlushBeforeFsync));
+    crash_inject::disarm();
+
+    db.discard_for_crash_recovery();
+    drop(db);
+
+    // The in-flight batch (data records + footer) extended the WAL past the last
+    // fsync. Power loss: lop off the footer so the trailing batch is unterminated.
+    let len_after = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(
+        len_after >= len_before + FOOTER_BYTES,
+        "in-flight txn should have appended at least a footer ({len_before}..{len_after})"
+    );
+    let f = std::fs::OpenOptions::new().write(true).open(&wal_path).unwrap();
+    f.set_len(len_after - FOOTER_BYTES).unwrap(); // tear off the footer, stay within the in-flight batch
+    drop(f);
+
+    // Recovery: the torn in-flight txn is dropped wholesale; everything fsync'd
+    // before it survives exactly.
+    let recovered = LsmTree::open(harness_config(dir.path())).unwrap();
+    let rec = read_keyspace(&recovered);
+    assert_eq!(
+        rec, shadow,
+        "torn power-loss tail must discard exactly the in-flight txn"
+    );
+}
+
+/// Inc-1 acceptance (kept): a crash injected mid-WAL-append unwinds the in-flight
+/// commit, the teardown faithfully discards the un-flushed bytes (it must NOT
+/// flush them — that would mask the data-loss class), the data-dir lock is
+/// released so a cold reopen succeeds, and recovery keeps everything committed
+/// before the crash while dropping the torn in-flight transaction.
 #[test]
 fn smoke_crash_in_wal_append_loses_only_the_in_flight_txn() {
     let dir = tempfile::tempdir().unwrap();
 
     let db = LsmTree::open(harness_config(dir.path())).unwrap();
-    put(&db, b"a", b"1"); // durably committed before the crash
+    {
+        let mut txn = db.begin_txn();
+        db.put(&mut txn, b"a", Bytes::from_static(b"1")).unwrap();
+        db.commit(&mut txn).unwrap(); // durably committed before the crash
+    }
 
     // Crash on the next WAL append, before its BufWriter flush.
     crash_inject::arm(Site::WalAfterWriteBeforeFlush, 1, Mode::Crash);
-    let outcome = crash_inject::catch_crash(|| {
+    let outcome = crash_inject::catch_crash(AssertUnwindSafe(|| {
         let mut txn = db.begin_txn();
         db.put(&mut txn, b"b", Bytes::from_static(b"2")).unwrap();
         let _ = db.commit(&mut txn); // unwinds inside append_txn
         unreachable!("commit must have crashed at the armed site");
-    });
+    }));
     assert_eq!(outcome, Caught::Crashed(Site::WalAfterWriteBeforeFlush));
     crash_inject::disarm();
 
-    // Faithful teardown: discard the un-flushed WAL buffer, then drop (releases
-    // the data-dir lock + closes fds without resurrecting the lost bytes).
     db.discard_for_crash_recovery();
     drop(db);
 
@@ -78,9 +389,14 @@ fn smoke_crash_in_wal_append_loses_only_the_in_flight_txn() {
     // whole batch (a tiny payload, well under the 8 KiB BufWriter capacity) sat
     // in the un-flushed buffer the teardown discarded, so its footer never
     // reached the WAL and framed replay drops the txn whole. (A batch >= 8 KiB
-    // could instead be page-cache-durable and survive — see the Site docs; Inc 2's
-    // oracle predicts from framing, not payload size.)
+    // could instead be page-cache-durable and survive — see the Site docs; the
+    // fuzz oracle predicts from framing/atomicity, not payload size.)
     let recovered = LsmTree::open(harness_config(dir.path())).unwrap();
-    assert_eq!(get(&recovered, b"a").as_deref(), Some(&b"1"[..]));
-    assert_eq!(get(&recovered, b"b"), None, "in-flight txn must not survive");
+    let snap = recovered.read_snapshot();
+    assert_eq!(recovered.get_at(snap, b"a").unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(
+        recovered.get_at(snap, b"b").unwrap(),
+        None,
+        "in-flight txn must not survive"
+    );
 }
