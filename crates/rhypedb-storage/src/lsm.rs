@@ -248,7 +248,7 @@ impl LsmTree {
         // torn framed batch).
         let wal_was_legacy = Wal::file_is_legacy(&wal_path)?;
         let memtable = Arc::new(MemTable::new());
-        let records = Wal::replay(&wal_path)?;
+        let (records, valid_wal_len) = Wal::replay_with_valid_len(&wal_path)?;
         for record in &records {
             max_version = max_version.max(record.version);
             match record.record_type {
@@ -266,6 +266,19 @@ impl LsmTree {
 
         // Initialize transaction manager at the recovered version.
         let txn_manager = Arc::new(TransactionManager::recover_at_version(max_version));
+
+        // Drop a torn (un-footered) trailing batch from the WAL FILE so
+        // post-recovery appends stay correctly framed. Without this, the next
+        // committed txn lands after the orphaned records and a later replay folds
+        // them into its footer-count check — silently losing that committed txn
+        // (and resurrecting the stale prior value) on a second crash. Legacy
+        // files are converted wholesale by the flush below, so skip them here.
+        if !wal_was_legacy && wal_path.exists() {
+            let file_len = std::fs::metadata(&wal_path)?.len();
+            if valid_wal_len < file_len {
+                Wal::truncate_to(&wal_path, valid_wal_len)?;
+            }
+        }
 
         // Open WAL for new writes (append to existing — records are still
         // needed until the next flush persists them to SST).

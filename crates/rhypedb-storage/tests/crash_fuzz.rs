@@ -355,6 +355,67 @@ fn torn_tail_power_loss_discards_unfsynced_in_flight_txn() {
     );
 }
 
+/// Regression test for a data-loss bug FOUND BY THIS HARNESS: recovering from a
+/// torn (un-footered) WAL left the orphaned records in the file, so the next
+/// committed transaction was appended after them and a later replay folded them
+/// into its footer-count check — silently dropping a durably-fsync'd commit (and
+/// resurrecting the stale prior value) on a second crash. Fixed by truncating
+/// the WAL to its valid prefix on recovery (Wal::replay_with_valid_len +
+/// LsmTree::open). Without the fix, `k0007` reads back as a stale preamble value
+/// after the second reopen.
+#[test]
+fn probe_commit_after_torn_recovery_survives_second_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shadow: Vec<Option<Bytes>> = vec![None; KEYSPACE as usize];
+    let mut rng = Rng::new(1);
+
+    let db = LsmTree::open(harness_config(dir.path())).unwrap();
+    for _ in 0..5 {
+        commit_random_txn(&db, &mut rng, &mut shadow);
+    }
+
+    let wal_path = dir.path().join("wal.log");
+    let len_before = std::fs::metadata(&wal_path).unwrap().len();
+
+    // Produce a torn (un-footered) trailing batch on disk.
+    let writes = gen_writes(&mut rng);
+    crash_inject::arm(Site::WalAfterFlushBeforeFsync, 1, Mode::Crash);
+    let outcome = crash_inject::catch_crash(AssertUnwindSafe(|| {
+        apply_writes(&db, &writes);
+        unreachable!();
+    }));
+    assert_eq!(outcome, Caught::Crashed(Site::WalAfterFlushBeforeFsync));
+    crash_inject::disarm();
+    db.discard_for_crash_recovery();
+    drop(db);
+    let len_after = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(len_after >= len_before + 29);
+    let f = std::fs::OpenOptions::new().write(true).open(&wal_path).unwrap();
+    f.set_len(len_after - 29).unwrap(); // tear off footer -> torn trailing batch on disk
+    drop(f);
+
+    // Recover from the torn WAL, then commit a NEW txn.
+    let db2 = LsmTree::open(harness_config(dir.path())).unwrap();
+    let mut t = db2.begin_txn();
+    db2.put(&mut t, b"k0007", Bytes::from_static(b"AFTER_RECOVERY")).unwrap();
+    db2.commit(&mut t).unwrap();
+    assert_eq!(
+        db2.get_at(db2.read_snapshot(), b"k0007").unwrap().as_deref(),
+        Some(&b"AFTER_RECOVERY"[..]),
+        "present before reopen"
+    );
+    drop(db2);
+
+    // SECOND cold reopen (no flush happened): does the post-recovery commit survive?
+    let db3 = LsmTree::open(harness_config(dir.path())).unwrap();
+    let got = db3.get_at(db3.read_snapshot(), b"k0007").unwrap();
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"AFTER_RECOVERY"[..]),
+        "post-torn-recovery commit LOST on second crash (got {got:?}) -- WAL torn-tail not cleaned on recovery"
+    );
+}
+
 /// Inc-1 acceptance (kept): a crash injected mid-WAL-append unwinds the in-flight
 /// commit, the teardown faithfully discards the un-flushed bytes (it must NOT
 /// flush them — that would mask the data-loss class), the data-dir lock is

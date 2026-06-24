@@ -287,9 +287,22 @@ impl Wal {
     ///     converts such a file to framed after recovery, so framed appends are
     ///     never mixed into an un-magic'd file.
     pub fn replay(path: impl AsRef<Path>) -> Result<Vec<WalRecord>> {
+        Ok(Self::replay_with_valid_len(path)?.0)
+    }
+
+    /// Like [`Wal::replay`], but also returns the byte length of the VALID prefix
+    /// of the file — the offset just past the last fully-footered batch (or, for
+    /// a legacy file, past the last applied per-record prefix; `0` for a missing
+    /// file). [`crate::lsm::LsmTree::open`] truncates the WAL to this length so a
+    /// torn (un-footered) trailing batch is removed from the FILE, not merely
+    /// skipped in memory. Otherwise the next post-recovery append lands AFTER the
+    /// orphaned records and a later replay folds them into that transaction's
+    /// footer-count check, silently dropping a committed transaction (and
+    /// resurrecting the stale prior value).
+    pub fn replay_with_valid_len(path: impl AsRef<Path>) -> Result<(Vec<WalRecord>, u64)> {
         let path = path.as_ref();
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         let file = File::open(path)?;
@@ -300,6 +313,10 @@ impl Wal {
         // Detect framing from the magic header; skip it before decoding records.
         let framed = data.len() >= WAL_MAGIC.len() && &data[..WAL_MAGIC.len()] == WAL_MAGIC;
         let mut offset = if framed { WAL_MAGIC.len() } else { 0 };
+        // Bytes proven to belong to fully-recovered records. For a framed file
+        // this starts just after the magic, so an all-torn file (no good footer)
+        // truncates back to a header-only WAL.
+        let mut valid_len = offset;
 
         let mut records = Vec::new();
         let mut pending: Vec<WalRecord> = Vec::new();
@@ -322,6 +339,8 @@ impl Wal {
                             break;
                         }
                         records.append(&mut pending);
+                        // Everything up to and including this footer is durable.
+                        valid_len = offset;
                     } else {
                         pending.push(record);
                     }
@@ -336,12 +355,25 @@ impl Wal {
         }
 
         if !pending.is_empty() && !framed {
-            // Legacy file only: apply the valid per-record prefix. In a framed
-            // file an unterminated trailing batch is a torn txn — discarded.
+            // Legacy file only: apply the valid per-record prefix, which extends
+            // the valid length to the last decoded record. In a framed file an
+            // unterminated trailing batch is a torn txn — discarded.
             records.append(&mut pending);
+            valid_len = offset;
         }
 
-        Ok(records)
+        Ok((records, valid_len as u64))
+    }
+
+    /// Truncate the WAL file to `len` bytes and fsync. Used by recovery to drop a
+    /// torn (un-footered) trailing batch (see [`Wal::replay_with_valid_len`]) so
+    /// subsequent appends stay correctly framed; the fsync makes the cleanup
+    /// durable against a re-crash.
+    pub fn truncate_to(path: impl AsRef<Path>, len: u64) -> Result<()> {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(len)?;
+        file.sync_all()?;
+        Ok(())
     }
 
     /// Create a fresh empty WAL, replacing any existing file. Writes the framing
