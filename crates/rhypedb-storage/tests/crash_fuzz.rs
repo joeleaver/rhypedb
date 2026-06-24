@@ -526,3 +526,121 @@ fn smoke_crash_in_wal_append_loses_only_the_in_flight_txn() {
         "in-flight txn must not survive"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// Inc 3 — compaction crash fuzz + file-leak accounting
+// ---------------------------------------------------------------------------
+
+/// Count files with the given extension in the data dir's `sst/` subdir.
+fn count_sst_files(dir: &Path, ext: &str) -> usize {
+    let sst_dir = dir.join("sst");
+    std::fs::read_dir(&sst_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == ext))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// One compaction fuzz case: build several SSTs, inject a crash at `site` during
+/// an explicit `compact()`, tear down, and verify recovery. A compaction crash
+/// must never change committed data, must leave no leaked temp files, and the
+/// redundant on-disk set must compact cleanly afterward.
+fn run_compaction_case(seed: u64, site: Site, after_hits: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shadow: Vec<Option<Bytes>> = vec![None; KEYSPACE as usize];
+    let mut rng = Rng::new(seed);
+
+    let db = LsmTree::open(harness_config(dir.path())).unwrap();
+    // Build several SSTs so compaction has >= 2 inputs and a non-trivial merge.
+    for _ in 0..6 {
+        let n = 2 + rng.below(4);
+        for _ in 0..n {
+            commit_random_txn(&db, &mut rng, &mut shadow);
+        }
+        db.flush().unwrap();
+    }
+    assert!(db.sst_count() >= 2, "need >= 2 SSTs to compact (seed={seed})");
+
+    crash_inject::arm(site, after_hits, Mode::Crash);
+    let outcome = crash_inject::catch_crash(AssertUnwindSafe(|| {
+        let _ = db.compact();
+        unreachable!("compaction must have crashed at the armed site");
+    }));
+    assert_eq!(outcome, Caught::Crashed(site), "expected a crash at {site:?} (seed={seed})");
+    crash_inject::disarm();
+    db.discard_for_crash_recovery();
+    drop(db);
+
+    // A compaction crash never loses, duplicates, or resurrects committed data.
+    verify_recovered(dir.path(), &shadow, None, Expect::Reverted, seed, site);
+
+    // File-leak accounting: no partial temp files survive recovery.
+    assert_eq!(
+        count_sst_files(dir.path(), "tmp"),
+        0,
+        "leaked *.sst.tmp after recovery (seed={seed} site={site:?})"
+    );
+    // The redundant on-disk set (merged + un-deleted inputs) compacts cleanly and
+    // still yields exactly the committed state.
+    let db2 = LsmTree::open(harness_config(dir.path())).unwrap();
+    db2.compact().unwrap();
+    assert_eq!(
+        read_keyspace(&db2),
+        shadow,
+        "state changed by post-recovery compaction (seed={seed} site={site:?})"
+    );
+    assert_eq!(count_sst_files(dir.path(), "tmp"), 0);
+}
+
+#[test]
+fn fuzz_compaction_boundaries_recover() {
+    const SITES: [Site; 4] = [
+        Site::SstMidWrite,
+        Site::CompactionAfterMergedPublished,
+        Site::CompactionAfterSwap,
+        Site::CompactionMidUnlink,
+    ];
+    for seed in 0..16u64 {
+        for site in SITES {
+            run_compaction_case(seed, site, 1);
+        }
+    }
+}
+
+/// Regression test for a data-availability bug FOUND BY THIS HARNESS: SSTs were
+/// written directly to their final `NNNNNNNN.sst` path, so a crash mid-write left
+/// a footerless `.sst` that `SstReader::open` rejected — and `LsmTree::open`
+/// propagated that error, so the WHOLE database failed to reopen (the committed
+/// data was safe in the WAL, but the DB would not start). Fixed by writing to a
+/// `.sst.tmp` temp + atomic rename on finish + temp cleanup on open. Before the
+/// fix, the reopen below returns Err(SstCorrupted).
+#[test]
+fn partial_sst_write_does_not_block_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut shadow: Vec<Option<Bytes>> = vec![None; KEYSPACE as usize];
+    let mut rng = Rng::new(7);
+
+    let db = LsmTree::open(harness_config(dir.path())).unwrap();
+    for _ in 0..3 {
+        commit_random_txn(&db, &mut rng, &mut shadow);
+    }
+    // Crash partway through the flush's SST write (leaves a partial `*.sst.tmp`;
+    // the committed data is still in the not-yet-truncated WAL).
+    crash_inject::arm(Site::SstMidWrite, 1, Mode::Crash);
+    let outcome = crash_inject::catch_crash(AssertUnwindSafe(|| {
+        let _ = db.flush();
+        unreachable!("flush must have crashed mid-SST-write");
+    }));
+    assert_eq!(outcome, Caught::Crashed(Site::SstMidWrite));
+    crash_inject::disarm();
+    db.discard_for_crash_recovery();
+    drop(db);
+
+    // Reopen MUST succeed (recovering from the WAL) and clean the temp file.
+    let recovered = LsmTree::open(harness_config(dir.path())).unwrap();
+    assert_eq!(read_keyspace(&recovered), shadow, "committed data must recover from the WAL");
+    assert_eq!(count_sst_files(dir.path(), "tmp"), 0, "partial temp SST must be cleaned");
+}

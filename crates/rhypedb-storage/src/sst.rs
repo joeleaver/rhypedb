@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::bloom::{BloomFilter, HashAlgo};
+use crate::crash_inject::{self, Site};
 use crate::key::InternalKey;
 use crate::memtable::MemValue;
 use crate::zone::{ZoneBuilder, ZoneFieldExtractor, ZoneMap};
@@ -108,13 +109,32 @@ struct IndexEntry {
     offset: u64,
 }
 
+/// Best-effort fsync of a file's parent directory, so a rename into it is
+/// durable across power loss. Failures are ignored: not all platforms/filesystems
+/// permit opening a directory for fsync, and the renamed data is independently
+/// recoverable (WAL records for a flush, un-deleted inputs for a compaction).
+fn sync_parent_dir(path: &Path) {
+    if let Some(dir) = path.parent()
+        && let Ok(f) = File::open(dir)
+    {
+        let _ = f.sync_all();
+    }
+}
+
 /// Writer for creating SST files from sorted key-value pairs.
 pub struct SstWriter {
     writer: BufWriter<File>,
     index: Vec<IndexEntry>,
     current_offset: u64,
     entry_count: usize,
+    /// Final published path (`NNNNNNNN.sst`). The file is written to `tmp_path`
+    /// and atomically renamed here by [`SstWriter::finish`].
     path: PathBuf,
+    /// Where bytes are actually written until `finish` (`<path>.tmp`). A crash
+    /// before `finish` leaves only this temp file — which the `.sst`-only
+    /// recovery scan ignores and `LsmTree::open` cleans up — so a partial SST
+    /// never blocks reopen.
+    tmp_path: PathBuf,
     /// Collected user keys for the bloom filter. The bloom filter is
     /// constructed in `finish()` once we know the entry count.
     user_keys: Vec<Bytes>,
@@ -162,7 +182,16 @@ impl SstWriter {
         compression: SstCompression,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::create(&path)?;
+        // Write to a temp sibling and atomically rename on `finish` — so a crash
+        // mid-write leaves a `.sst.tmp` (ignored by the recovery scan), never a
+        // headerless/footerless `.sst` that would fail `SstReader::open` and
+        // block reopen.
+        let tmp_path = {
+            let mut s = path.clone().into_os_string();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        let file = File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
 
         // Write file header. The version records the data-region format so the
@@ -180,6 +209,7 @@ impl SstWriter {
             current_offset: (SST_MAGIC.len() + 4) as u64, // past header
             entry_count: 0,
             path,
+            tmp_path,
             user_keys: Vec::new(),
             zone_extractor,
             zone_builder: ZoneBuilder::new(),
@@ -190,6 +220,9 @@ impl SstWriter {
 
     /// Add a sorted entry. Keys MUST be added in ascending order.
     pub fn add(&mut self, internal_key: &[u8], value: &MemValue) -> Result<()> {
+        // CRASH BOUNDARY: partway through an SST write (flush or compaction). A
+        // crash here leaves a partial `*.sst.tmp`, never a corrupt `.sst`.
+        crash_inject::hit(Site::SstMidWrite);
         let key_len = internal_key.len() as u32;
         let (value_len, value_bytes): (u32, &[u8]) = match value {
             Some(v) => (v.len() as u32, v.as_ref()),
@@ -342,6 +375,13 @@ impl SstWriter {
         self.writer.write_all(&footer)?;
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
+
+        // Atomically publish the fully-written, fsync'd file, then fsync the
+        // directory so the rename itself is durable. Before this point only the
+        // `.tmp` exists; after it the final `.sst` exists in full. There is no
+        // window where a partial `.sst` is visible to recovery.
+        std::fs::rename(&self.tmp_path, &self.path)?;
+        sync_parent_dir(&self.path);
 
         let first_key = self.index.first().map(|e| e.key.clone());
         let last_key = self

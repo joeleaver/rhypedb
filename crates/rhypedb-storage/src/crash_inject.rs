@@ -74,11 +74,26 @@ pub enum Site {
     /// `LsmTree::flush_locked`: after the WAL has been truncated to a fresh
     /// header-only file. The flushed data lives only in the SST now.
     FlushAfterWalTruncate,
+    /// `SstWriter::add`: partway through writing an SST's entries (flush OR
+    /// compaction). A crash here leaves a partial `*.sst.tmp` that recovery must
+    /// clean up — the data is still in the WAL (flush) or the un-deleted inputs
+    /// (compaction).
+    SstMidWrite,
+    /// `LsmTree::compact_inner`: after the merged SST is published (renamed in)
+    /// but before the in-RAM `sst_files` swap and before any input is unlinked —
+    /// reopen sees the merged SST AND all inputs (redundant but correct).
+    CompactionAfterMergedPublished,
+    /// `LsmTree::compact_inner`: after the in-RAM swap, before the input-unlink
+    /// loop — same on-disk state as above (the swap is in-RAM only).
+    CompactionAfterSwap,
+    /// `LsmTree::compact_inner`: partway through the input-unlink loop — some
+    /// inputs deleted, some remain, merged present. Reopen must reconcile.
+    CompactionMidUnlink,
 }
 
 /// Number of [`Site`] variants. Kept in sync with the enum by
 /// `tests::site_count_matches_variants` (feature-on build).
-pub const SITE_COUNT: usize = 8;
+pub const SITE_COUNT: usize = 12;
 
 #[cfg(feature = "crash-fuzz")]
 pub use imp::{arm, catch_crash, disarm, hit, Caught, Mode};
@@ -248,6 +263,10 @@ mod tests {
         Site::FlushAfterSstRegister,
         Site::FlushBeforeWalTruncate,
         Site::FlushAfterWalTruncate,
+        Site::SstMidWrite,
+        Site::CompactionAfterMergedPublished,
+        Site::CompactionAfterSwap,
+        Site::CompactionMidUnlink,
     ];
 
     #[test]

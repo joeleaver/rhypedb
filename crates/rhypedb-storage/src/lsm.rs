@@ -201,6 +201,16 @@ impl LsmTree {
         let mut max_sst_id = 0u64;
         let sst_dir = config.data_dir.join("sst");
         if sst_dir.exists() {
+            // Clean up partial SST temp files (`*.sst.tmp`) left by a crash during
+            // an SST write. Their data is still recoverable (WAL records for a
+            // flush; the un-deleted inputs for a compaction), so dropping them is
+            // safe and prevents an unbounded leak of orphaned temp files.
+            for entry in std::fs::read_dir(&sst_dir)?.filter_map(|e| e.ok()) {
+                let p = entry.path();
+                if p.extension().is_some_and(|ext| ext == "tmp") {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
             let entries: Vec<_> = std::fs::read_dir(&sst_dir)?
                 .filter_map(|e| e.ok())
                 .filter(|e| {
@@ -1280,6 +1290,10 @@ impl LsmTree {
         }
 
         let meta = writer.finish()?;
+        // CRASH BOUNDARY: merged SST published on disk; inputs still present and
+        // not yet swapped. Reopen sees the merged SST AND all inputs (redundant
+        // but correct — same versions dedupe; the next compaction reclaims them).
+        crash_inject::hit(Site::CompactionAfterMergedPublished);
 
         // The exact set of files we merged (captured under the read lock). Any
         // SST NOT in this set was flushed concurrently and must be preserved.
@@ -1320,10 +1334,17 @@ impl LsmTree {
             ssts.push(new_reader);
             ssts.extend(kept);
         }
+        // CRASH BOUNDARY: in-RAM swap done (lost on reopen — rebuilt by the dir
+        // scan), inputs still on disk. Same recoverable state as above.
+        crash_inject::hit(Site::CompactionAfterSwap);
 
         // Delete ONLY the files we actually merged.
         for path in &merged_paths {
             let _ = std::fs::remove_file(path);
+            // CRASH BOUNDARY: some inputs unlinked, some remain, merged present.
+            // Reopen must reconcile (merged has all the data; remaining inputs are
+            // a redundant subset).
+            crash_inject::hit(Site::CompactionMidUnlink);
         }
 
         Ok(())
