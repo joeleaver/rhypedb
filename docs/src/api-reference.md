@@ -108,43 +108,44 @@ Both produce byte-identical output for the same schema; the live form just sourc
 the SDL from the server instead of a file (handy after a migration, since the live
 schema reflects the post-migration shape).
 
-It emits, per object type, a `serde`-deriving row struct (scalar fields, each `Option<T>` so a column-projected response still deserializes) plus typed query constructors and a `Row<T>` response parser:
+It emits, per object type, a `serde`-deriving row struct (scalar fields, each `Option<T>` so a column-projected response still deserializes) plus typed query seeds that return a [`rhypedb_client::Query<T>`]. The generated module re-exports `Query` and `Row` from [`rhypedb-client`](https://crates.io/crates/rhypedb-client), so you pair it with a `Client` and get the binary round-trip for free:
 
 ```rust
 mod client;                                   // the generated module
 use client::{User, Row};
+use rhypedb_client::Client;
 
-// Build a query string — send `.build()` as the `query` of a `POST /query` body.
-let read = User::all().filter(".age > 18").limit(10).build();
-// -> "User.filter(.age > 18).limit(10)"
+let client = Client::connect("127.0.0.1:4201")?;
 
-// Typed create from a row's set fields (strings are escaped; numbers/bools coerce):
-let write = User::create(&User { name: Some("Ann".into()), age: Some(30), ..Default::default() }).build();
-// -> r#"User.create({ name: "Ann", age: 30 })"#
-
-// Parse the response into typed rows: the object `id` from the envelope plus the
-// typed `fields`, for both `{ "object": .. }` and `{ "objects": [..] }` shapes.
-let rows: Vec<Row<User>> = Row::from_response(&response_json)?;
-for row in &rows {
+// Seeds return a typed `Query<User>` — hand it straight to the client.
+let adults: Vec<Row<User>> = client.fetch(&User::all().filter(".age > 18").limit(10))?;
+for row in &adults {
     println!("{}: {:?}", row.id, row.data.name);
 }
+
+// Typed create from a row's set fields (strings escaped, numbers/bools coerced):
+let ann: Row<User> =
+    client.create(&User::create(&User { name: Some("Ann".into()), age: Some(30), ..Default::default() }))?;
+// the query: r#"User.create({ name: "Ann", age: 30 })"#
 ```
 
-A **TypeScript** client (`--lang ts`) mirrors the same shape — an `interface` per type plus a value namespace of query constructors, a `Query` builder, and a `parseResponse` helper:
+A **TypeScript** client (`--lang ts`) mirrors the same shape against the official [`@rhypedb/client`](https://www.npmjs.com/package/@rhypedb/client) (Node/Bun/Deno) — an `interface` per type plus a value namespace of typed seeds returning a `Query<T>`, both `Query` and `Row` imported from the client:
 
 ```bash
 rhypedb-codegen --schema schema.rhype --lang ts --out client.ts
 ```
 
 ```typescript
-import { User, parseResponse, type Row } from "./client.ts";
+import { AsyncClient } from "@rhypedb/client";
+import { User, type Row } from "./client.ts";   // generated; re-exports Query/Row
 
-const read = User.all().filter(".age > 18").limit(10).build();
-const write = User.create({ name: "Ann", age: 30 }).build();   // typed create
-const rows: Array<Row<User>> = parseResponse<User>(responseJson);   // { id, data }
+const client = await AsyncClient.connect("127.0.0.1:4201");
+
+const adults: Row<User>[] = await client.fetch(User.all().filter(".age > 18").limit(10));
+const ann: Row<User> = await client.create(User.create({ name: "Ann", age: 30 }));   // typed create
 ```
 
-The builder is transport-agnostic — bring your own HTTP client. Relations and vector fields are documented per type but are not scalar columns. Typed `create` sets a row's scalar fields: strings escaped, numbers/bools coerced, `DateTime` (RFC 3339 string) and `Bytes` (base64 string) emitted as quoted strings, and `Json` (a `serde_json::Value` / `unknown`) emitted as a raw JSON literal.
+Relations and vector fields are documented per type but are not scalar columns. Typed `create` sets a row's scalar fields: strings escaped, numbers/bools coerced, `DateTime` (RFC 3339 string) and `Bytes` (base64 string) emitted as quoted strings, and `Json` (a `serde_json::Value` / `unknown`) emitted as a raw JSON literal. Scalar types map per target — notably 64-bit integers (`u64`/`i64`) are Rust `u64`/`i64` and, in TypeScript, `bigint` (lossless), while other numerics are `number`.
 
 ### Admin plane (gated by `RHYPEDB_ADMIN_TOKEN`)
 
