@@ -2,6 +2,10 @@
 name = "rhypedb-storage"
 version.workspace = true
 edition.workspace = true
+description = "Log-structured merge-tree storage engine for rhypedb."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 ahash = "0.8"

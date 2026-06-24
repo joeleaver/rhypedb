@@ -2,6 +2,10 @@
 name = "rhypedb-query"
 version.workspace = true
 edition.workspace = true
+description = "Query language and execution layer for rhypedb."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 # Forward the ONNX linking choice through to rhypedb-engine → rhypedb-embed.
 # default-features=false so this path doesn't pin onnx-download (feature unification).

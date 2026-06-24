@@ -2,6 +2,10 @@
 name = "rhypedb-embed"
 version.workspace = true
 edition.workspace = true
+description = "Embedding and reranking traits for rhypedb, with an optional fastembed/ONNX-backed implementation."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 # The fastembed/ONNX stack is OPTIONAL. The `Embedder`/`Reranker` traits,
 # `EmbedError`, and `RerankResult` always compile (pure-Rust, no deps); the

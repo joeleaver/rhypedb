@@ -2,6 +2,10 @@
 name = "rhypedb-server"
 version.workspace = true
 edition.workspace = true
+description = "Network server for rhypedb: the binary TCP protocol plus an HTTP API."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 # The fastembed/ONNX stack is OPTIONAL (see rhypedb-embed). With `fastembed` off,
 # the server builds with NO ONNX dependency: the built-in embedder is absent, so

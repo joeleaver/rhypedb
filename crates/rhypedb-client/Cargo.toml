@@ -2,6 +2,9 @@
 name = "rhypedb-client"
 version.workspace = true
 edition.workspace = true
+description = "Official client for rhypedb: typed queries, prepared statements, vector ingest, and change-event subscriptions over the binary TCP protocol (synchronous; native async behind a feature)."
+repository.workspace = true
+homepage.workspace = true
 license.workspace = true
 
 # The official rhypedb client. Speaks the binary TCP protocol via the shared

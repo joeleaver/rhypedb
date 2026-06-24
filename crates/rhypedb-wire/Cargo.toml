@@ -2,6 +2,9 @@
 name = "rhypedb-wire"
 version.workspace = true
 edition.workspace = true
+description = "Shared wire format for rhypedb: the value model and binary protocol codecs."
+repository.workspace = true
+homepage.workspace = true
 license.workspace = true
 
 # The transport- and runtime-agnostic wire layer shared by the server and the

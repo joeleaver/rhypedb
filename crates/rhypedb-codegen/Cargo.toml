@@ -2,6 +2,9 @@
 name = "rhypedb-codegen"
 version.workspace = true
 edition.workspace = true
+description = "Code generation for rhypedb: typed Rust and TypeScript client bindings from a rhypedb schema."
+repository.workspace = true
+homepage.workspace = true
 license.workspace = true
 
 [lib]

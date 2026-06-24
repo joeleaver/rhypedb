@@ -2,6 +2,10 @@
 name = "rhypedb-engine"
 version.workspace = true
 edition.workspace = true
+description = "Core database engine for rhypedb: schema, objects, relations, transactions, secondary indexes, and vector search."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 # The fastembed/ONNX stack is OPTIONAL (see rhypedb-embed). With `fastembed` off,
 # the engine builds with no ONNX dependency; the built-in FastEmbedder/FastReranker
