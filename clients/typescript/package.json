@@ -1,0 +1,42 @@
+{
+  "name": "@rhypedb/client",
+  "version": "0.1.0",
+  "description": "Official TypeScript client for rhypedb: typed queries, prepared statements, vector ingest, and change-event subscriptions over the binary TCP protocol. Node/Bun/Deno (not browsers — it speaks raw TCP).",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joeleaver/rhypedb.git",
+    "directory": "clients/typescript"
+  },
+  "homepage": "https://joeleaver.github.io/rhypedb",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "keywords": [
+    "rhypedb",
+    "database",
+    "client",
+    "vector",
+    "embeddings"
+  ],
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^20.0.0"
+  }
+}
