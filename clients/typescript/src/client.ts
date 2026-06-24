@@ -6,10 +6,12 @@
 //! pipeline safely. Any socket/framing error latches the connection closed
 //! (fail-fast) rather than risk a mis-correlated reply — reconnect.
 
-import { connect as tcpConnect, Socket } from "node:net";
+import { type Socket } from "node:net";
 
+import { dialSocket } from "./dial.ts";
 import { RhypedbError } from "./errors.ts";
 import { type Query, type Row } from "./query.ts";
+import { AsyncSubscription, type SubscriptionFilter } from "./subscription.ts";
 import {
   FrameParser,
   MAX_FRAME_PAYLOAD,
@@ -104,12 +106,18 @@ export class AsyncClient {
   readonly #socket: Socket;
   readonly #parser = new FrameParser();
   readonly #clientId = nextClientId++;
+  readonly #peerHost: string;
+  readonly #peerPort: number;
+  readonly #connectTimeoutMs: number | undefined;
   #pending: Pending[] = [];
   #dead = false;
   #nextReqId = 1;
 
-  private constructor(socket: Socket) {
+  private constructor(socket: Socket, peerHost: string, peerPort: number, connectTimeoutMs: number | undefined) {
     this.#socket = socket;
+    this.#peerHost = peerHost;
+    this.#peerPort = peerPort;
+    this.#connectTimeoutMs = connectTimeoutMs;
     socket.on("data", (chunk: Buffer) => this.#onData(chunk));
     socket.on("error", (e: Error) => this.#fail(new RhypedbError("io", e.message)));
     socket.on("close", () => {
@@ -120,39 +128,17 @@ export class AsyncClient {
   }
 
   /** Connect to a rhypedb server's binary TCP port (`"host:port"`). */
-  static connect(
+  static async connect(
     addr: string | { host: string; port: number },
     opts: ClientOptions = {},
   ): Promise<AsyncClient> {
     const { host, port } = parseAddr(addr);
-    return new Promise<AsyncClient>((resolve, reject) => {
-      const socket = tcpConnect({ host, port });
-      socket.setNoDelay(true);
-      let settled = false;
-      const timer =
-        opts.connectTimeoutMs !== undefined
-          ? setTimeout(() => {
-              if (settled) return;
-              settled = true;
-              socket.destroy();
-              reject(new RhypedbError("connect", "connect timed out"));
-            }, opts.connectTimeoutMs)
-          : null;
-      const onError = (e: Error) => {
-        if (settled) return;
-        settled = true;
-        if (timer) clearTimeout(timer);
-        reject(new RhypedbError("connect", e.message));
-      };
-      socket.once("error", onError);
-      socket.once("connect", () => {
-        if (settled) return;
-        settled = true;
-        if (timer) clearTimeout(timer);
-        socket.removeListener("error", onError);
-        resolve(new AsyncClient(socket));
-      });
-    });
+    const socket = await dialSocket(host, port, opts.connectTimeoutMs);
+    // Prefer the RESOLVED peer address for subscription dials, so a subscription
+    // hits the same server even if `host` was a multi-record DNS name.
+    const peerHost = socket.remoteAddress ?? host;
+    const peerPort = socket.remotePort ?? port;
+    return new AsyncClient(socket, peerHost, peerPort, opts.connectTimeoutMs);
   }
 
   // --- request/response surface ------------------------------------------
@@ -251,6 +237,18 @@ export class AsyncClient {
     if (frame.kind === Resp.Done) return rows.length;
     if (frame.kind === Resp.Error) throw serverError(frame.payload);
     throw unexpected(frame.kind);
+  }
+
+  /**
+   * Open a change-event [`AsyncSubscription`] on a **dedicated** connection to
+   * the same server (independent of this client's query connection — the server
+   * makes a subscribed connection reject queries). It is an async iterable of
+   * [`Notification`](./subscription.ts)s; reconcile a `lagged` notification by
+   * re-querying with this client. The subscription dials the resolved peer the
+   * client connected to and honors the configured `connectTimeoutMs`.
+   */
+  subscribe(filter: SubscriptionFilter): Promise<AsyncSubscription> {
+    return AsyncSubscription.open(this.#peerHost, this.#peerPort, this.#connectTimeoutMs, filter);
   }
 
   /** Verify a [`Prepared`] belongs to this client (before any I/O), then run it. */

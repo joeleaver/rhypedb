@@ -20,6 +20,7 @@ import { createServer } from "node:net";
 
 import { AsyncClient } from "../src/client.ts";
 import { Query } from "../src/query.ts";
+import { SubscriptionFilter, type Notification } from "../src/subscription.ts";
 
 const BIN = process.env.RHYPEDB_SERVER_BIN;
 
@@ -156,6 +157,35 @@ test(
       const remaining = await client.fetch(Query.all<User>("User"));
       assert.equal(remaining.length, 1);
       assert.ok(remaining.every((r) => r.id !== ada.id));
+
+      // --- live subscription over a dedicated connection: Create/Update/Delete ---
+      const sub = await client.subscribe(SubscriptionFilter.forType("User"));
+      try {
+        const carol = await client.create(
+          Query.raw<User>('User.create({ name: "Carol", age: 40, active: true })'),
+        );
+        const created = (await sub.next()).value as Notification;
+        assert.ok(created.type === "change");
+        assert.equal(created.change.kind, "create");
+        assert.equal(created.change.id, carol.id);
+        assert.equal(created.change.fields?.name, "Carol");
+
+        await client.execute(Query.raw<User>(`User.get(${carol.id}).update({ age: 41 })`));
+        const updated = (await sub.next()).value as Notification;
+        assert.ok(updated.type === "change");
+        assert.equal(updated.change.kind, "update");
+        assert.equal(updated.change.id, carol.id);
+
+        await client.execute(Query.raw<User>(`User.get(${carol.id}).delete()`));
+        const deleted = (await sub.next()).value as Notification;
+        assert.ok(deleted.type === "change");
+        assert.equal(deleted.change.kind, "delete");
+        assert.equal(deleted.change.id, carol.id);
+
+        await sub.unsubscribe();
+      } finally {
+        sub.close();
+      }
     } catch (e) {
       throw new Error(`${(e as Error).message}\n--- server log ---\n${serverLog}`);
     } finally {

@@ -52,6 +52,13 @@ const Tag = {
   Json: 11,
 } as const;
 
+/** A change-event kind. Matches the lowercase wire form. */
+export type ChangeKind = "create" | "update" | "delete";
+
+const KIND_BIT: Record<ChangeKind, number> = { create: 0x01, update: 0x02, delete: 0x04 };
+const FILTER_FLAG_TYPE = 0x01;
+const FILTER_FLAG_OBJECT = 0x02;
+
 /** An error decoding malformed wire bytes (framing or payload). */
 export class WireError extends Error {
   override readonly name = "WireError";
@@ -375,6 +382,79 @@ export function encodeVectorBatchPayload(
     }
   }
   return out;
+}
+
+/** The structural shape `encodeSubscribeFilter` reads (the `SubscriptionFilter`). */
+export interface SubscribeFilterParts {
+  typeName?: string | undefined;
+  objectId?: bigint | undefined;
+  kinds: readonly ChangeKind[];
+}
+
+/**
+ * Encode a `Subscribe` filter payload: `[flags:u8 bit0=has_type bit1=has_object]`
+ * then (if set) `[type_len:u16][type]` and `[object_id:u64]`, then a
+ * `[kinds:u8 bitmask]` (bit0 Create / bit1 Update / bit2 Delete; 0 = all kinds).
+ * An empty type name is treated as "no type filter" (the server rejects a
+ * zero-length name), keeping encode round-trippable.
+ */
+export function encodeSubscribeFilter(filter: SubscribeFilterParts): Buffer {
+  const typeName = filter.typeName && filter.typeName.length > 0 ? filter.typeName : undefined;
+  const parts: Buffer[] = [];
+  let flags = 0;
+  if (typeName !== undefined) flags |= FILTER_FLAG_TYPE;
+  if (filter.objectId !== undefined) flags |= FILTER_FLAG_OBJECT;
+  parts.push(Buffer.from([flags]));
+  if (typeName !== undefined) {
+    const b = Buffer.from(typeName, "utf8");
+    const lh = Buffer.allocUnsafe(2);
+    lh.writeUInt16BE(b.length, 0);
+    parts.push(lh, b);
+  }
+  if (filter.objectId !== undefined) {
+    const o = Buffer.allocUnsafe(8);
+    o.writeBigUInt64BE(filter.objectId, 0);
+    parts.push(o);
+  }
+  let kinds = 0;
+  for (const k of filter.kinds) kinds |= KIND_BIT[k];
+  parts.push(Buffer.from([kinds]));
+  return Buffer.concat(parts);
+}
+
+/** Encode an `Unsubscribe` request payload: `[sub_req_id:u32]`. */
+export function encodeUnsubscribePayload(handle: number): Buffer {
+  const out = Buffer.allocUnsafe(4);
+  out.writeUInt32BE(handle, 0);
+  return out;
+}
+
+/**
+ * The wire form of a change event (the `RESP_EVENT` JSON). `id`/`version` are
+ * decimal strings (lossless past 2^53 through JSON), `type` is the type name,
+ * `v` is the format tag, `fields` is best-effort scalars in the `/query` form.
+ */
+export interface WireEvent {
+  v: string;
+  kind: string;
+  type: string;
+  id: string;
+  version: string;
+  fields?: Record<string, unknown>;
+}
+
+/** Decode a `RESP_EVENT` payload (JSON). Throws `WireError` if it isn't an object. */
+export function decodeEventPayload(payload: Buffer): WireEvent {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload.toString("utf8"));
+  } catch (e) {
+    throw new WireError(`event json: ${(e as Error).message}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new WireError("event json: not an object");
+  }
+  return parsed as WireEvent;
 }
 
 // ---------------------------------------------------------------------------
