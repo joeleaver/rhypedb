@@ -89,7 +89,11 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "tokio")]
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+#[cfg(feature = "tokio")]
+use std::task::{Context, Poll};
+#[cfg(feature = "tokio")]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
 use crate::object::{serialize_fields_into, try_deserialize_fields, Object};
 use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionFilter};
@@ -194,7 +198,7 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<F
 /// mid-frame loses nothing; the next call resumes. It also tolerates a read that
 /// returns more than one frame's worth of bytes (TCP coalescing / read-ahead).
 #[cfg(feature = "tokio")]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct FrameReader {
     buf: Vec<u8>,
     /// Parse cursor into `buf`; bytes before it are already-returned frames.
@@ -210,50 +214,67 @@ impl FrameReader {
         }
     }
 
+    /// Try to parse one complete frame out of the already-buffered bytes, without
+    /// any I/O. Returns `Ok(None)` when more bytes are needed; `Err` on a framing
+    /// violation (length out of bounds). Advances the parse cursor on success and
+    /// resets the buffer once fully drained. Shared by the async [`next_frame`]
+    /// and the poll-based [`poll_next_frame`] so the bounds-checked frame parser
+    /// is single-sourced.
+    fn try_parse(&mut self) -> io::Result<Option<Frame>> {
+        let avail = self.buf.len() - self.start;
+        if avail < 4 {
+            return Ok(None);
+        }
+        let off = self.start;
+        let len = u32::from_be_bytes(self.buf[off..off + 4].try_into().unwrap()) as usize;
+        if len < 5 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame too small: {len} bytes"),
+            ));
+        }
+        if len > MAX_FRAME_PAYLOAD + 5 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame too large: {len} bytes"),
+            ));
+        }
+        if avail < 4 + len {
+            return Ok(None);
+        }
+        let body = off + 4;
+        let req_id = u32::from_be_bytes(self.buf[body..body + 4].try_into().unwrap());
+        let kind = self.buf[body + 4];
+        let payload = self.buf[body + 5..off + 4 + len].to_vec();
+        self.start += 4 + len;
+        // Fully drained → reset to keep the buffer from growing.
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        }
+        Ok(Some(Frame {
+            req_id,
+            kind,
+            payload,
+        }))
+    }
+
+    /// Compact the already-consumed prefix so the buffer stays bounded by at most
+    /// one in-flight frame (+ any read-ahead) before reading more bytes.
+    fn compact(&mut self) {
+        if self.start > 0 {
+            self.buf.drain(0..self.start);
+            self.start = 0;
+        }
+    }
+
     /// Read the next complete frame. Cancel-safe across `select!` iterations.
     pub async fn next_frame<R: AsyncReadExt + Unpin>(&mut self, reader: &mut R) -> io::Result<Frame> {
         loop {
-            // Try to parse a complete frame from the buffered bytes first.
-            let avail = self.buf.len() - self.start;
-            if avail >= 4 {
-                let off = self.start;
-                let len = u32::from_be_bytes(self.buf[off..off + 4].try_into().unwrap()) as usize;
-                if len < 5 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("frame too small: {len} bytes"),
-                    ));
-                }
-                if len > MAX_FRAME_PAYLOAD + 5 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("frame too large: {len} bytes"),
-                    ));
-                }
-                if avail >= 4 + len {
-                    let body = off + 4;
-                    let req_id = u32::from_be_bytes(self.buf[body..body + 4].try_into().unwrap());
-                    let kind = self.buf[body + 4];
-                    let payload = self.buf[body + 5..off + 4 + len].to_vec();
-                    self.start += 4 + len;
-                    // Fully drained → reset to keep the buffer from growing.
-                    if self.start == self.buf.len() {
-                        self.buf.clear();
-                        self.start = 0;
-                    }
-                    return Ok(Frame {
-                        req_id,
-                        kind,
-                        payload,
-                    });
-                }
+            if let Some(frame) = self.try_parse()? {
+                return Ok(frame);
             }
-            // Need more bytes. Compact the consumed prefix first so the buffer is
-            // bounded by at most one in-flight frame (+ any read-ahead).
-            if self.start > 0 {
-                self.buf.drain(0..self.start);
-                self.start = 0;
-            }
+            self.compact();
             // Cancel-safe append: a dropped future leaves `buf` untouched.
             let n = reader.read_buf(&mut self.buf).await?;
             if n == 0 {
@@ -261,6 +282,48 @@ impl FrameReader {
                     io::ErrorKind::UnexpectedEof,
                     "connection closed mid-frame",
                 ));
+            }
+        }
+    }
+
+    /// Poll-based counterpart to [`next_frame`], for hand-rolled [`Stream`] /
+    /// `poll_*` implementations (e.g. the async client's subscription stream).
+    ///
+    /// Cancel-safe by construction: buffered bytes live in `self`, and each read
+    /// goes through a stack scratch buffer that is only appended to `self.buf`
+    /// once `poll_read` reports `Ready(Ok)`, so a `Pending`/dropped poll loses
+    /// nothing. EOF mid-frame surfaces as [`io::ErrorKind::UnexpectedEof`].
+    ///
+    /// [`Stream`]: https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html
+    pub fn poll_next_frame<R: AsyncRead + Unpin>(
+        &mut self,
+        cx: &mut Context<'_>,
+        reader: &mut R,
+    ) -> Poll<io::Result<Frame>> {
+        loop {
+            match self.try_parse() {
+                Ok(Some(frame)) => return Poll::Ready(Ok(frame)),
+                Ok(None) => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+            self.compact();
+            // Read into a stack scratch buffer; only commit to `self.buf` once the
+            // read actually yields bytes, keeping the poll cancel-safe.
+            let mut scratch = [0u8; 16 * 1024];
+            let mut read_buf = ReadBuf::new(&mut scratch);
+            match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {
+                    let filled = read_buf.filled();
+                    if filled.is_empty() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "connection closed mid-frame",
+                        )));
+                    }
+                    self.buf.extend_from_slice(filled);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         }
     }

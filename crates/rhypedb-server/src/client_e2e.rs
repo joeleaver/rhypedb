@@ -14,7 +14,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use super::*;
-use rhypedb_client::{ChangeKind, Client, Notification, Query, QueryResult, SubscriptionFilter};
+use rhypedb_client::{
+    AsyncClient, ChangeKind, Client, Notification, Query, QueryResult, SubscriptionFilter,
+};
 
 // The codegen-generated typed client for `E2E_SDL`. Compiling it here proves the
 // retargeted codegen output builds against `rhypedb-client`; `generated_fixture_is_in_sync`
@@ -309,6 +311,184 @@ fn run_client_flow(addr: SocketAddr) {
     // Created Ada + Bob + Carol; deleted Carol (in the subscription block) and
     // Ada → only Bob remains.
     assert_eq!(remaining.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_async_client_surface_against_real_server() {
+    let state = build_state();
+    let (addr, accept_task) = start_server(state).await;
+
+    // The async client runs natively on the runtime — no spawn_blocking needed.
+    run_async_client_flow(addr).await;
+
+    accept_task.abort();
+}
+
+/// The async parallel to [`run_client_flow`]: exercise the full `AsyncClient`
+/// surface against the real server. Panics on any assertion failure.
+async fn run_async_client_flow(addr: SocketAddr) {
+    use tokio_stream::StreamExt;
+
+    let client = AsyncClient::connect(addr).await.unwrap();
+
+    // --- liveness ---
+    client.ping().await.unwrap();
+
+    // --- typed create (generated User::create) ---
+    let ada = client
+        .create(&User::create(&User {
+            name: Some("Ada".into()),
+            age: Some(30),
+            active: Some(true),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(ada.data.name.as_deref(), Some("Ada"));
+    assert_eq!(ada.data.age, Some(30));
+    assert_eq!(ada.data.active, Some(true));
+    let _bob = client
+        .create(&User::create(&User {
+            name: Some("Bob".into()),
+            age: Some(20),
+            active: Some(false),
+        }))
+        .await
+        .unwrap();
+
+    // --- typed fetch (list) ---
+    assert_eq!(client.fetch(&User::all()).await.unwrap().len(), 2);
+
+    // --- typed fetch_one via filter (indexed predicate) ---
+    let adult = client
+        .fetch_one(&User::all().filter(".age > 25"))
+        .await
+        .unwrap()
+        .expect("a matching row");
+    assert_eq!(adult.data.name.as_deref(), Some("Ada"));
+
+    // --- typed get by id ---
+    let got = client.fetch_one(&User::get(ada.id)).await.unwrap().expect("a row");
+    assert_eq!((got.id, got.data.name.as_deref()), (ada.id, Some("Ada")));
+
+    // --- untyped query ---
+    match client.query("User").await.unwrap() {
+        QueryResult::Objects(v) => assert_eq!(v.len(), 2),
+        other => panic!("expected a list, got {other:?}"),
+    }
+
+    // --- prepared statements: full family ---
+    let stmt = client.prepare(&User::all()).await.unwrap();
+    assert_eq!(client.fetch_prepared(&stmt).await.unwrap().len(), 2);
+    assert_eq!(client.fetch_prepared(&stmt).await.unwrap().len(), 2); // re-runs, no re-parse
+    match client.execute_prepared(&stmt).await.unwrap() {
+        QueryResult::Objects(v) => assert_eq!(v.len(), 2),
+        other => panic!("expected a list, got {other:?}"),
+    }
+    let get_ada = client.prepare(&User::get(ada.id)).await.unwrap();
+    assert_eq!(
+        client.fetch_one_prepared(&get_ada).await.unwrap().unwrap().id,
+        ada.id
+    );
+    let mk_doc = client
+        .prepare(&Doc::create(&Doc { label: Some("prepared-doc".into()) }))
+        .await
+        .unwrap();
+    assert_eq!(
+        client.create_prepared(&mk_doc).await.unwrap().data.label.as_deref(),
+        Some("prepared-doc")
+    );
+
+    // --- DateTime / Bytes / Json typed create + read-back over the real socket ---
+    let thing = client
+        .create(&Thing::create(&Thing {
+            created: Some("2021-01-01T00:00:00Z".into()),
+            blob: Some("AAEC".into()),
+            meta: Some(serde_json::json!({ "k": 1, "tags": ["a", "b"] })),
+            label: Some("t1".into()),
+        }))
+        .await
+        .unwrap();
+    let back = client.fetch_one(&Thing::get(thing.id)).await.unwrap().expect("a row");
+    assert_eq!(back.data.created.as_deref(), Some("2021-01-01T00:00:00Z"));
+    assert_eq!(back.data.blob.as_deref(), Some("AAEC"));
+    assert_eq!(back.data.meta, Some(serde_json::json!({ "k": 1, "tags": ["a", "b"] })));
+    assert_eq!(back.data.label.as_deref(), Some("t1"));
+
+    // --- raw update, then confirm via a typed get ---
+    client
+        .execute(&Query::<User>::raw(format!("User.get({}).update({{ age: 31 }})", ada.id)))
+        .await
+        .unwrap();
+    let updated = client.fetch_one(&User::get(ada.id)).await.unwrap().expect("a row");
+    assert_eq!(updated.data.age, Some(31));
+
+    // --- BYO-vector ingest + similar search ---
+    let d1 = client.create(&Doc::create(&Doc { label: Some("d1".into()) })).await.unwrap();
+    let d2 = client.create(&Doc::create(&Doc { label: Some("d2".into()) })).await.unwrap();
+    assert_eq!(
+        client.ingest_vectors("Doc", "embedding", &[(d1.id, vec![1.0f32, 0.0, 0.0, 0.0])]).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        client.ingest_vectors("Doc", "embedding", &[(d2.id, vec![0.0f32, 1.0, 0.0, 0.0])]).await.unwrap(),
+        1
+    );
+    let hits = client
+        .fetch::<Doc>(&Query::raw("Doc.similar(.embedding, [1.0, 0.0, 0.0, 0.0], k: 1)"))
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, d1.id, "nearest to [1,0,0,0] must be d1");
+
+    // --- live subscription via the async Stream: Create / Update / Delete ---
+    let mut sub = client.subscribe(SubscriptionFilter::for_type("User")).await.unwrap();
+    let carol = client
+        .create(&User::create(&User {
+            name: Some("Carol".into()),
+            age: Some(40),
+            active: Some(true),
+        }))
+        .await
+        .unwrap();
+    // Drive the Stream surface (StreamExt::next) against real server pushes.
+    match sub.next().await.expect("a stream item").unwrap() {
+        Notification::Change(c) => {
+            assert_eq!(c.kind, ChangeKind::Create);
+            assert_eq!((c.type_name.as_str(), c.id), ("User", carol.id));
+            assert_eq!(
+                c.fields.as_ref().and_then(|m| m.get("name")),
+                Some(&serde_json::json!("Carol")),
+                "create event must carry the scalar fields"
+            );
+        }
+        other => panic!("expected a User create event, got {other:?}"),
+    }
+    client
+        .execute(&Query::<User>::raw(format!("User.get({}).update({{ age: 41 }})", carol.id)))
+        .await
+        .unwrap();
+    match sub.next_event().await.unwrap() {
+        Notification::Change(c) => assert_eq!((c.kind, c.id), (ChangeKind::Update, carol.id)),
+        other => panic!("expected a User update event, got {other:?}"),
+    }
+    client
+        .execute(&Query::<User>::raw(format!("User.get({}).delete()", carol.id)))
+        .await
+        .unwrap();
+    match sub.next_event().await.unwrap() {
+        Notification::Change(c) => assert_eq!((c.kind, c.id), (ChangeKind::Delete, carol.id)),
+        other => panic!("expected a User delete event, got {other:?}"),
+    }
+    sub.unsubscribe().await.unwrap();
+
+    // --- raw delete, then confirm it's gone ---
+    client
+        .execute(&Query::<User>::raw(format!("User.get({}).delete()", ada.id)))
+        .await
+        .unwrap();
+    let remaining = client.fetch(&User::all()).await.unwrap();
+    assert!(remaining.iter().all(|r| r.id != ada.id), "Ada must be deleted");
+    assert_eq!(remaining.len(), 1); // only Bob remains
 }
 
 #[test]

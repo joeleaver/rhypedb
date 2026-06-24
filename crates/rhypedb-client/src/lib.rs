@@ -1,8 +1,13 @@
-//! rhypedb-client — the official **synchronous** client for rhypedb.
+//! rhypedb-client — the official client for rhypedb.
 //!
 //! Speaks the binary TCP protocol over a single persistent connection, using
 //! the shared [`rhypedb_wire`] codecs (so the wire format is single-sourced with
-//! the server). No async runtime, no engine dependency.
+//! the server). No engine dependency.
+//!
+//! The default build is the **synchronous** [`Client`] and links zero of tokio.
+//! A native `AsyncClient` (same wire codecs, same typed [`Query`]/[`Row`]
+//! surface; its `subscribe` returns an `AsyncSubscription` that is a
+//! `futures`-style `Stream`) is available behind the `async` cargo feature.
 //!
 //! ```no_run
 //! use rhypedb_client::{Client, Query};
@@ -36,8 +41,12 @@ use rhypedb_wire::object::Object;
 use rhypedb_wire::protocol::{self, sync as wire_sync};
 use serde::de::DeserializeOwned;
 
+#[cfg(feature = "async")]
+mod async_client;
 mod query;
 mod subscription;
+#[cfg(feature = "async")]
+pub use async_client::{AsyncClient, AsyncSubscription};
 pub use query::{Query, Row};
 pub use subscription::{ChangeNotification, Notification, Subscription, SubscriptionStopper};
 // Re-export the filter model so callers can build subscriptions without naming

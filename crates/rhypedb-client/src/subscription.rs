@@ -53,7 +53,9 @@ pub struct ChangeNotification {
 }
 
 impl ChangeNotification {
-    fn from_wire(w: WireEvent) -> Result<Self> {
+    /// Decode a wire event envelope into a typed notification. Shared by the sync
+    /// [`Subscription`] and the async subscription (crate-internal).
+    pub(crate) fn from_wire(w: WireEvent) -> Result<Self> {
         // Reject an unknown event-envelope version loudly rather than risk
         // misinterpreting a future, differently-shaped format (the `v` tag exists
         // precisely so a consumer can detect the format — see protocol docs).

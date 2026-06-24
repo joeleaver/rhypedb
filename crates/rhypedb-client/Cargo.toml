@@ -4,10 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# The official synchronous rhypedb client. Speaks the binary TCP protocol via
-# the shared rhypedb-wire codecs (single source of truth for the wire format) —
-# no async runtime, no engine dependency. A native async variant will be added
-# behind a feature in a later increment.
+# The official rhypedb client. Speaks the binary TCP protocol via the shared
+# rhypedb-wire codecs (single source of truth for the wire format) — no engine
+# dependency. The DEFAULT build is the synchronous `Client` and links ZERO of
+# tokio. A native `AsyncClient` (sharing the same wire codecs + typed Query<T>/
+# Row<T> surface) lives behind the optional `async` feature, which pulls in tokio
+# + tokio-stream and the wire crate's `tokio` framing. Run the async tests with
+# `cargo test -p rhypedb-client --features async`.
+
+[features]
+# Native-async client (`AsyncClient` + `AsyncSubscription`). Additive: the sync
+# `Client` is always available; enabling this does not change the sync surface.
+async = ["dep:tokio", "dep:tokio-stream", "rhypedb-wire/tokio"]
 
 [dependencies]
 rhypedb-wire = { workspace = true }
@@ -17,3 +25,7 @@ rhypedb-subscribe = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Only compiled in for the `async` feature (the default sync client links no
+# tokio). When the feature is on, these are also available to the async tests.
+tokio = { workspace = true, optional = true }
+tokio-stream = { workspace = true, optional = true }
