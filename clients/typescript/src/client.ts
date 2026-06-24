@@ -1,0 +1,263 @@
+//! The asynchronous rhypedb client over a single persistent TCP connection.
+//!
+//! The binary protocol is strictly request/response on a (non-subscription)
+//! connection and the server replies in request order, so requests are matched
+//! to replies FIFO. Writes are ordered by the socket, so concurrent callers
+//! pipeline safely. Any socket/framing error latches the connection closed
+//! (fail-fast) rather than risk a mis-correlated reply — reconnect.
+
+import { connect as tcpConnect, Socket } from "node:net";
+
+import { RhypedbError } from "./errors.ts";
+import { type Query, type Row } from "./query.ts";
+import {
+  FrameParser,
+  Req,
+  Resp,
+  encodeFrame,
+  encodeQueryPayload,
+  decodeObjectsPayload,
+  decodeSinglePayload,
+  decodeErrorPayload,
+  type DecodedObject,
+  type Frame,
+} from "./wire.ts";
+
+/** Connection options. */
+export interface ClientOptions {
+  /** Bound on the initial TCP connect, in milliseconds. Omit for no bound. */
+  connectTimeoutMs?: number;
+}
+
+/** The decoded result of a query, before typing. */
+export type QueryResult =
+  | { kind: "objects"; objects: DecodedObject[] }
+  | { kind: "single"; object: DecodedObject }
+  | { kind: "done" };
+
+interface Pending {
+  resolve: (frame: Frame) => void;
+  reject: (err: RhypedbError) => void;
+}
+
+/** Parse a `"host:port"` string or `{ host, port }` into connect options. */
+function parseAddr(addr: string | { host: string; port: number }): { host: string; port: number } {
+  if (typeof addr !== "string") return addr;
+  const i = addr.lastIndexOf(":");
+  if (i < 0) throw new RhypedbError("connect", `invalid address ${JSON.stringify(addr)} (want host:port)`);
+  const host = addr.slice(0, i) || "127.0.0.1";
+  const port = Number(addr.slice(i + 1));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new RhypedbError("connect", `invalid port in ${JSON.stringify(addr)}`);
+  }
+  return { host, port };
+}
+
+/**
+ * A connected rhypedb client. Construct with [`connect`](AsyncClient.connect).
+ * Safe to share and call concurrently — calls pipeline on the one connection.
+ */
+export class AsyncClient {
+  readonly #socket: Socket;
+  readonly #parser = new FrameParser();
+  #pending: Pending[] = [];
+  #dead = false;
+  #nextReqId = 1;
+
+  private constructor(socket: Socket) {
+    this.#socket = socket;
+    socket.on("data", (chunk: Buffer) => this.#onData(chunk));
+    socket.on("error", (e: Error) => this.#fail(new RhypedbError("io", e.message)));
+    socket.on("close", () => {
+      // A close while requests are in flight (or unexpectedly) is an I/O failure;
+      // an intentional `close()` has already drained `#pending`.
+      this.#fail(new RhypedbError("io", "connection closed by peer"));
+    });
+  }
+
+  /** Connect to a rhypedb server's binary TCP port (`"host:port"`). */
+  static connect(
+    addr: string | { host: string; port: number },
+    opts: ClientOptions = {},
+  ): Promise<AsyncClient> {
+    const { host, port } = parseAddr(addr);
+    return new Promise<AsyncClient>((resolve, reject) => {
+      const socket = tcpConnect({ host, port });
+      socket.setNoDelay(true);
+      let settled = false;
+      const timer =
+        opts.connectTimeoutMs !== undefined
+          ? setTimeout(() => {
+              if (settled) return;
+              settled = true;
+              socket.destroy();
+              reject(new RhypedbError("connect", "connect timed out"));
+            }, opts.connectTimeoutMs)
+          : null;
+      const onError = (e: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        reject(new RhypedbError("connect", e.message));
+      };
+      socket.once("error", onError);
+      socket.once("connect", () => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        socket.removeListener("error", onError);
+        resolve(new AsyncClient(socket));
+      });
+    });
+  }
+
+  // --- request/response surface ------------------------------------------
+
+  /** Liveness check: `PING` → `PONG`. */
+  async ping(): Promise<void> {
+    const frame = await this.#roundTrip(Req.Ping, Buffer.alloc(0));
+    if (frame.kind === Resp.Pong) return;
+    if (frame.kind === Resp.Error) throw serverError(frame.payload);
+    throw unexpected(frame.kind);
+  }
+
+  /** Run a raw query string, returning the untyped [`QueryResult`]. */
+  async query(query: string): Promise<QueryResult> {
+    const frame = await this.#roundTrip(Req.Query, encodeQueryPayload(query));
+    return decodeQueryFrame(frame);
+  }
+
+  /** Run a typed [`Query`] and materialize every row into `T`. */
+  async fetch<T>(query: Query<T>): Promise<Row<T>[]> {
+    return flattenRows<T>(await this.query(query.text));
+  }
+
+  /** Run a typed [`Query`] and return the first row, if any. */
+  async fetchOne<T>(query: Query<T>): Promise<Row<T> | null> {
+    const rows = await this.fetch(query);
+    return rows.length > 0 ? rows[0]! : null;
+  }
+
+  /** Run a typed write that returns the affected object (`create`/`update`). */
+  async create<T>(query: Query<T>): Promise<Row<T>> {
+    return singleRow<T>(await this.query(query.text));
+  }
+
+  /** Run a query for its effect, returning the untyped result shape. */
+  execute<T>(query: Query<T>): Promise<QueryResult> {
+    return this.query(query.text);
+  }
+
+  /** Close the connection. In-flight requests reject with a closed error. */
+  close(): void {
+    this.#fail(new RhypedbError("closed", "connection closed by client"));
+  }
+
+  // --- internals ----------------------------------------------------------
+
+  #onData(chunk: Buffer): void {
+    this.#parser.push(chunk);
+    try {
+      for (let frame = this.#parser.next(); frame !== null; frame = this.#parser.next()) {
+        const pending = this.#pending.shift();
+        // A non-subscription connection never receives an unsolicited frame; if
+        // one arrives with nothing pending, the stream is desynced — fail fast.
+        if (pending === undefined) {
+          this.#fail(new RhypedbError("io", "unsolicited frame with no pending request"));
+          return;
+        }
+        pending.resolve(frame);
+      }
+    } catch (e) {
+      // A framing error (bad length) desyncs the stream irrecoverably → latch.
+      this.#fail(new RhypedbError("io", `framing error: ${(e as Error).message}`));
+    }
+  }
+
+  #fail(err: RhypedbError): void {
+    if (this.#dead) return;
+    this.#dead = true;
+    const pending = this.#pending;
+    this.#pending = [];
+    for (const p of pending) p.reject(err);
+    this.#socket.destroy();
+  }
+
+  #roundTrip(kind: number, payload: Buffer): Promise<Frame> {
+    if (this.#dead) {
+      return Promise.reject(
+        new RhypedbError("closed", "connection is closed; reconnect"),
+      );
+    }
+    const reqId = this.#nextReqId;
+    this.#nextReqId = (this.#nextReqId + 1) >>> 0; // wrap as u32
+    return new Promise<Frame>((resolve, reject) => {
+      this.#pending.push({ resolve, reject });
+      this.#socket.write(encodeFrame(reqId, kind, payload), (err) => {
+        if (err) this.#fail(new RhypedbError("io", err.message));
+      });
+    });
+  }
+}
+
+/** Map a query/execute reply frame to a [`QueryResult`] or throw. */
+function decodeQueryFrame(frame: Frame): QueryResult {
+  switch (frame.kind) {
+    case Resp.Objects:
+      return { kind: "objects", objects: decode(() => decodeObjectsPayload(frame.payload)) };
+    case Resp.Single:
+      return { kind: "single", object: decode(() => decodeSinglePayload(frame.payload)) };
+    case Resp.Done:
+      return { kind: "done" };
+    case Resp.Error:
+      throw serverError(frame.payload);
+    default:
+      throw unexpected(frame.kind);
+  }
+}
+
+/** Wrap a decode so a malformed (but framed) payload surfaces as `decode`. */
+function decode<T>(f: () => T): T {
+  try {
+    return f();
+  } catch (e) {
+    throw new RhypedbError("decode", (e as Error).message);
+  }
+}
+
+function objectToRow<T>(obj: DecodedObject): Row<T> {
+  return { id: obj.id, data: obj.fields as unknown as T };
+}
+
+/** `objects` → rows; `single` → one row; `done` → empty (the `fetch` shape). */
+function flattenRows<T>(result: QueryResult): Row<T>[] {
+  switch (result.kind) {
+    case "objects":
+      return result.objects.map((o) => objectToRow<T>(o));
+    case "single":
+      return [objectToRow<T>(result.object)];
+    case "done":
+      return [];
+  }
+}
+
+/** A result that must be exactly one object (the `create`/`update` shape). */
+function singleRow<T>(result: QueryResult): Row<T> {
+  if (result.kind === "single") return objectToRow<T>(result.object);
+  if (result.kind === "objects" && result.objects.length === 1) {
+    return objectToRow<T>(result.objects[0]!);
+  }
+  throw new RhypedbError("unexpected_shape", `expected a single object, got ${result.kind}`);
+}
+
+function serverError(payload: Buffer): RhypedbError {
+  try {
+    return new RhypedbError("server", decodeErrorPayload(payload));
+  } catch {
+    return new RhypedbError("server", payload.toString("utf8"));
+  }
+}
+
+function unexpected(kind: number): RhypedbError {
+  return new RhypedbError("unexpected_response", `unexpected response frame kind 0x${kind.toString(16)}`);
+}
