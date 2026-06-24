@@ -29,10 +29,18 @@ interface User {
   active: boolean | null;
 }
 
+interface Doc {
+  label: string | null;
+}
+
 const SCHEMA = `type User {
   name: String @unique
   age: u32 @indexed
   active: Bool
+}
+type Doc {
+  label: String
+  embedding: Vector<4>
 }
 `;
 
@@ -119,6 +127,24 @@ test(
       const got = await client.fetchOne(Query.get<User>("User", ada.id));
       assert.equal(got?.id, ada.id);
       assert.equal(got?.data.name, "Ada");
+
+      // --- prepared statements against the real server ---
+      const allUsers = await client.prepare(Query.all<User>("User"));
+      assert.equal((await client.fetchPrepared(allUsers)).length, 2);
+      assert.equal((await client.fetchPrepared(allUsers)).length, 2); // re-runs
+      const getAda = await client.prepare(Query.get<User>("User", ada.id));
+      assert.equal((await client.fetchOnePrepared(getAda))?.data.name, "Ada");
+
+      // --- BYO-vector ingest + similarity search ---
+      const d1 = await client.create(Query.raw<Doc>('Doc.create({ label: "d1" })'));
+      const d2 = await client.create(Query.raw<Doc>('Doc.create({ label: "d2" })'));
+      assert.equal(await client.ingestVectors("Doc", "embedding", [[d1.id, [1, 0, 0, 0]]]), 1);
+      assert.equal(await client.ingestVectors("Doc", "embedding", [[d2.id, [0, 1, 0, 0]]]), 1);
+      const hits = await client.fetch(
+        Query.raw<Doc>("Doc.similar(.embedding, [1.0, 0.0, 0.0, 0.0], k: 1)"),
+      );
+      assert.equal(hits.length, 1);
+      assert.equal(hits[0]!.id, d1.id, "nearest to [1,0,0,0] must be d1");
 
       // --- raw update, then confirm ---
       await client.execute(Query.raw<User>(`User.get(${ada.id}).update({ age: 31 })`));

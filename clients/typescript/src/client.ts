@@ -12,12 +12,17 @@ import { RhypedbError } from "./errors.ts";
 import { type Query, type Row } from "./query.ts";
 import {
   FrameParser,
+  MAX_FRAME_PAYLOAD,
   Req,
   Resp,
   encodeFrame,
   encodeQueryPayload,
+  encodePreparePayload,
+  encodeExecutePayload,
+  encodeVectorBatchPayload,
   decodeObjectsPayload,
   decodeSinglePayload,
+  decodePreparedPayload,
   decodeErrorPayload,
   type DecodedObject,
   type Frame,
@@ -38,6 +43,32 @@ export type QueryResult =
 interface Pending {
   resolve: (frame: Frame) => void;
   reject: (err: RhypedbError) => void;
+}
+
+/** Process-wide source of per-client brands for [`Prepared`] statements. */
+let nextClientId = 1;
+
+/**
+ * A statement prepared on an [`AsyncClient`]'s connection (see
+ * [`prepare`](AsyncClient#prepare)). The server parses + caches the query once
+ * and hands back this handle; re-running it via the `*Prepared` methods re-runs
+ * it with no re-parse and without re-sending the query text. There are no bind
+ * parameters — a prepared statement is a *fixed* query.
+ *
+ * Statement ids are scoped to the connection that created them. A `Prepared` is
+ * branded with its issuing client, so using it on a *different* client is
+ * rejected with a `foreign_statement` error (before any I/O) rather than running
+ * that client's unrelated statement of the same id.
+ */
+export class Prepared<T> {
+  readonly stmtId: bigint;
+  readonly clientId: number;
+  /** @internal — created by [`AsyncClient.prepare`]; do not construct directly. */
+  constructor(stmtId: bigint, clientId: number) {
+    this.stmtId = stmtId;
+    this.clientId = clientId;
+  }
+  declare private readonly _row: (x: T) => void;
 }
 
 /** Parse a `"host:port"` string or `{ host, port }` into connect options. */
@@ -72,6 +103,7 @@ function parseAddr(addr: string | { host: string; port: number }): { host: strin
 export class AsyncClient {
   readonly #socket: Socket;
   readonly #parser = new FrameParser();
+  readonly #clientId = nextClientId++;
   #pending: Pending[] = [];
   #dead = false;
   #nextReqId = 1;
@@ -158,6 +190,78 @@ export class AsyncClient {
   /** Run a query for its effect, returning the untyped result shape. */
   execute<T>(query: Query<T>): Promise<QueryResult> {
     return this.query(query.text);
+  }
+
+  /**
+   * Prepare a typed [`Query`] for repeated execution on this connection. The
+   * server parses + caches it and returns a [`Prepared`] handle; run it with the
+   * `*Prepared` methods (no re-parse, no re-sent text). Valid until this client
+   * is closed.
+   */
+  async prepare<T>(query: Query<T>): Promise<Prepared<T>> {
+    const frame = await this.#roundTrip(Req.Prepare, encodePreparePayload(query.text));
+    if (frame.kind === Resp.Prepared) {
+      return new Prepared<T>(decode(() => decodePreparedPayload(frame.payload)), this.#clientId);
+    }
+    if (frame.kind === Resp.Error) throw serverError(frame.payload);
+    throw unexpected(frame.kind);
+  }
+
+  /** Run a [`Prepared`] statement, returning the untyped [`QueryResult`]. */
+  async executePrepared<T>(stmt: Prepared<T>): Promise<QueryResult> {
+    return decodeQueryFrame(await this.#runPrepared(stmt));
+  }
+
+  /** Run a [`Prepared`] statement and materialize every row into `T`. */
+  async fetchPrepared<T>(stmt: Prepared<T>): Promise<Row<T>[]> {
+    return flattenRows<T>(await this.executePrepared(stmt));
+  }
+
+  /** Run a [`Prepared`] statement and return the first row, if any. */
+  async fetchOnePrepared<T>(stmt: Prepared<T>): Promise<Row<T> | null> {
+    const rows = await this.fetchPrepared(stmt);
+    return rows.length > 0 ? rows[0]! : null;
+  }
+
+  /** Run a [`Prepared`] write that returns the affected object. */
+  async createPrepared<T>(stmt: Prepared<T>): Promise<Row<T>> {
+    return singleRow<T>(await this.executePrepared(stmt));
+  }
+
+  /**
+   * Bulk-load precomputed vectors into one `Vector` field. `rows` is `[id,
+   * vector]` pairs; the server validates and applies the whole batch atomically
+   * (returns the row count). One frame per call — throws a `batch_too_large`
+   * error (before any write) if the encoded batch would exceed the protocol
+   * frame cap; split it across calls (each call is its own atomic batch).
+   */
+  async ingestVectors(
+    typeName: string,
+    fieldName: string,
+    rows: ReadonlyArray<readonly [bigint, ArrayLike<number>]>,
+  ): Promise<number> {
+    const payload = encodeVectorBatchPayload(typeName, fieldName, rows);
+    if (payload.length > MAX_FRAME_PAYLOAD) {
+      throw new RhypedbError(
+        "batch_too_large",
+        `vector batch too large: ${rows.length} rows encode to ${payload.length} bytes (frame cap ${MAX_FRAME_PAYLOAD})`,
+      );
+    }
+    const frame = await this.#roundTrip(Req.VectorBatch, payload);
+    if (frame.kind === Resp.Done) return rows.length;
+    if (frame.kind === Resp.Error) throw serverError(frame.payload);
+    throw unexpected(frame.kind);
+  }
+
+  /** Verify a [`Prepared`] belongs to this client (before any I/O), then run it. */
+  async #runPrepared<T>(stmt: Prepared<T>): Promise<Frame> {
+    if (stmt.clientId !== this.#clientId) {
+      throw new RhypedbError(
+        "foreign_statement",
+        "prepared statement belongs to a different client; prepare it on this client first",
+      );
+    }
+    return this.#roundTrip(Req.Execute, encodeExecutePayload(stmt.stmtId));
   }
 
   /** Close the connection. In-flight requests reject with a closed error. */

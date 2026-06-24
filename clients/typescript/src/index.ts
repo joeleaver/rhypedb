@@ -14,7 +14,7 @@
 //! for (const row of adults) console.log(row.id, row.data.name);
 //! ```
 
-export { AsyncClient } from "./client.ts";
+export { AsyncClient, Prepared } from "./client.ts";
 export type { ClientOptions, QueryResult } from "./client.ts";
 export { Query } from "./query.ts";
 export type { Row } from "./query.ts";
