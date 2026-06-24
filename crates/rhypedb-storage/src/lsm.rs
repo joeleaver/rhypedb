@@ -207,7 +207,13 @@ impl LsmTree {
             // safe and prevents an unbounded leak of orphaned temp files.
             for entry in std::fs::read_dir(&sst_dir)?.filter_map(|e| e.ok()) {
                 let p = entry.path();
-                if p.extension().is_some_and(|ext| ext == "tmp") {
+                // Match exactly the `NNNNNNNN.sst.tmp` files SstWriter creates,
+                // not any `.tmp`, so this never collides with another component's
+                // temp files that might one day live here.
+                if p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".sst.tmp"))
+                {
                     let _ = std::fs::remove_file(&p);
                 }
             }
