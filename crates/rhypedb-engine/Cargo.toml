@@ -3,14 +3,24 @@ name = "rhypedb-engine"
 version.workspace = true
 edition.workspace = true
 
-# Forward the ONNX linking choice to rhypedb-embed. default-features=false so this
-# path doesn't force `onnx-download` back on when a consumer selects onnx-dynamic
-# (Cargo unifies features across all paths to embed).
+# The fastembed/ONNX stack is OPTIONAL (see rhypedb-embed). With `fastembed` off,
+# the engine builds with no ONNX dependency; the built-in FastEmbedder/FastReranker
+# are absent, so the vectorize worker and `search_text` return a clear error /
+# fall back to raw HNSW results. A consumer with no @vectorize fields builds with
+# `--no-default-features` and pulls in NO ONNX Runtime.
+#
+# Each onnx-* arm forwards the ONNX linking choice to rhypedb-embed AND turns on
+# this crate's own `fastembed` feature (which the cfg-gating keys off). The embed
+# dep is default-features=false at the workspace level so this path doesn't force
+# `onnx-download` back on when a consumer selects onnx-dynamic (Cargo unifies
+# features across all paths to embed).
 [features]
 default = ["onnx-download"]
-onnx-download = ["rhypedb-embed/onnx-download"]
-onnx-static = ["rhypedb-embed/onnx-static"]
-onnx-dynamic = ["rhypedb-embed/onnx-dynamic"]
+# Compile the fastembed-backed embedder/reranker call sites; forwards to embed.
+fastembed = ["rhypedb-embed/fastembed"]
+onnx-download = ["fastembed", "rhypedb-embed/onnx-download"]
+onnx-static = ["fastembed", "rhypedb-embed/onnx-static"]
+onnx-dynamic = ["fastembed", "rhypedb-embed/onnx-dynamic"]
 
 [dependencies]
 rhypedb-storage = { workspace = true }

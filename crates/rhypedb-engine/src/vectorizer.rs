@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use rhypedb_embed::{Embedder, FastEmbedder, FastReranker, Reranker};
+use rhypedb_embed::{Embedder, Reranker};
+#[cfg(feature = "fastembed")]
+use rhypedb_embed::{FastEmbedder, FastReranker};
 use rhypedb_schema::{DistanceMetric, FieldType, IndexDef, QuantizationType, Schema, VectorizeDef};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::LsmTree;
@@ -668,12 +670,19 @@ impl Vectorizer {
             // insert/commit phase so concurrent query-path embeds don't block.
             let embed_result = {
                 let mut embedders = self.embedders.lock();
-                let embedder = embedders
-                    .entry(model_name.clone())
-                    .or_insert_with(|| {
-                        Box::new(FastEmbedder::new(model_name).expect("failed to load model"))
-                    });
-                embedder.embed(&text_refs)
+                // Lazily load the fastembed-backed embedder for this model. When
+                // built without the `fastembed` feature there's no built-in
+                // embedder to construct, so an absent entry yields a clear error.
+                #[cfg(feature = "fastembed")]
+                embedders.entry(model_name.clone()).or_insert_with(|| {
+                    Box::new(FastEmbedder::new(model_name).expect("failed to load model"))
+                });
+                match embedders.get_mut(model_name) {
+                    Some(embedder) => embedder.embed(&text_refs),
+                    None => Err(rhypedb_embed::EmbedError::Model(
+                        "no embedder available (built without the `fastembed` feature)".into(),
+                    )),
+                }
             };
             let embeddings = match embed_result {
                 Ok(e) => e,
@@ -739,14 +748,20 @@ impl Vectorizer {
 
         let query_vec = {
             let mut embedders = self.embedders.lock();
-            let embedder = embedders
-                .entry(model.clone())
-                .or_insert_with(|| {
-                    Box::new(FastEmbedder::new(&model).expect("failed to load model"))
-                });
-            embedder
-                .embed(&[query_text])
-                .map_err(|e| crate::EngineError::TypeNotFound(e.to_string()))?
+            #[cfg(feature = "fastembed")]
+            embedders.entry(model.clone()).or_insert_with(|| {
+                Box::new(FastEmbedder::new(&model).expect("failed to load model"))
+            });
+            match embedders.get_mut(&model) {
+                Some(embedder) => embedder
+                    .embed(&[query_text])
+                    .map_err(|e| crate::EngineError::TypeNotFound(e.to_string()))?,
+                None => {
+                    return Err(crate::EngineError::TypeNotFound(
+                        "no embedder available (built without the `fastembed` feature)".into(),
+                    ))
+                }
+            }
         };
 
         if query_vec.is_empty() {
@@ -838,12 +853,19 @@ impl Vectorizer {
                 // Lazily initialize the reranker.
                 let mut reranker = self.reranker.lock();
                 if reranker.is_none() {
+                    #[cfg(feature = "fastembed")]
                     match FastReranker::new() {
                         Ok(r) => *reranker = Some(Box::new(r)),
                         Err(_) => {
                             // Reranker unavailable — return HNSW results as-is.
                             return Ok(candidates.into_iter().take(k).collect());
                         }
+                    }
+                    // Still none — either the load above failed, or this build has
+                    // no `fastembed` feature (no built-in reranker). Return the
+                    // raw HNSW results rather than reranking.
+                    if reranker.is_none() {
+                        return Ok(candidates.into_iter().take(k).collect());
                     }
                 }
 
@@ -1431,6 +1453,8 @@ mod tests {
         assert_eq!(state, VectorState::Pending);
     }
 
+    // Drives the real fastembed embedding pipeline; only runs with the feature.
+    #[cfg(feature = "fastembed")]
     #[test]
     fn process_pending_embeds_and_indexes() {
         let dir = tempfile::tempdir().unwrap();
@@ -1464,6 +1488,7 @@ mod tests {
         assert_eq!(state, VectorState::Indexed);
     }
 
+    #[cfg(feature = "fastembed")]
     #[test]
     fn search_after_indexing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1510,6 +1535,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fastembed")]
     #[test]
     fn queue_survives_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1544,6 +1570,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fastembed")]
     #[test]
     fn indexed_vectors_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1609,6 +1636,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fastembed")]
     #[test]
     fn background_worker_processes_jobs() {
         let dir = tempfile::tempdir().unwrap();
@@ -1647,6 +1675,7 @@ mod tests {
         vectorizer.stop_worker();
     }
 
+    #[cfg(feature = "fastembed")]
     #[test]
     fn snapshot_speeds_up_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1713,6 +1742,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fastembed")]
     #[test]
     fn snapshot_delta_rebuild() {
         let dir = tempfile::tempdir().unwrap();
