@@ -28,8 +28,8 @@
 //! [`subscribe`](Client::subscribe), which returns a blocking [`Subscription`]
 //! iterator over its own dedicated connection.
 //!
-//! A native async client (sharing this protocol core) will be added behind a
-//! feature in a later increment — sync is the substrate, async is additive.
+//! The native async client (`AsyncClient`, behind the `async` feature) mirrors
+//! this surface — sync is the substrate, async is additive.
 
 use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};

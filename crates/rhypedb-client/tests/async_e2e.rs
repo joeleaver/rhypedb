@@ -10,8 +10,10 @@
 #![cfg(feature = "async")]
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use rhypedb_client::{AsyncClient, Error, Query, QueryResult};
 use rhypedb_wire::object::{FieldMap, Object, Value};
@@ -420,6 +422,50 @@ async fn malformed_prepared_reply_errors_without_latching() {
         .unwrap()
         .expect("a row");
     assert_eq!(ok.id, 1);
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_round_trip_latches_connection_closed() {
+    // Unlike the sync client, an async call can be cancelled mid-flight (a
+    // `tokio::time::timeout`, a `select!`, an aborted task). A round_trip future
+    // dropped after the write but before the full reply is read leaves an unread
+    // reply tail in the socket; the NEXT call would otherwise mis-correlate it
+    // (the protocol echoes no checkable request id). The pessimistic dead-latch
+    // must instead fail every subsequent call fast as Closed.
+    //
+    // The mock dribbles the PONG reply out in two halves with a gap so a short
+    // timeout drops the ping() future while only the first half is on the wire.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let frame = wire_sync::read_frame(&mut stream).unwrap();
+        assert_eq!(frame.kind, protocol::REQ_PING);
+        let mut framed = Vec::new();
+        wire_sync::write_frame(&mut framed, frame.req_id, protocol::RESP_PONG, &[]).unwrap();
+        let mid = framed.len() / 2;
+        stream.write_all(&framed[..mid]).unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(150));
+        stream.write_all(&framed[mid..]).unwrap();
+        stream.flush().unwrap();
+        // Hold the connection open briefly so the test, not the peer, drives timing.
+        thread::sleep(Duration::from_millis(200));
+    });
+
+    let client = AsyncClient::connect(addr).await.unwrap();
+    // The timeout fires mid-reply, dropping the ping() future.
+    let timed_out = tokio::time::timeout(Duration::from_millis(30), client.ping()).await;
+    assert!(timed_out.is_err(), "the timeout must fire before the full reply arrives");
+
+    // Latched dead → every subsequent call fails fast as Closed (never a stale,
+    // mis-correlated reply). With a latch-only-on-Err design this would instead
+    // return a mis-parsed frame, so this asserts the pessimistic latch.
+    assert!(matches!(client.ping().await, Err(Error::Closed)));
+    assert!(matches!(client.query("User").await, Err(Error::Closed)));
 
     drop(client);
     handle.join().unwrap();

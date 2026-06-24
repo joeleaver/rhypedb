@@ -86,6 +86,19 @@ struct AsyncConnection {
 impl AsyncConnection {
     /// Send one request frame and read the one reply frame. On any I/O failure
     /// (including a timeout) the connection is marked dead.
+    ///
+    /// The dead-latch is **pessimistic across the await**: we set `dead` *before*
+    /// the round-trip future and clear it only on a fully-completed success. This
+    /// is what makes the latch hold under *cancellation* — an async caller can
+    /// drop this future mid-flight (`tokio::time::timeout`, `select!`, an aborted
+    /// task), and a dropped read is not cancel-safe (it may have consumed part of
+    /// the reply from the socket). If we latched only on the `Err` path, a dropped
+    /// future would leave `dead == false` with an unread reply tail buffered in
+    /// the socket, and the next request would silently mis-correlate that stale
+    /// reply (the protocol does not echo a checkable request id). Assuming the
+    /// worst across the await closes that hole: a cancelled call leaves the
+    /// connection `Closed`, so the next call fails fast — reconnect. (The
+    /// synchronous `Client` cannot be cancelled mid-call, so it has no such hole.)
     async fn round_trip(
         &mut self,
         kind: u8,
@@ -98,11 +111,14 @@ impl AsyncConnection {
         }
         let req_id = self.next_req_id;
         self.next_req_id = self.next_req_id.wrapping_add(1);
+        // Arm the latch before the await; a dropped/cancelled future then leaves
+        // the connection dead. Only a clean, fully-read reply disarms it.
+        self.dead = true;
         let result = self
             .do_round_trip(req_id, kind, payload, read_timeout, write_timeout)
             .await;
-        if result.is_err() {
-            self.dead = true;
+        if result.is_ok() {
+            self.dead = false;
         }
         result
     }
