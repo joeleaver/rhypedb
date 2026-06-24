@@ -408,6 +408,7 @@ fn flush_vectors(
 /// whole import with the target dir untouched. Objects whose source field is
 /// absent or non-string are skipped (no text → no vector), mirroring the live
 /// `@vectorize` path.
+#[cfg(feature = "fastembed")]
 fn reembed_pass(db: &Database, report: &mut ImportReport) -> Result<(), String> {
     use rhypedb_embed::{Embedder, FastEmbedder};
     use rhypedb_engine::object::Value;
@@ -494,6 +495,29 @@ fn reembed_pass(db: &Database, report: &mut ImportReport) -> Result<(), String> 
                 _ => break,
             }
         }
+    }
+    Ok(())
+}
+
+/// Reembed mode, built WITHOUT the `fastembed` feature: there is no built-in
+/// embedder to re-derive vectors with. A dump that carries no `@vectorize` field
+/// has nothing to reembed, so the import still succeeds (a no-op here); a dump
+/// that DOES have `@vectorize` fields cannot be reembedded, so the import fails
+/// cleanly before the staging dir is swapped — mirroring the unavailable-model
+/// failure of the real path, target dir untouched.
+#[cfg(not(feature = "fastembed"))]
+fn reembed_pass(db: &Database, _report: &mut ImportReport) -> Result<(), String> {
+    let has_vectorize = db
+        .schema()
+        .types
+        .values()
+        .any(|t| t.vector_fields().any(|f| f.vectorize().is_some()));
+    if has_vectorize {
+        return Err("reembed import needs the built-in embedder, but this server \
+                    was built without the `fastembed` feature (no ONNX). Rebuild \
+                    with a fastembed/onnx-* feature, or import a `raw` dump that \
+                    carries its vectors."
+            .into());
     }
     Ok(())
 }
@@ -991,6 +1015,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fastembed")]
     #[test]
     fn reembed_import_refuses_unavailable_model() {
         // A @vectorize field whose model is unsupported fails a reembed import
@@ -1032,6 +1057,74 @@ mod tests {
             std::fs::read_dir(target.path()).unwrap().next().is_none(),
             "target must be untouched on a failed reembed import"
         );
+    }
+
+    // Built WITHOUT the fastembed feature: a reembed import of a dump that has
+    // @vectorize fields fails cleanly (no built-in embedder), but a reembed
+    // import of a vector-free dump still succeeds.
+    #[cfg(not(feature = "fastembed"))]
+    #[test]
+    fn reembed_without_fastembed_refuses_vectorize_but_allows_plain() {
+        use rhypedb_engine::logical::VectorMode;
+
+        // (a) A @vectorize field → reembed import must fail before the swap.
+        let dir = tempfile::tempdir().unwrap();
+        let sdl = r#"
+            type Doc {
+                body: String
+                auto: Vector<4> @vectorize(source: "body", model: "bge-small-en-v1.5")
+            }
+        "#;
+        let db = Database::open(parse_schema(sdl).unwrap(), dir.path()).unwrap();
+        let mut f = FieldMap::new();
+        f.insert("body".into(), Value::String("hello".into()));
+        db.create("Doc", f).unwrap();
+        let mut out = Vec::new();
+        db.logical_export_stream(
+            &mut out,
+            &LogicalExportOptions { types: None, vectors: VectorMode::Reembed },
+        )
+        .unwrap();
+        let file = dir.path().join("dump.ndjson");
+        std::fs::write(&file, &out).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let msg = run_import(
+            &file,
+            target.path(),
+            &ImportOptions { force: false, vectors: VectorImportMode::Reembed },
+        )
+        .expect_err("reembed of @vectorize data must fail without fastembed");
+        assert!(msg.contains("fastembed"), "got: {msg}");
+        assert!(
+            std::fs::read_dir(target.path()).unwrap().next().is_none(),
+            "target must be untouched on a failed reembed import"
+        );
+
+        // (b) A vector-free dump → reembed import is a no-op and succeeds.
+        let pdir = tempfile::tempdir().unwrap();
+        let pdb = Database::open(
+            parse_schema("type Note { body: String }").unwrap(),
+            pdir.path(),
+        )
+        .unwrap();
+        let mut pf = FieldMap::new();
+        pf.insert("body".into(), Value::String("plain".into()));
+        pdb.create("Note", pf).unwrap();
+        let mut pout = Vec::new();
+        pdb.logical_export_stream(
+            &mut pout,
+            &LogicalExportOptions { types: None, vectors: VectorMode::Reembed },
+        )
+        .unwrap();
+        let pfile = pdir.path().join("plain.ndjson");
+        std::fs::write(&pfile, &pout).unwrap();
+        let ptarget = tempfile::tempdir().unwrap();
+        run_import(
+            &pfile,
+            ptarget.path(),
+            &ImportOptions { force: false, vectors: VectorImportMode::Reembed },
+        )
+        .expect("reembed of a vector-free dump must succeed without fastembed");
     }
 
     #[test]

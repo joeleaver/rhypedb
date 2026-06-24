@@ -3,24 +3,44 @@ name = "rhypedb-server"
 version.workspace = true
 edition.workspace = true
 
+# The fastembed/ONNX stack is OPTIONAL (see rhypedb-embed). With `fastembed` off,
+# the server builds with NO ONNX dependency: the built-in embedder is absent, so
+# the offline `reembed` import refuses an import that has @vectorize fields with a
+# clear error (and is a no-op for a vector-free dump), while the live engine paths
+# fall back as described in rhypedb-engine. A server with no @vectorize workloads
+# builds with `--no-default-features` and pulls in NO ONNX Runtime.
+#
 # ONNX linking strategy, forwarded to every path that reaches rhypedb-embed
-# (direct, via engine, and via query). default-features=false on those deps so a
-# consumer building with `--no-default-features --features onnx-dynamic` (e.g. the
-# nlnwt buildpack, which embeds this crate as a lib) gets a pure offline build
-# with no path re-enabling the build-time download.
+# (direct, via engine, and via query). Each onnx-* arm also turns on this crate's
+# own `fastembed` feature (which the import-path cfg-gating keys off).
+# default-features=false on those deps (workspace level) so a consumer building
+# with `--no-default-features --features onnx-dynamic` (e.g. the nlnwt buildpack,
+# which embeds this crate as a lib) gets a pure offline build with no path
+# re-enabling the build-time download.
 [features]
 default = ["onnx-download"]
+# Compile the fastembed-backed reembed import path; forwards the backend through
+# the whole stack. Does NOT by itself select an ONNX linking strategy — use one
+# of the onnx-* arms (which each imply this).
+fastembed = [
+    "rhypedb-embed/fastembed",
+    "rhypedb-engine/fastembed",
+    "rhypedb-query/fastembed",
+]
 onnx-download = [
+    "fastembed",
     "rhypedb-embed/onnx-download",
     "rhypedb-engine/onnx-download",
     "rhypedb-query/onnx-download",
 ]
 onnx-static = [
+    "fastembed",
     "rhypedb-embed/onnx-static",
     "rhypedb-engine/onnx-static",
     "rhypedb-query/onnx-static",
 ]
 onnx-dynamic = [
+    "fastembed",
     "rhypedb-embed/onnx-dynamic",
     "rhypedb-engine/onnx-dynamic",
     "rhypedb-query/onnx-dynamic",
