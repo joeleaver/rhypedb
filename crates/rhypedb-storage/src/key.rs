@@ -337,6 +337,19 @@ impl KeyBuilder {
         buf.freeze()
     }
 
+    /// Vector-state prefix for scanning all states of a type: `s:<type_id>:`
+    /// Each full key trails `<object_id>:<field_id>` (two big-endian u64s), so a
+    /// caller decodes `object_id` from bytes `[11..19]` and `field_id` from
+    /// `[20..28]`.
+    pub fn vector_state_type_prefix(type_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1);
+        buf.put_u8(KeyPrefix::VectorState as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
     /// Per-object generation counter: `g:<type_id>:<object_id>` → u64 BE.
     pub fn object_version(type_id: u64, object_id: u64) -> Bytes {
         let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8);

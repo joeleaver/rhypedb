@@ -283,8 +283,168 @@ impl Vectorizer {
         };
 
         vectorizer.rebuild_indexes()?;
+        vectorizer.reconcile_pending_jobs()?;
 
         Ok(vectorizer)
+    }
+
+    /// Re-enqueue vectorize jobs orphaned by a crash between `claim_batch`
+    /// (which deletes + commits the queue entry up front) and `store_and_index`
+    /// (which writes the `v:` vector and flips the state to `Indexed`). Such a
+    /// job leaves a durable `vector_state == Pending` with no queue entry and no
+    /// vector, and nothing else re-creates it — the HNSW rebuild only sweeps the
+    /// `v:` keyspace — so without this the object stays unindexed until its
+    /// source row is mutated again (silent loss across a hard kill / jkbase
+    /// Pause→SIGKILL). Runs once at open, single-threaded, before the worker
+    /// starts, so it cannot race a live claim.
+    ///
+    /// Only `@vectorize` fields are auto-embedded; bare (BYO) `Vector` fields are
+    /// written `Indexed` directly by `ingest_vectors`, so they never sit at
+    /// `Pending` and are excluded. A `Pending` state whose queue entry still
+    /// exists is a normal backlog job (not an orphan) and is left alone — so a
+    /// routine restart never double-enqueues. A `Pending` state whose object no
+    /// longer exists (or whose source field is no longer a string) is a true
+    /// orphan the worker would only drop; it is cleaned up so the scan converges.
+    fn reconcile_pending_jobs(&self) -> EngineResult<()> {
+        struct Tmpl {
+            type_name: String,
+            source_field: String,
+            vector_field: String,
+            model: String,
+        }
+        // (type_id, field_id) -> job template, for every @vectorize field.
+        let mut templates: HashMap<(u64, u64), Tmpl> = HashMap::new();
+        for type_def in self.schema.types.values() {
+            let Some(&type_id) = self.type_ids.get(&type_def.name) else {
+                continue;
+            };
+            for field in &type_def.fields {
+                if !matches!(field.field_type, FieldType::Vector(_)) {
+                    continue;
+                }
+                let Some(vd) = field.vectorize() else {
+                    continue;
+                };
+                let field_key = format!("{}.{}", type_def.name, field.name);
+                let Some(&field_id) = self.field_ids.get(&field_key) else {
+                    continue;
+                };
+                templates.insert(
+                    (type_id, field_id),
+                    Tmpl {
+                        type_name: type_def.name.clone(),
+                        source_field: vd.source_field.clone(),
+                        vector_field: field.name.clone(),
+                        model: vd.model.clone(),
+                    },
+                );
+            }
+        }
+        if templates.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot = self.storage.read_snapshot();
+
+        // Objects already on the queue (legitimately pending, not orphaned), keyed
+        // by (type_id, object_id, field_id). Skip these so a normal restart with a
+        // pending backlog doesn't double-enqueue (and double-embed) every job.
+        let mut queued: HashSet<(u64, u64, u64)> = HashSet::new();
+        for (_, value) in &self
+            .storage
+            .scan_prefix_at(snapshot, &KeyBuilder::queue_prefix())?
+        {
+            if let Some(job) = VectorizeJob::deserialize(value) {
+                let field_key = format!("{}.{}", job.type_name, job.vector_field);
+                if let (Some(&tid), Some(&fid)) = (
+                    self.type_ids.get(&job.type_name),
+                    self.field_ids.get(&field_key),
+                ) {
+                    queued.insert((tid, job.object_id, fid));
+                }
+                // A queued job whose stored type/field name no longer resolves
+                // (e.g. renamed after enqueue) is simply omitted from `queued`.
+                // Benign: the live worker would itself drop that stale-name job
+                // (process_batch resolves by current name), and reconcile keys the
+                // state keyspace by the stable field_id, so the object is just
+                // re-enqueued under its current name instead.
+            }
+        }
+
+        let type_ids: HashSet<u64> = templates.keys().map(|(t, _)| *t).collect();
+        let mut to_enqueue: Vec<VectorizeJob> = Vec::new();
+        let mut stale_states: Vec<Bytes> = Vec::new();
+
+        for type_id in type_ids {
+            let prefix = KeyBuilder::vector_state_type_prefix(type_id);
+            for (key, value) in &self.storage.scan_prefix_at(snapshot, &prefix)? {
+                // Only Pending states are orphan candidates.
+                if value.first().copied().map(VectorState::from) != Some(VectorState::Pending) {
+                    continue;
+                }
+                // Key: s:<type_id>:<object_id>:<field_id> — object_id [11..19],
+                // field_id [20..28].
+                if key.len() < 28 {
+                    continue;
+                }
+                let object_id = u64::from_be_bytes(key[11..19].try_into().unwrap());
+                let field_id = u64::from_be_bytes(key[20..28].try_into().unwrap());
+                let Some(tmpl) = templates.get(&(type_id, field_id)) else {
+                    continue; // a Vector field without @vectorize — not auto-embedded
+                };
+                if queued.contains(&(type_id, object_id, field_id)) {
+                    continue; // still on the queue → the worker will handle it
+                }
+
+                // Mirror process_batch's filter: re-enqueue only if the source row
+                // still exists and carries a string source value; otherwise the
+                // state is a true orphan (object deleted / source cleared) and is
+                // cleaned up so it isn't re-scanned every restart.
+                let obj_key = KeyBuilder::object(type_id, object_id);
+                let has_source_text = match self.storage.get_at(snapshot, &obj_key) {
+                    Ok(Some(data)) => {
+                        matches!(
+                            deserialize_fields(&data).get(&tmpl.source_field),
+                            Some(Value::String(_))
+                        )
+                    }
+                    _ => false,
+                };
+
+                if has_source_text {
+                    to_enqueue.push(VectorizeJob {
+                        type_name: tmpl.type_name.clone(),
+                        object_id,
+                        source_field: tmpl.source_field.clone(),
+                        vector_field: tmpl.vector_field.clone(),
+                        model: tmpl.model.clone(),
+                    });
+                } else {
+                    stale_states.push(key.clone());
+                }
+            }
+        }
+
+        // Clean up true orphans (object gone / source cleared) in one txn.
+        if !stale_states.is_empty() {
+            let mut txn = self.storage.begin_txn();
+            for key in &stale_states {
+                self.storage.delete(&mut txn, key)?;
+            }
+            self.storage.commit(&mut txn).map_err(|e| match e {
+                rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
+                other => crate::EngineError::Storage(other),
+            })?;
+        }
+
+        // Re-enqueue recoverable orphans (each writes a fresh queue entry, and
+        // re-asserts the Pending state). Idempotent: a later store_and_index for
+        // an already-indexed object just re-inserts the same object_id.
+        for job in to_enqueue {
+            self.enqueue(job)?;
+        }
+
+        Ok(())
     }
 
     fn snapshot_path(&self, index_key: &str) -> std::path::PathBuf {
@@ -1451,6 +1611,139 @@ mod tests {
 
         let state = vectorizer.get_state("Post", 1, "embedding").unwrap();
         assert_eq!(state, VectorState::Pending);
+    }
+
+    /// The crash window: a job is claimed (queue entry deleted + committed) but
+    /// the process dies before `store_and_index`, leaving a durable `Pending`
+    /// state with no queue entry and no vector. A restart must re-enqueue it
+    /// (no manual re-mutation), since the HNSW rebuild only sweeps `v:` keys.
+    #[test]
+    fn reconcile_re_enqueues_orphaned_pending_job_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+        store_object(&storage, 1, 1, "the quick brown fox");
+
+        {
+            let vz = Vectorizer::new(
+                Arc::clone(&storage),
+                schema.clone(),
+                type_ids.clone(),
+                field_ids.clone(),
+            )
+            .unwrap();
+            vz.enqueue(VectorizeJob {
+                type_name: "Post".into(),
+                object_id: 1,
+                source_field: "body".into(),
+                vector_field: "embedding".into(),
+                model: "all-MiniLM-L6-v2".into(),
+            })
+            .unwrap();
+            // Claim (deletes + commits the queue entry) WITHOUT processing.
+            let claimed = vz.claim_batch().unwrap();
+            assert_eq!(claimed.len(), 1, "claim removes the queue entry");
+            let snap = storage.read_snapshot();
+            let q = storage
+                .scan_prefix_at(snap, &KeyBuilder::queue_prefix())
+                .unwrap();
+            assert!(q.is_empty(), "queue is empty after the claim (the orphan window)");
+            assert_eq!(
+                vz.get_state("Post", 1, "embedding").unwrap(),
+                VectorState::Pending
+            );
+        }
+
+        // Restart: reconcile must put the orphaned job back on the queue.
+        let vz2 = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let snap = storage.read_snapshot();
+        let q = storage
+            .scan_prefix_at(snap, &KeyBuilder::queue_prefix())
+            .unwrap();
+        assert_eq!(q.len(), 1, "reconcile re-enqueued the orphaned Pending job");
+        let job = VectorizeJob::deserialize(&q[0].1).unwrap();
+        assert_eq!(job.object_id, 1);
+        assert_eq!(job.type_name, "Post");
+        assert_eq!(job.source_field, "body");
+        assert_eq!(job.vector_field, "embedding");
+        // And it drains cleanly through the normal claim path.
+        assert_eq!(vz2.claim_batch().unwrap().len(), 1);
+    }
+
+    /// A `Pending` state whose queue entry still exists is a normal backlog job,
+    /// not an orphan — a routine restart must NOT duplicate it.
+    #[test]
+    fn reconcile_does_not_double_enqueue_a_still_queued_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+        store_object(&storage, 1, 1, "still pending");
+        {
+            let vz = Vectorizer::new(
+                Arc::clone(&storage),
+                schema.clone(),
+                type_ids.clone(),
+                field_ids.clone(),
+            )
+            .unwrap();
+            vz.enqueue(VectorizeJob {
+                type_name: "Post".into(),
+                object_id: 1,
+                source_field: "body".into(),
+                vector_field: "embedding".into(),
+                model: "all-MiniLM-L6-v2".into(),
+            })
+            .unwrap();
+            // Do NOT claim — the job is legitimately queued.
+        }
+        let _vz2 = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let snap = storage.read_snapshot();
+        let q = storage
+            .scan_prefix_at(snap, &KeyBuilder::queue_prefix())
+            .unwrap();
+        assert_eq!(
+            q.len(),
+            1,
+            "a still-queued pending job must not be duplicated by reconcile"
+        );
+    }
+
+    /// A `Pending` state whose source object no longer exists (deleted while
+    /// pending) is a true orphan the worker would only drop — reconcile must NOT
+    /// re-enqueue it, and must clean up the stale state so the scan converges.
+    #[test]
+    fn reconcile_skips_and_cleans_orphan_for_missing_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = test_setup(dir.path());
+        // Object 7 is never stored (simulates a deleted source row).
+        {
+            let vz = Vectorizer::new(
+                Arc::clone(&storage),
+                schema.clone(),
+                type_ids.clone(),
+                field_ids.clone(),
+            )
+            .unwrap();
+            vz.enqueue(VectorizeJob {
+                type_name: "Post".into(),
+                object_id: 7,
+                source_field: "body".into(),
+                vector_field: "embedding".into(),
+                model: "all-MiniLM-L6-v2".into(),
+            })
+            .unwrap();
+            vz.claim_batch().unwrap(); // orphan: queue empty, Pending for a missing object
+        }
+        let _vz2 = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let snap = storage.read_snapshot();
+        let q = storage
+            .scan_prefix_at(snap, &KeyBuilder::queue_prefix())
+            .unwrap();
+        assert!(q.is_empty(), "must not re-enqueue a job for a missing object");
+        // The stale Pending state key (type 1, object 7, field 3) was cleaned up.
+        let state_key = KeyBuilder::vector_state(1, 7, 3);
+        assert!(
+            storage.get_at(snap, &state_key).unwrap().is_none(),
+            "stale orphan state should be cleaned up"
+        );
     }
 
     // Drives the real fastembed embedding pipeline; only runs with the feature.
