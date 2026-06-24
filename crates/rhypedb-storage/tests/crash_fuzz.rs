@@ -153,44 +153,55 @@ fn is_flush_site(s: Site) -> bool {
     )
 }
 
+/// `Commit` footer record size: 21-byte header + 0-byte key + 8-byte count.
+/// Tearing this many bytes off the WAL tail un-terminates the trailing batch.
+const FOOTER_BYTES: u64 = 21 + 8;
+
 // ---------------------------------------------------------------------------
 // Oracle
 // ---------------------------------------------------------------------------
 
-/// Cold-reopen the data dir and assert the recovery invariants. `in_flight` is
-/// `Some` for a WAL-site crash (the interrupted commit's writes) and `None` for
-/// a flush-site crash (a flush must not change committed state).
+/// The expected fate of the in-flight transaction after recovery. Unlike a
+/// lenient "reverted OR survived" disjunction, each fuzz case asserts the EXACT
+/// arm its site + fault deterministically produce — so a recovery bug that picks
+/// the WRONG atomic arm (drops a durable txn, or resurrects a discarded one) is
+/// caught, not aliased onto an accepted alternative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    /// In-flight txn did NOT survive — recovered keyspace == shadow.
+    Reverted,
+    /// In-flight txn survived — recovered keyspace == shadow + in-flight writes.
+    Survived,
+}
+
+/// Cold-reopen the data dir and assert recovery. The recovered keyspace must
+/// EXACTLY equal the expected state (`expect` selects reverted vs survived);
+/// recovery must be idempotent; and — the broad guard for the torn-WAL-tail
+/// cleanup — a commit made AFTER recovery must survive a further reopen.
 fn verify_recovered(
     dir: &Path,
     shadow: &[Option<Bytes>],
     in_flight: Option<&Writes>,
+    expect: Expect,
     seed: u64,
     site: Site,
 ) {
-    let reverted = shadow.to_vec();
-    let survived = {
+    let want = {
         let mut s = shadow.to_vec();
-        if let Some(wf) = in_flight {
+        if let (Expect::Survived, Some(wf)) = (expect, in_flight) {
             apply_to_shadow(&mut s, wf);
         }
         s
     };
 
-    // First cold reopen (the reopen succeeding at all proves the data-dir lock
-    // was released by the simulated crash's teardown).
+    // First cold reopen (the reopen succeeding proves the data-dir lock was
+    // released by the simulated crash's teardown).
     let db1 = LsmTree::open(harness_config(dir)).unwrap();
     let rec = read_keyspace(&db1);
-
-    match in_flight {
-        None => assert_eq!(
-            rec, reverted,
-            "flush-site crash changed committed state (seed={seed} site={site:?})\n  rec={rec:?}\n  shadow={reverted:?}"
-        ),
-        Some(_) => assert!(
-            rec == reverted || rec == survived,
-            "in-flight txn left a torn/partial state (seed={seed} site={site:?})\n  rec={rec:?}\n  reverted={reverted:?}\n  survived={survived:?}"
-        ),
-    }
+    assert_eq!(
+        rec, want,
+        "recovered state != expected {expect:?} (seed={seed} site={site:?})\n  rec ={rec:?}\n  want={want:?}"
+    );
     drop(db1);
 
     // Second cold reopen: recovery must be idempotent (catches non-idempotent
@@ -202,23 +213,45 @@ fn verify_recovered(
         "recovery is not idempotent across a second reopen (seed={seed} site={site:?})"
     );
 
-    // The recovered tree is writable and its versioning advanced past recovery:
-    // a fresh commit succeeds and reads back. (`__probe__` sorts before the
-    // `k####` keyspace, so it never perturbs the enumeration above.)
-    let mut t = db2.begin_txn();
-    db2.put(&mut t, b"__probe__", Bytes::from_static(b"ok")).unwrap();
-    db2.commit(&mut t).unwrap();
+    // Post-recovery durability: a commit made AFTER recovery must survive a
+    // further cold reopen. A torn tail left in the WAL would conflate this
+    // commit's framing and drop it on reopen — this asserts the tail was cleaned.
+    // (`__after__` sorts before the `k####` keyspace, so it never perturbs the
+    // enumeration; it also proves the recovered tree is writable + advancing.)
+    let sentinel: &[u8] = b"__after__";
+    {
+        let mut t = db2.begin_txn();
+        db2.put(&mut t, sentinel, Bytes::from_static(b"durable")).unwrap();
+        db2.commit(&mut t).unwrap();
+    }
     assert_eq!(
-        db2.get_at(db2.read_snapshot(), b"__probe__").unwrap().as_deref(),
-        Some(&b"ok"[..]),
-        "recovered tree must accept new writes (seed={seed} site={site:?})"
+        db2.get_at(db2.read_snapshot(), sentinel).unwrap().as_deref(),
+        Some(&b"durable"[..])
+    );
+    drop(db2);
+
+    let db3 = LsmTree::open(harness_config(dir)).unwrap();
+    assert_eq!(
+        db3.get_at(db3.read_snapshot(), sentinel).unwrap().as_deref(),
+        Some(&b"durable"[..]),
+        "post-recovery commit lost on reopen — torn WAL tail not cleaned (seed={seed} site={site:?})"
+    );
+    assert_eq!(
+        read_keyspace(&db3),
+        want,
+        "keyspace changed after a post-recovery commit+reopen (seed={seed} site={site:?})"
     );
 }
 
 /// One fuzz case: build a deterministic preamble of durable commits + flushes,
-/// then inject a crash at `site` during the next commit (WAL site) or flush
-/// (flush site), tear down, and verify recovery.
-fn run_case(seed: u64, site: Site) {
+/// inject a crash at `site` during the next commit (WAL site) or flush (flush
+/// site), tear down, and verify recovery against the EXACT expected outcome.
+///
+/// `torn` (WAL sites only) additionally lops the footer off the in-flight
+/// batch's un-fsync'd tail, modelling power loss — so framed replay must discard
+/// the torn batch. This is the only path that exercises the torn-batch-discard
+/// branch (small batches are otherwise strictly all-or-nothing on disk).
+fn run_case(seed: u64, site: Site, torn: bool) {
     let dir = tempfile::tempdir().unwrap();
     let mut shadow: Vec<Option<Bytes>> = vec![None; KEYSPACE as usize];
     let mut rng = Rng::new(seed);
@@ -237,62 +270,97 @@ fn run_case(seed: u64, site: Site) {
         }
     }
 
-    let in_flight: Option<Writes>;
-    let outcome = if is_flush_site(site) {
+    let wal_path = dir.path().join("wal.log");
+
+    if is_flush_site(site) {
+        assert!(!torn, "the torn axis is WAL-only");
         // Dirty the memtable so flush_locked gets past its is_empty short-circuit
         // and reaches the armed site.
         commit_random_txn(&db, &mut rng, &mut shadow);
-        in_flight = None;
         crash_inject::arm(site, 1, Mode::Crash);
-        crash_inject::catch_crash(AssertUnwindSafe(|| {
+        let outcome = crash_inject::catch_crash(AssertUnwindSafe(|| {
             let _ = db.flush();
             unreachable!("flush must have crashed at the armed site");
-        }))
+        }));
+        assert_eq!(outcome, Caught::Crashed(site), "expected a crash at {site:?} (seed={seed})");
+        crash_inject::disarm();
+        db.discard_for_crash_recovery();
+        drop(db);
+        // A flush never loses, duplicates, or resurrects committed data.
+        verify_recovered(dir.path(), &shadow, None, Expect::Reverted, seed, site);
     } else {
         let writes = gen_writes(&mut rng);
-        in_flight = Some(writes.clone());
+        let len_before = std::fs::metadata(&wal_path).unwrap().len();
         crash_inject::arm(site, 1, Mode::Crash);
-        crash_inject::catch_crash(AssertUnwindSafe(|| {
+        let outcome = crash_inject::catch_crash(AssertUnwindSafe(|| {
             apply_writes(&db, &writes);
             unreachable!("commit must have crashed at the armed site");
-        }))
-    };
-    assert_eq!(
-        outcome,
-        Caught::Crashed(site),
-        "expected a crash at {site:?} (seed={seed})"
-    );
-    crash_inject::disarm();
+        }));
+        assert_eq!(outcome, Caught::Crashed(site), "expected a crash at {site:?} (seed={seed})");
+        crash_inject::disarm();
+        // Faithful teardown: discard the un-flushed WAL buffer (a no-op once the
+        // batch reached the page cache), then drop (releases the lock + fds).
+        db.discard_for_crash_recovery();
+        drop(db);
 
-    // Faithful teardown: discard the un-flushed WAL buffer (a no-op for flush
-    // sites), then drop (releases the data-dir lock + closes fds).
-    db.discard_for_crash_recovery();
-    drop(db);
-
-    verify_recovered(dir.path(), &shadow, in_flight.as_ref(), seed, site);
+        let expect = if torn {
+            // Power loss on the un-fsync'd tail: the in-flight batch (incl. footer)
+            // reached the page cache at WalAfterFlushBeforeFsync; tearing the footer
+            // off un-terminates it so framed replay discards the whole batch.
+            let len_after = std::fs::metadata(&wal_path).unwrap().len();
+            assert!(
+                len_after >= len_before + FOOTER_BYTES,
+                "in-flight batch too small to tear a footer (seed={seed})"
+            );
+            let f = std::fs::OpenOptions::new().write(true).open(&wal_path).unwrap();
+            f.set_len(len_after - FOOTER_BYTES).unwrap();
+            drop(f);
+            Expect::Reverted
+        } else {
+            match site {
+                // Small batch sat in the un-flushed buffer -> discarded by teardown.
+                Site::WalAfterWriteBeforeFlush => Expect::Reverted,
+                // Batch reached the page cache (and fsync, for the latter) before
+                // the in-process kill -> survives a SIGKILL-equivalent crash.
+                Site::WalAfterFlushBeforeFsync | Site::WalAfterFsync => Expect::Survived,
+                _ => unreachable!("non-WAL site in the WAL branch"),
+            }
+        };
+        verify_recovered(dir.path(), &shadow, Some(&writes), expect, seed, site);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// The full boundary sweep: every WAL/flush injection site, across a seed
-/// corpus. A failing case prints its seed + site for exact replay.
+/// The full boundary sweep across a seed corpus, asserting the EXACT recovery
+/// outcome per site. A failing case prints its seed + site for exact replay.
 #[test]
 fn fuzz_wal_and_flush_boundaries_recover() {
-    const SITES: [Site; 8] = [
+    const WAL_SITES: [Site; 3] = [
         Site::WalAfterWriteBeforeFlush,
         Site::WalAfterFlushBeforeFsync,
         Site::WalAfterFsync,
+    ];
+    const FLUSH_SITES: [Site; 5] = [
         Site::FlushAfterMemtableRotate,
         Site::FlushAfterSstFinish,
         Site::FlushAfterSstRegister,
         Site::FlushBeforeWalTruncate,
         Site::FlushAfterWalTruncate,
     ];
-    for site in SITES {
-        for seed in 0..16u64 {
-            run_case(seed, site);
+    for seed in 0..16u64 {
+        for site in WAL_SITES {
+            run_case(seed, site, false);
+        }
+        // Torn power-loss axis (WAL only): tear the footer off an un-fsync'd
+        // in-flight batch so framed replay MUST discard it. This is the only path
+        // that drives the torn-batch-discard branch — small batches are otherwise
+        // strictly all-or-nothing on disk, so the sweep would never exercise it.
+        run_case(seed, Site::WalAfterFlushBeforeFsync, true);
+        for site in FLUSH_SITES {
+            run_case(seed, site, false);
         }
     }
 }
@@ -304,9 +372,6 @@ fn fuzz_wal_and_flush_boundaries_recover() {
 /// WHOLE while every fsync'd commit before it survives.
 #[test]
 fn torn_tail_power_loss_discards_unfsynced_in_flight_txn() {
-    /// `Commit` footer record size: 21-byte header + 0-byte key + 8-byte count.
-    const FOOTER_BYTES: u64 = 21 + 8;
-
     let dir = tempfile::tempdir().unwrap();
     let mut shadow: Vec<Option<Bytes>> = vec![None; KEYSPACE as usize];
     let mut rng = Rng::new(0x70726E); // "prn"
@@ -389,9 +454,9 @@ fn probe_commit_after_torn_recovery_survives_second_crash() {
     db.discard_for_crash_recovery();
     drop(db);
     let len_after = std::fs::metadata(&wal_path).unwrap().len();
-    assert!(len_after >= len_before + 29);
+    assert!(len_after >= len_before + FOOTER_BYTES);
     let f = std::fs::OpenOptions::new().write(true).open(&wal_path).unwrap();
-    f.set_len(len_after - 29).unwrap(); // tear off footer -> torn trailing batch on disk
+    f.set_len(len_after - FOOTER_BYTES).unwrap(); // tear off footer -> torn trailing batch on disk
     drop(f);
 
     // Recover from the torn WAL, then commit a NEW txn.
