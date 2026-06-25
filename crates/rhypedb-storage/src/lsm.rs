@@ -1163,8 +1163,15 @@ impl LsmTree {
                 }
                 sst_names.push(name.to_string_lossy().into_owned());
                 max_version = max_version.max(reader.max_version()?);
+                // CRASH BOUNDARY: an SST is now in `dst`, more may remain, and
+                // `wal.log` is not copied yet — a partial destination. The source
+                // is untouched (SSTs are immutable + only linked/read here).
+                crash_inject::hit(Site::SnapshotMidSstCopy);
             }
         }
+
+        // CRASH BOUNDARY: every SST is in `dst`; `wal.log` not copied yet.
+        crash_inject::hit(Site::SnapshotBeforeWalCopy);
 
         // The WAL is mutable (truncated + recreated on flush), so ALWAYS copy
         // its bytes — never hard-link (a link would alias the live file and a

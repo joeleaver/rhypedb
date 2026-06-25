@@ -644,3 +644,145 @@ fn partial_sst_write_does_not_block_reopen() {
     assert_eq!(read_keyspace(&recovered), shadow, "committed data must recover from the WAL");
     assert_eq!(count_sst_files(dir.path(), "tmp"), 0, "partial temp SST must be cleaned");
 }
+
+// ---------------------------------------------------------------------------
+// Inc 5 — warm-equivalence via `snapshot_to`
+// ---------------------------------------------------------------------------
+//
+// jkbase hibernate = Firecracker Pause + snapshot + SIGKILL: a coherent freeze
+// of RAM+disk whose resume must be loss-free. The DB-level analog of that
+// "warm copy" is `LsmTree::snapshot_to` (force-flush-then-copy). Inc 5 proves
+// two properties: (1) a snapshot reopens to EXACTLY the source's committed state
+// across a fuzzed variety of flushed/unflushed/compacted workloads (warm
+// equivalence), and (2) a crash at ANY point inside `snapshot_to` never loses,
+// duplicates, or resurrects SOURCE data — the snapshot is read-only on the
+// source (its only source mutation is the force-flush, whose crash-safety Inc 2
+// already pins), so a crash can only leave a partial, unused destination.
+
+/// Reopen a snapshot destination and assert its committed keyspace equals
+/// `want`. The reopen also proves the snapshot is a self-contained, openable LSM
+/// (correct `sst/` + `wal.log` layout).
+fn verify_snapshot_equivalent(snap_dir: &Path, want: &[Option<Bytes>], seed: u64) {
+    let snap = LsmTree::open(harness_config(snap_dir)).unwrap();
+    assert_eq!(
+        read_keyspace(&snap),
+        want,
+        "snapshot is not warm-equivalent to the expected committed state (seed={seed})"
+    );
+}
+
+/// Warm-equivalence: across fuzzed workloads, a `snapshot_to` copy reopens equal
+/// to the source's committed state — including data only in the memtable/WAL at
+/// snapshot time (the force-flush captures it) — and stays a frozen point-in-time
+/// even after the source is mutated and compacted (which unlinks the SSTs the
+/// snapshot hard-linked).
+#[test]
+fn snapshot_is_warm_equivalent_across_workloads() {
+    for seed in 0..16u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut shadow: Vec<Option<Bytes>> = vec![None; KEYSPACE as usize];
+        let mut rng = Rng::new(seed);
+
+        let db = LsmTree::open(harness_config(dir.path())).unwrap();
+        // Fuzzed durable history: ~20% explicit flushes, so committed data is a
+        // mix of SST-resident (flushed) and memtable/WAL-resident (unflushed).
+        let n_ops = 3 + rng.below(28);
+        for _ in 0..n_ops {
+            if rng.below(10) < 2 {
+                db.flush().unwrap();
+            } else {
+                commit_random_txn(&db, &mut rng, &mut shadow);
+            }
+        }
+
+        // Snapshot the live tree (flushes first), then assert it is an exact warm
+        // copy and that the source itself was not perturbed.
+        let snap_dir = tempfile::tempdir().unwrap();
+        let manifest = db.snapshot_to(snap_dir.path()).unwrap();
+        assert!(
+            !manifest.sst_names.is_empty() || shadow.iter().all(|v| v.is_none()),
+            "a non-empty committed state must capture at least one SST (seed={seed})"
+        );
+        verify_snapshot_equivalent(snap_dir.path(), &shadow, seed);
+        assert_eq!(read_keyspace(&db), shadow, "snapshot must not mutate the source (seed={seed})");
+
+        // Point-in-time independence: mutate + compact the SOURCE (the compaction
+        // unlinks the SSTs the snapshot hard-linked), then re-verify the snapshot
+        // still reflects the ORIGINAL committed state.
+        let frozen = shadow.clone();
+        commit_random_txn(&db, &mut rng, &mut shadow);
+        db.flush().unwrap();
+        db.compact().unwrap();
+        verify_snapshot_equivalent(snap_dir.path(), &frozen, seed);
+    }
+}
+
+/// A crash at any boundary inside `snapshot_to` (the force-flush sites it reaches
+/// via `flush_locked`, plus the new copy-phase sites) must leave the SOURCE
+/// recoverable to EXACTLY its committed state, and `snapshot_to` must still work
+/// after the recovery. The flush sites share Inc 2's path; the value here is the
+/// copy-phase sites (`SnapshotMidSstCopy` / `SnapshotBeforeWalCopy`) and the
+/// end-to-end guarantee that snapshotting never endangers the live database.
+#[test]
+fn fuzz_snapshot_crash_preserves_source() {
+    const SNAPSHOT_SITES: [Site; 7] = [
+        Site::FlushAfterMemtableRotate,
+        Site::FlushAfterSstFinish,
+        Site::FlushAfterSstRegister,
+        Site::FlushBeforeWalTruncate,
+        Site::FlushAfterWalTruncate,
+        Site::SnapshotMidSstCopy,
+        Site::SnapshotBeforeWalCopy,
+    ];
+
+    for seed in 0..8u64 {
+        for site in SNAPSHOT_SITES {
+            let dir = tempfile::tempdir().unwrap();
+            let mut shadow: Vec<Option<Bytes>> = vec![None; KEYSPACE as usize];
+            let mut rng = Rng::new(seed);
+
+            let db = LsmTree::open(harness_config(dir.path())).unwrap();
+            let n_ops = 4 + rng.below(20);
+            for _ in 0..n_ops {
+                if rng.below(10) < 3 {
+                    db.flush().unwrap();
+                } else {
+                    commit_random_txn(&db, &mut rng, &mut shadow);
+                }
+            }
+            // Guarantee the snapshot reaches every site: >=2 SSTs (so the copy
+            // loop iterates and `SnapshotMidSstCopy` lands partway) AND a dirty
+            // memtable (so the force-flush gets past its is-empty short-circuit
+            // and the flush sites fire).
+            commit_random_txn(&db, &mut rng, &mut shadow);
+            db.flush().unwrap();
+            commit_random_txn(&db, &mut rng, &mut shadow);
+            db.flush().unwrap();
+            commit_random_txn(&db, &mut rng, &mut shadow); // left in the memtable
+
+            let snap_dir = tempfile::tempdir().unwrap();
+            crash_inject::arm(site, 1, Mode::Crash);
+            let outcome = crash_inject::catch_crash(AssertUnwindSafe(|| {
+                let _ = db.snapshot_to(snap_dir.path());
+                unreachable!("snapshot_to must have crashed at the armed site");
+            }));
+            assert_eq!(outcome, Caught::Crashed(site), "expected a crash at {site:?} (seed={seed})");
+            crash_inject::disarm();
+            db.discard_for_crash_recovery();
+            drop(db);
+            // The crashed snapshot is an incomplete backup (the caller got no
+            // manifest); we never restore from it. What MUST hold is the source.
+
+            // The SOURCE recovers to exactly its committed state, idempotently.
+            verify_recovered(dir.path(), &shadow, None, Expect::Reverted, seed, site);
+
+            // And the recovered source can still be snapshotted, warm-equivalently
+            // (`verify_recovered`'s `__after__` sentinel sorts outside the k####
+            // keyspace, so the committed keyspace is still exactly `shadow`).
+            let db2 = LsmTree::open(harness_config(dir.path())).unwrap();
+            let snap_dir2 = tempfile::tempdir().unwrap();
+            db2.snapshot_to(snap_dir2.path()).unwrap();
+            verify_snapshot_equivalent(snap_dir2.path(), &shadow, seed);
+        }
+    }
+}

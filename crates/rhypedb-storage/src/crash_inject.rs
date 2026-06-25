@@ -115,11 +115,22 @@ pub enum Site {
     /// still converge on the next reopen — the rebuild is purely derived from the
     /// durable `v:` keyspace and writes nothing.
     VectorizeRebuildMidScan,
+    // --- Online physical snapshot sites (`LsmTree::snapshot_to`) ---
+    // The copy phase runs AFTER the snapshot's force-flush, so the SOURCE tree is
+    // no longer being mutated — a crash here can only leave a PARTIAL destination
+    // dir; the source must always reopen unchanged.
+    /// `LsmTree::snapshot_to`: partway through the per-SST hard-link/copy loop —
+    /// some SSTs are in the destination, some are not, and `wal.log` is not copied
+    /// yet. The source is untouched; the partial snapshot is an incomplete backup.
+    SnapshotMidSstCopy,
+    /// `LsmTree::snapshot_to`: after every SST is in the destination, immediately
+    /// before `wal.log` is copied — the destination has all SSTs but no WAL.
+    SnapshotBeforeWalCopy,
 }
 
 /// Number of [`Site`] variants. Kept in sync with the enum by
 /// `tests::site_count_matches_variants` (feature-on build).
-pub const SITE_COUNT: usize = 16;
+pub const SITE_COUNT: usize = 18;
 
 #[cfg(feature = "crash-fuzz")]
 pub use imp::{arm, catch_crash, disarm, hit, Caught, Mode};
@@ -297,6 +308,8 @@ mod tests {
         Site::VectorizeBeforeStoreCommit,
         Site::VectorizeAfterStoreCommit,
         Site::VectorizeRebuildMidScan,
+        Site::SnapshotMidSstCopy,
+        Site::SnapshotBeforeWalCopy,
     ];
 
     #[test]
