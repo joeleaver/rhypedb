@@ -89,11 +89,34 @@ pub enum Site {
     /// `LsmTree::compact_inner`: partway through the input-unlink loop — some
     /// inputs deleted, some remain, merged present. Reopen must reconcile.
     CompactionMidUnlink,
+    // --- Vectorizer / HNSW pipeline sites (rhypedb-engine `vectorizer.rs`) ---
+    // These name fault points in the engine's vectorize queue + HNSW rebuild,
+    // not in storage. They live here because the injector machinery (the
+    // thread-local arm + `catch_crash`) and the [`Site`] vocabulary are shared;
+    // the engine reaches them through `rhypedb-storage/crash-fuzz`.
+    /// `Vectorizer::claim_batch`: immediately after the commit that deletes the
+    /// claimed queue entries. The jobs are durably dequeued and the objects sit
+    /// at `vector_state == Pending` with no `v:` vector yet — the orphan window
+    /// recovery (`reconcile_pending_jobs`) must re-enqueue them on reopen.
+    VectorizeAfterClaimCommit,
+    /// `Vectorizer::store_and_index`: after the in-RAM HNSW `index.insert` and
+    /// `begin_txn`, before the `v:`/state put+commit. The HNSW (in-RAM, discarded
+    /// on crash) is ahead of the LSM; nothing durable for this object yet.
+    VectorizeBeforeStoreCommit,
+    /// `Vectorizer::store_and_index`: right after the commit that writes the `v:`
+    /// vector and flips the state to `Indexed`. The object is fully durable — a
+    /// reopen is a no-op for it (idempotent).
+    VectorizeAfterStoreCommit,
+    /// `Vectorizer::scan_vectors_for_field` (cold-reopen HNSW rebuild): partway
+    /// through the `v:` keyspace scan that rebuilds an index. A crash here must
+    /// still converge on the next reopen — the rebuild is purely derived from the
+    /// durable `v:` keyspace and writes nothing.
+    VectorizeRebuildMidScan,
 }
 
 /// Number of [`Site`] variants. Kept in sync with the enum by
 /// `tests::site_count_matches_variants` (feature-on build).
-pub const SITE_COUNT: usize = 12;
+pub const SITE_COUNT: usize = 16;
 
 #[cfg(feature = "crash-fuzz")]
 pub use imp::{arm, catch_crash, disarm, hit, Caught, Mode};
@@ -267,6 +290,10 @@ mod tests {
         Site::CompactionAfterMergedPublished,
         Site::CompactionAfterSwap,
         Site::CompactionMidUnlink,
+        Site::VectorizeAfterClaimCommit,
+        Site::VectorizeBeforeStoreCommit,
+        Site::VectorizeAfterStoreCommit,
+        Site::VectorizeRebuildMidScan,
     ];
 
     #[test]

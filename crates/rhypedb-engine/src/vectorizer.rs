@@ -9,6 +9,7 @@ use rhypedb_embed::{Embedder, Reranker};
 #[cfg(feature = "fastembed")]
 use rhypedb_embed::{FastEmbedder, FastReranker};
 use rhypedb_schema::{DistanceMetric, FieldType, IndexDef, QuantizationType, Schema, VectorizeDef};
+use rhypedb_storage::crash_inject;
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::LsmTree;
 use rhypedb_vector::distance::{compute_distance, Metric};
@@ -598,6 +599,10 @@ impl Vectorizer {
 
         let mut results = Vec::new();
         for (key, data) in &entries {
+            // Cold-reopen rebuild boundary: a crash partway through this scan must
+            // still converge on the next reopen (the rebuild is purely derived
+            // from the durable `v:` keyspace and writes nothing).
+            crash_inject::hit(crash_inject::Site::VectorizeRebuildMidScan);
             if key.len() < 2 + 8 + 1 + 8 + 1 + 8 {
                 continue;
             }
@@ -775,6 +780,10 @@ impl Vectorizer {
             rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
             other => crate::EngineError::Storage(other),
         })?;
+
+        // The queue entries are now durably deleted but no `v:`/`Indexed` exists
+        // yet — the orphan window the crash-fuzz harness recovers from.
+        crash_inject::hit(crash_inject::Site::VectorizeAfterClaimCommit);
 
         Ok(jobs
             .into_iter()
@@ -1289,6 +1298,10 @@ impl Vectorizer {
         let state_key = KeyBuilder::vector_state(type_id, object_id, field_id);
 
         let mut txn = self.storage.begin_txn();
+        // The HNSW (in-RAM, rebuilt from `v:` on reopen) is now ahead of the LSM:
+        // nothing durable for this object yet. A crash here must recover via the
+        // still-`Pending` state being re-enqueued on reopen.
+        crash_inject::hit(crash_inject::Site::VectorizeBeforeStoreCommit);
         self.storage
             .put(&mut txn, &vector_key, serialize_f32_vec(vector))?;
         self.storage.put(
@@ -1300,6 +1313,8 @@ impl Vectorizer {
             rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
             other => crate::EngineError::Storage(other),
         })?;
+        // The object is fully durable (`v:` + `Indexed`); a reopen is a no-op.
+        crash_inject::hit(crash_inject::Site::VectorizeAfterStoreCommit);
         Ok(())
     }
 
@@ -2855,3 +2870,12 @@ mod tests {
         assert_eq!(ids, restrict, "filtered text search returns the filter's members");
     }
 }
+
+// Crash-recovery fuzz harness for the vectorize queue + HNSW rebuild. It is a
+// submodule of `vectorizer` (so it reaches the module-private key/serialization
+// helpers and the `embedders` field directly — no public surface widening) and
+// only compiles with both `cfg(test)` and the `crash-fuzz` feature, which makes
+// the four `Vectorize*` injection sites live and `catch_crash`/`arm` available.
+#[cfg(all(test, feature = "crash-fuzz"))]
+#[path = "vectorizer_crash_fuzz.rs"]
+mod vectorizer_crash_fuzz;

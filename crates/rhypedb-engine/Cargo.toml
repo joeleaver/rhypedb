@@ -25,6 +25,11 @@ fastembed = ["rhypedb-embed/fastembed"]
 onnx-download = ["fastembed", "rhypedb-embed/onnx-download"]
 onnx-static = ["fastembed", "rhypedb-embed/onnx-static"]
 onnx-dynamic = ["fastembed", "rhypedb-embed/onnx-dynamic"]
+# Crash-recovery fuzz harness support: forwards to the storage injector so the
+# vectorize/HNSW fault sites become live and `catch_crash`/`arm` are available.
+# OFF by default — a shipped engine build is byte-identical to one that never
+# named this feature (`crash_inject::hit` monomorphizes to nothing).
+crash-fuzz = ["rhypedb-storage/crash-fuzz"]
 
 [dependencies]
 rhypedb-storage = { workspace = true }
