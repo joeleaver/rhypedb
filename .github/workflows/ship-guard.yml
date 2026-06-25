@@ -1,0 +1,30 @@
+name: ship-guard
+
+# Proves the test-only `crash-fuzz` fault injector never reaches a production
+# build of the rhypedb-server binary (Overboard cmqshgpnx, Inc 7). The injector
+# is armed only under `cargo test --features crash-fuzz`; the default build must
+# stay byte-identical with it absent.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-crash-fuzz-in-prod:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pin a current stable toolchain (rustup is preinstalled on the runner). The
+      # workspace is edition 2024 + resolver "3", which a pre-1.85 `cargo` cannot
+      # parse — without this, `cargo tree` would hard-error into a spurious red on
+      # an older default toolchain. `cargo tree` only resolves the feature graph
+      # (no compile), so no other setup is needed.
+      - name: Use a current stable Rust toolchain
+        run: rustup update stable && rustup default stable
+      - name: Assert crash-fuzz stays out of the prod server feature tree
+        run: ./scripts/assert-no-crash-fuzz.sh

@@ -2841,6 +2841,137 @@ mod tests {
         );
     }
 
+    /// Sorted list of `*.sst` filenames in a data dir's `sst/` subdir — used to
+    /// assert a halted destructive boundary did NOT touch the on-disk SST set.
+    fn sst_file_names(sst_dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(sst_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".sst"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Owner-fence at the COMPACTION boundary (the flush test covers the flush
+    /// boundary; compaction is a separate `verify_owner` call site). A foreign
+    /// owner-stamp must halt compaction BEFORE it writes the merged SST or unlinks
+    /// any input — proven by the SST set being byte-for-byte unchanged after the halt.
+    #[test]
+    fn compaction_halts_when_owner_token_stomped() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        // Build several SSTs so compaction has real inputs to merge + unlink.
+        for i in 0..3 {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, format!("k{i}").as_bytes(), Bytes::from(format!("v{i}")))
+                .unwrap();
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+        }
+        let sst_dir = dir.path().join("sst");
+        let before = sst_file_names(&sst_dir);
+        assert!(before.len() >= 2, "need >= 2 SSTs to compact, got {}", before.len());
+
+        // A second writer that got past a no-op flock (network FS) stamps its own
+        // owner token over the LOCK file.
+        std::fs::write(
+            dir.path().join("LOCK"),
+            "owner_id=0000000000000000000000000000beef\npid=1\nhost=other\n",
+        )
+        .unwrap();
+
+        // Compaction's destructive boundary detects the foreign owner and halts.
+        let err = tree.compact().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DataDirOwnershipLost(_)),
+            "got {err:?}"
+        );
+
+        // Teeth: the SST set is unchanged — no merged output published, no input
+        // unlinked. A halt AFTER the merge/swap/unlink would change this set.
+        assert_eq!(
+            before,
+            sst_file_names(&sst_dir),
+            "a halted compaction must not touch the SST set"
+        );
+
+        // Poison is sticky: the cheap commit path now fails fast too.
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"k9", Bytes::from("v9")).unwrap();
+        assert!(
+            matches!(tree.commit(&mut txn).unwrap_err(), crate::Error::DataDirOwnershipLost(_)),
+            "commit after a fenced compaction must fail fast"
+        );
+    }
+
+    /// The fence's promise — "writes are halted to avoid corrupting the other
+    /// writer" — must actually PRESERVE this writer's committed data, not just
+    /// return an error. After a halted flush, a cold reopen must still recover
+    /// both the SST-resident group AND the WAL-resident group: a halt that
+    /// truncated the WAL or wrote a colliding SST first would lose/corrupt one.
+    #[test]
+    fn owner_fence_halt_preserves_committed_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        // Group A: committed AND flushed to an SST.
+        let mut ta = tree.begin_txn();
+        tree.put(&mut ta, b"a1", Bytes::from("A1")).unwrap();
+        tree.put(&mut ta, b"a2", Bytes::from("A2")).unwrap();
+        tree.commit(&mut ta).unwrap();
+        tree.flush().unwrap();
+
+        // Group B: committed but NOT flushed — lives only in the WAL + memtable.
+        let mut tb = tree.begin_txn();
+        tree.put(&mut tb, b"b1", Bytes::from("B1")).unwrap();
+        tree.commit(&mut tb).unwrap();
+
+        let sst_dir = dir.path().join("sst");
+        let ssts_before = sst_file_names(&sst_dir); // group A's single SST
+
+        // A second writer stamps its own owner token.
+        std::fs::write(
+            dir.path().join("LOCK"),
+            "owner_id=0000000000000000000000000000beef\npid=1\nhost=other\n",
+        )
+        .unwrap();
+
+        // The flush halts at the boundary BEFORE rotating the memtable, writing a
+        // colliding SST, or truncating the WAL.
+        assert!(
+            matches!(tree.flush().unwrap_err(), crate::Error::DataDirOwnershipLost(_)),
+            "flush must halt on a foreign owner-stamp"
+        );
+
+        // The halt wrote no SST, so group B never reached disk as an SST — it is
+        // provably WAL-only. (Without this, the reopen below couldn't distinguish a
+        // halted flush from one that completed by writing B's SST then truncating
+        // the WAL.) This pins the survival proof to "the WAL itself was preserved".
+        assert_eq!(
+            ssts_before,
+            sst_file_names(&sst_dir),
+            "a halted flush must not write an SST"
+        );
+
+        // Release the poisoned guard's flock so a fresh owner can reopen.
+        drop(tree);
+
+        // Cold reopen: a new owner stamps over the foreign token, then recovers
+        // from the on-disk SST(A) + WAL(B). Both groups must be intact.
+        let reopened = LsmTree::open(test_config(dir.path())).unwrap();
+        let txn = reopened.begin_txn();
+        assert_eq!(reopened.get(&txn, b"a1").unwrap(), Some(Bytes::from("A1")));
+        assert_eq!(reopened.get(&txn, b"a2").unwrap(), Some(Bytes::from("A2")));
+        assert_eq!(
+            reopened.get(&txn, b"b1").unwrap(),
+            Some(Bytes::from("B1")),
+            "the WAL-resident group must survive the halted flush (WAL not truncated)"
+        );
+    }
+
     #[test]
     fn sync_compact_serializes_with_background_worker() {
         // Even with the worker enabled, an explicit `compact()` call runs
