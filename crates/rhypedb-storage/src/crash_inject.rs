@@ -102,10 +102,13 @@ pub enum Site {
     /// `Vectorizer::store_and_index`: after the in-RAM HNSW `index.insert` and
     /// `begin_txn`, before the `v:`/state put+commit. The HNSW (in-RAM, discarded
     /// on crash) is ahead of the LSM; nothing durable for this object yet.
+    /// (`store_and_index` is shared with the BYO `ingest_vector` path, so this site
+    /// also covers a crash there; the vectorize harness arms it via the queue.)
     VectorizeBeforeStoreCommit,
     /// `Vectorizer::store_and_index`: right after the commit that writes the `v:`
     /// vector and flips the state to `Indexed`. The object is fully durable — a
-    /// reopen is a no-op for it (idempotent).
+    /// reopen is a no-op for it (idempotent). Also covers the BYO `ingest_vector`
+    /// path that shares `store_and_index`.
     VectorizeAfterStoreCommit,
     /// `Vectorizer::scan_vectors_for_field` (cold-reopen HNSW rebuild): partway
     /// through the `v:` keyspace scan that rebuilds an index. A crash here must

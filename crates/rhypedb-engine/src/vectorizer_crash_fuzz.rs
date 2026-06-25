@@ -117,6 +117,42 @@ fn open_storage(path: &Path) -> Arc<LsmTree> {
     LsmTree::open(LsmConfig::new(path)).unwrap()
 }
 
+/// Remove any persisted HNSW snapshot (`hnsw_*.bin`) from the data dir.
+///
+/// A real crash (SIGKILL) never runs `Vectorizer::Drop`, so it never writes a
+/// fresh snapshot — but the harness drops its `Vectorizer` normally, and that Drop
+/// calls `save_snapshots()`. Left in place, a complete snapshot would be reloaded
+/// by `rebuild_indexes` on the next open and shadow the `v:`-keyspace rebuild this
+/// harness exists to exercise (the search oracle would then validate the snapshot,
+/// not a reconstruction). Clearing it before every cold reopen makes the reopen
+/// faithfully reconstruct the HNSW from the durable `v:` vectors — exactly what a
+/// crashed node with no saved snapshot does.
+fn clear_hnsw_snapshots(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("hnsw_") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Cold-reopen the data dir the way a crashed node would: clear any stale HNSW
+/// snapshot (forcing a `v:`-derived rebuild), open the LSM, then open + inject a
+/// fresh `Vectorizer` (which runs `rebuild_indexes` + `reconcile_pending_jobs`).
+fn cold_reopen(
+    dir: &Path,
+    schema: &Schema,
+    type_ids: &HashMap<String, u64>,
+    field_ids: &HashMap<String, u64>,
+) -> (Arc<LsmTree>, Vectorizer) {
+    clear_hnsw_snapshots(dir);
+    let storage = open_storage(dir);
+    let vz = open_vectorizer(Arc::clone(&storage), schema, type_ids, field_ids);
+    (storage, vz)
+}
+
 /// Cold-open a `Vectorizer` (rebuild + reconcile) and inject the deterministic
 /// embedder. The embedder MUST be re-injected after every reopen — without it
 /// `process_batch` fails on a missing model and the fixpoint never converges.
@@ -247,25 +283,28 @@ fn run_process_crash_case(dir: &Path, site: crash_inject::Site, after_hits: u64)
             "site {site:?} after {after_hits} hit(s) must crash, got {outcome:?}",
         );
 
-        // Faithful teardown: forget the WAL's un-flushed user-space buffer, then
-        // drop both handles so the data-dir lock releases before the reopen.
+        // Teardown that models a SIGKILL. `discard_for_crash_recovery` forgets the
+        // WAL's un-flushed buffer — a defensive no-op at the Vectorize* sites (the
+        // last commit already fsynced, so the buffer is empty), kept uniform with
+        // the storage harness. What actually matters here: dropping `vz` discards
+        // the in-RAM HNSW a real crash would lose (its Drop persists a snapshot,
+        // which `cold_reopen` then clears), and dropping both handles releases the
+        // data-dir lock before the reopen.
         storage.discard_for_crash_recovery();
         drop(vz);
         drop(storage);
     }
 
-    // --- Phase 2: cold reopen -> reconcile + rebuild; drive to fixpoint. ---
+    // --- Phase 2: cold reopen -> reconcile + `v:` rebuild; drive to fixpoint. ---
     {
-        let storage = open_storage(dir);
-        let vz = open_vectorizer(Arc::clone(&storage), &schema, &type_ids, &field_ids);
+        let (storage, vz) = cold_reopen(dir, &schema, &type_ids, &field_ids);
         drive_to_fixpoint(&vz);
         assert_fully_recovered(&vz, &storage);
     }
 
     // --- Phase 3: idempotence — a 2nd cold reopen with NO processing matches. ---
     {
-        let storage = open_storage(dir);
-        let vz = open_vectorizer(Arc::clone(&storage), &schema, &type_ids, &field_ids);
+        let (storage, vz) = cold_reopen(dir, &schema, &type_ids, &field_ids);
         assert_eq!(
             vz.status().pending,
             0,
@@ -324,7 +363,10 @@ fn fuzz_rebuild_mid_scan_converges() {
     // Index all N cleanly, then crash partway through the cold-reopen HNSW rebuild
     // scan (after_hits in 1..=N — one hit per `v:` entry). The rebuild writes
     // nothing, so the next reopen must reconstruct the identical, fully searchable
-    // index from the durable `v:` keyspace.
+    // index from the durable `v:` keyspace. The snapshot Phase 1's clean drop
+    // persists is cleared before each reopen, so the crash hits — and recovery
+    // takes — the full `v:`-scan rebuild (`rebuild_index_from_lsm`), not the
+    // snapshot-load delta path that would otherwise shadow it.
     for after_hits in 1..=N {
         let dir = tempfile::tempdir().unwrap();
         let (schema, type_ids, field_ids) = schema_and_ids();
@@ -344,7 +386,11 @@ fn fuzz_rebuild_mid_scan_converges() {
         }
 
         // Phase 2: cold reopen #1 — crash mid-rebuild-scan inside `Vectorizer::new`.
+        // Clearing the snapshot first forces `rebuild_indexes` down the full
+        // `v:`-scan path, where the site fires (and where a real no-snapshot crash
+        // would land).
         {
+            clear_hnsw_snapshots(dir.path());
             let storage = open_storage(dir.path());
             let outcome = crash_inject::catch_crash(|| {
                 crash_inject::arm(
@@ -367,15 +413,15 @@ fn fuzz_rebuild_mid_scan_converges() {
                 ),
                 "rebuild scan after {after_hits} hit(s) must crash, got {outcome:?}",
             );
-            // The rebuild only reads, so nothing durable changed; still tear down
-            // faithfully and release the lock before the reopen.
+            // The rebuild only reads, so nothing durable changed (the crashed
+            // partial index is empty -> its Drop writes no snapshot); release the
+            // lock before the reopen.
             storage.discard_for_crash_recovery();
             drop(storage);
         }
 
-        // Phase 3: cold reopen #2 — full rebuild converges; nothing to process.
-        let storage = open_storage(dir.path());
-        let vz = open_vectorizer(Arc::clone(&storage), &schema, &type_ids, &field_ids);
+        // Phase 3: cold reopen #2 — full `v:` rebuild converges; nothing to process.
+        let (storage, vz) = cold_reopen(dir.path(), &schema, &type_ids, &field_ids);
         assert_eq!(
             vz.process_pending().unwrap(),
             0,
