@@ -38,7 +38,7 @@
 
 use bytes::Bytes;
 use rhypedb_storage::crash_inject::{self, Caught, Mode, Site};
-use rhypedb_storage::lsm::{LsmConfig, LsmTree};
+use rhypedb_storage::lsm::{LsmConfig, LsmTree, SstSnapshotManifest};
 use rhypedb_storage::SstCompression;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -659,6 +659,27 @@ fn partial_sst_write_does_not_block_reopen() {
 // source (its only source mutation is the force-flush, whose crash-safety Inc 2
 // already pins), so a crash can only leave a partial, unused destination.
 
+/// Assert the snapshot dir is STRUCTURALLY complete: every SST the manifest
+/// reports is present under `dst/sst/`, and `wal.log` was copied.
+///
+/// This gives the file-copy steps teeth the keyspace oracle alone cannot:
+/// `snapshot_to` force-flushes first, so the copied `wal.log` is header-only and
+/// a DROPPED wal.log copy reopens IDENTICALLY (an absent WAL just re-creates a
+/// fresh header) — invisible to a data comparison. Asserting the file exists
+/// makes a broken WAL copy observable.
+fn assert_snapshot_files_present(snap_dir: &Path, manifest: &SstSnapshotManifest, seed: u64) {
+    for name in &manifest.sst_names {
+        assert!(
+            snap_dir.join("sst").join(name).exists(),
+            "snapshot is missing SST `{name}` listed in its manifest (seed={seed})"
+        );
+    }
+    assert!(
+        snap_dir.join("wal.log").exists(),
+        "snapshot did not copy wal.log (seed={seed})"
+    );
+}
+
 /// Reopen a snapshot destination and assert its committed keyspace equals
 /// `want`. The reopen also proves the snapshot is a self-contained, openable LSM
 /// (correct `sst/` + `wal.log` layout).
@@ -703,6 +724,9 @@ fn snapshot_is_warm_equivalent_across_workloads() {
             !manifest.sst_names.is_empty() || shadow.iter().all(|v| v.is_none()),
             "a non-empty committed state must capture at least one SST (seed={seed})"
         );
+        // Structural completeness (file-level teeth for the SST + WAL copies),
+        // then data equivalence.
+        assert_snapshot_files_present(snap_dir.path(), &manifest, seed);
         verify_snapshot_equivalent(snap_dir.path(), &shadow, seed);
         assert_eq!(read_keyspace(&db), shadow, "snapshot must not mutate the source (seed={seed})");
 
@@ -768,6 +792,15 @@ fn fuzz_snapshot_crash_preserves_source() {
             }));
             assert_eq!(outcome, Caught::Crashed(site), "expected a crash at {site:?} (seed={seed})");
             crash_inject::disarm();
+            // The crash interrupted snapshot_to before its FINAL step (the wal.log
+            // copy), so the destination is detectably incomplete — a backup that
+            // returned no manifest must never look complete. This also pins the
+            // crash sites to BEFORE completion (a site mistakenly placed after the
+            // wal.log copy would leave a finished snapshot and fail here).
+            assert!(
+                !snap_dir.path().join("wal.log").exists(),
+                "a crashed snapshot_to left a completed wal.log (seed={seed} site={site:?})"
+            );
             db.discard_for_crash_recovery();
             drop(db);
             // The crashed snapshot is an incomplete backup (the caller got no
