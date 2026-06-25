@@ -1,11 +1,16 @@
-//! Crash-recovery fuzz harness for the vectorize queue + HNSW rebuild (Inc 4 of
-//! the crash-fuzz epic, Overboard cmqshgpnx).
+//! Crash-recovery fuzz harness for the vectorize queue + HNSW rebuild (Inc 4 +
+//! Inc 5 of the crash-fuzz epic, Overboard cmqshgpnx).
 //!
 //! Mirrors the storage harness (`rhypedb-storage/tests/crash_fuzz.rs`): a seeded,
 //! deterministic workload is driven under [`crash_inject::catch_crash`] with one
 //! of the four `Vectorize*` sites armed to fire after N hits, then the data dir
 //! is faithfully torn down and cold-reopened, and a shadow-model oracle asserts
 //! the recovered state is exactly correct.
+//!
+//! Inc 5 (warm-equivalence) adds `fuzz_stale_hnsw_snapshot_delta_recovers`, which
+//! covers the HNSW snapshot-load + delta-from-`v:` recovery path the Inc-4 rebuild
+//! test deliberately bypasses (a periodic HNSW snapshot that lags the durable
+//! `v:` keyspace must be caught up on reopen, even across a crash mid-delta-scan).
 //!
 //! # Why in-process, single-threaded
 //!
@@ -189,6 +194,33 @@ fn job(oid: u64) -> VectorizeJob {
         vector_field: "embedding".into(),
         model: MODEL.into(),
     }
+}
+
+/// Write the durable `v:` vector + `Indexed` state for an object directly,
+/// exactly as `store_and_index` commits them — but WITHOUT touching any in-RAM
+/// HNSW index or snapshot. Models the worker having indexed an object (its `v:`
+/// is durable) more recently than the last periodic HNSW snapshot was saved.
+fn store_indexed_vector_direct(
+    storage: &LsmTree,
+    type_id: u64,
+    oid: u64,
+    field_id: u64,
+    vec: &[f32],
+) {
+    let vector_key = KeyBuilder::vector(type_id, oid, field_id);
+    let state_key = KeyBuilder::vector_state(type_id, oid, field_id);
+    let mut txn = storage.begin_txn();
+    storage
+        .put(&mut txn, &vector_key, serialize_f32_vec(vec))
+        .unwrap();
+    storage
+        .put(
+            &mut txn,
+            &state_key,
+            Bytes::from(vec![VectorState::Indexed as u8]),
+        )
+        .unwrap();
+    storage.commit(&mut txn).unwrap();
 }
 
 /// Read the durable full-precision `v:` vector for an object, or `None` if absent.
@@ -426,6 +458,90 @@ fn fuzz_rebuild_mid_scan_converges() {
             vz.process_pending().unwrap(),
             0,
             "a crashed rebuild leaves no pending work (the `v:` keyspace is intact)",
+        );
+        assert_fully_recovered(&vz, &storage);
+    }
+}
+
+#[test]
+fn fuzz_stale_hnsw_snapshot_delta_recovers() {
+    // The HNSW snapshot-load + delta path Inc 4's rebuild test deliberately
+    // skipped (warm-equivalence): a periodic HNSW snapshot LAGS the durable `v:`
+    // keyspace. It captured objects 1..=M, but the worker has since indexed
+    // M+1..=N (durable `v:`) without saving a fresh snapshot. On reopen,
+    // `rebuild_indexes` must LOAD the stale snapshot and DELTA-insert the missing
+    // objects from `v:` (`insert_delta_vectors`) — and a crash partway through
+    // that delta scan must still converge on the next reopen (the stale snapshot
+    // survives: the crashed partial index is empty, so its Drop saves nothing).
+    const M: u64 = 3; // objects captured by the stale snapshot (M < N)
+
+    for crash_after in [0u64, 1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, type_ids, field_ids) = schema_and_ids();
+
+        // Phase 1: index 1..=M cleanly; drop(vz) saves a snapshot of exactly {1..=M}.
+        {
+            let storage = open_storage(dir.path());
+            let vz = open_vectorizer(Arc::clone(&storage), &schema, &type_ids, &field_ids);
+            for oid in 1..=M {
+                store_object(&storage, TYPE_ID, oid, &doc_body(oid));
+                vz.enqueue(job(oid)).unwrap();
+            }
+            assert_eq!(vz.process_pending().unwrap(), M as usize);
+            drop(vz); // Drop -> save_snapshots persists hnsw_*.bin = {1..=M}
+            drop(storage);
+        }
+
+        // Phase 2: the worker durably indexed M+1..=N (writes `v:` + Indexed) but
+        // no fresh snapshot was saved — so the on-disk snapshot stays stale at
+        // {1..=M} while `v:` now holds {1..=N}.
+        {
+            let storage = open_storage(dir.path());
+            for oid in (M + 1)..=N {
+                store_object(&storage, TYPE_ID, oid, &doc_body(oid));
+                store_indexed_vector_direct(&storage, TYPE_ID, oid, EMBEDDING_FIELD_ID, &gt(oid));
+            }
+            drop(storage);
+        }
+
+        // Phase 3 (optional crash): reopen WITHOUT clearing the stale snapshot, so
+        // `rebuild_indexes` loads {1..=M} and runs `insert_delta_vectors`, whose
+        // `v:` scan fires `VectorizeRebuildMidScan`. Crash partway through it.
+        if crash_after > 0 {
+            let storage = open_storage(dir.path());
+            let outcome = crash_inject::catch_crash(|| {
+                crash_inject::arm(
+                    crash_inject::Site::VectorizeRebuildMidScan,
+                    crash_after,
+                    crash_inject::Mode::Crash,
+                );
+                let _ = Vectorizer::new(
+                    Arc::clone(&storage),
+                    schema.clone(),
+                    type_ids.clone(),
+                    field_ids.clone(),
+                );
+            });
+            crash_inject::disarm();
+            assert!(
+                matches!(
+                    outcome,
+                    crash_inject::Caught::Crashed(crash_inject::Site::VectorizeRebuildMidScan)
+                ),
+                "delta scan must crash after {crash_after} hit(s), got {outcome:?}",
+            );
+            storage.discard_for_crash_recovery();
+            drop(storage);
+        }
+
+        // Final reopen (no crash, snapshot still stale at {1..=M}): load the stale
+        // snapshot + delta-insert M+1..=N from `v:` -> a complete, searchable index.
+        let storage = open_storage(dir.path());
+        let vz = open_vectorizer(Arc::clone(&storage), &schema, &type_ids, &field_ids);
+        assert_eq!(
+            vz.process_pending().unwrap(),
+            0,
+            "every object is already durably Indexed (crash_after={crash_after})",
         );
         assert_fully_recovered(&vz, &storage);
     }
