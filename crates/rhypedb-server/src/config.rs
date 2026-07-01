@@ -16,6 +16,7 @@
 //! `process::exit`) — it only emits stderr WARNINGs for out-of-range tuning values.
 //! That keeps the precedence logic exhaustively unit-testable on the return value.
 
+use rhypedb_query::GovernorLimits;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -69,6 +70,16 @@ pub struct EnvLayer {
     pub restore_from: Option<PathBuf>,
     pub restore_from_force: Option<String>,
     pub block_compression: Option<String>,
+    /// Query-governor tuning (raw env strings; parsed in [`resolve`]). See
+    /// [`rhypedb_query::GovernorLimits`]. `RHYPEDB_QUERY_GOVERNOR` set to a falsey
+    /// value disables the governor entirely; each `RHYPEDB_MAX_QUERY_*` overrides
+    /// one dimension (a `0` turns that dimension off).
+    pub query_governor: Option<String>,
+    pub max_query_rows: Option<String>,
+    pub max_query_limit: Option<String>,
+    pub max_query_depth: Option<String>,
+    pub max_query_result_rows: Option<String>,
+    pub max_query_ms: Option<String>,
 }
 
 impl EnvLayer {
@@ -80,6 +91,12 @@ impl EnvLayer {
             restore_from: std::env::var_os("RHYPEDB_RESTORE_FROM").map(PathBuf::from),
             restore_from_force: std::env::var("RHYPEDB_RESTORE_FROM_FORCE").ok(),
             block_compression: std::env::var("RHYPEDB_BLOCK_COMPRESSION").ok(),
+            query_governor: std::env::var("RHYPEDB_QUERY_GOVERNOR").ok(),
+            max_query_rows: std::env::var("RHYPEDB_MAX_QUERY_ROWS").ok(),
+            max_query_limit: std::env::var("RHYPEDB_MAX_QUERY_LIMIT").ok(),
+            max_query_depth: std::env::var("RHYPEDB_MAX_QUERY_DEPTH").ok(),
+            max_query_result_rows: std::env::var("RHYPEDB_MAX_QUERY_RESULT_ROWS").ok(),
+            max_query_ms: std::env::var("RHYPEDB_MAX_QUERY_MS").ok(),
         }
     }
 }
@@ -119,6 +136,10 @@ pub struct ServerConfig {
     pub worker_quiesce_budget: Duration,
     /// Per-block SST compression for newly written files (flush + compaction).
     pub block_compression: rhypedb_storage::SstCompression,
+    /// Per-query resource governor limits (`Some` = on, the default with generous
+    /// caps; `None` = disabled via `RHYPEDB_QUERY_GOVERNOR`). Threaded into every
+    /// query's `ExecContext`. See [`rhypedb_query::GovernorLimits`].
+    pub query_governor: Option<GovernorLimits>,
 }
 
 fn env_truthy(v: &str) -> bool {
@@ -179,6 +200,20 @@ fn parse_compression(
     }
 }
 
+/// Resolve one governor knob (rows / limit / depth / result-rows) from its env var:
+/// absent → `default`; `>= 0` → that value (`0` disables THAT dimension, per
+/// [`GovernorLimits`]); negative or unparseable → warn + keep `default`.
+fn governor_knob(name: &str, raw: Option<&str>, default: usize) -> usize {
+    match env_int(name, raw) {
+        None => default,
+        Some(n) if n >= 0 => n as usize,
+        Some(n) => {
+            eprintln!("WARNING: {name} must be >= 0 (got {n}); using the default {default}.");
+            default
+        }
+    }
+}
+
 /// A positive-or-default knob (cache size, drain/quiesce seconds): warn + use the
 /// default if the file value is < 1.
 fn positive_or_default(name: &str, v: Option<i64>, default: u64) -> u64 {
@@ -231,6 +266,53 @@ pub fn resolve(
     // on the resolved value. A valid env value wins over the file.
     let ef_raw = env_int("RHYPEDB_EF", env.ef.as_deref()).or(f_ef);
     let rerank_raw = env_int("RHYPEDB_RERANK", env.rerank.as_deref()).or(f_rerank);
+
+    // Query governor: ON by default with generous caps. A non-empty falsey
+    // `RHYPEDB_QUERY_GOVERNOR` (off/0/false/no) disables it wholesale; otherwise
+    // each dimension starts from `GovernorLimits::DEFAULT` and is overridable by
+    // its own `RHYPEDB_MAX_QUERY_*` (a `0` turns that one dimension off). Env-only
+    // (an operational per-deployment cap set by the orchestrator).
+    let query_governor = {
+        let governor_off = env
+            .query_governor
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| !env_truthy(v))
+            .unwrap_or(false);
+        if governor_off {
+            None
+        } else {
+            let d = GovernorLimits::DEFAULT;
+            Some(GovernorLimits {
+                max_limit: governor_knob(
+                    "RHYPEDB_MAX_QUERY_LIMIT",
+                    env.max_query_limit.as_deref(),
+                    d.max_limit,
+                ),
+                max_rows_scanned: governor_knob(
+                    "RHYPEDB_MAX_QUERY_ROWS",
+                    env.max_query_rows.as_deref(),
+                    d.max_rows_scanned,
+                ),
+                max_depth: governor_knob(
+                    "RHYPEDB_MAX_QUERY_DEPTH",
+                    env.max_query_depth.as_deref(),
+                    d.max_depth,
+                ),
+                max_result_rows: governor_knob(
+                    "RHYPEDB_MAX_QUERY_RESULT_ROWS",
+                    env.max_query_result_rows.as_deref(),
+                    d.max_result_rows,
+                ),
+                max_duration: Duration::from_millis(governor_knob(
+                    "RHYPEDB_MAX_QUERY_MS",
+                    env.max_query_ms.as_deref(),
+                    d.max_duration.as_millis() as usize,
+                ) as u64),
+            })
+        }
+    };
 
     ServerConfig {
         schema: cli.schema.clone().or(f_schema),
@@ -286,6 +368,7 @@ pub fn resolve(
             DEFAULT_WORKER_QUIESCE_SECS,
         )),
         block_compression,
+        query_governor,
     }
 }
 
@@ -348,6 +431,44 @@ mod tests {
         // SST compression is OFF by default (the v6 LZ4 default was flipped back
         // to None after a benchmark showed it cost ~3.7x on multi-hop traversal).
         assert_eq!(c.block_compression, rhypedb_storage::SstCompression::None);
+        // The query governor is ON by default with the generous DoS caps.
+        assert_eq!(c.query_governor, Some(GovernorLimits::DEFAULT));
+    }
+
+    #[test]
+    fn query_governor_env_resolution() {
+        // Off switch (falsey, non-empty) disables the governor entirely.
+        for off in ["off", "0", "false", "no"] {
+            let env = EnvLayer { query_governor: Some(off.into()), ..Default::default() };
+            assert_eq!(
+                resolve(&CliLayer::default(), &env, None).query_governor,
+                None,
+                "RHYPEDB_QUERY_GOVERNOR={off} must disable the governor"
+            );
+        }
+        // An empty value is treated as unset -> default ON.
+        let env = EnvLayer { query_governor: Some("".into()), ..Default::default() };
+        assert_eq!(
+            resolve(&CliLayer::default(), &env, None).query_governor,
+            Some(GovernorLimits::DEFAULT)
+        );
+        // Per-dimension overrides; `0` turns that one dimension off, the rest keep
+        // their defaults.
+        let env = EnvLayer {
+            max_query_rows: Some("5000".into()),
+            max_query_ms: Some("2500".into()),
+            max_query_depth: Some("0".into()),
+            ..Default::default()
+        };
+        let g = resolve(&CliLayer::default(), &env, None).query_governor.unwrap();
+        assert_eq!(g.max_rows_scanned, 5000);
+        assert_eq!(g.max_duration, Duration::from_millis(2500));
+        assert_eq!(g.max_depth, 0, "0 disables the depth dimension");
+        assert_eq!(g.max_limit, GovernorLimits::DEFAULT.max_limit, "unset knob keeps default");
+        // A negative value warns and falls back to the default for that knob.
+        let env = EnvLayer { max_query_rows: Some("-1".into()), ..Default::default() };
+        let g = resolve(&CliLayer::default(), &env, None).query_governor.unwrap();
+        assert_eq!(g.max_rows_scanned, GovernorLimits::DEFAULT.max_rows_scanned);
     }
 
     #[test]
