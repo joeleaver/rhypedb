@@ -1409,6 +1409,7 @@ mod tests {
             events_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             query_governor: None,
             queries_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            metering_cache: std::sync::Mutex::new(None),
         });
         let app = Router::new()
             .merge(admin_router(state.clone()))

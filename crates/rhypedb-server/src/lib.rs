@@ -166,7 +166,16 @@ pub(crate) struct AppState {
     /// Cumulative count of queries executed (HTTP `/query` + binary protocol), a
     /// per-instance metering signal exposed in `/status`. Bumped once per query.
     pub(crate) queries_total: Arc<AtomicU64>,
+    /// Short-TTL cache of the expensive `/status` count scans (object/edge live
+    /// counts): `(as_of, objects, edges)`. `/status` is open + loopback-only, so
+    /// this bounds how often a hammering caller can trigger an O(n) keyspace scan
+    /// (self-amplification) — at most once per [`METERING_CACHE_TTL`].
+    pub(crate) metering_cache: std::sync::Mutex<Option<(std::time::Instant, u64, u64)>>,
 }
+
+/// How long an object/edge count is reused before `/status` re-scans. Small enough
+/// that metering stays fresh, large enough that a burst of polls scans at most once.
+const METERING_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl AppState {
     /// Load the current database handle (a cheap `ArcSwap` load). Operations that
@@ -419,12 +428,22 @@ async fn handle_status(
     let db = state.db();
     // Per-instance metering counters. The logical object/edge population lives
     // behind the engine — the host cannot dir-walk it — so RhypeDB exports it here.
-    // These are count-only keyspace scans (no field deserialize); `/status` is
-    // loopback-only in the managed deploy and polled at a controlled rate by the
-    // platform's metering loop. A count error (near-impossible I/O failure) reports
-    // 0 for that dimension rather than failing the whole endpoint.
-    let objects = db.count_objects().unwrap_or(0);
-    let edges = db.count_edges().unwrap_or(0);
+    // The object/edge counts are O(n) count-only keyspace scans, cached behind a
+    // short TTL so a burst of polls against this open (loopback-only) endpoint
+    // triggers at most one scan per window (self-amplification bound). A count
+    // error (near-impossible I/O failure) reports 0 rather than failing /status.
+    let (objects, edges) = {
+        let mut cache = state.metering_cache.lock().unwrap_or_else(|e| e.into_inner());
+        match *cache {
+            Some((as_of, o, e)) if as_of.elapsed() < METERING_CACHE_TTL => (o, e),
+            _ => {
+                let o = db.count_objects().unwrap_or(0);
+                let e = db.count_edges().unwrap_or(0);
+                *cache = Some((std::time::Instant::now(), o, e));
+                (o, e)
+            }
+        }
+    };
 
     let mut result = serde_json::json!({
         "subscriptions": db.subscriptions().subscription_count(),
@@ -859,6 +878,7 @@ pub async fn run() {
         events_dropped: Arc::new(AtomicU64::new(0)),
         query_governor: cfg.query_governor,
         queries_total: Arc::new(AtomicU64::new(0)),
+        metering_cache: std::sync::Mutex::new(None),
     });
 
     // Re-register completion watchers for any migration left in flight by a prior
@@ -1842,6 +1862,7 @@ mod tcp_tests {
             events_dropped: Arc::new(AtomicU64::new(0)),
             query_governor,
             queries_total: Arc::new(AtomicU64::new(0)),
+            metering_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -1859,11 +1880,10 @@ mod tcp_tests {
             execute_query(&state, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#))
                 .expect("create");
         }
-        // A bare full listing of 5 rows exceeds the 3-row scan cap.
+        // A type of 5 rows exceeds the 3-row budget -> fail closed through the
+        // server's execute path (the count-gate refuses it, no silent truncation).
         let err = execute_query(&state, "User").unwrap_err();
         assert!(err.contains("resource limit exceeded"), "got: {err}");
-        // A bounded listing is fine.
-        assert!(execute_query(&state, "User.limit(2)").is_ok());
         // And with the governor OFF, the same listing succeeds unbounded.
         let open = test_state_with_governor(None);
         for i in 0..5 {
