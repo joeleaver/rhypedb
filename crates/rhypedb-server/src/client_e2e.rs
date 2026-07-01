@@ -90,6 +90,7 @@ fn build_state() -> Arc<AppState> {
         events_dropped: Arc::new(AtomicU64::new(0)),
         query_governor: None,
         queries_total: Arc::new(AtomicU64::new(0)),
+        metering_cache: std::sync::Mutex::new(None),
     })
 }
 

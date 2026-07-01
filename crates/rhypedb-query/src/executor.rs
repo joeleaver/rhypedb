@@ -196,10 +196,9 @@ fn execute_source(
                 return Ok(QueryOutput::Objects(objects));
             }
             // No index/zone pushdown applied — this is an UNINDEXED full scan, the
-            // sharpest DoS. Bound it (peak memory + fail-closed past the cap); a
-            // leading `.limit` is NOT safe to push here (we filter after scanning,
-            // so a scan limit would drop unseen matches), hence `None`.
-            let mut all = scan_all_objects(ctx, type_name, None)?;
+            // sharpest DoS. The governor refuses it (fail-closed) if the type is
+            // over budget, before materializing anything.
+            let mut all = scan_all_objects(ctx, type_name)?;
             for obj in &mut all {
                 obj.ensure_fields_deserialized();
             }
@@ -217,6 +216,9 @@ fn execute_source(
         }
 
         Source::CreateBatch { type_name, rows } => {
+            // Bound a bulk insert against the row budget (like the Update/Delete/
+            // Link/Unlink mutation steps), so a giant createBatch is refused.
+            ctx.governor.charge(rows.len() as u64)?;
             let field_maps: Vec<FieldMap> = rows
                 .iter()
                 .map(|r| literal_map_to_field_map(db, type_name, r))
@@ -226,10 +228,12 @@ fn execute_source(
         }
 
         Source::All { type_name } => {
-            // A bare listing. A leading `.limit(N)` IS safe to push into the scan
-            // here (no post-scan filter can drop matches), so `User.limit(10)` on a
-            // huge type stays cheap instead of tripping the scan cap.
-            let all = scan_all_objects(ctx, type_name, leading_limit(steps))?;
+            // A bare listing. The governor refuses it (fail-closed) if the type is
+            // over the row budget; a leading `.limit(N)` is NOT pushed into the scan
+            // (the underlying limited scan drops leading tombstones and would return
+            // incomplete results), so a `.limit` on a huge unindexed listing is
+            // refused — add an indexed filter to page a large type.
+            let all = scan_all_objects(ctx, type_name)?;
             Ok(QueryOutput::Objects(all))
         }
     }
@@ -324,6 +328,10 @@ fn execute_step(
                 None
             };
             if let Some(items) = fusion_input {
+                // Governor: charge this 1:1-forward hop's input against the row
+                // budget (and re-check the deadline), like the streaming path
+                // charges its edges. Output is 1:1-bounded by the input.
+                ctx.governor.charge(items.len() as u64)?;
                 let items = &items[..];
                 let cover_field_name = format!("{field_name}__cover");
                 let cover_v_field_name = format!("{field_name}__cover_v");
@@ -1228,51 +1236,43 @@ fn literal_to_value(lit: &Literal, target: Option<rhypedb_schema::ScalarType>) -
 
 /// Full-type scan, bounded by the governor.
 ///
-/// `listing_limit` is `Some(n)` only for a bare `Source::All` listing with a
-/// leading `.limit(n)` — a value it is SAFE to push into the scan (nothing
-/// downstream can drop rows the scan didn't return). For the unindexed filter
-/// fallback it MUST be `None` (we filter after scanning, so a scan limit would
-/// silently drop matches → wrong results); there the scan is capped at
-/// `max_rows_scanned + 1` and fails closed past the cap rather than truncating.
-///
-/// With the governor disabled (embedded/library path), this is byte-identical to
+/// With the governor disabled (embedded/library path) this is byte-identical to
 /// the old `db.scan_type(type_name)` — no cap, no error, no behaviour change.
-fn scan_all_objects(
-    ctx: &ExecContext<'_>,
-    type_name: &str,
-    listing_limit: Option<usize>,
-) -> QueryResult<Vec<Object>> {
+///
+/// When a row budget is set, it first takes a TOMBSTONE-CORRECT live count of the
+/// type (a count-only keyspace scan that retains only a liveness bool per key, not
+/// the object payloads) and FAILS CLOSED if that exceeds `max_rows_scanned` — so a
+/// huge unindexed scan is refused BEFORE materializing any objects, without ever
+/// silently truncating (which would return wrong results for a listing or a
+/// post-scan filter). A type within budget is then materialized in full and
+/// charged.
+///
+/// NB: a previous `scan_type_limited(cap+1)` bound was removed — its underlying
+/// *limited* storage scan stops after N DISTINCT keys INCLUDING tombstones, so
+/// leading deleted-but-uncompacted rows could make it return fewer live rows than
+/// exist, silently corrupting `Type.limit(N)` and the filter fallback. The
+/// count-then-scan here is correct because the count merges the WHOLE prefix.
+fn scan_all_objects(ctx: &ExecContext<'_>, type_name: &str) -> QueryResult<Vec<Object>> {
     let g = &ctx.governor;
     if !g.is_enabled() {
         return Ok(ctx.db.scan_type(type_name)?);
     }
-    // A safe-to-push listing limit: scan exactly that many (clamped to `max_limit`).
-    if let Some(n) = listing_limit {
-        let n = g.clamp_limit(n);
-        let objs = ctx.db.scan_type_limited(type_name, n)?;
-        g.charge(objs.len() as u64)?;
-        return Ok(objs);
-    }
-    match g.scan_cap() {
-        None => {
-            let objs = ctx.db.scan_type(type_name)?;
-            g.charge(objs.len() as u64)?;
-            Ok(objs)
-        }
-        Some(cap) => {
-            // Scan `cap + 1` so an over-cap scan is DETECTED (and rejected) instead
-            // of silently truncated. Peak memory is bounded to `cap + 1` objects.
-            let objs = ctx.db.scan_type_limited(type_name, cap.saturating_add(1))?;
-            if objs.len() > cap {
-                return Err(QueryError::ResourceLimitExceeded(format!(
-                    "query scans more than {cap} rows of type '{type_name}'; \
-                     add an indexed filter or a .limit()"
-                )));
-            }
-            g.charge(objs.len() as u64)?;
-            Ok(objs)
+    if let Some(cap) = g.scan_cap() {
+        // Refuse before materializing if the type is larger than the budget. The
+        // count is bool-per-key (no object payloads), so this bounds peak memory of
+        // an over-budget scan to the key-set rather than the (much larger) object
+        // set — and it never truncates.
+        let live = ctx.db.count_type(type_name)?;
+        if live > cap as u64 {
+            return Err(QueryError::ResourceLimitExceeded(format!(
+                "query scans more than {cap} rows of type '{type_name}'; \
+                 narrow it with an indexed filter or a smaller query"
+            )));
         }
     }
+    let objs = ctx.db.scan_type(type_name)?;
+    g.charge(objs.len() as u64)?;
+    Ok(objs)
 }
 
 /// Recognize the shape `Filter(Compare { int_field, op, int_literal })` and
@@ -2606,16 +2606,60 @@ mod tests {
         for i in 0..5 {
             create_user(&db, &format!("User{i}"), 20 + i);
         }
-        let limits = crate::governor::GovernorLimits {
+        let tight = crate::governor::GovernorLimits {
             max_rows_scanned: 3,
             ..crate::governor::GovernorLimits::UNLIMITED
         };
-        // A bare full listing of 5 rows exceeds the 3-row scan cap -> fail closed.
-        let err = execute(&gov_ctx(&db, limits), &parse_query("User").unwrap()).unwrap_err();
+        // A type of 5 rows exceeds the 3-row budget -> fail closed BEFORE
+        // materializing (the count-gate refuses it), never silently truncating.
+        let err = execute(&gov_ctx(&db, tight), &parse_query("User").unwrap()).unwrap_err();
         assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "got {err:?}");
-        // A leading .limit(2) is a safe pushdown -> stays under the cap, no error.
-        match execute(&gov_ctx(&db, limits), &parse_query("User.limit(2)").unwrap()).unwrap() {
-            QueryOutput::Objects(objs) => assert_eq!(objs.len(), 2),
+        // A leading `.limit(2)` does NOT rescue it — a `.limit` on an unindexed
+        // listing is not pushed into the scan (the limited scan drops tombstones and
+        // would return incomplete results), so it is refused too. Correctness over a
+        // cheap-but-wrong pushdown.
+        let err = execute(&gov_ctx(&db, tight), &parse_query("User.limit(2)").unwrap()).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "got {err:?}");
+        // A type WITHIN the budget scans fully and correctly.
+        let roomy = crate::governor::GovernorLimits {
+            max_rows_scanned: 10,
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        match execute(&gov_ctx(&db, roomy), &parse_query("User").unwrap()).unwrap() {
+            QueryOutput::Objects(objs) => assert_eq!(objs.len(), 5),
+            _ => panic!("expected Objects"),
+        }
+    }
+
+    #[test]
+    fn governor_scan_gate_never_truncates_across_tombstones() {
+        // Regression for the adversarial-review HIGH: the old scan_type_limited
+        // pushdown returned FEWER live rows than exist when leading (low-id) rows
+        // were tombstoned. The count-then-scan gate must be tombstone-correct.
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(dir.path());
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            ids.push(create_user(&db, &format!("User{i}"), 20 + i).id);
+        }
+        // Delete the 5 LOWEST ids (tombstones, pre-compaction) — the exact shape
+        // that made the limited scan under-return.
+        for id in ids.iter().take(5) {
+            db.delete("User", *id).unwrap();
+        }
+        // 15 live, budget 100 -> full correct scan returns ALL 15 (not 15 minus the
+        // tombstones in the low slots).
+        let g = crate::governor::GovernorLimits {
+            max_rows_scanned: 100,
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        match execute(&gov_ctx(&db, g), &parse_query("User").unwrap()).unwrap() {
+            QueryOutput::Objects(objs) => assert_eq!(objs.len(), 15, "no silent truncation"),
+            _ => panic!("expected Objects"),
+        }
+        // And it matches the governor-disabled (embedded) result exactly.
+        match execute(&ExecContext::new(&db, None), &parse_query("User").unwrap()).unwrap() {
+            QueryOutput::Objects(objs) => assert_eq!(objs.len(), 15),
             _ => panic!("expected Objects"),
         }
     }

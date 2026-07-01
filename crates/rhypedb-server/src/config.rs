@@ -267,19 +267,28 @@ pub fn resolve(
     let ef_raw = env_int("RHYPEDB_EF", env.ef.as_deref()).or(f_ef);
     let rerank_raw = env_int("RHYPEDB_RERANK", env.rerank.as_deref()).or(f_rerank);
 
-    // Query governor: ON by default with generous caps. A non-empty falsey
-    // `RHYPEDB_QUERY_GOVERNOR` (off/0/false/no) disables it wholesale; otherwise
-    // each dimension starts from `GovernorLimits::DEFAULT` and is overridable by
-    // its own `RHYPEDB_MAX_QUERY_*` (a `0` turns that one dimension off). Env-only
-    // (an operational per-deployment cap set by the orchestrator).
+    // Query governor: ON by default with generous caps. Only an EXPLICIT falsey
+    // `RHYPEDB_QUERY_GOVERNOR` (off/0/false/no) disables it wholesale; a DoS gate
+    // must FAIL CLOSED on misconfiguration, so ANY other non-empty value — a typo,
+    // or an affirmative like "enabled" — leaves it ON (with a warning), never
+    // silently vanishes. Each dimension then starts from `GovernorLimits::DEFAULT`
+    // and is overridable by its own `RHYPEDB_MAX_QUERY_*` (a `0` turns that one
+    // dimension off). Env-only (operational per-deployment caps set by the orchestrator).
     let query_governor = {
-        let governor_off = env
-            .query_governor
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(|v| !env_truthy(v))
-            .unwrap_or(false);
+        let governor_off = match env.query_governor.as_deref().map(str::trim) {
+            None | Some("") => false,
+            Some(v) => match v.to_ascii_lowercase().as_str() {
+                "off" | "0" | "false" | "no" => true,
+                "on" | "1" | "true" | "yes" => false,
+                other => {
+                    eprintln!(
+                        "WARNING: RHYPEDB_QUERY_GOVERNOR=\"{other}\" is not recognized; the query \
+                         governor stays ON (use off/0/false/no to disable)."
+                    );
+                    false
+                }
+            },
+        };
         if governor_off {
             None
         } else {
@@ -452,6 +461,16 @@ mod tests {
             resolve(&CliLayer::default(), &env, None).query_governor,
             Some(GovernorLimits::DEFAULT)
         );
+        // FAIL CLOSED: a garbage value or an affirmative typo must NOT disable the
+        // gate — the governor stays ON. (Recognized truthy values also stay ON.)
+        for on in ["enabled", "enable", "y", "yep", "strict", "on", "true", "garbage"] {
+            let env = EnvLayer { query_governor: Some(on.into()), ..Default::default() };
+            assert_eq!(
+                resolve(&CliLayer::default(), &env, None).query_governor,
+                Some(GovernorLimits::DEFAULT),
+                "RHYPEDB_QUERY_GOVERNOR={on} must keep the governor ON (fail closed)"
+            );
+        }
         // Per-dimension overrides; `0` turns that one dimension off, the rest keep
         // their defaults.
         let env = EnvLayer {

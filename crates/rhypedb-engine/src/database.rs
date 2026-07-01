@@ -4305,38 +4305,17 @@ impl Database {
         Ok(objects)
     }
 
-    /// Bounded variant of [`scan_type`](Self::scan_type): materialize at most
-    /// `max` live objects of the type (in id/key order). Used by the query governor
-    /// to cap an unindexed full scan's peak memory — the caller requests `cap + 1`
-    /// and fails closed if more than `cap` come back, so a hostile `Type.all()` or
-    /// unindexed filter can't OOM a small deployment VM. `max == 0` returns empty.
-    pub fn scan_type_limited(&self, type_name: &str, max: usize) -> EngineResult<Vec<Object>> {
+    /// Tombstone-CORRECT live count of one type's objects (a count-only keyspace
+    /// scan over `o:<type_id>:` that retains only a liveness bool per key, not the
+    /// object payloads). Used by the query governor to refuse an over-budget
+    /// unindexed scan BEFORE materializing any objects — much lighter than the
+    /// object set, and (unlike a *limited* scan) never under-counts across leading
+    /// tombstones.
+    pub fn count_type(&self, type_name: &str) -> EngineResult<u64> {
         let type_id = self.resolve_type_id(type_name)?;
-
         let prefix = KeyBuilder::object_prefix(type_id);
         let snapshot = self.storage.read_snapshot();
-        let entries = self.storage.scan_prefix_at_limited(snapshot, &prefix, max)?;
-
-        let mut objects = Vec::with_capacity(entries.len());
-        for (key, data) in entries {
-            // Object key: o:<type_id>:<object_id> — extract object_id from last 8 bytes.
-            if key.len() < 8 {
-                continue;
-            }
-            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-            let object_id = u64::from_be_bytes(id_bytes);
-
-            let mut fields = deserialize_fields(&data);
-            self.strip_tombstoned_fields(type_name, &mut fields);
-            objects.push(Object {
-                type_name: type_name.into(),
-                id: object_id,
-                fields,
-                raw_fields: None,
-            });
-        }
-
-        Ok(objects)
+        Ok(self.storage.count_prefix_at(snapshot, &prefix)?)
     }
 
     /// Metering: total live objects across ALL types — a count-only keyspace scan
