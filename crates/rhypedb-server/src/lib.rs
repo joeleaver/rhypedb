@@ -159,6 +159,10 @@ pub(crate) struct AppState {
     /// overflowed (each drop is signalled to that client via `SubLagged`).
     /// Exposed in `/status` as a slow-consumer health signal.
     pub(crate) events_dropped: Arc<AtomicU64>,
+    /// Per-query resource-governor limits, read ONCE from `RHYPEDB_MAX_QUERY_*` at
+    /// startup. `Some` = on (the default, generous DoS caps); `None` = disabled via
+    /// `RHYPEDB_QUERY_GOVERNOR`. Armed into a fresh `Governor` per request.
+    pub(crate) query_governor: Option<rhypedb_query::GovernorLimits>,
 }
 
 impl AppState {
@@ -167,6 +171,18 @@ impl AppState {
     /// the load + use so a hot-reload cannot swap the handle mid-operation.
     pub(crate) fn db(&self) -> Arc<Database> {
         self.db.load_full()
+    }
+
+    /// Build a fresh per-request query governor from the configured limits (arming
+    /// the wall-clock deadline at `now`); a no-op [`Governor::disabled`] when the
+    /// governor is turned off. Called once per query.
+    ///
+    /// [`Governor::disabled`]: rhypedb_query::Governor::disabled
+    pub(crate) fn governor(&self) -> rhypedb_query::Governor {
+        match self.query_governor {
+            Some(limits) => rhypedb_query::Governor::new(limits, std::time::Instant::now()),
+            None => rhypedb_query::Governor::disabled(),
+        }
     }
 }
 
@@ -250,6 +266,7 @@ async fn handle_query(
             vectorizer: state.vectorizer.as_deref(),
             default_ef: state.default_ef,
             default_rerank: state.default_rerank,
+            governor: state.governor(),
         };
         rhypedb_query::executor::execute(&ctx, &query)
     };
@@ -293,15 +310,24 @@ async fn handle_query(
         Ok(QueryOutput::IdSet { .. }) | Ok(QueryOutput::IdSetWithFields { .. }) => unreachable!(
             "QueryOutput::IdSet variants should be materialized to Objects before leaving execute()"
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(QueryResponse {
-                objects: None,
-                object: None,
-                ok: None,
-                error: Some(format!("{e}")),
-            }),
-        ),
+        Err(e) => {
+            // A governor limit is a client-caused "this query is too expensive" —
+            // surface it as 400 (don't imply a server fault, and signal "fix the
+            // query, don't blindly retry"). Every other error stays a 500.
+            let status = match e {
+                rhypedb_query::QueryError::ResourceLimitExceeded(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(QueryResponse {
+                    objects: None,
+                    object: None,
+                    ok: None,
+                    error: Some(format!("{e}")),
+                }),
+            )
+        }
     }
 }
 
@@ -790,6 +816,7 @@ pub async fn run() {
         worker_quiesce_budget: cfg.worker_quiesce_budget,
         network_subs: Arc::new(AtomicUsize::new(0)),
         events_dropped: Arc::new(AtomicU64::new(0)),
+        query_governor: cfg.query_governor,
     });
 
     // Re-register completion watchers for any migration left in flight by a prior
@@ -1666,6 +1693,7 @@ fn execute_parsed(
         vectorizer: state.vectorizer.as_deref(),
         default_ef: state.default_ef,
         default_rerank: state.default_rerank,
+        governor: state.governor(),
     };
     rhypedb_query::executor::execute(&ctx, query).map_err(|e| format!("{e}"))
 }
@@ -1730,6 +1758,14 @@ mod tcp_tests {
     use tokio::io::duplex;
 
     fn test_state() -> Arc<AppState> {
+        // Governor off in the shared test fixture so existing server tests stay
+        // unbounded; the governor's behaviour is covered in rhypedb-query.
+        test_state_with_governor(None)
+    }
+
+    fn test_state_with_governor(
+        query_governor: Option<rhypedb_query::GovernorLimits>,
+    ) -> Arc<AppState> {
         let dir = tempfile::tempdir().unwrap();
         let schema = parse_schema(
             r#"
@@ -1760,7 +1796,36 @@ mod tcp_tests {
             worker_quiesce_budget: std::time::Duration::from_secs(10),
             network_subs: Arc::new(AtomicUsize::new(0)),
             events_dropped: Arc::new(AtomicU64::new(0)),
+            query_governor,
         })
+    }
+
+    #[test]
+    fn governor_wired_into_query_path() {
+        // The server threads `state.query_governor` into every query's ExecContext
+        // (both the HTTP and binary paths go through `execute_parsed`). Arm a tight
+        // governor and prove a real query fails closed through that path.
+        let limits = rhypedb_query::GovernorLimits {
+            max_rows_scanned: 3,
+            ..rhypedb_query::GovernorLimits::UNLIMITED
+        };
+        let state = test_state_with_governor(Some(limits));
+        for i in 0..5 {
+            execute_query(&state, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#))
+                .expect("create");
+        }
+        // A bare full listing of 5 rows exceeds the 3-row scan cap.
+        let err = execute_query(&state, "User").unwrap_err();
+        assert!(err.contains("resource limit exceeded"), "got: {err}");
+        // A bounded listing is fine.
+        assert!(execute_query(&state, "User.limit(2)").is_ok());
+        // And with the governor OFF, the same listing succeeds unbounded.
+        let open = test_state_with_governor(None);
+        for i in 0..5 {
+            execute_query(&open, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#))
+                .expect("create");
+        }
+        assert!(execute_query(&open, "User").is_ok());
     }
 
     #[tokio::test]

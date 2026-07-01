@@ -9,6 +9,7 @@ use rhypedb_engine::vectorizer::Vectorizer;
 
 use crate::ast::*;
 use crate::error::{QueryError, QueryResult};
+use crate::governor::Governor;
 
 /// Result of executing a query (intermediate or terminal).
 ///
@@ -69,18 +70,24 @@ pub struct ExecContext<'a> {
     /// default. An explicit per-query `rerank:` — including `rerank: 0` (off) —
     /// always wins. The server sets this from `RHYPEDB_RERANK`.
     pub default_rerank: Option<usize>,
+    /// Per-query resource governor (row/depth/result/wall-clock caps + `.limit`/`k`
+    /// clamps). [`Governor::disabled`] for embedded/library callers (the default);
+    /// the server arms it from `RHYPEDB_MAX_QUERY_*`. See [`crate::governor`].
+    pub governor: Governor,
 }
 
 impl<'a> ExecContext<'a> {
-    /// A context with no server-wide vector-search defaults: `.similar` queries
-    /// fall back to the engine's per-shape `ef`/`rerank` heuristics. Server
-    /// callers construct this then set `default_ef`/`default_rerank` from config.
+    /// A context with no server-wide vector-search defaults and the governor
+    /// disabled: `.similar` queries fall back to the engine's per-shape `ef`/
+    /// `rerank` heuristics, and no resource caps apply. Server callers construct
+    /// this then set `default_ef`/`default_rerank` and `governor` from config.
     pub fn new(db: &'a Database, vectorizer: Option<&'a Vectorizer>) -> Self {
         Self {
             db,
             vectorizer,
             default_ef: None,
             default_rerank: None,
+            governor: Governor::disabled(),
         }
     }
 }
@@ -99,10 +106,21 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
             run_similar(ctx, type_name, field_name, sq, *k, None, *ef, *rerank)?,
             1,
         ),
-        _ => (execute_source(ctx.db, &query.source, &query.steps)?, 0),
+        _ => (execute_source(ctx, &query.source, &query.steps)?, 0),
     };
 
+    // Governor: bound the wall-clock and the traversal depth as the pipeline runs.
+    // `depth` counts relationship hops (`Step::Traverse`), whose chained fan-out is
+    // the multiplicative-cost risk; the deadline is re-checked before every step so
+    // a long-running pipeline fails closed between stages (each step's inner loops
+    // also charge rows, which re-checks the deadline in bulk).
+    let mut depth = 0usize;
     for step in &query.steps[first_step..] {
+        ctx.governor.check_deadline()?;
+        if matches!(step, Step::Traverse { .. }) {
+            depth += 1;
+            ctx.governor.check_depth(depth)?;
+        }
         result = execute_step(ctx, result, step, &query.source)?;
     }
 
@@ -112,26 +130,39 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
     // cost we still pay for those IDs.
     match result {
         QueryOutput::IdSet { type_name, ids } => {
+            // The final id set is about to be returned — enforce the result-row
+            // ceiling before paying the per-id `get` to materialize it.
+            ctx.governor.check_result_rows(ids.len())?;
+            ctx.governor.charge(ids.len() as u64)?;
             result = QueryOutput::Objects(materialize_ids(ctx.db, &type_name, &ids));
         }
         QueryOutput::IdSetWithFields { type_name, items } => {
             // Terminal materialize: ignore the carried raw bytes (would only
             // hold edge_fields, not the target's object fields) and probe the
             // LSM for the full Object data.
+            ctx.governor.check_result_rows(items.len())?;
+            ctx.governor.charge(items.len() as u64)?;
             let ids: Vec<u64> = items.into_iter().map(|(id, _)| id).collect();
             result = QueryOutput::Objects(materialize_ids(ctx.db, &type_name, &ids));
         }
         _ => {}
     }
 
+    // A pipeline that produced `Objects` directly (filter, scan, similar, get)
+    // rather than a streaming IdSet still owes the result-row ceiling.
+    if let QueryOutput::Objects(ref objs) = result {
+        ctx.governor.check_result_rows(objs.len())?;
+    }
+
     Ok(result)
 }
 
 fn execute_source(
-    db: &Database,
+    ctx: &ExecContext<'_>,
     source: &Source,
     steps: &[Step],
 ) -> QueryResult<QueryOutput> {
+    let db = ctx.db;
     match source {
         Source::Get { type_name, id } => {
             let obj = db.get(type_name, *id)?;
@@ -150,7 +181,9 @@ fn execute_source(
             // step is a bare `.limit(N)`); a top-level AND pushes its most
             // selective indexed conjunct and filters the residual in memory.
             // Anything it can't profitably narrow falls through to the full scan.
-            let pushed_limit = leading_limit(steps);
+            // Clamp the pushed `.limit(N)` to the governor's `max_limit` so the
+            // indexed fast path can't be asked to buffer an absurd match count.
+            let pushed_limit = leading_limit(steps).map(|n| ctx.governor.clamp_limit(n));
             if let Some(mut objects) = plan_filter_scan(db, type_name, predicate, pushed_limit)? {
                 // Fast-path objects may carry `raw_fields` — if a downstream
                 // step inspects them via `obj.fields`, eagerly populate now.
@@ -158,9 +191,15 @@ fn execute_source(
                 for obj in &mut objects {
                     obj.ensure_fields_deserialized();
                 }
+                // Charge the narrowed match set against the examined-rows budget.
+                ctx.governor.charge(objects.len() as u64)?;
                 return Ok(QueryOutput::Objects(objects));
             }
-            let mut all = scan_all_objects(db, type_name)?;
+            // No index/zone pushdown applied — this is an UNINDEXED full scan, the
+            // sharpest DoS. Bound it (peak memory + fail-closed past the cap); a
+            // leading `.limit` is NOT safe to push here (we filter after scanning,
+            // so a scan limit would drop unseen matches), hence `None`.
+            let mut all = scan_all_objects(ctx, type_name, None)?;
             for obj in &mut all {
                 obj.ensure_fields_deserialized();
             }
@@ -187,7 +226,10 @@ fn execute_source(
         }
 
         Source::All { type_name } => {
-            let all = scan_all_objects(db, type_name)?;
+            // A bare listing. A leading `.limit(N)` IS safe to push into the scan
+            // here (no post-scan filter can drop matches), so `User.limit(10)` on a
+            // huge type stays cheap instead of tripping the scan cap.
+            let all = scan_all_objects(ctx, type_name, leading_limit(steps))?;
             Ok(QueryOutput::Objects(all))
         }
     }
@@ -379,6 +421,14 @@ fn execute_step(
             let (source_type, source_ids) = ids_from_output(current, source)?;
             let groups = db.get_links_many(&source_type, &source_ids, field_name)?;
 
+            // Governor: charge the edges examined this hop (pre-dedup) against the
+            // row budget and re-check the deadline. A chained traversal's
+            // multiplicative fan-out fails closed here before it compounds into the
+            // next hop. The seed scan cap already bounds `source_ids`, so one hop's
+            // edge count is itself bounded.
+            let hop_edges: u64 = groups.iter().map(|g| g.len() as u64).sum();
+            ctx.governor.charge(hop_edges)?;
+
             // Inverse traversals: preserve the per-source covering bytes that
             // get_links_many returned (these carry the source's effective
             // fields so the next forward-1:1 hop can fuse via
@@ -455,6 +505,8 @@ fn execute_step(
         Step::Update { fields } => {
             // Update needs (type, id) only — work directly from IDs.
             let (type_name, ids) = ids_from_output(current, source)?;
+            // Bound a bulk update against the row budget (and re-check the deadline).
+            ctx.governor.charge(ids.len() as u64)?;
             let field_map = literal_map_to_field_map(db, &type_name, fields)?;
             let mut updated = Vec::with_capacity(ids.len());
             for id in &ids {
@@ -469,6 +521,7 @@ fn execute_step(
 
         Step::Delete => {
             let (type_name, ids) = ids_from_output(current, source)?;
+            ctx.governor.charge(ids.len() as u64)?;
             for id in ids {
                 db.delete(&type_name, id)?;
             }
@@ -481,6 +534,7 @@ fn execute_step(
             edge_fields,
         } => {
             let (source_type, ids) = ids_from_output(current, source)?;
+            ctx.governor.charge(ids.len() as u64)?;
             // Resolve the relation field once — every source row has the
             // same type at this point. (Resolved before coercing the edge
             // fields, which need the relation's declared edge-field types.)
@@ -511,6 +565,7 @@ fn execute_step(
             target_id,
         } => {
             let (source_type, ids) = ids_from_output(current, source)?;
+            ctx.governor.charge(ids.len() as u64)?;
             let field_name = resolve_relation_field(db, &source_type, target_type)?;
             for id in ids {
                 db.unlink(&source_type, id, &field_name, *target_id)?;
@@ -543,21 +598,26 @@ fn execute_step(
             )
         }
 
-        Step::Limit { count } => match current {
-            QueryOutput::IdSet { type_name, mut ids } => {
-                ids.truncate(*count);
-                Ok(QueryOutput::IdSet { type_name, ids })
+        Step::Limit { count } => {
+            // Clamp the requested limit to the governor's `max_limit` so a
+            // `.limit(1_000_000_000)` can't be used to demand an absurd buffer.
+            let count = ctx.governor.clamp_limit(*count);
+            match current {
+                QueryOutput::IdSet { type_name, mut ids } => {
+                    ids.truncate(count);
+                    Ok(QueryOutput::IdSet { type_name, ids })
+                }
+                QueryOutput::IdSetWithFields { type_name, mut items } => {
+                    items.truncate(count);
+                    Ok(QueryOutput::IdSetWithFields { type_name, items })
+                }
+                other => {
+                    let mut objects = extract_objects(other)?;
+                    objects.truncate(count);
+                    Ok(QueryOutput::Objects(objects))
+                }
             }
-            QueryOutput::IdSetWithFields { type_name, mut items } => {
-                items.truncate(*count);
-                Ok(QueryOutput::IdSetWithFields { type_name, items })
-            }
-            other => {
-                let mut objects = extract_objects(other)?;
-                objects.truncate(*count);
-                Ok(QueryOutput::Objects(objects))
-            }
-        },
+        }
 
         Step::Offset { count } => match current {
             QueryOutput::IdSet { type_name, ids } => {
@@ -694,6 +754,13 @@ fn run_similar(
     if matches!(restrict, Some(set) if set.is_empty()) {
         return Ok(QueryOutput::Objects(Vec::new()));
     }
+
+    // Governor: clamp `k` to `max_limit`. The retrieval pool is already bounded by
+    // `MAX_VECTOR_SEARCH_POOL`, but an explicit `k` cap makes the returned-row
+    // bound a stated invariant rather than an emergent one, and re-checks the
+    // deadline before the (potentially heavy) HNSW search.
+    let k = ctx.governor.clamp_limit(k);
+    ctx.governor.check_deadline()?;
 
     let vectorizer = ctx.vectorizer.ok_or_else(|| {
         QueryError::Type("vector similarity search requires a vectorizer".into())
@@ -1159,8 +1226,53 @@ fn literal_to_value(lit: &Literal, target: Option<rhypedb_schema::ScalarType>) -
     })
 }
 
-fn scan_all_objects(db: &Database, type_name: &str) -> QueryResult<Vec<Object>> {
-    Ok(db.scan_type(type_name)?)
+/// Full-type scan, bounded by the governor.
+///
+/// `listing_limit` is `Some(n)` only for a bare `Source::All` listing with a
+/// leading `.limit(n)` — a value it is SAFE to push into the scan (nothing
+/// downstream can drop rows the scan didn't return). For the unindexed filter
+/// fallback it MUST be `None` (we filter after scanning, so a scan limit would
+/// silently drop matches → wrong results); there the scan is capped at
+/// `max_rows_scanned + 1` and fails closed past the cap rather than truncating.
+///
+/// With the governor disabled (embedded/library path), this is byte-identical to
+/// the old `db.scan_type(type_name)` — no cap, no error, no behaviour change.
+fn scan_all_objects(
+    ctx: &ExecContext<'_>,
+    type_name: &str,
+    listing_limit: Option<usize>,
+) -> QueryResult<Vec<Object>> {
+    let g = &ctx.governor;
+    if !g.is_enabled() {
+        return Ok(ctx.db.scan_type(type_name)?);
+    }
+    // A safe-to-push listing limit: scan exactly that many (clamped to `max_limit`).
+    if let Some(n) = listing_limit {
+        let n = g.clamp_limit(n);
+        let objs = ctx.db.scan_type_limited(type_name, n)?;
+        g.charge(objs.len() as u64)?;
+        return Ok(objs);
+    }
+    match g.scan_cap() {
+        None => {
+            let objs = ctx.db.scan_type(type_name)?;
+            g.charge(objs.len() as u64)?;
+            Ok(objs)
+        }
+        Some(cap) => {
+            // Scan `cap + 1` so an over-cap scan is DETECTED (and rejected) instead
+            // of silently truncated. Peak memory is bounded to `cap + 1` objects.
+            let objs = ctx.db.scan_type_limited(type_name, cap.saturating_add(1))?;
+            if objs.len() > cap {
+                return Err(QueryError::ResourceLimitExceeded(format!(
+                    "query scans more than {cap} rows of type '{type_name}'; \
+                     add an indexed filter or a .limit()"
+                )));
+            }
+            g.charge(objs.len() as u64)?;
+            Ok(objs)
+        }
+    }
 }
 
 /// Recognize the shape `Filter(Compare { int_field, op, int_literal })` and
@@ -2455,6 +2567,131 @@ mod tests {
         }
     }
 
+    // --- Query governor: end-to-end enforcement through real queries. ---
+
+    /// A context with the governor armed from `limits` (deadline relative to now).
+    fn gov_ctx<'a>(
+        db: &'a Database,
+        limits: crate::governor::GovernorLimits,
+    ) -> ExecContext<'a> {
+        let mut ctx = ExecContext::new(db, None);
+        ctx.governor = Governor::new(limits, std::time::Instant::now());
+        ctx
+    }
+
+    #[test]
+    fn governor_clamps_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(dir.path());
+        for i in 0..5 {
+            create_user(&db, &format!("User{i}"), 20 + i);
+        }
+        let limits = crate::governor::GovernorLimits {
+            max_limit: 2,
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        let q = parse_query("User.limit(100)").unwrap();
+        match execute(&gov_ctx(&db, limits), &q).unwrap() {
+            QueryOutput::Objects(objs) => {
+                assert_eq!(objs.len(), 2, ".limit(100) clamped to max_limit=2")
+            }
+            _ => panic!("expected Objects"),
+        }
+    }
+
+    #[test]
+    fn governor_forbids_unindexed_scan_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(dir.path());
+        for i in 0..5 {
+            create_user(&db, &format!("User{i}"), 20 + i);
+        }
+        let limits = crate::governor::GovernorLimits {
+            max_rows_scanned: 3,
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        // A bare full listing of 5 rows exceeds the 3-row scan cap -> fail closed.
+        let err = execute(&gov_ctx(&db, limits), &parse_query("User").unwrap()).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "got {err:?}");
+        // A leading .limit(2) is a safe pushdown -> stays under the cap, no error.
+        match execute(&gov_ctx(&db, limits), &parse_query("User.limit(2)").unwrap()).unwrap() {
+            QueryOutput::Objects(objs) => assert_eq!(objs.len(), 2),
+            _ => panic!("expected Objects"),
+        }
+    }
+
+    #[test]
+    fn governor_caps_traversal_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(dir.path());
+        let u = create_user(&db, "Root", 30);
+        let limits = crate::governor::GovernorLimits {
+            max_depth: 1,
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        // Two hops exceeds the 1-hop budget (fires before the 2nd hop runs, so it
+        // needs no graph data).
+        let two_hop = format!("User.get({}).friends.friends", u.id);
+        let err = execute(&gov_ctx(&db, limits), &parse_query(&two_hop).unwrap()).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "got {err:?}");
+        // One hop is within budget.
+        let one_hop = format!("User.get({}).friends", u.id);
+        assert!(execute(&gov_ctx(&db, limits), &parse_query(&one_hop).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn governor_caps_result_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(dir.path());
+        for i in 0..5 {
+            create_user(&db, &format!("User{i}"), 20 + i);
+        }
+        // Row budget off, result ceiling = 2. A 5-row listing exceeds it.
+        let limits = crate::governor::GovernorLimits {
+            max_result_rows: 2,
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        let err = execute(&gov_ctx(&db, limits), &parse_query("User").unwrap()).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "got {err:?}");
+        assert!(execute(&gov_ctx(&db, limits), &parse_query("User.limit(2)").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn governor_enforces_wall_clock_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(dir.path());
+        for i in 0..3 {
+            create_user(&db, &format!("User{i}"), 20 + i);
+        }
+        // Arm the deadline in the past so any governor checkpoint (here: the scan's
+        // row charge) trips it deterministically.
+        let limits = crate::governor::GovernorLimits {
+            max_duration: std::time::Duration::from_millis(1),
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        let mut ctx = ExecContext::new(&db, None);
+        ctx.governor =
+            Governor::new(limits, std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let err = execute(&ctx, &parse_query("User").unwrap()).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "got {err:?}");
+        assert!(format!("{err}").contains("time budget"));
+    }
+
+    #[test]
+    fn governor_disabled_by_default_is_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db(dir.path());
+        for i in 0..5 {
+            create_user(&db, &format!("User{i}"), 20 + i);
+        }
+        // ExecContext::new => Governor::disabled(): a full listing returns all rows,
+        // exactly as before the governor existed (embedded/library path unchanged).
+        match execute(&ExecContext::new(&db, None), &parse_query("User").unwrap()).unwrap() {
+            QueryOutput::Objects(objs) => assert_eq!(objs.len(), 5),
+            _ => panic!("expected Objects"),
+        }
+    }
+
     #[test]
     fn fusion_returns_fresh_target_after_second_degree_update() {
         // End-to-end: bench-shape graph (User ↔ Rating ↔ Movie) and a 2-hop
@@ -3034,7 +3271,8 @@ mod tests {
     /// Full-scan oracle: ids (ascending) where `evaluate_predicate` holds —
     /// exactly the baseline the planner must reproduce.
     fn oracle_ids(db: &Database, predicate: &Predicate) -> Vec<u64> {
-        let mut all = scan_all_objects(db, "Person").unwrap();
+        // The oracle wants the full unbounded scan (the governor-disabled shape).
+        let mut all = db.scan_type("Person").unwrap();
         for o in &mut all {
             o.ensure_fields_deserialized();
         }

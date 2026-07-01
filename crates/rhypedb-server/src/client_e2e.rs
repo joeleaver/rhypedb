@@ -88,6 +88,7 @@ fn build_state() -> Arc<AppState> {
         worker_quiesce_budget: std::time::Duration::from_secs(10),
         network_subs: Arc::new(AtomicUsize::new(0)),
         events_dropped: Arc::new(AtomicU64::new(0)),
+        query_governor: None,
     })
 }
 
