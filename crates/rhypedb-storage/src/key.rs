@@ -142,6 +142,19 @@ impl KeyBuilder {
         buf.freeze()
     }
 
+    /// Prefix matching EVERY object key across all types: `o:`. Used for a
+    /// count-only metering scan of the total live object population.
+    pub fn all_objects_prefix() -> Bytes {
+        Bytes::from_static(&[KeyPrefix::Object as u8, SEPARATOR])
+    }
+
+    /// Prefix matching EVERY forward edge across all relationships: `e:` (reverse
+    /// edges live under `r:` and are NOT counted, so a link counts once). Used for
+    /// a count-only metering scan.
+    pub fn all_edges_prefix() -> Bytes {
+        Bytes::from_static(&[KeyPrefix::Edge as u8, SEPARATOR])
+    }
+
     /// Object prefix for scanning all objects of a type: `o:<type_id>:`
     pub fn object_prefix(type_id: u64) -> Bytes {
         let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1);

@@ -861,6 +861,39 @@ impl LsmTree {
             .collect())
     }
 
+    /// Count live user keys under `prefix` at `version` — tombstone-correct across
+    /// SSTs + memtables, WITHOUT retaining value payloads (only a per-key liveness
+    /// flag), so it is much lighter than `scan_prefix_at(..).len()` for large
+    /// values (object rows). O(n) in the keys under the prefix; intended for the
+    /// infrequently-polled metering counters, not a hot path.
+    pub fn count_prefix_at(&self, version: u64, prefix: &[u8]) -> Result<u64> {
+        // Merge newest-wins across all levels, keeping only a liveness flag per key
+        // (value present = live, tombstone = dead) rather than the value bytes.
+        let mut merged: std::collections::BTreeMap<Bytes, bool> = std::collections::BTreeMap::new();
+
+        let ssts = self.sst_files.read();
+        for sst in ssts.iter() {
+            for (key, value) in sst.scan_prefix(prefix, version) {
+                merged.insert(key, value.is_some());
+            }
+        }
+        drop(ssts);
+
+        let immutables = self.immutable_memtables.read().clone();
+        for mt in immutables.iter() {
+            for (key, value) in mt.scan_prefix(prefix, version) {
+                merged.insert(key, value.is_some());
+            }
+        }
+
+        let active = self.active_memtable.read().clone();
+        for (key, value) in active.scan_prefix(prefix, version) {
+            merged.insert(key, value.is_some());
+        }
+
+        Ok(merged.values().filter(|live| **live).count() as u64)
+    }
+
     /// Write a key-value pair within a transaction.
     pub fn put(&self, txn: &mut Transaction, user_key: &[u8], value: Bytes) -> Result<()> {
         // Buffer into the transaction. The write is applied to the WAL + memtable
@@ -3159,6 +3192,34 @@ mod tests {
         let snapshot = tree.read_snapshot();
         let results = tree.scan_prefix_at(snapshot, b"a:").unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn count_prefix_at_counts_live_keys_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"a:1", Bytes::from("one")).unwrap();
+        tree.put(&mut txn, b"a:2", Bytes::from("two")).unwrap();
+        tree.put(&mut txn, b"a:3", Bytes::from("three")).unwrap();
+        tree.put(&mut txn, b"b:1", Bytes::from("other")).unwrap();
+        tree.commit(&mut txn).unwrap();
+
+        let snap = tree.read_snapshot();
+        assert_eq!(tree.count_prefix_at(snap, b"a:").unwrap(), 3, "3 live under a:");
+        assert_eq!(tree.count_prefix_at(snap, b"b:").unwrap(), 1, "prefix isolates b:");
+        assert_eq!(tree.count_prefix_at(snap, b"z:").unwrap(), 0, "no match");
+
+        // A tombstone is not counted; the count tracks the delete's snapshot,
+        // matching scan_prefix_at's live-only semantics.
+        let mut txn = tree.begin_txn();
+        tree.delete(&mut txn, b"a:2").unwrap();
+        tree.commit(&mut txn).unwrap();
+        let snap2 = tree.read_snapshot();
+        assert_eq!(tree.count_prefix_at(snap2, b"a:").unwrap(), 2, "deleted key not counted");
+        // The old snapshot still sees the pre-delete count (MVCC).
+        assert_eq!(tree.count_prefix_at(snap, b"a:").unwrap(), 3, "pre-delete snapshot unchanged");
     }
 
     #[test]

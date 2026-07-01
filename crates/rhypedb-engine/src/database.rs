@@ -4339,6 +4339,25 @@ impl Database {
         Ok(objects)
     }
 
+    /// Metering: total live objects across ALL types — a count-only keyspace scan
+    /// (no field deserialize, no value retention). O(n) in object count; for the
+    /// infrequently-polled `/status` metering counters. The host cannot compute
+    /// this without the engine (it must never parse the guest keyspace).
+    pub fn count_objects(&self) -> EngineResult<u64> {
+        let snapshot = self.storage.read_snapshot();
+        let prefix = KeyBuilder::all_objects_prefix();
+        Ok(self.storage.count_prefix_at(snapshot, &prefix)?)
+    }
+
+    /// Metering: total live forward edges (relationship links) across all
+    /// relationships. Reverse-edge index entries (`r:`) are excluded, so each link
+    /// counts once. Same cost profile as [`count_objects`](Self::count_objects).
+    pub fn count_edges(&self) -> EngineResult<u64> {
+        let snapshot = self.storage.read_snapshot();
+        let prefix = KeyBuilder::all_edges_prefix();
+        Ok(self.storage.count_prefix_at(snapshot, &prefix)?)
+    }
+
     /// Column-projected point lookup: like [`get`](Self::get) but deserializes
     /// only `fields` instead of the whole object, skipping the `String`-key +
     /// `Value` allocations for every other field. The returned Object's
@@ -9628,6 +9647,50 @@ mod tests {
             &[(7, bytes::Bytes::from_static(&[0, 1, 2, 3]))],
         );
         assert!(matches!(bad, Err(EngineError::TypeMismatch { .. })), "got {bad:?}");
+    }
+
+    #[test]
+    fn metering_counts_objects_and_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User {
+                name: String
+                favourites: [Movie] @on_delete(remove)
+            }
+            type Movie { title: String }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        assert_eq!(db.count_objects().unwrap(), 0);
+        assert_eq!(db.count_edges().unwrap(), 0);
+
+        let mut m = FieldMap::new();
+        m.insert("title".into(), Value::String("A".into()));
+        let movie1 = db.create("Movie", m).unwrap();
+        let mut m = FieldMap::new();
+        m.insert("title".into(), Value::String("B".into()));
+        let movie2 = db.create("Movie", m).unwrap();
+        let mut u = FieldMap::new();
+        u.insert("name".into(), Value::String("Alice".into()));
+        let user = db.create("User", u).unwrap();
+        assert_eq!(db.count_objects().unwrap(), 3, "3 live objects");
+        assert_eq!(db.count_edges().unwrap(), 0, "no links yet");
+
+        db.link("User", user.id, "favourites", movie1.id, None).unwrap();
+        db.link("User", user.id, "favourites", movie2.id, None).unwrap();
+        assert_eq!(
+            db.count_edges().unwrap(),
+            2,
+            "two forward links (reverse `r:` entries are not counted)"
+        );
+
+        // A delete drops the object count and, via @on_delete(remove), its inbound
+        // edge — counts reflect live rows only, never tombstones.
+        db.delete("Movie", movie1.id).unwrap();
+        assert_eq!(db.count_objects().unwrap(), 2, "one object deleted");
+        assert_eq!(db.count_edges().unwrap(), 1, "the removed movie's edge is gone");
     }
 
     #[test]

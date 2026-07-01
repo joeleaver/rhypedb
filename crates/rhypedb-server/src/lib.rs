@@ -163,6 +163,9 @@ pub(crate) struct AppState {
     /// startup. `Some` = on (the default, generous DoS caps); `None` = disabled via
     /// `RHYPEDB_QUERY_GOVERNOR`. Armed into a fresh `Governor` per request.
     pub(crate) query_governor: Option<rhypedb_query::GovernorLimits>,
+    /// Cumulative count of queries executed (HTTP `/query` + binary protocol), a
+    /// per-instance metering signal exposed in `/status`. Bumped once per query.
+    pub(crate) queries_total: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -253,6 +256,9 @@ async fn handle_query(
             );
         }
     };
+
+    // Metering: count the query (post-parse) for the `/status` counter.
+    state.queries_total.fetch_add(1, Ordering::Relaxed);
 
     // Hold the schema-epoch read guard only across execute (the schema-driven
     // work); a hot-reload (write guard) can't swap the handle mid-query.
@@ -410,26 +416,61 @@ pub(crate) async fn handle_admin_compact(
 async fn handle_status(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
+    let db = state.db();
+    // Per-instance metering counters. The logical object/edge population lives
+    // behind the engine — the host cannot dir-walk it — so RhypeDB exports it here.
+    // These are count-only keyspace scans (no field deserialize); `/status` is
+    // loopback-only in the managed deploy and polled at a controlled rate by the
+    // platform's metering loop. A count error (near-impossible I/O failure) reports
+    // 0 for that dimension rather than failing the whole endpoint.
+    let objects = db.count_objects().unwrap_or(0);
+    let edges = db.count_edges().unwrap_or(0);
+
     let mut result = serde_json::json!({
-        "subscriptions": state.db().subscriptions().subscription_count(),
+        "subscriptions": db.subscriptions().subscription_count(),
         "network_subscriptions": state.network_subs.load(Ordering::Relaxed),
         "events_dropped": state.events_dropped.load(Ordering::Relaxed),
+        "queries": state.queries_total.load(Ordering::Relaxed),
+        "objects": objects,
+        "edges": edges,
     });
+
+    // Resident memory (Linux /proc/self/statm) when available — a live RSS signal
+    // for memory metering. Omitted where unreadable (non-Linux / restricted CI).
+    if let Some(rss) = process_rss_bytes() {
+        result["rss_bytes"] = serde_json::json!(rss);
+    }
 
     if let Some(vectorizer) = &state.vectorizer {
         let status = vectorizer.status();
+        let vectors_total: u64 = status.index_stats.iter().map(|s| s.vectors as u64).sum();
         let indexes: Vec<serde_json::Value> = status
             .index_stats
             .iter()
             .map(|s| serde_json::json!({ "name": s.name, "vectors": s.vectors }))
             .collect();
+        result["vectors"] = serde_json::json!(vectors_total);
         result["vectorizer"] = serde_json::json!({
             "pending": status.pending,
             "indexes": indexes,
         });
+    } else {
+        // No `@vectorize` fields → no vector index → zero indexed vectors.
+        result["vectors"] = serde_json::json!(0);
     }
 
     Json(result)
+}
+
+/// Best-effort resident-set size of THIS process in bytes, from Linux
+/// `/proc/self/statm` (field 2 = resident pages × page size). `None` off Linux or
+/// if the file can't be read/parsed — the caller then omits `rss_bytes`. The
+/// managed DB runs in an x86_64 Linux guest (4 KiB pages).
+fn process_rss_bytes() -> Option<u64> {
+    // statm fields (all in pages): size resident shared text lib data dt.
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(resident_pages.saturating_mul(4096))
 }
 
 /// `GET /schema` — a structured JSON introspection of the LIVE schema (types,
@@ -817,6 +858,7 @@ pub async fn run() {
         network_subs: Arc::new(AtomicUsize::new(0)),
         events_dropped: Arc::new(AtomicU64::new(0)),
         query_governor: cfg.query_governor,
+        queries_total: Arc::new(AtomicU64::new(0)),
     });
 
     // Re-register completion watchers for any migration left in flight by a prior
@@ -1687,6 +1729,8 @@ fn execute_parsed(
     state: &AppState,
     query: &rhypedb_query::ast::Query,
 ) -> Result<QueryOutput, String> {
+    // Metering: the binary-protocol choke point (HTTP `/query` counts separately).
+    state.queries_total.fetch_add(1, Ordering::Relaxed);
     let db = state.db();
     let ctx = ExecContext {
         db: &db,
@@ -1797,6 +1841,7 @@ mod tcp_tests {
             network_subs: Arc::new(AtomicUsize::new(0)),
             events_dropped: Arc::new(AtomicU64::new(0)),
             query_governor,
+            queries_total: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -2260,6 +2305,48 @@ mod tcp_tests {
             .iter()
             .any(|t| t["name"] == "User"));
         assert!(body["sdl"].as_str().unwrap().contains("type User"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_reports_metering_counters() {
+        let state = test_state();
+        // Seed data + run queries; each execute_query goes through the metered
+        // `execute_parsed` choke point.
+        for i in 0..3 {
+            execute_query(&state, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#))
+                .expect("create");
+        }
+        execute_query(&state, "User").expect("read"); // 4th query
+        let app = Router::new()
+            .route("/status", get(handle_status))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let text = tokio::task::spawn_blocking(move || {
+            ureq::get(&format!("http://{addr}/status"))
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_to_string()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["objects"].as_u64().unwrap(), 3, "3 users created: {body}");
+        assert_eq!(body["edges"].as_u64().unwrap(), 0, "schema has no relations");
+        assert_eq!(body["vectors"].as_u64().unwrap(), 0, "no @vectorize fields");
+        assert!(
+            body["queries"].as_u64().unwrap() >= 4,
+            "3 creates + 1 read = 4 queries: {body}"
+        );
+        // rss_bytes is present on Linux (dev + CI); if present it must be positive.
+        // Tolerate absence so the test isn't tied to a readable /proc.
+        if let Some(rss) = body.get("rss_bytes").and_then(|v| v.as_u64()) {
+            assert!(rss > 0, "rss_bytes should be positive: {body}");
+        }
     }
 
     // ----------------------------------------------------------------------
