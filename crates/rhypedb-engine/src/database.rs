@@ -15025,6 +15025,11 @@ mod tests {
         assert!(evs.iter().all(|e| e.kind == ChangeKind::Create && e.origin == Some(88)));
         let ids: std::collections::HashSet<u64> = evs.iter().map(|e| e.object_id).collect();
         assert!(ids.contains(&9001) && ids.contains(&9002));
+
+        // plain restore_objects → untagged (delegates with origin = None).
+        db.restore_objects("User", vec![(9003, row("R3"))], true).unwrap();
+        let evs = drain(&rx, 1);
+        assert!(evs.iter().all(|e| e.kind == ChangeKind::Create && e.origin.is_none()));
     }
 
     // --- Shadow-field card 2d: live writes during migration (no quiesce) ---

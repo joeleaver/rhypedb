@@ -173,6 +173,18 @@ async fn malformed_event_errors_but_keeps_subscription_live() {
         })
         .unwrap();
         wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &bad_kind).unwrap();
+        // (b2) valid envelope but a non-numeric origin.
+        let bad_origin = serde_json::to_vec(&WireEvent {
+            v: protocol::EVENT_FORMAT_TAG.to_string(),
+            kind: "create".to_string(),
+            type_name: "User".to_string(),
+            id: "1".to_string(),
+            version: "1".to_string(),
+            fields: None,
+            origin: Some("0x2a".to_string()),
+        })
+        .unwrap();
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &bad_origin).unwrap();
         // (c) a good event — must still be delivered.
         wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &event_payload("create", "User", 9, 3)).unwrap();
     });
@@ -182,6 +194,10 @@ async fn malformed_event_errors_but_keeps_subscription_live() {
 
     assert!(matches!(sub.next_event().await, Err(Error::Io(_))));
     assert!(matches!(sub.next_event().await, Err(Error::Deserialize(_))));
+    match sub.next_event().await {
+        Err(Error::Deserialize(m)) => assert!(m.contains("origin"), "got: {m}"),
+        other => panic!("expected an origin deserialize error, got {other:?}"),
+    }
     match sub.next_event().await.unwrap() {
         Notification::Change(c) => assert_eq!((c.kind, c.id), (ChangeKind::Create, 9)),
         other => panic!("expected the good event, got {other:?}"),

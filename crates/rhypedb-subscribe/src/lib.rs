@@ -463,6 +463,10 @@ mod tests {
         assert!(json.contains("\"kind\":\"create\""));
         assert!(json.contains("\"version\":42"));
         assert!(json.contains("\"Alice\""));
+        // NB: this guards ChangeEvent's IN-CRATE serde contract, where origin is a
+        // bare number (`"origin":7`). It is NOT proof of what crosses the network —
+        // the wire form is `WireEvent` with a decimal-STRING origin (`"origin":"7"`),
+        // covered by rhypedb-wire's `wire_event_roundtrip_and_lossless_ids`.
         assert!(json.contains("\"origin\":7"));
 
         // An untagged event omits `origin` entirely (skip_serializing_if).

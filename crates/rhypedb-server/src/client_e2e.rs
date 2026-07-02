@@ -316,6 +316,73 @@ fn run_client_flow(addr: SocketAddr) {
     assert_eq!(remaining.len(), 1);
 }
 
+/// Issue #13: an engine-stamped write origin survives the FULL network seam —
+/// engine publish → hub → `ConnEventSink` → wire (decimal string) →
+/// `ChangeNotification::from_wire` — and reaches a real network subscriber
+/// intact, losslessly past 2^53. The unit tests cover the halves in isolation
+/// (wire `from_change_event`, client decode of a hand-crafted frame); this joins
+/// them against a real engine event. Writes are stamped via the ENGINE handle
+/// because the network verbs cannot tag origin (inbound origin is out of scope).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_origin_reaches_network_subscriber() {
+    let state = build_state();
+    let db_state = Arc::clone(&state);
+    let (addr, accept_task) = start_server(state).await;
+
+    tokio::task::spawn_blocking(move || {
+        use rhypedb_engine::object::FieldMap;
+        const ORIGIN: u64 = 9_007_199_254_740_993; // 2^53 + 1: lossless only as a string
+
+        let client = Client::connect(addr).unwrap();
+        // Subscribe first: the handshake ack means the sink is registered
+        // server-side before any write is stamped, so no event can be missed.
+        let mut sub = client.subscribe(SubscriptionFilter::for_type("User")).unwrap();
+        let db = db_state.db();
+
+        // Tagged create → origin surfaces on the network subscriber, lossless.
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("Origin-Ada".into()));
+        let obj = db.create_with_origin("User", f, Some(ORIGIN)).unwrap();
+        match sub.next_event().unwrap() {
+            Notification::Change(c) => {
+                assert_eq!((c.kind, c.id), (ChangeKind::Create, obj.id));
+                assert_eq!(
+                    c.origin,
+                    Some(ORIGIN),
+                    "engine-stamped origin must survive the wire losslessly past 2^53"
+                );
+            }
+            other => panic!("expected a tagged create event, got {other:?}"),
+        }
+
+        // Untagged engine write → origin is None over the same seam.
+        let mut f2 = FieldMap::new();
+        f2.insert("name".into(), Value::String("Plain-Bob".into()));
+        db.create("User", f2).unwrap();
+        match sub.next_event().unwrap() {
+            Notification::Change(c) => {
+                assert_eq!(c.origin, None, "untagged write → no origin on the wire")
+            }
+            other => panic!("expected an untagged create event, got {other:?}"),
+        }
+
+        // Delete carries the origin through the same seam too.
+        db.delete_with_origin("User", obj.id, Some(ORIGIN)).unwrap();
+        match sub.next_event().unwrap() {
+            Notification::Change(c) => {
+                assert_eq!((c.kind, c.id, c.origin), (ChangeKind::Delete, obj.id, Some(ORIGIN)));
+            }
+            other => panic!("expected a tagged delete event, got {other:?}"),
+        }
+
+        sub.unsubscribe().unwrap();
+    })
+    .await
+    .expect("client flow thread panicked");
+
+    accept_task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_async_client_surface_against_real_server() {
     let state = build_state();
