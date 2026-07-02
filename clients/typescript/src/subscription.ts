@@ -39,11 +39,24 @@ export class SubscriptionFilter {
   typeName?: string;
   objectId?: bigint;
   kinds: ChangeKind[];
+  /**
+   * Drop events carrying this write origin. The wire subscribe filter cannot
+   * carry it, so the client applies it CLIENT-SIDE after decode (the server still
+   * sends the events; they're dropped locally). This makes `excludingOrigin()`
+   * work over the network — the loop-breaker for a subscriber that also writes.
+   */
+  excludeOrigin?: bigint;
 
-  private constructor(typeName: string | undefined, objectId: bigint | undefined, kinds: ChangeKind[]) {
+  private constructor(
+    typeName: string | undefined,
+    objectId: bigint | undefined,
+    kinds: ChangeKind[],
+    excludeOrigin?: bigint,
+  ) {
     this.typeName = typeName;
     this.objectId = objectId;
     this.kinds = kinds;
+    this.excludeOrigin = excludeOrigin;
   }
 
   /** All change events. */
@@ -63,7 +76,16 @@ export class SubscriptionFilter {
 
   /** Narrow to specific change kinds (returns a new filter; empty = all kinds). */
   withKinds(...kinds: ChangeKind[]): SubscriptionFilter {
-    return new SubscriptionFilter(this.typeName, this.objectId, [...kinds]);
+    return new SubscriptionFilter(this.typeName, this.objectId, [...kinds], this.excludeOrigin);
+  }
+
+  /**
+   * Drop events carrying this write origin (returns a new filter). Applied
+   * client-side after decode, so it works over the network. Tag your writes with
+   * the same origin (via the engine's `*_with_origin` verbs) to skip your own.
+   */
+  excludingOrigin(origin: bigint): SubscriptionFilter {
+    return new SubscriptionFilter(this.typeName, this.objectId, [...this.kinds], origin);
   }
 }
 
@@ -75,6 +97,12 @@ export interface ChangeNotification {
   id: bigint;
   /** The commit version (lossless from the wire's decimal-string form). */
   version: bigint;
+  /**
+   * The write origin (lossless from the wire's decimal-string form), or absent
+   * for an untagged write. Observational: use it to recognise a change this
+   * process caused via another (writing) connection and skip it.
+   */
+  origin?: bigint;
   fields?: Record<string, unknown>;
 }
 
@@ -103,6 +131,15 @@ function changeFromWire(w: WireEvent): ChangeNotification {
     throw new RhypedbError("decode", `invalid event id/version (${JSON.stringify(w.id)}/${JSON.stringify(w.version)})`);
   }
   const out: ChangeNotification = { kind: w.kind, typeName: w.type, id, version };
+  // Origin is absent for an untagged write; present ⇒ a lossless decimal string,
+  // parsed like id/version (a malformed one is a decode error, not silently dropped).
+  if (w.origin !== undefined) {
+    try {
+      out.origin = BigInt(w.origin);
+    } catch {
+      throw new RhypedbError("decode", `invalid event origin ${JSON.stringify(w.origin)}`);
+    }
+  }
   if (w.fields !== undefined) out.fields = w.fields;
   return out;
 }
@@ -138,6 +175,9 @@ export class AsyncSubscription implements AsyncIterableIterator<Notification> {
   readonly #socket: Socket;
   readonly #parser = new FrameParser();
   readonly #handle = 1; // one subscription per connection → a fixed handle suffices
+  /** Client-side loop-breaker: drop Change events whose origin matches (the wire
+   *  subscribe filter can't carry it — see SubscriptionFilter.excludeOrigin). */
+  readonly #excludeOrigin?: bigint;
   #items: Item[] = [];
   #waiters: Waiter[] = [];
   #ended = false; // clean end: drain remaining items then yield done
@@ -151,6 +191,7 @@ export class AsyncSubscription implements AsyncIterableIterator<Notification> {
 
   private constructor(socket: Socket, filter: SubscriptionFilter) {
     this.#socket = socket;
+    this.#excludeOrigin = filter.excludeOrigin;
     this.#ackReady = new Promise<void>((resolve, reject) => {
       this.#ackResolve = resolve;
       this.#ackReject = reject;
@@ -282,7 +323,11 @@ export class AsyncSubscription implements AsyncIterableIterator<Notification> {
     switch (frame.kind) {
       case Resp.Event:
         try {
-          this.#items.push({ ok: { type: "change", change: changeFromWire(decodeEventPayload(frame.payload)) } });
+          const change = changeFromWire(decodeEventPayload(frame.payload));
+          // Client-side loop-breaker: drop our OWN-origin events (the wire filter
+          // can't carry excludeOrigin), matching the in-process hub + Rust client.
+          if (this.#excludeOrigin !== undefined && change.origin === this.#excludeOrigin) break;
+          this.#items.push({ ok: { type: "change", change } });
         } catch (e) {
           this.#items.push({ err: e instanceof RhypedbError ? e : new RhypedbError("decode", (e as Error).message) });
         }

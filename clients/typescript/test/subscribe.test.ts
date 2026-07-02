@@ -134,6 +134,72 @@ test("u64 id/version decode losslessly past 2^53", async () => {
   }
 });
 
+test("origin decodes losslessly past 2^53; absent → undefined; malformed rejects", async () => {
+  const bigOrigin = 9_007_199_254_740_993n; // 2^53 + 1
+  const evt = (extra: Record<string, unknown>): Buffer =>
+    Buffer.from(JSON.stringify({ v: EVENT_FORMAT_TAG, type: "User", ...extra }), "utf8");
+  const { port, server } = await spawnSubServer((sub) => {
+    ackSubscribe(sub, {
+      afterAck: () => {
+        // (a) tagged event with an origin.
+        sub.write(encodeFrame(1, Resp.Event, evt({ kind: "update", id: "5", version: "9", origin: bigOrigin.toString() })));
+        // (b) untagged event (no origin key) → undefined.
+        sub.write(encodeFrame(1, Resp.Event, eventPayload("create", "User", 6n, 10n)));
+        // (c) malformed origin → decode error, subscription stays live. ("abc"
+        // is rejected by BigInt(); note JS BigInt() DOES accept hex like "0x2a",
+        // unlike Rust's decimal-only parse, so use a clearly non-numeric string.)
+        sub.write(encodeFrame(1, Resp.Event, evt({ kind: "create", id: "7", version: "11", origin: "abc" })));
+        // (d) a good event still arrives after the bad one.
+        sub.write(encodeFrame(1, Resp.Event, eventPayload("create", "User", 8n, 12n)));
+      },
+    });
+  });
+  const client = await AsyncClient.connect({ host: "127.0.0.1", port });
+  try {
+    const sub = await client.subscribe(SubscriptionFilter.all());
+    const n1 = (await sub.next()).value as Notification;
+    assert.ok(n1.type === "change" && n1.change.origin === bigOrigin);
+    const n2 = (await sub.next()).value as Notification;
+    assert.ok(n2.type === "change" && n2.change.origin === undefined);
+    await assert.rejects(sub.next(), (e: unknown) => e instanceof RhypedbError && e.code === "decode"); // bad origin
+    const n4 = (await sub.next()).value as Notification;
+    assert.ok(n4.type === "change" && n4.change.id === 8n); // subscription stayed live
+    sub.close();
+  } finally {
+    client.close();
+    server.close();
+  }
+});
+
+test("excludingOrigin drops own-origin events client-side", async () => {
+  const evt = (id: string, origin?: string): Buffer =>
+    Buffer.from(
+      JSON.stringify({ v: EVENT_FORMAT_TAG, kind: "create", type: "User", id, version: "1", ...(origin !== undefined ? { origin } : {}) }),
+      "utf8",
+    );
+  const { port, server } = await spawnSubServer((sub) => {
+    ackSubscribe(sub, {
+      afterAck: () => {
+        sub.write(encodeFrame(1, Resp.Event, evt("1", "42"))); // ours → dropped client-side
+        sub.write(encodeFrame(1, Resp.Event, evt("2", "7"))); // other origin → delivered
+        sub.write(encodeFrame(1, Resp.Event, evt("3"))); // untagged → delivered
+      },
+    });
+  });
+  const client = await AsyncClient.connect({ host: "127.0.0.1", port });
+  try {
+    const sub = await client.subscribe(SubscriptionFilter.forType("User").excludingOrigin(42n));
+    const n1 = (await sub.next()).value as Notification;
+    assert.ok(n1.type === "change" && n1.change.id === 2n && n1.change.origin === 7n);
+    const n2 = (await sub.next()).value as Notification;
+    assert.ok(n2.type === "change" && n2.change.id === 3n && n2.change.origin === undefined);
+    sub.close();
+  } finally {
+    client.close();
+    server.close();
+  }
+});
+
 test("a malformed event rejects that next() but keeps the subscription live", async () => {
   const { port, server } = await spawnSubServer((sub) => {
     ackSubscribe(sub, {

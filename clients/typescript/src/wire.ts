@@ -440,6 +440,12 @@ export interface WireEvent {
   type: string;
   id: string;
   version: string;
+  /**
+   * The write origin as a decimal string (lossless past 2^53), or absent for an
+   * untagged write. An opaque, caller-defined token a subscriber that also writes
+   * uses to recognise and skip its own changes.
+   */
+  origin?: string;
   fields?: Record<string, unknown>;
 }
 
