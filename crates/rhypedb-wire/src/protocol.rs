@@ -958,6 +958,13 @@ pub struct WireEvent {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fields: Option<HashMap<String, serde_json::Value>>,
+    /// The write [`origin`](ChangeEvent::origin) as a decimal STRING (lossless
+    /// past 2^53 in a JS `JSON.parse`), or absent for an untagged write. Purely
+    /// OBSERVATIONAL: a network subscriber reads it to recognise writes it caused
+    /// via another connection. Additive and back-compatible — an older payload
+    /// with no `origin` key decodes to `None` (no [`EVENT_FORMAT_TAG`] bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 impl WireEvent {
@@ -974,6 +981,7 @@ impl WireEvent {
             id: ev.object_id.to_string(),
             version: ev.version.to_string(),
             fields: ev.fields.clone(),
+            origin: ev.origin.map(|o| o.to_string()),
         }
     }
 }
@@ -1358,7 +1366,7 @@ mod tests {
             type_name: "User".into(),
             object_id: 18_446_744_073_709_551_615, // u64::MAX
             fields: Some(fields),
-            origin: None,
+            origin: Some(9_007_199_254_740_993), // 2^53 + 1: also lossless as a decimal string
         };
         let mut buf = Vec::new();
         encode_event_payload_into(&ev, &mut buf);
@@ -1369,6 +1377,8 @@ mod tests {
         // Ids are decimal strings, exact even past 2^53.
         assert_eq!(wire.id, "18446744073709551615");
         assert_eq!(wire.version, "9007199254740993");
+        // Origin is a decimal string too, lossless past 2^53.
+        assert_eq!(wire.origin.as_deref(), Some("9007199254740993"));
         assert_eq!(
             wire.fields.unwrap().get("name"),
             Some(&serde_json::json!("Alice"))
@@ -1388,7 +1398,10 @@ mod tests {
         encode_event_payload_into(&del_no_fields, &mut dbuf);
         let json = String::from_utf8(dbuf.clone()).unwrap();
         assert!(!json.contains("fields"), "fields-less event must omit fields: {json}");
-        assert_eq!(decode_event_payload(&dbuf).unwrap().kind, "delete");
+        assert!(!json.contains("origin"), "untagged event must omit origin: {json}");
+        let decoded = decode_event_payload(&dbuf).unwrap();
+        assert_eq!(decoded.kind, "delete");
+        assert_eq!(decoded.origin, None, "absent origin key decodes to None");
 
         // A delete event WITH captured scalar fields carries them on the wire,
         // exactly like create/update — a subscriber learns which object went.

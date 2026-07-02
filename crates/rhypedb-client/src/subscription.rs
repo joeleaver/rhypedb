@@ -46,6 +46,10 @@ pub struct ChangeNotification {
     pub id: u64,
     /// The commit version (decoded from the wire's lossless decimal-string form).
     pub version: u64,
+    /// The write origin (decoded from the wire's lossless decimal-string form),
+    /// or `None` for an untagged write. Observational: use it to recognise a
+    /// change this process caused via another (writing) connection.
+    pub origin: Option<u64>,
     /// Best-effort scalar fields in the `/query` read form, or `None` for a
     /// cascade-deleted edge-only join row. Large 64-bit values may have lost
     /// precision in transit — re-query for exact values.
@@ -80,11 +84,21 @@ impl ChangeNotification {
             .version
             .parse::<u64>()
             .map_err(|_| Error::Deserialize(format!("invalid event version {:?}", w.version)))?;
+        // Origin is absent for an untagged write; present ⇒ a lossless decimal
+        // string, parsed like id/version (a malformed one is a protocol error).
+        let origin = match w.origin {
+            Some(ref s) => Some(
+                s.parse::<u64>()
+                    .map_err(|_| Error::Deserialize(format!("invalid event origin {s:?}")))?,
+            ),
+            None => None,
+        };
         Ok(ChangeNotification {
             kind,
             type_name: w.type_name,
             id,
             version,
+            origin,
             fields: w.fields,
         })
     }

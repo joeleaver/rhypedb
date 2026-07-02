@@ -23,6 +23,7 @@ fn event_payload(kind: &str, type_name: &str, id: u64, version: u64) -> Vec<u8> 
         id: id.to_string(),
         version: version.to_string(),
         fields: Some(fields),
+        origin: None,
     };
     serde_json::to_vec(&we).unwrap()
 }
@@ -178,6 +179,7 @@ fn malformed_event_errors_but_keeps_subscription_live() {
             id: "1".to_string(),
             version: "1".to_string(),
             fields: None,
+            origin: None,
         })
         .unwrap();
         wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &bad_kind).unwrap();
@@ -215,6 +217,7 @@ fn unknown_event_format_tag_is_rejected() {
             id: "1".to_string(),
             version: "1".to_string(),
             fields: None,
+            origin: None,
         })
         .unwrap();
         wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &future).unwrap();
@@ -225,6 +228,41 @@ fn unknown_event_format_tag_is_rejected() {
     match sub.next_event() {
         Err(Error::Deserialize(m)) => assert!(m.contains("format tag"), "got: {m}"),
         other => panic!("expected a format-tag rejection, got {other:?}"),
+    }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
+fn event_origin_is_decoded_losslessly() {
+    // A tagged event's origin decodes to the exact u64 (lossless past 2^53);
+    // an untagged event (no `origin` key on the wire) decodes to None.
+    let tagged = serde_json::to_vec(&WireEvent {
+        v: protocol::EVENT_FORMAT_TAG.to_string(),
+        kind: "update".to_string(),
+        type_name: "Post".to_string(),
+        id: "5".to_string(),
+        version: "9".to_string(),
+        fields: None,
+        origin: Some("9007199254740993".to_string()), // 2^53 + 1
+    })
+    .unwrap();
+    let (addr, handle) = spawn_sub_server(move |mut sub| {
+        let h = accept_subscribe(&mut sub);
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &tagged).unwrap();
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &event_payload("create", "Post", 6, 10)).unwrap();
+    });
+
+    let client = Client::connect(addr).unwrap();
+    let mut sub = client.subscribe(SubscriptionFilter::for_type("Post")).unwrap();
+    match sub.next_event().unwrap() {
+        Notification::Change(c) => assert_eq!(c.origin, Some(9_007_199_254_740_993)),
+        other => panic!("expected a tagged change, got {other:?}"),
+    }
+    match sub.next_event().unwrap() {
+        Notification::Change(c) => assert_eq!(c.origin, None),
+        other => panic!("expected an untagged change, got {other:?}"),
     }
 
     drop(client);

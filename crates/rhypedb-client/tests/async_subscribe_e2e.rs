@@ -27,6 +27,7 @@ fn event_payload(kind: &str, type_name: &str, id: u64, version: u64) -> Vec<u8> 
         id: id.to_string(),
         version: version.to_string(),
         fields: Some(fields),
+        origin: None,
     };
     serde_json::to_vec(&we).unwrap()
 }
@@ -168,6 +169,7 @@ async fn malformed_event_errors_but_keeps_subscription_live() {
             id: "1".to_string(),
             version: "1".to_string(),
             fields: None,
+            origin: None,
         })
         .unwrap();
         wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &bad_kind).unwrap();
@@ -200,6 +202,7 @@ async fn unknown_event_format_tag_is_rejected() {
             id: "1".to_string(),
             version: "1".to_string(),
             fields: None,
+            origin: None,
         })
         .unwrap();
         wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &future).unwrap();
