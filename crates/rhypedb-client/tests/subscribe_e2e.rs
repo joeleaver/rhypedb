@@ -287,6 +287,51 @@ fn event_origin_is_decoded_losslessly() {
 }
 
 #[test]
+fn excluding_origin_drops_own_events_client_side() {
+    // The wire subscribe filter can't carry exclude_origin, so the client applies
+    // it locally: an event tagged with the excluded origin is dropped and the next
+    // non-excluded event is delivered instead.
+    fn evt(id: u64, origin: Option<&str>) -> Vec<u8> {
+        serde_json::to_vec(&WireEvent {
+            v: protocol::EVENT_FORMAT_TAG.to_string(),
+            kind: "create".to_string(),
+            type_name: "User".to_string(),
+            id: id.to_string(),
+            version: "1".to_string(),
+            fields: None,
+            origin: origin.map(str::to_string),
+        })
+        .unwrap()
+    }
+    let (addr, handle) = spawn_sub_server(|mut sub| {
+        let h = accept_subscribe(&mut sub);
+        // (a) our OWN write (origin 42) — must be skipped by the client.
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &evt(1, Some("42"))).unwrap();
+        // (b) someone else's write (origin 7) — delivered.
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &evt(2, Some("7"))).unwrap();
+        // (c) an untagged write — delivered.
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &evt(3, None)).unwrap();
+    });
+
+    let client = Client::connect(addr).unwrap();
+    let mut sub = client
+        .subscribe(SubscriptionFilter::for_type("User").excluding_origin(42))
+        .unwrap();
+    // (a) was dropped client-side, so the first delivered event is (b).
+    match sub.next_event().unwrap() {
+        Notification::Change(c) => assert_eq!((c.id, c.origin), (2, Some(7))),
+        other => panic!("expected the origin-7 event, got {other:?}"),
+    }
+    match sub.next_event().unwrap() {
+        Notification::Change(c) => assert_eq!((c.id, c.origin), (3, None)),
+        other => panic!("expected the untagged event, got {other:?}"),
+    }
+
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[test]
 fn shutdown_pushes_lagged_then_closes() {
     // The real server's graceful shutdown pushes a best-effort SUBLAGGED to each
     // live subscription, then closes — i.e. the LAST frame is SUBLAGGED, then EOF.

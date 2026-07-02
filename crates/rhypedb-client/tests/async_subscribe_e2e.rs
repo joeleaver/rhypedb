@@ -32,6 +32,20 @@ fn event_payload(kind: &str, type_name: &str, id: u64, version: u64) -> Vec<u8> 
     serde_json::to_vec(&we).unwrap()
 }
 
+/// A minimal create event with an optional origin (decimal string on the wire).
+fn event_with_origin(id: u64, origin: Option<&str>) -> Vec<u8> {
+    serde_json::to_vec(&WireEvent {
+        v: protocol::EVENT_FORMAT_TAG.to_string(),
+        kind: "create".to_string(),
+        type_name: "User".to_string(),
+        id: id.to_string(),
+        version: "1".to_string(),
+        fields: None,
+        origin: origin.map(str::to_string),
+    })
+    .unwrap()
+}
+
 /// Spawn a mock that accepts the client's (idle) query connection, then the
 /// subscription connection, and hands the latter to `script` to drive.
 fn spawn_sub_server<F>(script: F) -> (SocketAddr, JoinHandle<()>)
@@ -231,6 +245,53 @@ async fn unknown_event_format_tag_is_rejected() {
         other => panic!("expected a format-tag rejection, got {other:?}"),
     }
 
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn excluding_origin_drops_own_events_next_event() {
+    // Client-side exclude_origin via next_event(): the own-origin event is skipped.
+    let (addr, handle) = spawn_sub_server(|mut sub| {
+        let h = accept_subscribe(&mut sub);
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &event_with_origin(1, Some("42"))).unwrap(); // ours → skipped
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &event_with_origin(2, Some("7"))).unwrap(); // other → delivered
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &event_with_origin(3, None)).unwrap(); // untagged → delivered
+    });
+    let client = AsyncClient::connect(addr).await.unwrap();
+    let mut sub = client
+        .subscribe(SubscriptionFilter::for_type("User").excluding_origin(42))
+        .await
+        .unwrap();
+    match sub.next_event().await.unwrap() {
+        Notification::Change(c) => assert_eq!((c.id, c.origin), (2, Some(7))),
+        other => panic!("expected the origin-7 event, got {other:?}"),
+    }
+    match sub.next_event().await.unwrap() {
+        Notification::Change(c) => assert_eq!((c.id, c.origin), (3, None)),
+        other => panic!("expected the untagged event, got {other:?}"),
+    }
+    drop(client);
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn excluding_origin_drops_own_events_stream() {
+    // Same, but through the Stream impl (the poll_next skip loop).
+    let (addr, handle) = spawn_sub_server(|mut sub| {
+        let h = accept_subscribe(&mut sub);
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &event_with_origin(1, Some("42"))).unwrap(); // ours → skipped
+        wire_sync::write_frame(&mut sub, h, protocol::RESP_EVENT, &event_with_origin(2, None)).unwrap(); // untagged → delivered
+    });
+    let client = AsyncClient::connect(addr).await.unwrap();
+    let mut sub = client
+        .subscribe(SubscriptionFilter::all().excluding_origin(42))
+        .await
+        .unwrap();
+    match sub.next().await.unwrap().unwrap() {
+        Notification::Change(c) => assert_eq!((c.id, c.origin), (2, None)),
+        other => panic!("expected the untagged event via Stream, got {other:?}"),
+    }
     drop(client);
     handle.join().unwrap();
 }

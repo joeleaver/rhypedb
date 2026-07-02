@@ -380,6 +380,11 @@ pub struct AsyncSubscription {
     /// Reused for the `UNSUBSCRIBE` write (the event read deliberately has no
     /// deadline — see [`AsyncClient::subscribe`]).
     write_timeout: Option<Duration>,
+    /// The filter's `exclude_origin`, applied CLIENT-SIDE (the wire subscribe
+    /// filter can't carry it): `Change` events whose `origin` matches are dropped
+    /// by both [`next_event`](Self::next_event) and the [`Stream`] impl, so
+    /// [`SubscriptionFilter::excluding_origin`] works over the network too.
+    exclude_origin: Option<u64>,
     /// Latches once the stream ends (EOF or a terminal frame) so it stops after
     /// surfacing the cause exactly once.
     ended: bool,
@@ -420,6 +425,7 @@ impl AsyncSubscription {
                 reader,
                 handle: HANDLE,
                 write_timeout,
+                exclude_origin: filter.exclude_origin,
                 ended: false,
             }),
             // An old server replies ERROR to an unknown SUBSCRIBE kind ⇒
@@ -438,14 +444,31 @@ impl AsyncSubscription {
         if self.ended {
             return Err(Error::Closed);
         }
-        let frame = match self.reader.next_frame(&mut self.stream).await {
-            Ok(f) => f,
-            Err(e) => {
-                self.ended = true;
-                return Err(Error::Io(e));
+        loop {
+            let frame = match self.reader.next_frame(&mut self.stream).await {
+                Ok(f) => f,
+                Err(e) => {
+                    self.ended = true;
+                    return Err(Error::Io(e));
+                }
+            };
+            let notification = self.classify(frame)?;
+            // Client-side loop-breaker: skip our OWN-origin events and await the
+            // next (the wire subscribe filter can't carry exclude_origin).
+            if self.is_excluded(&notification) {
+                continue;
             }
-        };
-        self.classify(frame)
+            return Ok(notification);
+        }
+    }
+
+    /// Whether a notification is an own-origin `Change` to drop under the filter's
+    /// client-side [`exclude_origin`](AsyncSubscription::exclude_origin).
+    fn is_excluded(&self, n: &Notification) -> bool {
+        match self.exclude_origin {
+            Some(ex) => matches!(n, Notification::Change(c) if c.origin == Some(ex)),
+            None => false,
+        }
     }
 
     /// Map a pushed frame to a [`Notification`] (or an error). Sets `ended` for a
@@ -515,12 +538,24 @@ impl Stream for AsyncSubscription {
         if this.ended {
             return Poll::Ready(None);
         }
-        match this.reader.poll_next_frame(cx, &mut this.stream) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(frame)) => Poll::Ready(Some(this.classify(frame))),
-            Poll::Ready(Err(e)) => {
-                this.ended = true;
-                Poll::Ready(Some(Err(Error::Io(e))))
+        loop {
+            match this.reader.poll_next_frame(cx, &mut this.stream) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(frame)) => {
+                    let n = this.classify(frame);
+                    // Skip our OWN-origin events (client-side exclude_origin) and
+                    // poll the next frame; a buffered frame yields Ready again.
+                    if let Ok(ref notif) = n
+                        && this.is_excluded(notif)
+                    {
+                        continue;
+                    }
+                    return Poll::Ready(Some(n));
+                }
+                Poll::Ready(Err(e)) => {
+                    this.ended = true;
+                    return Poll::Ready(Some(Err(Error::Io(e))));
+                }
             }
         }
     }

@@ -47,9 +47,11 @@ pub struct SubscriptionFilter {
     /// the engine's `*_with_origin` verbs, set this to the same value, and the
     /// hub filters out your OWN events before they reach you.
     ///
-    /// IN-PROCESS ONLY — the local [`SubscriptionHub`] applies this predicate; it
-    /// is deliberately NOT carried on the binary subscribe protocol, so a network
-    /// subscriber must filter on `origin` client-side instead.
+    /// The local [`SubscriptionHub`] applies this predicate directly. It is NOT
+    /// carried on the binary subscribe protocol (the wire filter can't express
+    /// it), so over the network the official clients apply it CLIENT-SIDE after
+    /// decoding each event — the server still sends the event; the client drops
+    /// it. Either way, `exclude_origin` breaks the write → react → write loop.
     pub exclude_origin: Option<u64>,
 }
 

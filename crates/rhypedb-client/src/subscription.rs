@@ -129,6 +129,11 @@ pub struct Subscription {
     /// The subscription handle (the `SUBSCRIBE` frame's `req_id`); the server
     /// tags every pushed frame with it and it is the `UNSUBSCRIBE` target.
     handle: u32,
+    /// The filter's `exclude_origin`, applied CLIENT-SIDE: the wire subscribe
+    /// filter cannot carry it, so `next_event` drops `Change` events whose
+    /// `origin` matches, making [`SubscriptionFilter::excluding_origin`] work over
+    /// the network too (the server still sends them; they're dropped here).
+    exclude_origin: Option<u64>,
     /// Latches once the stream ends (EOF or a terminal error) so the iterator
     /// stops after surfacing the cause exactly once.
     ended: bool,
@@ -177,6 +182,7 @@ impl Subscription {
             protocol::RESP_SUBSCRIBED => Ok(Subscription {
                 stream,
                 handle: HANDLE,
+                exclude_origin: filter.exclude_origin,
                 ended: false,
             }),
             // An old server replies ERROR to an unknown SUBSCRIBE kind ⇒
@@ -194,32 +200,47 @@ impl Subscription {
     /// socket error (and latches the subscription ended); a malformed event
     /// payload also returns an error but leaves the subscription live (framing
     /// intact). After the subscription has ended, returns [`Error::Closed`].
+    ///
+    /// If the filter set [`excluding_origin`](SubscriptionFilter::excluding_origin),
+    /// events whose `origin` matches are dropped here (the server still sends them)
+    /// and this blocks until the next non-excluded event.
     pub fn next_event(&mut self) -> Result<Notification> {
         if self.ended {
             return Err(Error::Closed);
         }
-        let frame = match wire_sync::read_frame(&mut self.stream) {
-            Ok(f) => f,
-            Err(e) => {
-                self.ended = true;
-                return Err(Error::Io(e));
-            }
-        };
-        match frame.kind {
-            protocol::RESP_EVENT => {
-                // Payload-decode failure (framing intact) → surface but stay live.
-                let wire = protocol::decode_event_payload(&frame.payload).map_err(Error::Io)?;
-                Ok(Notification::Change(ChangeNotification::from_wire(wire)?))
-            }
-            protocol::RESP_SUBLAGGED => Ok(Notification::Lagged),
-            // Neither is part of the post-subscribe push protocol; treat as terminal.
-            protocol::RESP_ERROR => {
-                self.ended = true;
-                Err(server_error(&frame.payload))
-            }
-            other => {
-                self.ended = true;
-                Err(Error::UnexpectedResponse(other))
+        loop {
+            let frame = match wire_sync::read_frame(&mut self.stream) {
+                Ok(f) => f,
+                Err(e) => {
+                    self.ended = true;
+                    return Err(Error::Io(e));
+                }
+            };
+            match frame.kind {
+                protocol::RESP_EVENT => {
+                    // Payload-decode failure (framing intact) → surface but stay live.
+                    let wire = protocol::decode_event_payload(&frame.payload).map_err(Error::Io)?;
+                    let change = ChangeNotification::from_wire(wire)?;
+                    // Client-side loop-breaker: skip our OWN-origin events. The wire
+                    // subscribe filter can't carry exclude_origin, so it's applied
+                    // here — the server sent the event, we drop it and read the next.
+                    if let Some(ex) = self.exclude_origin
+                        && change.origin == Some(ex)
+                    {
+                        continue;
+                    }
+                    return Ok(Notification::Change(change));
+                }
+                protocol::RESP_SUBLAGGED => return Ok(Notification::Lagged),
+                // Neither is part of the post-subscribe push protocol; treat as terminal.
+                protocol::RESP_ERROR => {
+                    self.ended = true;
+                    return Err(server_error(&frame.payload));
+                }
+                other => {
+                    self.ended = true;
+                    return Err(Error::UnexpectedResponse(other));
+                }
             }
         }
     }

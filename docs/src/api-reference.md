@@ -344,8 +344,11 @@ the writer tagged the mutation with a write origin (via the engine's
 `create_with_origin` / `update_with_origin` / `delete_with_origin` verbs), and is
 omitted for an untagged write. It is an opaque, caller-defined token — a
 subscriber that *also writes* uses it to recognise and skip its own changes and
-so avoid a write → event → react → write loop. It is purely observational over
-the wire; a batch or cascade write stamps the same `origin` on all of its events.
+so avoid a write → event → react → write loop. A batch or cascade write stamps
+the same `origin` on all of its events. The official Rust and TypeScript clients
+honor a subscription filter's `excluding_origin` / `.excludingOrigin()` by
+dropping matching events **client-side** after decode (the server still sends
+them), so you can break the loop without inspecting `origin` yourself.
 The `Event` is a **notification**, not a faithful snapshot: `fields` use
 the `/query` read form (`Bytes` as base64, `DateTime` as RFC 3339, `Json` inline),
 but large 64-bit scalar field values may lose precision in a JS `JSON.parse` —
