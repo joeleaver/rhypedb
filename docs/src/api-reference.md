@@ -334,12 +334,19 @@ trailing bytes are all rejected) so a malformed filter fails loudly.
 
 ```json
 { "v": "rhypedb-event-v1", "kind": "create", "type": "User",
-  "id": "42", "version": "7", "fields": { "name": "Alice", "age": 30 } }
+  "id": "42", "version": "7", "origin": "9001", "fields": { "name": "Alice", "age": 30 } }
 ```
 
 `id` and `version` are **decimal strings** so 64-bit values survive a JavaScript
 `JSON.parse` (which would coerce a bare number to a float and lose precision past
-2^53). The `Event` is a **notification**, not a faithful snapshot: `fields` use
+2^53). `origin` (also a decimal string) is **optional**: it is present only when
+the writer tagged the mutation with a write origin (via the engine's
+`create_with_origin` / `update_with_origin` / `delete_with_origin` verbs), and is
+omitted for an untagged write. It is an opaque, caller-defined token — a
+subscriber that *also writes* uses it to recognise and skip its own changes and
+so avoid a write → event → react → write loop. It is purely observational over
+the wire; a batch or cascade write stamps the same `origin` on all of its events.
+The `Event` is a **notification**, not a faithful snapshot: `fields` use
 the `/query` read form (`Bytes` as base64, `DateTime` as RFC 3339, `Json` inline),
 but large 64-bit scalar field values may lose precision in a JS `JSON.parse` —
 **re-query for authoritative state**. `create`, `update`, and `delete` events all
