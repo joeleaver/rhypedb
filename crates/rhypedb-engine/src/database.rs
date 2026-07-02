@@ -10569,6 +10569,7 @@ mod tests {
             type_name: Some("Account".into()),
             kinds: Vec::new(),
             object_id: None,
+            exclude_origin: None,
         });
 
         let schema_after = parse_schema(r#"type Account { name: String }"#).unwrap();

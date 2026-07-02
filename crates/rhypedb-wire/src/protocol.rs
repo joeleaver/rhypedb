@@ -910,6 +910,9 @@ pub fn decode_subscribe_filter(data: &[u8]) -> io::Result<SubscriptionFilter> {
         type_name,
         object_id,
         kinds,
+        // `exclude_origin` is an in-process-only predicate; it is not part of the
+        // wire subscribe filter, so a network subscription never carries it.
+        exclude_origin: None,
     })
 }
 
@@ -1158,11 +1161,13 @@ mod tests {
                 type_name: Some("User".into()),
                 object_id: None,
                 kinds: vec![ChangeKind::Create, ChangeKind::Delete],
+                exclude_origin: None,
             },
             SubscriptionFilter {
                 type_name: None,
                 object_id: None,
                 kinds: vec![ChangeKind::Update],
+                exclude_origin: None,
             },
         ];
         for f in cases {
@@ -1200,10 +1205,22 @@ mod tests {
             type_name: Some(String::new()),
             object_id: None,
             kinds: vec![],
+            exclude_origin: None,
         };
         let bytes = encode_subscribe_filter(&f);
         let back = decode_subscribe_filter(&bytes).expect("must round-trip");
         assert_eq!(back.type_name, None);
+    }
+
+    #[test]
+    fn exclude_origin_not_carried_on_wire() {
+        // `exclude_origin` is an in-process-only predicate; the binary subscribe
+        // filter must NOT carry it, so a network subscription always decodes it
+        // as None (and filters on origin client-side instead).
+        let f = SubscriptionFilter::for_type("Post").excluding_origin(99);
+        let back = decode_subscribe_filter(&encode_subscribe_filter(&f)).unwrap();
+        assert_eq!(back.type_name.as_deref(), Some("Post"));
+        assert_eq!(back.exclude_origin, None, "origin-exclude must not cross the wire");
     }
 
     #[test]

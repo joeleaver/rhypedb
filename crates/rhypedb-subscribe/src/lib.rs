@@ -41,6 +41,16 @@ pub struct SubscriptionFilter {
     pub object_id: Option<u64>,
     /// Only match these change kinds (empty = all kinds).
     pub kinds: Vec<ChangeKind>,
+    /// Drop events carrying this write [`origin`](ChangeEvent::origin)
+    /// (None = no origin filter). This is the loop-breaker for a subscriber that
+    /// also writes in reaction to the feed: tag your writes with an origin via
+    /// the engine's `*_with_origin` verbs, set this to the same value, and the
+    /// hub filters out your OWN events before they reach you.
+    ///
+    /// IN-PROCESS ONLY — the local [`SubscriptionHub`] applies this predicate; it
+    /// is deliberately NOT carried on the binary subscribe protocol, so a network
+    /// subscriber must filter on `origin` client-side instead.
+    pub exclude_origin: Option<u64>,
 }
 
 impl SubscriptionFilter {
@@ -49,6 +59,7 @@ impl SubscriptionFilter {
             type_name: None,
             object_id: None,
             kinds: Vec::new(),
+            exclude_origin: None,
         }
     }
 
@@ -57,6 +68,7 @@ impl SubscriptionFilter {
             type_name: Some(type_name.into()),
             object_id: None,
             kinds: Vec::new(),
+            exclude_origin: None,
         }
     }
 
@@ -65,7 +77,15 @@ impl SubscriptionFilter {
             type_name: Some(type_name.into()),
             object_id: Some(object_id),
             kinds: Vec::new(),
+            exclude_origin: None,
         }
+    }
+
+    /// Chainable setter for [`exclude_origin`](Self::exclude_origin):
+    /// `SubscriptionFilter::for_type("Post").excluding_origin(my_origin)`.
+    pub fn excluding_origin(mut self, origin: u64) -> Self {
+        self.exclude_origin = Some(origin);
+        self
     }
 
     fn matches(&self, event: &ChangeEvent) -> bool {
@@ -80,6 +100,12 @@ impl SubscriptionFilter {
         if !self.kinds.is_empty() && !self.kinds.contains(&event.kind) {
             return false;
         }
+        // Loop-breaker: drop an event whose origin matches the excluded one. An
+        // untagged event (origin = None) is never excluded.
+        if let Some(ex) = self.exclude_origin
+            && event.origin == Some(ex) {
+                return false;
+            }
         true
     }
 }
@@ -292,6 +318,25 @@ mod tests {
         let event = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(event.kind, ChangeKind::Delete);
 
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn filter_exclude_origin() {
+        let hub = SubscriptionHub::new();
+        let (_id, rx) = hub.subscribe(SubscriptionFilter::all().excluding_origin(42));
+
+        // Tagged with the excluded origin → dropped.
+        hub.publish(ChangeEvent { origin: Some(42), ..make_event(ChangeKind::Create, "User", 1) });
+        // A different origin → delivered.
+        hub.publish(ChangeEvent { origin: Some(7), ..make_event(ChangeKind::Update, "User", 2) });
+        // Untagged (origin = None) → delivered; None is never excluded.
+        hub.publish(make_event(ChangeKind::Delete, "User", 3));
+
+        let e1 = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!((e1.object_id, e1.origin), (2, Some(7)));
+        let e2 = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!((e2.object_id, e2.origin), (3, None));
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
     }
 

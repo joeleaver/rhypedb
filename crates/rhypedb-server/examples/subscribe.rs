@@ -83,6 +83,7 @@ async fn main() {
         type_name,
         object_id,
         kinds,
+        exclude_origin: None,
     };
 
     let stream = TcpStream::connect(&addr).await.unwrap_or_else(|e| {
