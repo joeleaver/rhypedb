@@ -3877,7 +3877,21 @@ impl Database {
     /// whole batch rolls back — none of the rows land. This is intentional:
     /// callers reaching for the bulk path want the all-or-nothing shape of
     /// `COPY ... FROM STDIN`, not a partial insert.
+    /// Batch-create objects. Untagged: delegates to
+    /// [`create_batch_with_origin`](Self::create_batch_with_origin) with
+    /// `origin = None`.
     pub fn create_batch(&self, type_name: &str, rows: Vec<FieldMap>) -> EngineResult<Vec<Object>> {
+        self.create_batch_with_origin(type_name, rows, None)
+    }
+
+    /// Batch-create objects, stamping the SAME `origin` on every per-row Create
+    /// event (see [`create_with_origin`](Self::create_with_origin)).
+    pub fn create_batch_with_origin(
+        &self,
+        type_name: &str,
+        rows: Vec<FieldMap>,
+        origin: Option<u64>,
+    ) -> EngineResult<Vec<Object>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -3961,7 +3975,7 @@ impl Database {
                 type_name: type_name.into(),
                 object_id: id,
                 fields: Some(fields_to_json(&scalar_fields)),
-                origin: None,
+                origin,
             });
             out.push(Object {
                 type_name: type_name.into(),
@@ -3988,11 +4002,26 @@ impl Database {
     /// `FieldMap` is the object's SCALAR fields (a logical import recreates
     /// relations separately as edges, after every object exists); a relation
     /// field present here is staged inline and so requires its target to exist.
+    /// Bulk-restore objects with caller-supplied ids. Untagged: delegates to
+    /// [`restore_objects_with_origin`](Self::restore_objects_with_origin) with
+    /// `origin = None`.
     pub fn restore_objects(
         &self,
         type_name: &str,
         rows: Vec<(u64, FieldMap)>,
         reject_existing: bool,
+    ) -> EngineResult<()> {
+        self.restore_objects_with_origin(type_name, rows, reject_existing, None)
+    }
+
+    /// Bulk-restore objects, stamping the SAME `origin` on every per-object
+    /// Create event (see [`create_with_origin`](Self::create_with_origin)).
+    pub fn restore_objects_with_origin(
+        &self,
+        type_name: &str,
+        rows: Vec<(u64, FieldMap)>,
+        reject_existing: bool,
+        origin: Option<u64>,
     ) -> EngineResult<()> {
         if rows.is_empty() {
             return Ok(());
@@ -4078,7 +4107,7 @@ impl Database {
                 type_name: type_name.into(),
                 object_id: *object_id,
                 fields: Some(fields_to_json(scalar_fields)),
-                origin: None,
+                origin,
             });
         }
         Ok(())
@@ -14945,6 +14974,56 @@ mod tests {
         let types: std::collections::HashSet<&str> =
             deletes.iter().map(|e| e.type_name.as_str()).collect();
         assert!(types.contains("User") && types.contains("Post"));
+    }
+
+    /// Issue #13 (Inc 2): the bulk write verbs stamp the SAME origin on every
+    /// per-row event; the plain bulk verbs stamp `None`.
+    #[test]
+    fn bulk_write_origin_stamps_all_rows() {
+        use rhypedb_subscribe::{ChangeKind, SubscriptionFilter};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type User { name: String }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let (_id, rx) = db.subscriptions().subscribe(SubscriptionFilter::all());
+        let drain = |rx: &std::sync::mpsc::Receiver<rhypedb_subscribe::ChangeEvent>, n: usize| {
+            let mut v = Vec::new();
+            for _ in 0..n {
+                v.push(rx.recv_timeout(Duration::from_secs(1)).expect("an event"));
+            }
+            assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "exactly {n} events");
+            v
+        };
+        let row = |name: &str| {
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String(name.into()));
+            f
+        };
+
+        // create_batch_with_origin → every per-row Create event carries origin.
+        db.create_batch_with_origin("User", vec![row("A"), row("B"), row("C")], Some(77))
+            .unwrap();
+        let evs = drain(&rx, 3);
+        assert!(evs.iter().all(|e| e.kind == ChangeKind::Create && e.origin == Some(77)));
+
+        // plain create_batch → untagged.
+        db.create_batch("User", vec![row("D"), row("E")]).unwrap();
+        let evs = drain(&rx, 2);
+        assert!(evs.iter().all(|e| e.origin.is_none()));
+
+        // restore_objects_with_origin → every per-object Create event carries origin.
+        db.restore_objects_with_origin(
+            "User",
+            vec![(9001, row("R1")), (9002, row("R2"))],
+            true,
+            Some(88),
+        )
+        .unwrap();
+        let evs = drain(&rx, 2);
+        assert!(evs.iter().all(|e| e.kind == ChangeKind::Create && e.origin == Some(88)));
+        let ids: std::collections::HashSet<u64> = evs.iter().map(|e| e.object_id).collect();
+        assert!(ids.contains(&9001) && ids.contains(&9002));
     }
 
     // --- Shadow-field card 2d: live writes during migration (no quiesce) ---
