@@ -13,6 +13,15 @@ pub struct ChangeEvent {
     pub object_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<HashMap<String, serde_json::Value>>,
+    /// An opaque caller-supplied write origin, threaded from the mutating verb
+    /// (`create_with_origin` / `update_with_origin` / `delete_with_origin`) onto
+    /// every event that write produces. `None` for an untagged write. Its meaning
+    /// is the embedder's: it exists so a subscriber that also *writes in reaction*
+    /// to the feed can deterministically skip its OWN changes (via
+    /// [`SubscriptionFilter::exclude_origin`]) and not loop. A batch/cascade write
+    /// stamps the SAME origin on all of its events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -222,6 +231,7 @@ mod tests {
             type_name: type_name.into(),
             object_id,
             fields: None,
+            origin: None,
         }
     }
 
@@ -401,11 +411,21 @@ mod tests {
                 m.insert("name".into(), serde_json::json!("Alice"));
                 m
             }),
+            origin: Some(7),
         };
 
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"kind\":\"create\""));
         assert!(json.contains("\"version\":42"));
         assert!(json.contains("\"Alice\""));
+        assert!(json.contains("\"origin\":7"));
+
+        // An untagged event omits `origin` entirely (skip_serializing_if).
+        let untagged = ChangeEvent {
+            origin: None,
+            ..event
+        };
+        let json = serde_json::to_string(&untagged).unwrap();
+        assert!(!json.contains("origin"), "untagged event must omit origin: {json}");
     }
 }

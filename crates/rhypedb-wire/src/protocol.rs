@@ -1341,6 +1341,7 @@ mod tests {
             type_name: "User".into(),
             object_id: 18_446_744_073_709_551_615, // u64::MAX
             fields: Some(fields),
+            origin: None,
         };
         let mut buf = Vec::new();
         encode_event_payload_into(&ev, &mut buf);
@@ -1364,6 +1365,7 @@ mod tests {
             type_name: "User".into(),
             object_id: 5,
             fields: None,
+            origin: None,
         };
         let mut dbuf = Vec::new();
         encode_event_payload_into(&del_no_fields, &mut dbuf);
@@ -1383,6 +1385,7 @@ mod tests {
                 m.insert("name".into(), serde_json::json!("Alice"));
                 m
             }),
+            origin: None,
         };
         let mut dbuf2 = Vec::new();
         encode_event_payload_into(&del_with_fields, &mut dbuf2);

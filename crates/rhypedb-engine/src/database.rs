@@ -3576,7 +3576,25 @@ impl Database {
     /// built from the in-memory FieldMap (no per-link `scan_prefix` for
     /// other targets, no extra commits). This collapses the historical
     /// `Type.create + link + link` 3-txn dance into one batched txn.
+    /// Create an object. Untagged: delegates to
+    /// [`create_with_origin`](Self::create_with_origin) with `origin = None`.
     pub fn create(&self, type_name: &str, fields: FieldMap) -> EngineResult<Object> {
+        self.create_with_origin(type_name, fields, None)
+    }
+
+    /// Create an object, tagging the emitted [`ChangeEvent`] with `origin`.
+    ///
+    /// `origin` is an opaque, caller-owned token surfaced on
+    /// [`ChangeEvent::origin`]; pass `None` for an untagged write. A subscriber
+    /// that also writes in reaction to the change feed uses it — via
+    /// [`SubscriptionFilter::exclude_origin`] — to skip its own writes and avoid
+    /// a write → event → react → write loop.
+    pub fn create_with_origin(
+        &self,
+        type_name: &str,
+        fields: FieldMap,
+        origin: Option<u64>,
+    ) -> EngineResult<Object> {
         // Block under the migration write-barrier: if a rename / change
         // / run_migrations is in flight, wait until it commits so this
         // create observes the post-migration schema (and writes a
@@ -3630,6 +3648,7 @@ impl Database {
             type_name: type_name.into(),
             object_id,
             fields: Some(fields_to_json(&scalar_fields)),
+            origin,
         });
 
         Ok(Object {
@@ -3942,6 +3961,7 @@ impl Database {
                 type_name: type_name.into(),
                 object_id: id,
                 fields: Some(fields_to_json(&scalar_fields)),
+                origin: None,
             });
             out.push(Object {
                 type_name: type_name.into(),
@@ -4058,6 +4078,7 @@ impl Database {
                 type_name: type_name.into(),
                 object_id: *object_id,
                 fields: Some(fields_to_json(scalar_fields)),
+                origin: None,
             });
         }
         Ok(())
@@ -5409,11 +5430,25 @@ impl Database {
 
     /// Update an object's fields. Only the provided fields are updated;
     /// unmentioned fields are preserved.
+    /// Update an object. Untagged: delegates to
+    /// [`update_with_origin`](Self::update_with_origin) with `origin = None`.
     pub fn update(
         &self,
         type_name: &str,
         object_id: u64,
         updates: FieldMap,
+    ) -> EngineResult<Object> {
+        self.update_with_origin(type_name, object_id, updates, None)
+    }
+
+    /// Update an object, tagging the emitted [`ChangeEvent`] with `origin`
+    /// (see [`create_with_origin`](Self::create_with_origin) for the rationale).
+    pub fn update_with_origin(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        updates: FieldMap,
+        origin: Option<u64>,
     ) -> EngineResult<Object> {
         let _migration_guard = self.migration_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
@@ -5561,6 +5596,7 @@ impl Database {
             type_name: type_name.into(),
             object_id,
             fields: Some(fields_to_json(&fields)),
+            origin,
         });
 
         Ok(Object {
@@ -5685,7 +5721,21 @@ impl Database {
     /// Delete an object, enforcing @on_delete policies on all inbound relationships.
     /// Cascades are recursive — if deleting A cascades to B, and B has its own
     /// cascade relationships, those are followed too.
+    /// Delete an object (cascading to its owned edges). Untagged: delegates to
+    /// [`delete_with_origin`](Self::delete_with_origin) with `origin = None`.
     pub fn delete(&self, type_name: &str, object_id: u64) -> EngineResult<()> {
+        self.delete_with_origin(type_name, object_id, None)
+    }
+
+    /// Delete an object, tagging EVERY emitted [`ChangeEvent`] — the top-level
+    /// delete and every cascaded delete — with the SAME `origin` (see
+    /// [`create_with_origin`](Self::create_with_origin) for the rationale).
+    pub fn delete_with_origin(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        origin: Option<u64>,
+    ) -> EngineResult<()> {
         let _migration_guard = self.migration_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
 
@@ -5748,6 +5798,7 @@ impl Database {
                 type_name,
                 object_id: *del_id,
                 fields: fields.clone(),
+                origin,
             });
         }
 
@@ -14830,6 +14881,70 @@ mod tests {
             db.get("Post", post.id),
             Err(EngineError::ObjectNotFound { .. })
         ));
+    }
+
+    /// Issue #13: the `*_with_origin` write verbs stamp their opaque origin onto
+    /// every emitted `ChangeEvent`; the plain verbs stamp `None`; and a cascade
+    /// delete fans the SAME origin onto every event it produces.
+    #[test]
+    fn write_origin_stamps_change_events() {
+        use rhypedb_subscribe::{ChangeKind, SubscriptionFilter};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User { name: String }
+            type Post { title: String  author: User @on_delete(cascade) }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let (_id, rx) = db.subscriptions().subscribe(SubscriptionFilter::all());
+        let next = |rx: &std::sync::mpsc::Receiver<rhypedb_subscribe::ChangeEvent>| {
+            rx.recv_timeout(Duration::from_secs(1)).expect("an event")
+        };
+
+        // create_with_origin → Create event carries the origin.
+        let mut uf = FieldMap::new();
+        uf.insert("name".into(), Value::String("Alice".into()));
+        let alice = db.create_with_origin("User", uf, Some(42)).unwrap();
+        let e = next(&rx);
+        assert_eq!((e.kind, e.type_name.as_str(), e.origin), (ChangeKind::Create, "User", Some(42)));
+
+        // plain create → untagged.
+        let mut pf = FieldMap::new();
+        pf.insert("title".into(), Value::String("Hello".into()));
+        let post = db.create("Post", pf).unwrap();
+        let e = next(&rx);
+        assert_eq!((e.kind, e.origin), (ChangeKind::Create, None));
+
+        // link emits no change event today, so the next event is the update.
+        db.link("Post", post.id, "author", alice.id, None).unwrap();
+
+        // update_with_origin → Update event carries the origin.
+        let mut uf2 = FieldMap::new();
+        uf2.insert("name".into(), Value::String("Alicia".into()));
+        db.update_with_origin("User", alice.id, uf2, Some(43)).unwrap();
+        let e = next(&rx);
+        assert_eq!((e.kind, e.origin), (ChangeKind::Update, Some(43)));
+
+        // delete_with_origin → the top-level AND cascaded Delete events all
+        // carry the ONE origin passed to the call.
+        db.delete_with_origin("User", alice.id, Some(44)).unwrap();
+        let mut deletes = Vec::new();
+        while let Ok(e) = rx.recv_timeout(Duration::from_millis(300)) {
+            deletes.push(e);
+        }
+        assert_eq!(deletes.len(), 2, "User + cascaded Post = 2 delete events");
+        assert!(deletes.iter().all(|e| e.kind == ChangeKind::Delete));
+        assert!(
+            deletes.iter().all(|e| e.origin == Some(44)),
+            "every cascade delete event must carry the same origin"
+        );
+        let types: std::collections::HashSet<&str> =
+            deletes.iter().map(|e| e.type_name.as_str()).collect();
+        assert!(types.contains("User") && types.contains("Post"));
     }
 
     // --- Shadow-field card 2d: live writes during migration (no quiesce) ---

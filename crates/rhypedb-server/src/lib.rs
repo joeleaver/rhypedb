@@ -2667,6 +2667,7 @@ mod tcp_tests {
             type_name: "User".into(),
             object_id: 1,
             fields: Some(fields),
+            origin: None,
         };
         let dropped = Arc::new(AtomicU64::new(0));
         let d2 = Arc::clone(&dropped);
