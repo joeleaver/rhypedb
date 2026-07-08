@@ -18,6 +18,10 @@ ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# For compile-time validation of rules against the live schema (type/field/relation
+# names + arity). rhypedb-schema is dependency-light (thiserror only) — no ONNX/engine
+# weight is pulled into the authz crate.
+rhypedb-schema = { workspace = true }
 
 [dev-dependencies]
 # The verify half is exercised against tokens minted by an in-test signer, so

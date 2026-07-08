@@ -17,6 +17,8 @@
 
 pub mod jose;
 pub mod principal;
+pub mod rules;
 
 pub use jose::{verify, Claims, Jwk, Jwks, VerifiedToken, VerifyError, VerifyOptions, ALG_EDDSA};
 pub use principal::{JwtSource, Principal, PrincipalSource};
+pub use rules::{Decision, EmptyResource, Op, ResourceAccessor, RulesError, RulesProgram};

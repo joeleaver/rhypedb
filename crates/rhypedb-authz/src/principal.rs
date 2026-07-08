@@ -65,6 +65,18 @@ impl Principal {
     pub fn claim(&self, key: &str) -> Option<&serde_json::Value> {
         self.claims.get(key)
     }
+
+    /// Test-only: build an authenticated principal directly. Production principals come ONLY from a
+    /// verified token ([`Principal::from_verified`]) — this constructor is unavailable outside test
+    /// builds, which is what makes "a principal exists ⇒ a token verified" a type-level guarantee.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_authenticated(uid: impl Into<String>, claims: serde_json::Value) -> Self {
+        Self {
+            authenticated: true,
+            uid: Some(uid.into()),
+            claims,
+        }
+    }
 }
 
 /// Resolves a request's bearer token into a [`Principal`]. Isolates the trust seam (DECISION 2):
