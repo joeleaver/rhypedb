@@ -158,15 +158,13 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
         _ => {}
     }
 
-    // P4 read authz: filter the terminal result set through the `read` rule (no-op when rules are
-    // off). Only READ-shaped queries are filtered — a `create_batch`/multi-row `update` also lands
-    // as `Objects` but is gated at its own create/write site, not read-filtered. Denied rows are
+    // P4 read authz: filter the terminal result through the `read` rule (no-op when rules are off).
+    // Applies to EVERY returned object shape — Objects AND a mutation's returned Single/post-image —
+    // because any object surfaced to the caller is a read: a create/update that returns a row the
+    // principal may not read must not leak it (a denied Single collapses to void). Denied rows are
     // dropped (Firestore semantics), so a point-`get` of an unreadable id returns an empty result.
-    if ctx.rules.is_some()
-        && crate::authz::is_read_query(query)
-        && let QueryOutput::Objects(ref mut objs) = result
-    {
-        crate::authz::filter_read(ctx, objs);
+    if ctx.rules.is_some() {
+        result = crate::authz::apply_read_filter(ctx, result);
     }
 
     // A pipeline that produced `Objects` directly (filter, scan, similar, get)

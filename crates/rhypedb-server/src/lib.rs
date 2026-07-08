@@ -218,16 +218,20 @@ impl AppState {
     }
 }
 
-/// Extract an `Authorization: Bearer <token>` value from request headers (P4). Case-sensitive on the
-/// `Bearer ` scheme (RFC 6750); a non-ASCII header, a different scheme, or an empty token → `None`.
+/// Extract an `Authorization: Bearer <token>` value from request headers (P4). The auth-scheme is
+/// matched **case-insensitively** per RFC 6750/7235 (so `bearer`/`BEARER` are accepted); a non-ASCII
+/// header, a different scheme, or an empty token → `None`.
 fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
         .ok()?;
-    raw.strip_prefix("Bearer ")
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+    let (scheme, token) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 #[derive(Deserialize)]
@@ -1443,25 +1447,20 @@ async fn handle_connection_stream<R, W>(
                             return;
                         }
                         // P4 per-event read authz (P0-DBA-5): a subscription is a standing read, so
-                        // only deliver an event for an object this connection's principal may READ —
-                        // else drop it silently (a sub must never leak rows the read rule denies).
-                        // Runs off the commit hot path (here at dequeue), not in the sink.
-                        if let Some(rules) = &state.rules {
-                            let db = state.db();
-                            let is_delete =
-                                matches!(push.event.kind, rhypedb_subscribe::ChangeKind::Delete);
-                            if !rhypedb_query::authz::event_read_allowed(
-                                &db,
-                                &state.governor(),
+                        // only deliver an event whose delivered SNAPSHOT this connection's principal
+                        // may READ — else drop it silently (a sub must never leak rows the read rule
+                        // denies). Authorizes against the event's own fields (what's delivered), not
+                        // a live re-fetch, so authorize-and-deliver stay self-consistent. Runs off
+                        // the commit hot path (here at dequeue), not in the sink.
+                        if let Some(rules) = &state.rules
+                            && !rhypedb_query::authz::event_read_allowed(
                                 rules,
                                 &principal,
                                 &push.event.type_name,
-                                push.event.object_id,
-                                is_delete,
                                 push.event.fields.as_ref(),
-                            ) {
-                                continue;
-                            }
+                            )
+                        {
+                            continue;
                         }
                         if let Err(e) = write_event_push(
                             writer,
@@ -1723,17 +1722,30 @@ async fn handle_connection_stream<R, W>(
                 }
             }
             protocol::REQ_VECTOR_BATCH => {
-                let result = match protocol::decode_vector_batch_payload(&frame.payload) {
-                    Ok(batch) => match &state.vectorizer {
-                        Some(v) => v
-                            .ingest_vectors(&batch.type_name, &batch.field_name, &batch.rows)
-                            .map_err(|e| format!("{e}")),
-                        None => Err(
-                            "server has no vector index (schema declares no Vector field)"
-                                .to_string(),
-                        ),
-                    },
-                    Err(e) => Err(format!("decode: {e}")),
+                // P4: vector-batch ingest is a bulk write of embeddings for arbitrary object ids that
+                // does NOT flow through the rules-gated executor and isn't expressible in the rules
+                // language — so under a security-rules program it would be an ungated write bypass
+                // (a review finding). Refuse it fail-closed when rules are active; the trusted-backend
+                // path (rules off) keeps the fast bulk-ingest op.
+                let result = if state.rules.is_some() {
+                    Err(
+                        "vector batch ingest is not permitted while security rules are active \
+                         (use the trusted-backend path)"
+                            .to_string(),
+                    )
+                } else {
+                    match protocol::decode_vector_batch_payload(&frame.payload) {
+                        Ok(batch) => match &state.vectorizer {
+                            Some(v) => v
+                                .ingest_vectors(&batch.type_name, &batch.field_name, &batch.rows)
+                                .map_err(|e| format!("{e}")),
+                            None => Err(
+                                "server has no vector index (schema declares no Vector field)"
+                                    .to_string(),
+                            ),
+                        },
+                        Err(e) => Err(format!("decode: {e}")),
+                    }
                 };
                 let write_result = match result {
                     Ok(_n) => {
@@ -2125,6 +2137,11 @@ mod tcp_tests {
         assert_eq!(bearer_from_headers(&h), None, "no header → None");
         h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer abc.def.ghi"));
         assert_eq!(bearer_from_headers(&h).as_deref(), Some("abc.def.ghi"));
+        // RFC 6750: the scheme is case-insensitive.
+        h.insert(AUTHORIZATION, HeaderValue::from_static("bearer abc.def.ghi"));
+        assert_eq!(bearer_from_headers(&h).as_deref(), Some("abc.def.ghi"), "lowercase scheme accepted");
+        h.insert(AUTHORIZATION, HeaderValue::from_static("BEARER tok"));
+        assert_eq!(bearer_from_headers(&h).as_deref(), Some("tok"));
         h.insert(AUTHORIZATION, HeaderValue::from_static("Basic zzz"));
         assert_eq!(bearer_from_headers(&h), None, "non-Bearer scheme → None");
         h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer   "));
