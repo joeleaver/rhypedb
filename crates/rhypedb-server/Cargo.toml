@@ -85,3 +85,5 @@ ureq = { workspace = true }
 # the server's runtime dependency set.
 rhypedb-client = { workspace = true, features = ["async"] }
 rhypedb-codegen = { workspace = true }
+# test-support exposes the in-test JWT signer so the authz tests can mint tokens.
+rhypedb-authz = { workspace = true, features = ["test-support"] }
