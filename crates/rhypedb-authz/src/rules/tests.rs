@@ -274,6 +274,9 @@ fn compile_fails_closed_on_bad_programs() {
         "match Post { allow read: if request.auth.uid == resource.author.ghost; }", // bad target field
         "match Post { allow read: if resource.title }",      // missing semicolon
         "match Post { allow read if true; }",                // missing colon
+        "match Org { allow read: if resource.members.uid != \"x\"; }", // to-many set as LHS (would always grant)
+        "match Org { allow read: if resource.members.uid == \"x\"; }", // to-many set outside `in`
+        "match Org { allow read: if \"x\" == resource.members.uid; }", // to-many set as non-`in` RHS
     ];
     for src in bad {
         assert!(
