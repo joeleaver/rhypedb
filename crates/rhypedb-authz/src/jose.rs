@@ -460,6 +460,36 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_real_jkbase_issuer_token() {
+        // Golden vector minted by the ACTUAL jkbase-Auth issuer (jkbase repo,
+        // jkbase-control/src/jose.rs) — locks cross-implementation format compatibility so a token
+        // from auth.jkbase.app verifies in the engine byte-for-byte. Ed25519 signing is
+        // deterministic, so this vector is stable (seed=[7;32], kid=goldenproj.1, iat=1_700_000_000).
+        const TOKEN: &str = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImdvbGRlbnByb2ouMSJ9.eyJpc3MiOiJodHRwczovL2F1dGguamtiYXNlLmFwcC92MS9wcm9qZWN0cy9wcm9qIiwic3ViIjoidXNlci00MiIsImF1ZCI6InByb2oiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMzYwMCwianRpIjoianRpLWFiYyIsImNsYWltcyI6eyJyb2xlIjoiYWRtaW4ifX0.tH93W-TeRTOa_0VPZslaplxwtJgH36rd6fq_3-wHpklaAFzcT3H9utpKUMq5dQAGAxl8YCPwBSuu43aO4PNmAw";
+        const JWKS: &str = r#"{"keys":[{"kty":"OKP","crv":"Ed25519","use":"sig","alg":"EdDSA","kid":"goldenproj.1","x":"6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw"}]}"#;
+
+        let jwks = Jwks::from_json(JWKS.as_bytes()).unwrap();
+        let now = 1_700_000_100; // within [iat, iat+3600]
+        // Full verify including the issuer/audience pins the engine will use.
+        let opts = VerifyOptions::at(now)
+            .expect_iss("https://auth.jkbase.app/v1/projects/proj")
+            .expect_aud("proj");
+        let v = verify(TOKEN, &jwks, &opts).expect("a real jkbase token must verify in the engine");
+        assert_eq!(v.kid, "goldenproj.1");
+        assert_eq!(v.claims.sub, "user-42");
+        assert_eq!(v.claims.claims.as_ref().unwrap()["role"], "admin");
+
+        // A one-char corruption of the real issuer's token fails closed.
+        let tampered = format!("{}X", &TOKEN[..TOKEN.len() - 1]);
+        assert!(verify(&tampered, &jwks, &VerifyOptions::at(now)).is_err());
+        // And it is expired past its window.
+        assert_eq!(
+            verify(TOKEN, &jwks, &VerifyOptions::at(1_700_003_600 + 3600)).unwrap_err(),
+            VerifyError::Expired
+        );
+    }
+
+    #[test]
     fn jwks_parses_from_platform_json() {
         // The exact RFC 7517 shape jkbase's `GET …/jwks.json` emits — must round-trip in.
         let k = kp("proj.7", 3);
