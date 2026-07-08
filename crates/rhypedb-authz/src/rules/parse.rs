@@ -510,6 +510,21 @@ fn compile_expr(
                     ));
                 }
             }
+            // A to-many relationship projection resolves to a SET, which is only meaningful as the
+            // RHS of `in` (`<value> in resource.<rel>.<field>`). Reject it anywhere else at compile
+            // time (fail-closed, P0-DBA-8) so a footgun like `resource.members.uid != "x"` — which
+            // would ALWAYS grant (a set never equals a scalar) — can't silently open access.
+            let is_many = |e: &Expr| matches!(e, Expr::Operand(Operand::ResourceRelationMany(..)));
+            if is_many(&lhs) {
+                return Err(RulesError::schema(
+                    "a to-many relationship projection can't be a comparison's left operand — write `<value> in resource.<rel>.<field>`",
+                ));
+            }
+            if is_many(&rhs) && !matches!(op, CmpOp::In) {
+                return Err(RulesError::schema(
+                    "a to-many relationship projection is only valid as the right side of `in`",
+                ));
+            }
             Expr::Cmp { lhs: Box::new(lhs), op: *op, rhs: Box::new(rhs) }
         }
         RawExpr::Path { segs, pos } => {
