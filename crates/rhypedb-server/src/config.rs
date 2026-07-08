@@ -56,6 +56,16 @@ pub struct FileConfig {
     /// `"lz4"` (default) or `"none"`. Per-block SST compression for newly
     /// written files. An unrecognized value warns and falls through.
     pub block_compression: Option<String>,
+    // ---- P4 data-plane authz (all optional; absent ⇒ authz off, engine unchanged) ----
+    /// Path to the project's `rules.rhype` security rules. Compiled against the live schema at
+    /// startup (a malformed file is a fatal, fail-closed error). Absent ⇒ rules off.
+    pub rules: Option<PathBuf>,
+    /// Path to the project's JWKS (public Ed25519 keys) used to verify end-user JWTs offline.
+    /// Required when `rules` is set. Absent ⇒ no token is ever verified (every request anonymous).
+    pub auth_jwks: Option<PathBuf>,
+    /// Optional issuer / audience pins (defense-in-depth on top of per-project `kid` scoping).
+    pub auth_iss: Option<String>,
+    pub auth_aud: Option<String>,
 }
 
 /// A snapshot of the relevant env vars (raw, unparsed). Built once via
@@ -80,6 +90,11 @@ pub struct EnvLayer {
     pub max_query_depth: Option<String>,
     pub max_query_result_rows: Option<String>,
     pub max_query_ms: Option<String>,
+    // P4 authz (paths via var_os so a non-UTF-8 path survives; iss/aud are plain strings).
+    pub rules: Option<PathBuf>,
+    pub auth_jwks: Option<PathBuf>,
+    pub auth_iss: Option<String>,
+    pub auth_aud: Option<String>,
 }
 
 impl EnvLayer {
@@ -97,6 +112,10 @@ impl EnvLayer {
             max_query_depth: std::env::var("RHYPEDB_MAX_QUERY_DEPTH").ok(),
             max_query_result_rows: std::env::var("RHYPEDB_MAX_QUERY_RESULT_ROWS").ok(),
             max_query_ms: std::env::var("RHYPEDB_MAX_QUERY_MS").ok(),
+            rules: std::env::var_os("RHYPEDB_RULES").map(PathBuf::from),
+            auth_jwks: std::env::var_os("RHYPEDB_AUTH_JWKS").map(PathBuf::from),
+            auth_iss: std::env::var("RHYPEDB_AUTH_ISS").ok().filter(|s| !s.is_empty()),
+            auth_aud: std::env::var("RHYPEDB_AUTH_AUD").ok().filter(|s| !s.is_empty()),
         }
     }
 }
@@ -140,6 +159,12 @@ pub struct ServerConfig {
     /// caps; `None` = disabled via `RHYPEDB_QUERY_GOVERNOR`). Threaded into every
     /// query's `ExecContext`. See [`rhypedb_query::GovernorLimits`].
     pub query_governor: Option<GovernorLimits>,
+    /// P4 data-plane authz (resolved paths/strings; the caller reads + compiles them at startup,
+    /// fail-closed). `rules` absent ⇒ authz off; `auth_jwks` required when `rules` is set.
+    pub rules: Option<PathBuf>,
+    pub auth_jwks: Option<PathBuf>,
+    pub auth_iss: Option<String>,
+    pub auth_aud: Option<String>,
 }
 
 fn env_truthy(v: &str) -> bool {
@@ -378,6 +403,22 @@ pub fn resolve(
         )),
         block_compression,
         query_governor,
+        // P4 authz knobs: env > file (no CLI flag, like the governor). Empty iss/aud → None.
+        rules: env.rules.clone().or_else(|| file.and_then(|f| f.rules.clone())),
+        auth_jwks: env
+            .auth_jwks
+            .clone()
+            .or_else(|| file.and_then(|f| f.auth_jwks.clone())),
+        auth_iss: env
+            .auth_iss
+            .clone()
+            .or_else(|| file.and_then(|f| f.auth_iss.clone()))
+            .filter(|s| !s.is_empty()),
+        auth_aud: env
+            .auth_aud
+            .clone()
+            .or_else(|| file.and_then(|f| f.auth_aud.clone()))
+            .filter(|s| !s.is_empty()),
     }
 }
 
@@ -692,6 +733,39 @@ mod tests {
         let env = EnvLayer { admin_token: Some(String::new()), ..Default::default() };
         let c = resolve(&CliLayer::default(), &env, Some(&f));
         assert_eq!(c.admin_token, Some("file-tok".into()), "empty env must not shadow the file");
+    }
+
+    #[test]
+    fn authz_knobs_resolution() {
+        // Absent everywhere → all None (authz off).
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), None);
+        assert_eq!(c.rules, None);
+        assert_eq!(c.auth_jwks, None);
+        assert_eq!(c.auth_iss, None);
+        assert_eq!(c.auth_aud, None);
+        // File provides them.
+        let f = file(
+            r#"
+            rules = "/etc/rhypedb/rules.rhype"
+            auth_jwks = "/etc/rhypedb/jwks.json"
+            auth_iss = "https://auth.jkbase.app/v1/projects/p"
+            auth_aud = "p"
+        "#,
+        );
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.rules, Some(PathBuf::from("/etc/rhypedb/rules.rhype")));
+        assert_eq!(c.auth_jwks, Some(PathBuf::from("/etc/rhypedb/jwks.json")));
+        assert_eq!(c.auth_aud, Some("p".into()));
+        // Env wins over file for the paths; an empty iss/aud env resolves to None.
+        let env = EnvLayer {
+            rules: Some(PathBuf::from("/env/rules.rhype")),
+            auth_aud: Some(String::new()),
+            ..Default::default()
+        };
+        let c = resolve(&CliLayer::default(), &env, Some(&f));
+        assert_eq!(c.rules, Some(PathBuf::from("/env/rules.rhype")), "env path wins");
+        assert_eq!(c.auth_jwks, Some(PathBuf::from("/etc/rhypedb/jwks.json")), "file used when env absent");
+        assert_eq!(c.auth_aud, None, "empty env aud → None");
     }
 
     #[test]

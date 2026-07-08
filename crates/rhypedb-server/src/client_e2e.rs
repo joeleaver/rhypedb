@@ -91,6 +91,8 @@ fn build_state() -> Arc<AppState> {
         query_governor: None,
         queries_total: Arc::new(AtomicU64::new(0)),
         metering_cache: std::sync::Mutex::new(None),
+        rules: None,
+        principal_source: None,
     })
 }
 

@@ -185,6 +185,69 @@ pub(crate) fn filter_read(ctx: &ExecContext<'_>, objs: &mut Vec<Object>) {
     });
 }
 
+/// A [`ResourceAccessor`] over a change event's JSON field snapshot — no db, so relationship
+/// projections are unavailable (a rule that traverses evaluates them as absent ⇒ its clause is
+/// false). Used for the subscribe per-event filter when the live object is gone (a delete).
+struct JsonSnapshot<'a> {
+    fields: Option<&'a std::collections::HashMap<String, serde_json::Value>>,
+}
+
+impl ResourceAccessor for JsonSnapshot<'_> {
+    fn resource_scalar(&self, field: &str) -> Option<serde_json::Value> {
+        self.fields?.get(field).cloned()
+    }
+    fn resource_relation_one(&self, _rel: &str, _f: &str) -> Option<serde_json::Value> {
+        None
+    }
+    fn resource_relation_many(&self, _rel: &str, _f: &str) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    fn request_field(&self, _f: &str) -> Option<serde_json::Value> {
+        None
+    }
+}
+
+/// Subscribe per-event read gate (P0-DBA-5): may `principal` **read** the object this change event
+/// is about? A subscription is a standing read, so an event is delivered only if the subscriber
+/// passes the same `read` rule a query would (otherwise a sub is a read-rule bypass). For a live
+/// object (create/update) the current object is fetched and evaluated with the full
+/// [`EngineResource`] (so relationship + unchanged-field rules work exactly as on the query path);
+/// for a delete (object gone) it evaluates against the event's JSON field snapshot. **Fail-closed**:
+/// a vanished object or an absent snapshot field simply doesn't grant. Callers invoke this only when
+/// a rules program is configured.
+// The arg list is a cohesive set (authz context + the event's identity); bundling it into a struct
+// would add a type without adding clarity.
+#[allow(clippy::too_many_arguments)]
+pub fn event_read_allowed(
+    db: &Database,
+    governor: &Governor,
+    rules: &RulesProgram,
+    principal: &rhypedb_authz::Principal,
+    type_name: &str,
+    object_id: u64,
+    is_delete: bool,
+    snapshot: Option<&std::collections::HashMap<String, serde_json::Value>>,
+) -> bool {
+    // Live object (create/update): fetch it and use the full accessor (relationship rules work).
+    if !is_delete
+        && let Ok(mut obj) = db.get(type_name, object_id)
+    {
+        obj.ensure_fields_deserialized();
+        let res = EngineResource {
+            db,
+            governor,
+            type_name,
+            object: Some(&obj),
+            request: None,
+        };
+        return rules.evaluate(Op::Read, type_name, principal, &res).is_allow();
+    }
+    // A delete (object gone), or an object that vanished between commit and delivery → evaluate
+    // against the event's JSON snapshot (fail-closed for relationship/absent-field rules).
+    let res = JsonSnapshot { fields: snapshot };
+    rules.evaluate(Op::Read, type_name, principal, &res).is_allow()
+}
+
 fn decide(
     rules: &RulesProgram,
     op: Op,
@@ -398,6 +461,28 @@ mod tests {
         ));
         // read still works.
         assert_eq!(n_objects(run(&c, "Post")), 1);
+    }
+
+    #[test]
+    fn event_read_allowed_gates_subscription() {
+        use crate::Governor;
+        let (_d, db) = db();
+        let pid = mk_post(&db, "t", false, "u1");
+        let r = rules(
+            "match Post { allow read: if request.auth.uid == resource.ownerUid; }",
+            &db,
+        );
+        let gov = Governor::disabled();
+        // Live object (create/update event): fetch + evaluate the read rule.
+        assert!(super::event_read_allowed(&db, &gov, &r, &user("u1"), "Post", pid, false, None));
+        assert!(!super::event_read_allowed(&db, &gov, &r, &user("u2"), "Post", pid, false, None));
+        assert!(!super::event_read_allowed(&db, &gov, &r, &Principal::anonymous(), "Post", pid, false, None));
+        // Delete event (object gone): evaluate against the event's field snapshot.
+        let snap = std::collections::HashMap::from([("ownerUid".to_string(), serde_json::json!("u1"))]);
+        assert!(super::event_read_allowed(&db, &gov, &r, &user("u1"), "Post", pid, true, Some(&snap)));
+        assert!(!super::event_read_allowed(&db, &gov, &r, &user("u2"), "Post", pid, true, Some(&snap)));
+        // Delete with no snapshot → fail-closed (can't confirm the principal could read it).
+        assert!(!super::event_read_allowed(&db, &gov, &r, &user("u1"), "Post", pid, true, None));
     }
 
     #[test]

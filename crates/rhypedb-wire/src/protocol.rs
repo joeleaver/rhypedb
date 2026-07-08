@@ -116,6 +116,12 @@ pub const REQ_EXECUTE: u8 = 0x05;
 pub const REQ_SUBSCRIBE: u8 = 0x06;
 /// Close a subscription (payload = `[sub_req_id: u32 BE]`); replies `Done`.
 pub const REQ_UNSUBSCRIBE: u8 = 0x07;
+/// Authenticate this connection (P4). Payload = the raw UTF-8 end-user JWT (the whole payload, no
+/// inner length). Sets the connection's verified principal; replies `Done` on success, `Error` on an
+/// absent/invalid token (the connection stays open, principal reset to anonymous). Back-compat is
+/// free: an old server has no arm for `0x08` and returns the unknown-request-type `Error`, so a new
+/// client can detect "auth unsupported"; an old client never sends it and stays anonymous.
+pub const REQ_AUTH: u8 = 0x08;
 
 // Response types
 pub const RESP_OBJECTS: u8 = 0x80;

@@ -171,6 +171,15 @@ pub(crate) struct AppState {
     /// this bounds how often a hammering caller can trigger an O(n) keyspace scan
     /// (self-amplification) — at most once per [`METERING_CACHE_TTL`].
     pub(crate) metering_cache: std::sync::Mutex<Option<(std::time::Instant, u64, u64)>>,
+    /// P4 data-plane authz — the compiled default-deny security-rules program, or `None` = **authz
+    /// off** (every `ExecContext` gets `rules = None`, so the executor takes its exact pre-P4 path).
+    /// Fixed at startup; a schema hot-reload does NOT recompile rules — a stale rule referencing a
+    /// renamed field resolves to `null` and fails **closed** (never open); a restart recompiles.
+    pub(crate) rules: Option<Arc<rhypedb_authz::RulesProgram>>,
+    /// P4 — verifies an end-user JWT into a [`rhypedb_authz::Principal`] offline, against the
+    /// project's JWKS. `None` = no verification configured ⇒ every request is anonymous. Never
+    /// `None` when [`AppState::rules`] is `Some` (startup refuses that combination).
+    pub(crate) principal_source: Option<Arc<rhypedb_authz::JwtSource>>,
 }
 
 /// How long an object/edge count is reused before `/status` re-scans. Small enough
@@ -196,6 +205,29 @@ impl AppState {
             None => rhypedb_query::Governor::disabled(),
         }
     }
+
+    /// Resolve a request's bearer token into a verified [`rhypedb_authz::Principal`] (P4). Anonymous
+    /// when no verifier is configured or the token is absent/invalid — which, under a rules program,
+    /// is subject to default-deny, never fail-open.
+    pub(crate) fn principal(&self, bearer: Option<&str>) -> rhypedb_authz::Principal {
+        use rhypedb_authz::PrincipalSource;
+        match &self.principal_source {
+            Some(src) => src.principal(bearer),
+            None => rhypedb_authz::Principal::anonymous(),
+        }
+    }
+}
+
+/// Extract an `Authorization: Bearer <token>` value from request headers (P4). Case-sensitive on the
+/// `Bearer ` scheme (RFC 6750); a non-ASCII header, a different scheme, or an empty token → `None`.
+fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    raw.strip_prefix("Bearer ")
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 #[derive(Deserialize)]
@@ -249,8 +281,12 @@ fn value_to_json(v: Value) -> serde_json::Value {
 
 async fn handle_query(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<QueryRequest>,
 ) -> (StatusCode, Json<QueryResponse>) {
+    // P4: resolve the end-user principal from the Authorization header (anonymous when authz is off
+    // or the token is absent/invalid). Cheap when no verifier is configured.
+    let principal = state.principal(bearer_from_headers(&headers).as_deref());
     let query = match state.query_cache.get_or_parse(&req.query) {
         Ok(q) => q,
         Err(e) => {
@@ -282,10 +318,8 @@ async fn handle_query(
             default_ef: state.default_ef,
             default_rerank: state.default_rerank,
             governor: state.governor(),
-            // P4d wires the request principal (from the Authorization header) + `state.rules` here;
-            // until then this path is anonymous + rules-off (behavior unchanged).
-            principal: rhypedb_authz::Principal::anonymous(),
-            rules: None,
+            principal,
+            rules: state.rules.clone(),
         };
         rhypedb_query::executor::execute(&ctx, &query)
     };
@@ -638,6 +672,64 @@ fn quantization_name(q: &QuantizationType) -> &'static str {
     }
 }
 
+/// Load the P4 data-plane authz config, **fail-closed**: any misconfiguration aborts startup rather
+/// than starting the DB open. Returns `(rules, principal_source)`, both `None` when authz is off.
+///
+/// Rules are compiled against the live `schema` here (unknown type/field ⇒ startup error). A rules
+/// program REQUIRES a JWKS to verify end-user tokens against — without it every request would be
+/// anonymous and default-deny would lock the DB, so that combination is rejected loudly instead.
+fn load_authz(
+    cfg: &config::ServerConfig,
+    schema: &Schema,
+) -> (
+    Option<Arc<rhypedb_authz::RulesProgram>>,
+    Option<Arc<rhypedb_authz::JwtSource>>,
+) {
+    let fatal = |msg: String| -> ! {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    };
+
+    // JWKS → JwtSource (verifier). May be set without rules (verify-but-don't-enforce is harmless).
+    let principal_source = cfg.auth_jwks.as_ref().map(|path| {
+        let raw = std::fs::read(path)
+            .unwrap_or_else(|e| fatal(format!("failed to read RHYPEDB_AUTH_JWKS {}: {e}", path.display())));
+        let jwks = rhypedb_authz::Jwks::from_json(&raw)
+            .unwrap_or_else(|e| fatal(format!("invalid JWKS in {}: {e}", path.display())));
+        if jwks.is_empty() {
+            fatal(format!("JWKS in {} contains no keys", path.display()));
+        }
+        let mut src = rhypedb_authz::JwtSource::new(jwks);
+        if let Some(iss) = &cfg.auth_iss {
+            src = src.expect_iss(iss.clone());
+        }
+        if let Some(aud) = &cfg.auth_aud {
+            src = src.expect_aud(aud.clone());
+        }
+        Arc::new(src)
+    });
+
+    // Rules → compiled program (schema-validated, fail-closed).
+    let rules = cfg.rules.as_ref().map(|path| {
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| fatal(format!("failed to read RHYPEDB_RULES {}: {e}", path.display())));
+        let program = rhypedb_authz::RulesProgram::compile(&src, schema)
+            .unwrap_or_else(|e| fatal(format!("invalid security rules in {}: {e}", path.display())));
+        Arc::new(program)
+    });
+
+    if rules.is_some() && principal_source.is_none() {
+        fatal(
+            "RHYPEDB_RULES is set but RHYPEDB_AUTH_JWKS is not — security rules can't verify \
+             end-user tokens without a JWKS (every request would be anonymous and default-deny \
+             would lock the database). Set RHYPEDB_AUTH_JWKS to the project's public keys."
+                .to_string(),
+        );
+    }
+
+    (rules, principal_source)
+}
+
 /// Build the CLI layer for config resolution. Flags WITH a clap default
 /// (`data_dir`/`listen`/`tcp_listen`) contribute ONLY when the user actually typed
 /// them (`ValueSource::CommandLine`), so a default never shadows env/file.
@@ -865,6 +957,11 @@ pub async fn run() {
     // `config::resolve`). Admin disabled (token None) → admin endpoints return 403.
     let admin_enabled = cfg.admin_token.is_some();
 
+    // P4 data-plane authz: compile the security rules against the live schema + build the JWT
+    // verifier from the project JWKS. Fail-closed — a malformed rules file/JWKS, or rules with no
+    // JWKS to verify tokens against, aborts startup rather than opening the DB unprotected.
+    let (rules, principal_source) = load_authz(&cfg, &schema);
+
     let state = Arc::new(AppState {
         db: ArcSwap::from(db),
         vectorizer,
@@ -883,6 +980,8 @@ pub async fn run() {
         query_governor: cfg.query_governor,
         queries_total: Arc::new(AtomicU64::new(0)),
         metering_cache: std::sync::Mutex::new(None),
+        rules,
+        principal_source,
     });
 
     // Re-register completion watchers for any migration left in flight by a prior
@@ -1306,6 +1405,10 @@ async fn handle_connection_stream<R, W>(
     // protect a client that does not demultiplex. Run queries on another socket.
     let mut subscription_mode = false;
 
+    // Per-connection verified identity (P4). Anonymous until a REQ_AUTH frame sets it; consulted by
+    // every query/subscribe on this connection when a rules program is configured (otherwise unused).
+    let mut principal = rhypedb_authz::Principal::anonymous();
+
     loop {
         // Multiplex three sources on this one task (so whole frames never
         // interleave — only one branch's write runs to completion at a time):
@@ -1338,6 +1441,27 @@ async fn handle_connection_stream<R, W>(
                         {
                             eprintln!("tcp sublagged write error: {e}");
                             return;
+                        }
+                        // P4 per-event read authz (P0-DBA-5): a subscription is a standing read, so
+                        // only deliver an event for an object this connection's principal may READ —
+                        // else drop it silently (a sub must never leak rows the read rule denies).
+                        // Runs off the commit hot path (here at dequeue), not in the sink.
+                        if let Some(rules) = &state.rules {
+                            let db = state.db();
+                            let is_delete =
+                                matches!(push.event.kind, rhypedb_subscribe::ChangeKind::Delete);
+                            if !rhypedb_query::authz::event_read_allowed(
+                                &db,
+                                &state.governor(),
+                                rules,
+                                &principal,
+                                &push.event.type_name,
+                                push.event.object_id,
+                                is_delete,
+                                push.event.fields.as_ref(),
+                            ) {
+                                continue;
+                            }
                         }
                         if let Err(e) = write_event_push(
                             writer,
@@ -1425,6 +1549,41 @@ async fn handle_connection_stream<R, W>(
                     return;
                 }
             }
+            protocol::REQ_AUTH => {
+                // P4: authenticate the connection. Payload = the raw UTF-8 JWT. Verify it into a
+                // principal (anonymous on ANY failure — bad UTF-8, invalid/expired token, or no
+                // verifier configured). A failure resets the connection to anonymous and replies
+                // Error; success replies Done. The connection is NEVER closed (the client may retry).
+                let token = std::str::from_utf8(&frame.payload)
+                    .ok()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty());
+                principal = state.principal(token);
+                let write = if principal.is_authenticated() {
+                    protocol::write_frame_buffered(
+                        writer,
+                        &mut response_buf,
+                        frame.req_id,
+                        protocol::RESP_DONE,
+                        |_| {},
+                    )
+                    .await
+                } else {
+                    let msg = "authentication failed";
+                    protocol::write_frame_buffered(
+                        writer,
+                        &mut response_buf,
+                        frame.req_id,
+                        protocol::RESP_ERROR,
+                        |buf| protocol::encode_error_payload_into(msg, buf),
+                    )
+                    .await
+                };
+                if let Err(e) = write {
+                    eprintln!("tcp auth reply write error: {e}");
+                    return;
+                }
+            }
             protocol::REQ_QUERY => {
                 let query_text = match protocol::decode_query_payload(&frame.payload) {
                     Ok(q) => q,
@@ -1446,7 +1605,7 @@ async fn handle_connection_stream<R, W>(
                 // released before the frame write, which touches no handle state.
                 let response = {
                     let _epoch = state.reload_lock.read().await;
-                    execute_query(&state, &query_text)
+                    execute_query(&state, &query_text, &principal)
                 };
                 if let Err(e) =
                     write_query_result(writer, &mut response_buf, frame.req_id, &state, response).await
@@ -1550,7 +1709,7 @@ async fn handle_connection_stream<R, W>(
                 let response = match prepared.get(&stmt_id).cloned() {
                     Some(query) => {
                         let _epoch = state.reload_lock.read().await;
-                        execute_parsed(&state, &query)
+                        execute_parsed(&state, &query, &principal)
                     }
                     None => Err(format!(
                         "unknown statement id {stmt_id} — prepare it on this connection first"
@@ -1611,6 +1770,25 @@ async fn handle_connection_stream<R, W>(
                 let outcome: Result<(), String> = (|| {
                     let filter = protocol::decode_subscribe_filter(&frame.payload)
                         .map_err(|e| format!("decode: {e}"))?;
+                    // P4 subscribe authz: gate the `subscribe` op for the target type (P0-DBA-5).
+                    // A wildcard (no type) subscription can't be authorized under rules → deny. The
+                    // per-event READ filter (at dequeue) still gates every delivered event.
+                    if let Some(rules) = &state.rules {
+                        let allowed = match filter.type_name.as_deref() {
+                            Some(t) => rules
+                                .evaluate(
+                                    rhypedb_authz::Op::Subscribe,
+                                    t,
+                                    &principal,
+                                    &rhypedb_authz::EmptyResource,
+                                )
+                                .is_allow(),
+                            None => false,
+                        };
+                        if !allowed {
+                            return Err("subscribe denied by security rules".to_string());
+                        }
+                    }
                     if conn_subs.subs.len() >= MAX_SUBSCRIPTIONS_PER_CONN {
                         return Err(format!(
                             "too many subscriptions on this connection (max {MAX_SUBSCRIPTIONS_PER_CONN})"
@@ -1738,13 +1916,18 @@ async fn handle_connection_stream<R, W>(
     }
 }
 
-/// Parse and execute a query, returning either the result or an error message.
-fn execute_query(state: &AppState, query_text: &str) -> Result<QueryOutput, String> {
+/// Parse and execute a query, returning either the result or an error message. `principal` is the
+/// connection's verified identity (P4) — anonymous until a `REQ_AUTH` frame set it.
+fn execute_query(
+    state: &AppState,
+    query_text: &str,
+    principal: &rhypedb_authz::Principal,
+) -> Result<QueryOutput, String> {
     let query = state
         .query_cache
         .get_or_parse(query_text)
         .map_err(|e| format!("parse error: {e}"))?;
-    execute_parsed(state, &query)
+    execute_parsed(state, &query, principal)
 }
 
 /// Execute an already-parsed query (the shared tail of `execute_query` and the
@@ -1752,6 +1935,7 @@ fn execute_query(state: &AppState, query_text: &str) -> Result<QueryOutput, Stri
 fn execute_parsed(
     state: &AppState,
     query: &rhypedb_query::ast::Query,
+    principal: &rhypedb_authz::Principal,
 ) -> Result<QueryOutput, String> {
     // Metering: the binary-protocol choke point (HTTP `/query` counts separately).
     state.queries_total.fetch_add(1, Ordering::Relaxed);
@@ -1762,10 +1946,8 @@ fn execute_parsed(
         default_ef: state.default_ef,
         default_rerank: state.default_rerank,
         governor: state.governor(),
-        // P4d wires the per-connection principal (set by the REQ_AUTH frame) + `state.rules` here;
-        // until then this path is anonymous + rules-off (behavior unchanged).
-        principal: rhypedb_authz::Principal::anonymous(),
-        rules: None,
+        principal: principal.clone(),
+        rules: state.rules.clone(),
     };
     rhypedb_query::executor::execute(&ctx, query).map_err(|e| format!("{e}"))
 }
@@ -1871,7 +2053,117 @@ mod tcp_tests {
             query_governor,
             queries_total: Arc::new(AtomicU64::new(0)),
             metering_cache: std::sync::Mutex::new(None),
+            rules: None,
+            principal_source: None,
         })
+    }
+
+    /// A rules-ON `AppState` (schema `User { name, age }`) for the P4 authz-path tests: compiles
+    /// `rules_src` against the live schema and installs a `JwtSource` over `signer`'s public key.
+    fn test_state_with_rules(
+        rules_src: &str,
+        signer: &rhypedb_authz::jose::test_support::SigningKeypair,
+    ) -> Arc<AppState> {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema("type User { name: String  age: u32 }").unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let data_dir = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        let schema_path = data_dir.join("schema.rhype");
+        let rules = Some(Arc::new(
+            rhypedb_authz::RulesProgram::compile(rules_src, db.schema()).unwrap(),
+        ));
+        let jwks = rhypedb_authz::Jwks::new(vec![signer.jwk()]);
+        let principal_source = Some(Arc::new(rhypedb_authz::JwtSource::new(jwks)));
+        Arc::new(AppState {
+            db: ArcSwap::from(db),
+            vectorizer: None,
+            query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
+            admin_token: None,
+            reload_lock: tokio::sync::RwLock::new(()),
+            pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
+            data_dir,
+            schema_path,
+            default_ef: None,
+            default_rerank: None,
+            graceful_drain: std::time::Duration::from_secs(20),
+            worker_quiesce_budget: std::time::Duration::from_secs(10),
+            network_subs: Arc::new(AtomicUsize::new(0)),
+            events_dropped: Arc::new(AtomicU64::new(0)),
+            query_governor: None,
+            queries_total: Arc::new(AtomicU64::new(0)),
+            metering_cache: std::sync::Mutex::new(None),
+            rules,
+            principal_source,
+        })
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn mint(signer: &rhypedb_authz::jose::test_support::SigningKeypair, sub: &str) -> String {
+        let now = now_secs();
+        signer.sign(&rhypedb_authz::Claims {
+            iss: "iss".into(),
+            sub: sub.into(),
+            aud: "aud".into(),
+            iat: now,
+            exp: now + 3600,
+            jti: "j".into(),
+            claims: None,
+        })
+    }
+
+    #[test]
+    fn bearer_from_headers_parses_only_valid_bearer() {
+        use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        assert_eq!(bearer_from_headers(&h), None, "no header → None");
+        h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer abc.def.ghi"));
+        assert_eq!(bearer_from_headers(&h).as_deref(), Some("abc.def.ghi"));
+        h.insert(AUTHORIZATION, HeaderValue::from_static("Basic zzz"));
+        assert_eq!(bearer_from_headers(&h), None, "non-Bearer scheme → None");
+        h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer   "));
+        assert_eq!(bearer_from_headers(&h), None, "empty token → None");
+    }
+
+    #[tokio::test]
+    async fn http_query_enforces_rules_via_authorization_header() {
+        // Read requires an authenticated principal. Seed rows directly through the engine (bypassing
+        // query authz), then prove the HTTP path filters by the header-derived principal.
+        let signer = rhypedb_authz::jose::test_support::SigningKeypair::from_seed("p.1", [5u8; 32]);
+        let state = test_state_with_rules("match User { allow read: if request.auth != null; }", &signer);
+        {
+            let db = state.db();
+            for name in ["a", "b"] {
+                let mut f = rhypedb_engine::object::FieldMap::new();
+                f.insert("name".into(), rhypedb_engine::object::Value::String(name.into()));
+                f.insert("age".into(), rhypedb_engine::object::Value::U32(1));
+                db.create("User", f).unwrap();
+            }
+        }
+        let ask = |st: Arc<AppState>, hdrs: axum::http::HeaderMap| async move {
+            let (_status, axum::Json(body)) =
+                handle_query(State(st), hdrs, Json(QueryRequest { query: "User".into() })).await;
+            body.objects.map(|o| o.len()).unwrap_or(0)
+        };
+        // Anonymous → the read rule denies → every row filtered out.
+        assert_eq!(ask(state.clone(), axum::http::HeaderMap::new()).await, 0, "anon sees nothing");
+        // Valid Bearer token → authenticated principal → rows returned.
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", mint(&signer, "u1")).parse().unwrap(),
+        );
+        assert_eq!(ask(state.clone(), h).await, 2, "authenticated sees rows");
+        // A garbage token → anonymous → nothing (fail-closed, never fail-open).
+        let mut bad = axum::http::HeaderMap::new();
+        bad.insert(axum::http::header::AUTHORIZATION, "Bearer not.a.jwt".parse().unwrap());
+        assert_eq!(ask(state, bad).await, 0, "invalid token → anonymous → denied");
     }
 
     #[test]
@@ -1885,20 +2177,20 @@ mod tcp_tests {
         };
         let state = test_state_with_governor(Some(limits));
         for i in 0..5 {
-            execute_query(&state, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#))
+            execute_query(&state, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#), &rhypedb_authz::Principal::anonymous())
                 .expect("create");
         }
         // A type of 5 rows exceeds the 3-row budget -> fail closed through the
         // server's execute path (the count-gate refuses it, no silent truncation).
-        let err = execute_query(&state, "User").unwrap_err();
+        let err = execute_query(&state, "User", &rhypedb_authz::Principal::anonymous()).unwrap_err();
         assert!(err.contains("resource limit exceeded"), "got: {err}");
         // And with the governor OFF, the same listing succeeds unbounded.
         let open = test_state_with_governor(None);
         for i in 0..5 {
-            execute_query(&open, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#))
+            execute_query(&open, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#), &rhypedb_authz::Principal::anonymous())
                 .expect("create");
         }
-        assert!(execute_query(&open, "User").is_ok());
+        assert!(execute_query(&open, "User", &rhypedb_authz::Principal::anonymous()).is_ok());
     }
 
     #[tokio::test]
@@ -2156,7 +2448,7 @@ mod tcp_tests {
 
         // Write a row so the active memtable is non-empty — flush is a no-op on an
         // empty memtable, so without this the test would prove nothing.
-        execute_query(&state, r#"User.create({ name: "Persist", age: 7 })"#).unwrap();
+        execute_query(&state, r#"User.create({ name: "Persist", age: 7 })"#, &rhypedb_authz::Principal::anonymous()).unwrap();
 
         // Ephemeral ports so the test never collides with a fixed bind.
         let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2341,10 +2633,10 @@ mod tcp_tests {
         // Seed data + run queries; each execute_query goes through the metered
         // `execute_parsed` choke point.
         for i in 0..3 {
-            execute_query(&state, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#))
+            execute_query(&state, &format!(r#"User.create({{ name: "u{i}", age: {i} }})"#), &rhypedb_authz::Principal::anonymous())
                 .expect("create");
         }
-        execute_query(&state, "User").expect("read"); // 4th query
+        execute_query(&state, "User", &rhypedb_authz::Principal::anonymous()).expect("read"); // 4th query
         let app = Router::new()
             .route("/status", get(handle_status))
             .with_state(state.clone());
