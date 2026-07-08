@@ -1,0 +1,25 @@
+[package]
+name = "rhypedb-authz"
+version.workspace = true
+edition.workspace = true
+description = "Data-plane authorization for rhypedb: verified end-user principal (EdDSA/JWT) and default-deny security rules."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+# Exposes a test-only `SigningKeypair` (jose::test_support) so downstream crates'
+# tests can mint tokens that exercise verify(). The production engine NEVER signs.
+test-support = []
+
+[dependencies]
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The verify half is exercised against tokens minted by an in-test signer, so
+# tests need the signing side of ed25519-dalek even though the crate itself only
+# ever verifies (the private key lives host-side in jkbase, never in the engine).
