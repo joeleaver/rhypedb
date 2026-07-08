@@ -282,6 +282,10 @@ async fn handle_query(
             default_ef: state.default_ef,
             default_rerank: state.default_rerank,
             governor: state.governor(),
+            // P4d wires the request principal (from the Authorization header) + `state.rules` here;
+            // until then this path is anonymous + rules-off (behavior unchanged).
+            principal: rhypedb_authz::Principal::anonymous(),
+            rules: None,
         };
         rhypedb_query::executor::execute(&ctx, &query)
     };
@@ -1758,6 +1762,10 @@ fn execute_parsed(
         default_ef: state.default_ef,
         default_rerank: state.default_rerank,
         governor: state.governor(),
+        // P4d wires the per-connection principal (set by the REQ_AUTH frame) + `state.rules` here;
+        // until then this path is anonymous + rules-off (behavior unchanged).
+        principal: rhypedb_authz::Principal::anonymous(),
+        rules: None,
     };
     rhypedb_query::executor::execute(&ctx, query).map_err(|e| format!("{e}"))
 }

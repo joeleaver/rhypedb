@@ -2555,6 +2555,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
+ "rhypedb-schema",
  "serde",
  "serde_json",
  "thiserror",
@@ -2631,6 +2632,7 @@ name = "rhypedb-query"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "rhypedb-authz",
  "rhypedb-engine",
  "rhypedb-schema",
  "rhypedb-storage",
@@ -2657,6 +2659,7 @@ dependencies = [
  "libmimalloc-sys",
  "mimalloc",
  "parking_lot",
+ "rhypedb-authz",
  "rhypedb-client",
  "rhypedb-codegen",
  "rhypedb-embed",

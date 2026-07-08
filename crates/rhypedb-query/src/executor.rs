@@ -74,6 +74,14 @@ pub struct ExecContext<'a> {
     /// clamps). [`Governor::disabled`] for embedded/library callers (the default);
     /// the server arms it from `RHYPEDB_MAX_QUERY_*`. See [`crate::governor`].
     pub governor: Governor,
+    /// The verified end-user identity for this query (P4). The **anonymous** principal for
+    /// embedded/library callers and for any request without a valid token — which, under a rules
+    /// program, is subject to default-deny (never fail-open). See [`crate::authz`].
+    pub principal: rhypedb_authz::Principal,
+    /// The compiled default-deny security-rules program, or `None` = **authz disabled**: the
+    /// executor takes its exact pre-P4 path (no gate, no principal check), so every rules-off
+    /// deployment is byte-unchanged. `Some` ⇒ create/write/read are gated (P0-DBA-1).
+    pub rules: Option<std::sync::Arc<rhypedb_authz::RulesProgram>>,
 }
 
 impl<'a> ExecContext<'a> {
@@ -88,6 +96,8 @@ impl<'a> ExecContext<'a> {
             default_ef: None,
             default_rerank: None,
             governor: Governor::disabled(),
+            principal: rhypedb_authz::Principal::anonymous(),
+            rules: None,
         }
     }
 }
@@ -146,6 +156,17 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
             result = QueryOutput::Objects(materialize_ids(ctx.db, &type_name, &ids));
         }
         _ => {}
+    }
+
+    // P4 read authz: filter the terminal result set through the `read` rule (no-op when rules are
+    // off). Only READ-shaped queries are filtered — a `create_batch`/multi-row `update` also lands
+    // as `Objects` but is gated at its own create/write site, not read-filtered. Denied rows are
+    // dropped (Firestore semantics), so a point-`get` of an unreadable id returns an empty result.
+    if ctx.rules.is_some()
+        && crate::authz::is_read_query(query)
+        && let QueryOutput::Objects(ref mut objs) = result
+    {
+        crate::authz::filter_read(ctx, objs);
     }
 
     // A pipeline that produced `Objects` directly (filter, scan, similar, get)
@@ -211,6 +232,8 @@ fn execute_source(
 
         Source::Create { type_name, fields } => {
             let field_map = literal_map_to_field_map(db, type_name, fields)?;
+            // P4 create authz: gate the incoming fields before the write (no-op when rules off).
+            crate::authz::gate_create(ctx, type_name, &field_map)?;
             let obj = db.create(type_name, field_map)?;
             Ok(QueryOutput::Single(obj))
         }
@@ -223,6 +246,11 @@ fn execute_source(
                 .iter()
                 .map(|r| literal_map_to_field_map(db, type_name, r))
                 .collect::<QueryResult<_>>()?;
+            // P4 create authz: every row must pass the `create` rule (no-op when rules off) — the
+            // whole batch fails closed if any row is denied.
+            for fm in &field_maps {
+                crate::authz::gate_create(ctx, type_name, fm)?;
+            }
             let objects = db.create_batch(type_name, field_maps)?;
             Ok(QueryOutput::Objects(objects))
         }
@@ -516,6 +544,17 @@ fn execute_step(
             // Bound a bulk update against the row budget (and re-check the deadline).
             ctx.governor.charge(ids.len() as u64)?;
             let field_map = literal_map_to_field_map(db, &type_name, fields)?;
+            // P4 write authz: gate each PRE-mutation object against the `update` rule, with the
+            // incoming fields visible as `request.*` (no-op when rules off). P0-DBA-6: checking the
+            // stored object before the write stops a rule like `resource.author == request.auth.uid`
+            // from being defeated by the same update that rewrites `author`.
+            crate::authz::gate_write(
+                ctx,
+                rhypedb_authz::Op::Update,
+                &type_name,
+                &ids,
+                Some(&field_map),
+            )?;
             let mut updated = Vec::with_capacity(ids.len());
             for id in &ids {
                 updated.push(db.update(&type_name, *id, field_map.clone())?);
@@ -530,6 +569,8 @@ fn execute_step(
         Step::Delete => {
             let (type_name, ids) = ids_from_output(current, source)?;
             ctx.governor.charge(ids.len() as u64)?;
+            // P4 write authz: gate each pre-mutation object against the `delete` rule (no-op off).
+            crate::authz::gate_write(ctx, rhypedb_authz::Op::Delete, &type_name, &ids, None)?;
             for id in ids {
                 db.delete(&type_name, id)?;
             }
@@ -543,6 +584,9 @@ fn execute_step(
         } => {
             let (source_type, ids) = ids_from_output(current, source)?;
             ctx.governor.charge(ids.len() as u64)?;
+            // P4 write authz: a link mutates the source object's relationships → gate it as an
+            // `update` on the source type (no-op when rules off).
+            crate::authz::gate_write(ctx, rhypedb_authz::Op::Update, &source_type, &ids, None)?;
             // Resolve the relation field once — every source row has the
             // same type at this point. (Resolved before coercing the edge
             // fields, which need the relation's declared edge-field types.)
@@ -574,6 +618,8 @@ fn execute_step(
         } => {
             let (source_type, ids) = ids_from_output(current, source)?;
             ctx.governor.charge(ids.len() as u64)?;
+            // P4 write authz: an unlink mutates the source object's relationships → gate as `update`.
+            crate::authz::gate_write(ctx, rhypedb_authz::Op::Update, &source_type, &ids, None)?;
             let field_name = resolve_relation_field(db, &source_type, target_type)?;
             for id in ids {
                 db.unlink(&source_type, id, &field_name, *target_id)?;

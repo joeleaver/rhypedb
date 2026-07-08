@@ -23,6 +23,7 @@ onnx-dynamic = ["fastembed", "rhypedb-engine/onnx-dynamic"]
 bytes = { workspace = true }
 rhypedb-schema = { workspace = true }
 rhypedb-engine = { workspace = true }
+rhypedb-authz = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
@@ -30,3 +31,7 @@ thiserror = { workspace = true }
 rhypedb-storage = { workspace = true }
 tempfile = { workspace = true }
 bytes = { workspace = true }
+# test-support exposes Principal::new_authenticated so the authz gate tests can build
+# authenticated principals directly. Only affects the test build (dev-deps never reach the
+# library or downstream consumers), so the production surface stays principal-from-token-only.
+rhypedb-authz = { workspace = true, features = ["test-support"] }

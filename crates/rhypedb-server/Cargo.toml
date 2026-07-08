@@ -58,6 +58,7 @@ rhypedb-storage = { workspace = true }
 rhypedb-schema = { workspace = true }
 rhypedb-engine = { workspace = true }
 rhypedb-query = { workspace = true }
+rhypedb-authz = { workspace = true }
 rhypedb-embed = { workspace = true }
 rhypedb-vector = { workspace = true }
 rhypedb-subscribe = { workspace = true }
