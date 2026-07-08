@@ -37,6 +37,8 @@ struct Mock {
     scalar: HashMap<String, serde_json::Value>,
     rel_one: HashMap<String, serde_json::Value>,
     rel_many: HashMap<String, Vec<serde_json::Value>>,
+    /// Relation keys whose to-many projection is INDETERMINATE (over-budget) ⇒ resolves to `None`.
+    rel_many_unknown: std::collections::HashSet<String>,
     request: HashMap<String, serde_json::Value>,
 }
 
@@ -53,6 +55,11 @@ impl Mock {
         self.rel_many.insert(format!("{rel}.{f}"), v);
         self
     }
+    /// Mark a to-many projection as indeterminate (simulating an over-budget traversal → `None`).
+    fn rel_many_unknown(mut self, rel: &str, f: &str) -> Self {
+        self.rel_many_unknown.insert(format!("{rel}.{f}"));
+        self
+    }
     fn request(mut self, f: &str, v: serde_json::Value) -> Self {
         self.request.insert(f.into(), v);
         self
@@ -66,11 +73,12 @@ impl ResourceAccessor for Mock {
     fn resource_relation_one(&self, rel: &str, target_field: &str) -> Option<serde_json::Value> {
         self.rel_one.get(&format!("{rel}.{target_field}")).cloned()
     }
-    fn resource_relation_many(&self, rel: &str, target_field: &str) -> Vec<serde_json::Value> {
-        self.rel_many
-            .get(&format!("{rel}.{target_field}"))
-            .cloned()
-            .unwrap_or_default()
+    fn resource_relation_many(&self, rel: &str, target_field: &str) -> Option<Vec<serde_json::Value>> {
+        let key = format!("{rel}.{target_field}");
+        if self.rel_many_unknown.contains(&key) {
+            return None; // indeterminate (over-budget)
+        }
+        Some(self.rel_many.get(&key).cloned().unwrap_or_default())
     }
     fn request_field(&self, field: &str) -> Option<serde_json::Value> {
         self.request.get(field).cloned()
@@ -318,6 +326,23 @@ fn negation_of_absent_or_nonbool_denies() {
         eval(&strprog, Op::Read, "Post", &anon(), &Mock::default().scalar("title", serde_json::json!("hi"))),
         Decision::Deny
     );
+}
+
+#[test]
+fn overbudget_relation_denies_denylist() {
+    // Re-verify NEW_GAP: an INDETERMINATE (over-budget) to-many traversal must resolve to Absent
+    // (⇒ the comparison is Unknown ⇒ deny), NOT a concrete empty set — else a deny-list rule
+    // `!(uid in resource.members.uid)` would fail OPEN when the edge is too large to scan.
+    let prog = compile("match Org { allow read: if !(request.auth.uid in resource.members.uid); }");
+    // Genuinely-empty relation (determinate Some([])): uid not in {} → !(false) → allow.
+    assert_eq!(eval(&prog, Op::Read, "Org", &user("u"), &Mock::default()), Decision::Allow);
+    // Non-member of a determinate set → !(false) → allow; a member → !(true) → deny.
+    let with_members = Mock::default().rel_many("members", "uid", vec![serde_json::json!("blocked")]);
+    assert_eq!(eval(&prog, Op::Read, "Org", &user("u"), &with_members), Decision::Allow);
+    assert_eq!(eval(&prog, Op::Read, "Org", &user("blocked"), &with_members), Decision::Deny);
+    // OVER-BUDGET (indeterminate) → Absent → `in` Unknown → !(Unknown) → Unknown → DENY (fail closed).
+    let overbudget = Mock::default().rel_many_unknown("members", "uid");
+    assert_eq!(eval(&prog, Op::Read, "Org", &user("u"), &overbudget), Decision::Deny);
 }
 
 #[test]

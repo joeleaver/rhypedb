@@ -87,26 +87,26 @@ impl<'a> EngineResource<'a> {
         }
     }
 
-    /// Linked target ids for `rel` off the current object, bounded + governor-charged. Empty on any
-    /// failure or over-budget (⇒ the rule clause is simply false — fail-closed, P0-DBA-7).
-    fn linked_ids(&self, rel: &str) -> Vec<u64> {
-        let Some(obj) = self.object else { return Vec::new() };
-        let Ok(groups) = self.db.get_links_many(self.type_name, &[obj.id], rel) else {
-            return Vec::new();
-        };
-        // Charge the FULL edge set examined — like the query traversal path charges `hop_edges`
-        // (executor.rs) — NOT just the capped slice, so a rule over a huge to-many edge trips the
-        // row budget and fails closed rather than evading it. Over budget ⇒ empty (deny).
+    /// Linked target ids for `rel` off the current object. `None` = INDETERMINATE (no object,
+    /// traversal error, or over-budget) — the caller must fail this closed (Absent/Unknown), NOT
+    /// treat it as an empty set. `Some(ids)` is the determinate id list (`Some(empty)` = genuinely
+    /// unlinked). Charges the FULL examined edge set (like the query traversal's `hop_edges`), so a
+    /// rule over a huge to-many edge trips the row budget instead of evading it.
+    fn linked_ids(&self, rel: &str) -> Option<Vec<u64>> {
+        let obj = self.object?;
+        let groups = self.db.get_links_many(self.type_name, &[obj.id], rel).ok()?;
         let examined: u64 = groups.iter().map(|g| g.len() as u64).sum();
         if self.governor.charge(examined).is_err() {
-            return Vec::new();
+            return None; // over budget ⇒ indeterminate ⇒ fail closed (NOT an empty set)
         }
-        groups
-            .into_iter()
-            .flatten()
-            .map(|(id, _)| id)
-            .take(MAX_RULE_RELATION_TARGETS)
-            .collect()
+        Some(
+            groups
+                .into_iter()
+                .flatten()
+                .map(|(id, _)| id)
+                .take(MAX_RULE_RELATION_TARGETS)
+                .collect(),
+        )
     }
 
     fn target_scalar(&self, target_type: &str, id: u64, field: &str) -> Option<serde_json::Value> {
@@ -123,18 +123,21 @@ impl ResourceAccessor for EngineResource<'_> {
 
     fn resource_relation_one(&self, rel: &str, target_field: &str) -> Option<serde_json::Value> {
         let target_type = self.relation_target(rel)?;
-        let id = *self.linked_ids(rel).first()?;
+        // `None`/empty (indeterminate or unlinked) ⇒ None ⇒ Absent (fail closed).
+        let id = *self.linked_ids(rel)?.first()?;
         self.target_scalar(&target_type, id, target_field)
     }
 
-    fn resource_relation_many(&self, rel: &str, target_field: &str) -> Vec<serde_json::Value> {
-        let Some(target_type) = self.relation_target(rel) else {
-            return Vec::new();
-        };
-        self.linked_ids(rel)
-            .into_iter()
-            .filter_map(|id| self.target_scalar(&target_type, id, target_field))
-            .collect()
+    fn resource_relation_many(&self, rel: &str, target_field: &str) -> Option<Vec<serde_json::Value>> {
+        let target_type = self.relation_target(rel)?;
+        // Propagate indeterminacy: `None` from linked_ids (over-budget) stays `None` ⇒ Absent, so a
+        // deny-list rule fails closed rather than seeing a spurious empty set.
+        let ids = self.linked_ids(rel)?;
+        Some(
+            ids.into_iter()
+                .filter_map(|id| self.target_scalar(&target_type, id, target_field))
+                .collect(),
+        )
     }
 
     fn request_field(&self, field: &str) -> Option<serde_json::Value> {
@@ -224,8 +227,8 @@ impl ResourceAccessor for JsonSnapshot<'_> {
     fn resource_relation_one(&self, _rel: &str, _f: &str) -> Option<serde_json::Value> {
         None
     }
-    fn resource_relation_many(&self, _rel: &str, _f: &str) -> Vec<serde_json::Value> {
-        Vec::new()
+    fn resource_relation_many(&self, _rel: &str, _f: &str) -> Option<Vec<serde_json::Value>> {
+        None // relationships unavailable in a snapshot ⇒ Absent ⇒ deny (fail closed)
     }
     fn request_field(&self, _f: &str) -> Option<serde_json::Value> {
         None
