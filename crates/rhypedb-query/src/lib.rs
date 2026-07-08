@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod authz;
 pub mod parser;
 pub mod executor;
 pub mod error;

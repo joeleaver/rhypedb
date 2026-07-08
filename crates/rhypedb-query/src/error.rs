@@ -25,4 +25,11 @@ pub enum QueryError {
     /// [`crate::governor`].
     #[error("query resource limit exceeded: {0}")]
     ResourceLimitExceeded(String),
+
+    /// A default-deny security rule (P4) denied this operation for the request's
+    /// principal. A *write* fails loudly with this; a denied *read* silently
+    /// drops the row from the result instead (Firestore semantics). Only ever
+    /// produced when a rules program is configured (`ExecContext.rules = Some`).
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
 }
