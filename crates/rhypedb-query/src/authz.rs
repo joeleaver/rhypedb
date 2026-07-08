@@ -20,9 +20,8 @@ use rhypedb_authz::{Decision, Op, ResourceAccessor, RulesProgram};
 use rhypedb_engine::database::Database;
 use rhypedb_engine::object::{value_to_query_json, FieldMap, Object};
 
-use crate::ast::{Query, Source, Step};
 use crate::error::{QueryError, QueryResult};
-use crate::executor::ExecContext;
+use crate::executor::{ExecContext, QueryOutput};
 use crate::governor::Governor;
 
 /// Hard cap on the linked targets one rule relationship-projection reads, so a predicate over a
@@ -30,17 +29,40 @@ use crate::governor::Governor;
 /// rule additionally can't outrun the query's row budget.
 const MAX_RULE_RELATION_TARGETS: usize = 1024;
 
-/// The op class of a whole query, taken from its terminal step — used only to decide whether the
-/// terminal result set is a *read* (and so gets read-filtered). The create/write gates fire at
-/// their own engine-call sites regardless, so this never needs to reason about mid-pipeline type
-/// changes.
-pub(crate) fn is_read_query(query: &Query) -> bool {
-    match query.steps.last() {
-        Some(Step::Update { .. } | Step::Delete | Step::Link { .. } | Step::Unlink { .. }) => false,
-        _ => !matches!(
-            query.source,
-            Source::Create { .. } | Source::CreateBatch { .. }
-        ),
+/// Filter a terminal result through the `read` rule when rules are on (no-op otherwise). ANY object
+/// surfaced to the caller is a read, so this covers reads AND a mutation's returned post-image: a
+/// multi-row `Objects` result is filtered row-wise, and a `Single` (a create/update return value)
+/// the principal may not read collapses to `Done` (void, Firestore-style) rather than leaking. This
+/// is what stops an `update` return value from bypassing the read rule.
+pub(crate) fn apply_read_filter(ctx: &ExecContext<'_>, result: QueryOutput) -> QueryOutput {
+    let Some(rules) = &ctx.rules else {
+        return result;
+    };
+    match result {
+        QueryOutput::Objects(mut objs) => {
+            filter_read(ctx, &mut objs);
+            QueryOutput::Objects(objs)
+        }
+        QueryOutput::Single(mut obj) => {
+            obj.ensure_fields_deserialized();
+            let type_name = obj.type_name.clone();
+            let res = EngineResource {
+                db: ctx.db,
+                governor: &ctx.governor,
+                type_name: &type_name,
+                object: Some(&obj),
+                request: None,
+            };
+            if rules
+                .evaluate(Op::Read, &type_name, &ctx.principal, &res)
+                .is_allow()
+            {
+                QueryOutput::Single(obj)
+            } else {
+                QueryOutput::Done
+            }
+        }
+        other => other,
     }
 }
 
@@ -72,16 +94,19 @@ impl<'a> EngineResource<'a> {
         let Ok(groups) = self.db.get_links_many(self.type_name, &[obj.id], rel) else {
             return Vec::new();
         };
-        let ids: Vec<u64> = groups
+        // Charge the FULL edge set examined — like the query traversal path charges `hop_edges`
+        // (executor.rs) — NOT just the capped slice, so a rule over a huge to-many edge trips the
+        // row budget and fails closed rather than evading it. Over budget ⇒ empty (deny).
+        let examined: u64 = groups.iter().map(|g| g.len() as u64).sum();
+        if self.governor.charge(examined).is_err() {
+            return Vec::new();
+        }
+        groups
             .into_iter()
             .flatten()
             .map(|(id, _)| id)
             .take(MAX_RULE_RELATION_TARGETS)
-            .collect();
-        if self.governor.charge(ids.len() as u64).is_err() {
-            return Vec::new();
-        }
-        ids
+            .collect()
     }
 
     fn target_scalar(&self, target_type: &str, id: u64, field: &str) -> Option<serde_json::Value> {
@@ -209,41 +234,25 @@ impl ResourceAccessor for JsonSnapshot<'_> {
 
 /// Subscribe per-event read gate (P0-DBA-5): may `principal` **read** the object this change event
 /// is about? A subscription is a standing read, so an event is delivered only if the subscriber
-/// passes the same `read` rule a query would (otherwise a sub is a read-rule bypass). For a live
-/// object (create/update) the current object is fetched and evaluated with the full
-/// [`EngineResource`] (so relationship + unchanged-field rules work exactly as on the query path);
-/// for a delete (object gone) it evaluates against the event's JSON field snapshot. **Fail-closed**:
-/// a vanished object or an absent snapshot field simply doesn't grant. Callers invoke this only when
-/// a rules program is configured.
-// The arg list is a cohesive set (authz context + the event's identity); bundling it into a struct
-// would add a type without adding clarity.
-#[allow(clippy::too_many_arguments)]
+/// passes the `read` rule (otherwise a sub is a read-rule bypass).
+///
+/// The rule is evaluated against the event's OWN field `snapshot` — i.e. exactly the data that will
+/// be delivered — NOT a live re-fetch of the current object. This is load-bearing (a review finding):
+/// re-fetching authorizes the *current* state while delivering the *commit-time* state, so an object
+/// that transitions unreadable→readable across two writes would leak the earlier, private-era
+/// snapshot. Evaluating against the delivered snapshot makes authorize-and-deliver self-consistent.
+///
+/// The snapshot carries the object's SCALAR fields only, so a **relationship-based** read rule
+/// (`resource.owners.uid`) resolves its relation operands to absent ⇒ the clause is `Unknown` ⇒
+/// **the event is denied** (fail-closed). v1 limitation: subscription-visible read rules should key
+/// on scalar fields (denormalize an owner id) rather than edge traversals. Callers invoke this only
+/// when a rules program is configured.
 pub fn event_read_allowed(
-    db: &Database,
-    governor: &Governor,
     rules: &RulesProgram,
     principal: &rhypedb_authz::Principal,
     type_name: &str,
-    object_id: u64,
-    is_delete: bool,
     snapshot: Option<&std::collections::HashMap<String, serde_json::Value>>,
 ) -> bool {
-    // Live object (create/update): fetch it and use the full accessor (relationship rules work).
-    if !is_delete
-        && let Ok(mut obj) = db.get(type_name, object_id)
-    {
-        obj.ensure_fields_deserialized();
-        let res = EngineResource {
-            db,
-            governor,
-            type_name,
-            object: Some(&obj),
-            request: None,
-        };
-        return rules.evaluate(Op::Read, type_name, principal, &res).is_allow();
-    }
-    // A delete (object gone), or an object that vanished between commit and delivery → evaluate
-    // against the event's JSON snapshot (fail-closed for relationship/absent-field rules).
     let res = JsonSnapshot { fields: snapshot };
     rules.evaluate(Op::Read, type_name, principal, &res).is_allow()
 }
@@ -426,6 +435,34 @@ mod tests {
     }
 
     #[test]
+    fn update_return_value_is_read_filtered() {
+        // Review HIGH: an update returns the post-image; that return must pass the READ rule, else a
+        // principal who may update-but-not-read exfiltrates the whole object via the update response.
+        let (_d, db) = db();
+        let pid = mk_post(&db, "secret", false, "u1"); // owned by u1
+        let r = rules(
+            "match Post { allow update: if request.auth != null; allow read: if request.auth.uid == resource.ownerUid; }",
+            &db,
+        );
+        // u2 may update (authenticated) but NOT read (not owner) → the returned object is filtered to
+        // void; nothing leaks.
+        let out = run(&ctx_with(&db, &r, user("u2")), &format!("Post.get({pid}).update({{ title: \"x\" }})"));
+        assert_eq!(n_objects(out), 0, "non-owner's update return is read-filtered to void");
+        // ...but the write still applied (side effect): title changed (re-read rules-off).
+        let plain = ExecContext::new(&db, None);
+        if let QueryOutput::Objects(o) = run(&plain, &format!("Post.get({pid})")).unwrap() {
+            let mut obj = o.into_iter().next().unwrap();
+            obj.ensure_fields_deserialized();
+            assert_eq!(obj.fields.get("title"), Some(&Value::String("x".into())));
+        } else {
+            panic!("post should still exist");
+        }
+        // The owner CAN read their own update's return value.
+        let out = run(&ctx_with(&db, &r, user("u1")), &format!("Post.get({pid}).update({{ title: \"y\" }})"));
+        assert_eq!(n_objects(out), 1, "owner sees their update return value");
+    }
+
+    #[test]
     fn delete_gate() {
         let (_d, db) = db();
         let pid = mk_post(&db, "t", false, "u1");
@@ -465,24 +502,25 @@ mod tests {
 
     #[test]
     fn event_read_allowed_gates_subscription() {
-        use crate::Governor;
         let (_d, db) = db();
-        let pid = mk_post(&db, "t", false, "u1");
         let r = rules(
             "match Post { allow read: if request.auth.uid == resource.ownerUid; }",
             &db,
         );
-        let gov = Governor::disabled();
-        // Live object (create/update event): fetch + evaluate the read rule.
-        assert!(super::event_read_allowed(&db, &gov, &r, &user("u1"), "Post", pid, false, None));
-        assert!(!super::event_read_allowed(&db, &gov, &r, &user("u2"), "Post", pid, false, None));
-        assert!(!super::event_read_allowed(&db, &gov, &r, &Principal::anonymous(), "Post", pid, false, None));
-        // Delete event (object gone): evaluate against the event's field snapshot.
+        // Authorizes against the event's own SNAPSHOT (the delivered data) — not a live re-fetch —
+        // so authorize-and-deliver stay consistent (the TOCTOU-leak fix).
         let snap = std::collections::HashMap::from([("ownerUid".to_string(), serde_json::json!("u1"))]);
-        assert!(super::event_read_allowed(&db, &gov, &r, &user("u1"), "Post", pid, true, Some(&snap)));
-        assert!(!super::event_read_allowed(&db, &gov, &r, &user("u2"), "Post", pid, true, Some(&snap)));
-        // Delete with no snapshot → fail-closed (can't confirm the principal could read it).
-        assert!(!super::event_read_allowed(&db, &gov, &r, &user("u1"), "Post", pid, true, None));
+        assert!(super::event_read_allowed(&r, &user("u1"), "Post", Some(&snap)));
+        assert!(!super::event_read_allowed(&r, &user("u2"), "Post", Some(&snap)));
+        assert!(!super::event_read_allowed(&r, &Principal::anonymous(), "Post", Some(&snap)));
+        // No snapshot → fail-closed (can't confirm the principal could read it).
+        assert!(!super::event_read_allowed(&r, &user("u1"), "Post", None));
+        // A relationship-based read rule can't be satisfied by a scalar snapshot → fail-closed.
+        let rel = rules(
+            "match Post { allow read: if request.auth.uid == resource.author.uid; }",
+            &db,
+        );
+        assert!(!super::event_read_allowed(&rel, &user("u1"), "Post", Some(&snap)));
     }
 
     #[test]

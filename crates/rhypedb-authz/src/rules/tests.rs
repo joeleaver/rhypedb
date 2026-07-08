@@ -276,6 +276,67 @@ fn compile_fails_closed_on_bad_programs() {
 }
 
 #[test]
+fn null_equality_never_grants() {
+    // Regression (review BLOCKER→HIGH): `uid == ownerUid` must NOT grant via Null==Null when the
+    // owner field is unset — for the anonymous principal OR an authenticated one.
+    let prog = compile("match Post { allow read, delete: if request.auth.uid == resource.ownerUid; }");
+    // Post with NO ownerUid (absent).
+    let ownerless = Mock::default().scalar("published", serde_json::json!(true));
+    assert_eq!(eval(&prog, Op::Read, "Post", &anon(), &ownerless), Decision::Deny);
+    assert_eq!(eval(&prog, Op::Read, "Post", &user("u1"), &ownerless), Decision::Deny);
+    assert_eq!(eval(&prog, Op::Delete, "Post", &anon(), &ownerless), Decision::Deny);
+    // A present owner still works normally.
+    let owned = Mock::default().scalar("ownerUid", serde_json::json!("u1"));
+    assert_eq!(eval(&prog, Op::Read, "Post", &user("u1"), &owned), Decision::Allow);
+    assert_eq!(eval(&prog, Op::Read, "Post", &user("u2"), &owned), Decision::Deny);
+    // An unlinked to-one relation projection is Absent too (never Null==Null).
+    let rel_prog = compile("match Post { allow read: if request.auth.uid == resource.author.uid; }");
+    assert_eq!(eval(&rel_prog, Op::Read, "Post", &anon(), &Mock::default()), Decision::Deny);
+    assert_eq!(eval(&rel_prog, Op::Read, "Post", &user("u1"), &Mock::default()), Decision::Deny);
+}
+
+#[test]
+fn negation_of_absent_or_nonbool_denies() {
+    // Regression (review MEDIUM): `!resource.field` must NOT grant when the field is absent or
+    // non-boolean — Not(Unknown) is Unknown, which denies.
+    let prog = compile("match Post { allow read: if !resource.published; }");
+    // Absent `published` → Unknown → deny (was: fail-open TRUE).
+    assert_eq!(eval(&prog, Op::Read, "Post", &anon(), &Mock::default()), Decision::Deny);
+    // Present false → !false = true → allow (the legitimate case still works).
+    assert_eq!(
+        eval(&prog, Op::Read, "Post", &anon(), &Mock::default().scalar("published", serde_json::json!(false))),
+        Decision::Allow
+    );
+    // Present true → !true = false → deny.
+    assert_eq!(
+        eval(&prog, Op::Read, "Post", &anon(), &Mock::default().scalar("published", serde_json::json!(true))),
+        Decision::Deny
+    );
+    // Negating a NON-bool scalar (String) → Unknown → deny (was: unconditional TRUE).
+    let strprog = compile("match Post { allow read: if !resource.title; }");
+    assert_eq!(
+        eval(&strprog, Op::Read, "Post", &anon(), &Mock::default().scalar("title", serde_json::json!("hi"))),
+        Decision::Deny
+    );
+}
+
+#[test]
+fn auth_null_idiom_still_works() {
+    // The `request.auth (==|!=) null` idiom must remain decidable (it uses the intentional-null Auth
+    // marker, not an Absent path), even after the three-valued fix.
+    let is_null = compile("match Post { allow read: if request.auth == null; }");
+    assert_eq!(eval(&is_null, Op::Read, "Post", &anon(), &Mock::default()), Decision::Allow);
+    assert_eq!(eval(&is_null, Op::Read, "Post", &user("u"), &Mock::default()), Decision::Deny);
+    let not_null = compile("match Post { allow read: if request.auth != null; }");
+    assert_eq!(eval(&not_null, Op::Read, "Post", &user("u"), &Mock::default()), Decision::Allow);
+    assert_eq!(eval(&not_null, Op::Read, "Post", &anon(), &Mock::default()), Decision::Deny);
+    // Bare `request.auth` is truthy only when authenticated.
+    let bare = compile("match Post { allow read: if request.auth; }");
+    assert_eq!(eval(&bare, Op::Read, "Post", &user("u"), &Mock::default()), Decision::Allow);
+    assert_eq!(eval(&bare, Op::Read, "Post", &anon(), &Mock::default()), Decision::Deny);
+}
+
+#[test]
 fn empty_program_denies_all() {
     let prog = compile("");
     assert_eq!(eval(&prog, Op::Read, "Post", &user("u"), &Mock::default()), Decision::Deny);
