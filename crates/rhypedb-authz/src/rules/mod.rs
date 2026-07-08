@@ -134,8 +134,12 @@ pub trait ResourceAccessor {
     fn resource_relation_one(&self, rel: &str, target_field: &str) -> Option<serde_json::Value>;
 
     /// `resource.<rel>.<targetField>` for a to-many relation — the projected scalar across every
-    /// linked target (a bounded traversal). Empty if none/unlinked.
-    fn resource_relation_many(&self, rel: &str, target_field: &str) -> Vec<serde_json::Value>;
+    /// linked target (a bounded traversal). `Some(vec)` is the actual set (`Some(empty)` = a
+    /// genuinely-empty relation); **`None` means the set could NOT be determined** (traversal
+    /// over-budget, or relationships unavailable such as in a subscribe snapshot) and MUST resolve
+    /// to an unknown/absent value that fails closed — never a concrete empty set (else a deny-list
+    /// rule `!(x in resource.blocked.field)` would fail open when the edge is too large to scan).
+    fn resource_relation_many(&self, rel: &str, target_field: &str) -> Option<Vec<serde_json::Value>>;
 
     /// `request.<field>` — an incoming write value on a `create`/`update`. `None` if not present in
     /// the write or not applicable (e.g. a read).
@@ -153,8 +157,8 @@ impl ResourceAccessor for EmptyResource {
     fn resource_relation_one(&self, _r: &str, _f: &str) -> Option<serde_json::Value> {
         None
     }
-    fn resource_relation_many(&self, _r: &str, _f: &str) -> Vec<serde_json::Value> {
-        Vec::new()
+    fn resource_relation_many(&self, _r: &str, _f: &str) -> Option<Vec<serde_json::Value>> {
+        None
     }
     fn request_field(&self, _f: &str) -> Option<serde_json::Value> {
         None

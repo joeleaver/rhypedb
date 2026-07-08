@@ -189,9 +189,13 @@ fn resolve(o: &Operand, p: &Principal, r: &dyn ResourceAccessor) -> RVal {
             .resource_relation_one(rel, f)
             .map(|v| json_to_rval(&v))
             .unwrap_or(RVal::Absent),
-        Operand::ResourceRelationMany(rel, f) => {
-            RVal::Set(r.resource_relation_many(rel, f).iter().map(json_to_rval).collect())
-        }
+        // `Some(set)` (incl. an empty set) is a determinate relation; `None` (over-budget /
+        // unavailable) is Absent so it poisons its comparison to Unknown — an over-budget deny-list
+        // fails CLOSED rather than looking like an empty set.
+        Operand::ResourceRelationMany(rel, f) => match r.resource_relation_many(rel, f) {
+            Some(items) => RVal::Set(items.iter().map(json_to_rval).collect()),
+            None => RVal::Absent,
+        },
         Operand::RequestField(f) => r.request_field(f).map(|v| json_to_rval(&v)).unwrap_or(RVal::Absent),
     }
 }
