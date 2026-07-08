@@ -24,9 +24,13 @@ use crate::error::{QueryError, QueryResult};
 use crate::executor::{ExecContext, QueryOutput};
 use crate::governor::Governor;
 
-/// Hard cap on the linked targets one rule relationship-projection reads, so a predicate over a
-/// huge to-many edge can't fan out unbounded. The governor *also* charges every edge/target, so a
-/// rule additionally can't outrun the query's row budget.
+/// Hard cap on the linked targets one rule relationship-projection will enumerate. A relation
+/// LARGER than this is treated as **indeterminate** (fails closed ⇒ deny), NOT truncated to a
+/// partial set — a truncated deny-list (`!(x in resource.blocked.field)`) would fail OPEN for a
+/// member past the cap. So membership rules (`x in resource.rel.field`) are only evaluable over a
+/// relation of at most this many linked targets; beyond it, the rule denies (v1 limitation —
+/// denormalize a scalar for larger sets). The governor also charges every edge, so a rule can't
+/// outrun the query row budget either.
 const MAX_RULE_RELATION_TARGETS: usize = 1024;
 
 /// Filter a terminal result through the `read` rule when rules are on (no-op otherwise). ANY object
@@ -96,17 +100,14 @@ impl<'a> EngineResource<'a> {
         let obj = self.object?;
         let groups = self.db.get_links_many(self.type_name, &[obj.id], rel).ok()?;
         let examined: u64 = groups.iter().map(|g| g.len() as u64).sum();
-        if self.governor.charge(examined).is_err() {
-            return None; // over budget ⇒ indeterminate ⇒ fail closed (NOT an empty set)
+        // Indeterminate ⇒ `None` ⇒ Absent ⇒ deny, for BOTH triggers: over the query row budget, OR
+        // too large to fully enumerate. NEVER truncate to a partial set — a partial deny-list would
+        // fail OPEN for a member past the cap (a review finding). `examined` (pre-dedup edge count)
+        // is an upper bound on the id count, so `examined <= cap` guarantees the full set fits.
+        if self.governor.charge(examined).is_err() || examined > MAX_RULE_RELATION_TARGETS as u64 {
+            return None;
         }
-        Some(
-            groups
-                .into_iter()
-                .flatten()
-                .map(|(id, _)| id)
-                .take(MAX_RULE_RELATION_TARGETS)
-                .collect(),
-        )
+        Some(groups.into_iter().flatten().map(|(id, _)| id).collect())
     }
 
     fn target_scalar(&self, target_type: &str, id: u64, field: &str) -> Option<serde_json::Value> {
@@ -296,6 +297,7 @@ mod tests {
             published: Bool
             ownerUid: String
             author: User
+            editors: [User]
         }
     "#;
 
@@ -463,6 +465,37 @@ mod tests {
         // The owner CAN read their own update's return value.
         let out = run(&ctx_with(&db, &r, user("u1")), &format!("Post.get({pid}).update({{ title: \"y\" }})"));
         assert_eq!(n_objects(out), 1, "owner sees their update return value");
+    }
+
+    #[test]
+    fn oversized_relation_denylist_fails_closed() {
+        // Review verify residual: a to-many relation too large to fully enumerate is INDETERMINATE
+        // ⇒ deny — never truncated to a partial set (which would fail OPEN for a deny-list member
+        // past the enumeration cap). End-to-end against a real DB + a real deny-list rule.
+        let (_d, db) = db();
+        let pid = mk_post(&db, "t", true, "owner");
+        let r = rules(
+            "match Post { allow read: if !(request.auth.uid in resource.editors.uid); }",
+            &db,
+        );
+        let getq = format!("Post.get({pid})");
+        // Small editor set (≤ cap = determinate): a non-editor reads; an editor is denied.
+        let ed1 = mk_user(&db, "ed1");
+        db.link("Post", pid, "editors", ed1, None).unwrap();
+        assert_eq!(n_objects(run(&ctx_with(&db, &r, user("stranger")), &getq)), 1);
+        assert_eq!(n_objects(run(&ctx_with(&db, &r, user("ed1")), &getq)), 0);
+        // Grow the editor set past the enumeration cap (MAX_RULE_RELATION_TARGETS = 1024): the
+        // relation is now indeterminate, so the deny-list denies EVERYONE (fail-closed) rather than
+        // truncating and leaking to a would-be editor past the cap.
+        for i in 0..1100 {
+            let u = mk_user(&db, &format!("bulk{i}"));
+            db.link("Post", pid, "editors", u, None).unwrap();
+        }
+        assert_eq!(
+            n_objects(run(&ctx_with(&db, &r, user("stranger")), &getq)),
+            0,
+            "an un-enumerable deny-list must deny (fail closed), not truncate"
+        );
     }
 
     #[test]
