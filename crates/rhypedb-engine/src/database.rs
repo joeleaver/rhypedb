@@ -7,12 +7,16 @@ use parking_lot::RwLock;
 
 use bytes::Bytes;
 
-use rhypedb_schema::{FieldType, OnDeletePolicy, ScalarType, Schema};
+use rhypedb_schema::{FieldType, OnDeletePolicy, ScalarType, Schema, SchemaError};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::{LsmConfig, LsmTree};
 use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionHub};
 
 use crate::error::{EngineError, EngineResult};
+use crate::fulltext::{
+    Analyzer, FulltextField, FulltextSearchResult, FulltextStats, StatsDelta, encode_term,
+    tokenize_for_index,
+};
 use crate::object::{
     FieldMap, Object, Value, deserialize_fields, deserialize_fields_projected, extract_field,
     serialize_fields,
@@ -163,6 +167,30 @@ impl TombstoneArena {
         self.ranges.push(r);
     }
 
+    fn push_fulltext_posting(
+        &mut self,
+        type_id: u64,
+        field_id: u64,
+        generation: u32,
+        encoded_term: &[u8],
+        object_id: u64,
+    ) {
+        let r = KeyBuilder::fulltext_posting_into(
+            &mut self.buf,
+            type_id,
+            field_id,
+            generation,
+            encoded_term,
+            object_id,
+        );
+        self.ranges.push(r);
+    }
+
+    fn push_fulltext_doc(&mut self, type_id: u64, field_id: u64, generation: u32, object_id: u64) {
+        let r = KeyBuilder::fulltext_doc_into(&mut self.buf, type_id, field_id, generation, object_id);
+        self.ranges.push(r);
+    }
+
     fn len(&self) -> usize {
         self.ranges.len()
     }
@@ -295,6 +323,15 @@ pub struct Database {
     /// (field_name, field_id). Cached so the create/update/delete write
     /// paths don't re-traverse the schema per object.
     indexed_fields: HashMap<String, Vec<IndexedField>>,
+    /// type_name → list of `@fulltext` String fields with their pre-resolved
+    /// field id, index generation, analyzer, positions flag and corpus
+    /// stats. The write paths maintain the `f:`/`l:` rows from this table;
+    /// `fulltext_search` reads it. See `crate::fulltext`.
+    fulltext_fields: HashMap<String, Vec<FulltextField>>,
+    /// `(type_id, field_id)` → the same `Arc<FulltextStats>` the entry in
+    /// `fulltext_fields` holds, for O(1) post-commit delta application
+    /// (deletes cascade across types, so they need the id-keyed lookup).
+    fulltext_stats: HashMap<(u64, u64), Arc<FulltextStats>>,
     /// Per-object monotonic generation counter, bumped on every successful
     /// `update`. Lives in-memory for cheap reads (cover-write stamps the
     /// target's current generation into `<name>__cover_v`; executor fusion
@@ -1214,6 +1251,69 @@ impl Database {
             }
         }
 
+        // Precompute the @fulltext fields per type and rebuild each one's
+        // in-memory corpus statistics from its `l:` rows (doc count + total
+        // tokens). The stats are derived state — never persisted as a shared
+        // row (see `crate::fulltext`) — so every open re-derives them; a
+        // corrupt `l:` value is surfaced rather than skipped (it would skew
+        // every score on the field).
+        let mut fulltext_fields: HashMap<String, Vec<FulltextField>> = HashMap::new();
+        let mut fulltext_stats: HashMap<(u64, u64), Arc<FulltextStats>> = HashMap::new();
+        {
+            let stats_txn = storage.begin_txn();
+            for (type_name, type_def) in &schema.types {
+                let type_id = type_ids[type_name];
+                let mut list = Vec::new();
+                for field in &type_def.fields {
+                    let Some(ft) = field.fulltext() else {
+                        continue;
+                    };
+                    let analyzer = Analyzer::from_name(&ft.analyzer).ok_or_else(|| {
+                        EngineError::Schema(SchemaError::Validation(format!(
+                            "@fulltext on '{type_name}.{}': analyzer {:?} is not known to this \
+                             engine build",
+                            field.name, ft.analyzer
+                        )))
+                    })?;
+                    let key = format!("{type_name}.{}", field.name);
+                    let field_id = field_ids[&key];
+                    // Index generation 0 until the build-marker increment
+                    // introduces analyzer-change rebuilds.
+                    let generation = 0u32;
+                    let mut doc_count = 0u64;
+                    let mut total_tokens = 0u64;
+                    for (_, value) in storage.scan_prefix(
+                        &stats_txn,
+                        &KeyBuilder::fulltext_doc_prefix(type_id, field_id, generation),
+                    )? {
+                        let len = crate::fulltext::decode_doc_len(&value).map_err(|e| {
+                            EngineError::FulltextIndexCorrupt {
+                                type_name: type_name.clone(),
+                                field: field.name.clone(),
+                                detail: format!("doc-length row: {e}"),
+                            }
+                        })?;
+                        doc_count += 1;
+                        total_tokens += len as u64;
+                    }
+                    let stats = Arc::new(FulltextStats::new(doc_count, total_tokens));
+                    fulltext_stats.insert((type_id, field_id), Arc::clone(&stats));
+                    list.push(FulltextField {
+                        name: field.name.clone(),
+                        field_id,
+                        generation,
+                        analyzer,
+                        positions: ft.positions,
+                        stats,
+                    });
+                }
+                if !list.is_empty() {
+                    fulltext_fields.insert(type_name.clone(), list);
+                }
+            }
+            drop(stats_txn);
+        }
+
         // Override the born-bit seed with persisted generations for objects
         // that have been UPDATED at least once. A `g:` key is written only on
         // update (generation >= 2), so this scan touches just those objects;
@@ -1302,6 +1402,8 @@ impl Database {
             cascade_meta_by_id,
             type_name_by_id,
             indexed_fields,
+            fulltext_fields,
+            fulltext_stats,
             version_counter_count: match &carry {
                 Some(c) => Arc::clone(&c.version_counter_count),
                 None => Arc::new(std::sync::atomic::AtomicUsize::new(version_counters.len())),
@@ -3621,10 +3723,11 @@ impl Database {
         // Single object — no cross-row uniqueness to track, but the helper
         // takes a staged set, so hand it a throwaway one.
         let mut staged_unique: HashMap<Bytes, u64> = HashMap::new();
+        let mut ft_delta = StatsDelta::default();
 
         let scalar_fields = self.stage_create_writes(
             &mut txn, type_name, type_def, type_id, object_id, &fields, &mut puts,
-            &mut staged_unique,
+            &mut staged_unique, &mut ft_delta,
         )?;
 
         // `stage_create_writes` bumped this object's in-memory generation to 1
@@ -3641,6 +3744,7 @@ impl Database {
                 other => EngineError::Storage(other),
             }
         })?;
+        self.apply_fulltext_delta(&ft_delta);
 
         self.subscriptions.publish(ChangeEvent {
             version,
@@ -3688,6 +3792,7 @@ impl Database {
         fields: &FieldMap,
         puts: &mut Vec<(Bytes, Bytes)>,
         staged: &mut HashMap<Bytes, u64>,
+        ft_delta: &mut StatsDelta,
     ) -> EngineResult<FieldMap> {
         // First pass: validate, split scalars from relations.
         let mut scalar_fields = FieldMap::new();
@@ -3823,6 +3928,20 @@ impl Database {
             }
         }
 
+        // Full-text index rows — one posting per distinct term + the `l:`
+        // doc row — staged into the same `puts` so they commit with the
+        // object (an aborted txn leaves none). A Null / absent value is
+        // simply not a document.
+        if let Some(ft_fields) = self.fulltext_fields.get(type_name) {
+            for ff in ft_fields {
+                if let Some(Value::String(text)) = scalar_fields.get(&ff.name) {
+                    let doc = tokenize_for_index(ff, text);
+                    crate::fulltext::stage_doc_puts(type_id, ff, object_id, &doc, puts);
+                    ft_delta.add(type_id, ff.field_id, 1, doc.doc_len as i64);
+                }
+            }
+        }
+
         // Object key.
         puts.push((KeyBuilder::object(type_id, object_id), serialized.clone()));
 
@@ -3919,12 +4038,13 @@ impl Database {
         // resolve at the txn snapshot), so without this two rows sharing a
         // `@unique` value would both commit. Threaded into every row.
         let mut staged_unique: HashMap<Bytes, u64> = HashMap::new();
+        let mut ft_delta = StatsDelta::default();
 
         for fields in &rows {
             let object_id = self.next_object_id.fetch_add(1, Ordering::SeqCst);
             match self.stage_create_writes(
                 &mut txn, type_name, type_def, type_id, object_id, fields, &mut puts,
-                &mut staged_unique,
+                &mut staged_unique, &mut ft_delta,
             ) {
                 Ok(scalar_fields) => {
                     // stage_create_writes bumped this object to generation 1.
@@ -3963,6 +4083,7 @@ impl Database {
                 });
             }
         };
+        self.apply_fulltext_delta(&ft_delta);
 
         // Build the returned Objects + publish events after commit.
         // Events report only the scalar fields (relation values went into
@@ -4036,6 +4157,7 @@ impl Database {
         let mut txn = self.storage.begin_txn();
         let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(rows.len() * 2);
         let mut staged_unique: HashMap<Bytes, u64> = HashMap::new();
+        let mut ft_delta = StatsDelta::default();
         let mut staged: Vec<(u64, FieldMap)> = Vec::with_capacity(rows.len());
         let mut max_id = 0u64;
 
@@ -4058,7 +4180,7 @@ impl Database {
             }
             match self.stage_create_writes(
                 &mut txn, type_name, type_def, type_id, *object_id, fields, &mut puts,
-                &mut staged_unique,
+                &mut staged_unique, &mut ft_delta,
             ) {
                 Ok(scalar_fields) => {
                     max_id = max_id.max(*object_id);
@@ -4094,6 +4216,7 @@ impl Database {
                 });
             }
         };
+        self.apply_fulltext_delta(&ft_delta);
 
         // Advance the id counter past every restored id so a future create
         // cannot collide. fetch_max is monotonic, so chunked calls compose.
@@ -5547,6 +5670,37 @@ impl Database {
             }
         }
 
+        // Full-text index maintenance: for every @fulltext field this update
+        // touches, diff the old and new token streams and stage only the
+        // difference (deleted terms → tombstones, new/changed terms → puts,
+        // the `l:` row when the length changes). Staged into the txn so it
+        // commits — or aborts — with the object blob.
+        let mut ft_delta = StatsDelta::default();
+        if let Some(ft_fields) = self.fulltext_fields.get(type_name) {
+            for ff in ft_fields {
+                let Some(new_value) = updates.get(&ff.name) else {
+                    continue;
+                };
+                let old_text = match fields.get(&ff.name) {
+                    Some(Value::String(s)) => Some(s.as_str()),
+                    _ => None,
+                };
+                let new_text = match new_value {
+                    Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                };
+                self.stage_fulltext_update(
+                    &mut txn,
+                    type_id,
+                    ff,
+                    object_id,
+                    old_text,
+                    new_text,
+                    &mut ft_delta,
+                )?;
+            }
+        }
+
         // Build the NEW field set by merging updates into the old fields.
         // We need both the old values (to look up index entries to remove)
         // and the merged set (to build the covering payload AND the new
@@ -5608,6 +5762,7 @@ impl Database {
                 other => EngineError::Storage(other),
             }
         })?;
+        self.apply_fulltext_delta(&ft_delta);
 
         // Enqueue cover refresh for this target. Every other rev_edge that
         // embedded this object as `<name>__cover` (under a different source)
@@ -5786,6 +5941,7 @@ impl Database {
         // when we hand them to `delete_batch`. At K=100 that's ~500
         // mallocs replaced by ONE.
         let mut arena = TombstoneArena::new();
+        let mut ft_delta = StatsDelta::default();
 
         // Top-level delete: verify existence (per public API contract).
         // Pass `None` for the cascade context — there's no parent rev_edge
@@ -5797,6 +5953,7 @@ impl Database {
             true,
             &mut deleted,
             &mut arena,
+            &mut ft_delta,
             None,
         )?;
 
@@ -5807,6 +5964,7 @@ impl Database {
             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
             other => EngineError::Storage(other),
         })?;
+        self.apply_fulltext_delta(&ft_delta);
 
         // Drop the in-memory version-counter entries for everything the
         // commit just removed. The persisted `g:` keys were already
@@ -5866,6 +6024,7 @@ impl Database {
         verify_exists: bool,
         deleted: &mut HashMap<(u64, u64), Option<HashMap<String, serde_json::Value>>>,
         arena: &mut TombstoneArena,
+        ft_delta: &mut StatsDelta,
         cascade_ctx: Option<(u64, Bytes)>,
     ) -> EngineResult<()> {
         if deleted.contains_key(&(type_id, object_id)) {
@@ -5996,6 +6155,30 @@ impl Database {
                     }
                 }
 
+                // Full-text rows: every posting of every term in the value,
+                // plus the `l:` doc row. Re-tokenizing the stored value is
+                // the only way to enumerate the postings (the index is keyed
+                // term-first), and it is exactly what the write path did.
+                if let Some(ft_fields) = self.fulltext_fields.get(&meta.type_name) {
+                    for ff in ft_fields {
+                        if let Some(Value::String(text)) = fields.get(&ff.name) {
+                            let doc = tokenize_for_index(ff, text);
+                            arena.reserve(doc.terms.len() + 1);
+                            for (term, _) in &doc.terms {
+                                arena.push_fulltext_posting(
+                                    type_id,
+                                    ff.field_id,
+                                    ff.generation,
+                                    &encode_term(term),
+                                    object_id,
+                                );
+                            }
+                            arena.push_fulltext_doc(type_id, ff.field_id, ff.generation, object_id);
+                            ft_delta.add(type_id, ff.field_id, -1, -(doc.doc_len as i64));
+                        }
+                    }
+                }
+
                 // Capture the deleted object's scalar fields for the Delete
                 // change event — the same payload create/update emit, so a
                 // subscriber learns *which* object went away (esp. its
@@ -6093,6 +6276,7 @@ impl Database {
                 false,
                 deleted,
                 arena,
+                ft_delta,
                 Some((cascade_rel_id, cascade_cover)),
             )?;
         }
@@ -8262,6 +8446,214 @@ pub(crate) fn encode_int_for_zone(value: &Value) -> Option<[u8; 8]> {
         _ => return None,
     };
     Some(bits.to_be_bytes())
+}
+
+// =====================================================================
+// FULL-TEXT SEARCH (see `crate::fulltext`)
+// =====================================================================
+
+impl Database {
+    /// The `@fulltext` metadata for `type_name.field_name`, if that field
+    /// carries the directive in the live schema.
+    pub fn fulltext_field(&self, type_name: &str, field_name: &str) -> Option<&FulltextField> {
+        self.fulltext_fields
+            .get(type_name)?
+            .iter()
+            .find(|f| f.name == field_name)
+    }
+
+    /// Apply the corpus-stat deltas of a transaction that just COMMITTED.
+    /// Never called on the abort path — the index rows didn't land, so the
+    /// stats must not move either.
+    fn apply_fulltext_delta(&self, delta: &StatsDelta) {
+        if delta.is_empty() {
+            return;
+        }
+        for (&(type_id, field_id), &(docs, tokens)) in delta.iter() {
+            if let Some(stats) = self.fulltext_stats.get(&(type_id, field_id)) {
+                stats.apply(docs, tokens);
+            }
+        }
+    }
+
+    /// Stage the full-text index difference between an object's old and new
+    /// value of one `@fulltext` field (`None` = null/absent = not a document).
+    ///
+    /// Only the difference is written: postings for terms that disappeared
+    /// are tombstoned, postings whose `(positions, doc_len)` changed (or are
+    /// new) are put, unchanged ones are left alone, and the `l:` row moves
+    /// only when the length does. The transaction's write buffer coalesces
+    /// per key, so this is also the minimal write set at commit.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_fulltext_update(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_id: u64,
+        ff: &FulltextField,
+        object_id: u64,
+        old_text: Option<&str>,
+        new_text: Option<&str>,
+        ft_delta: &mut StatsDelta,
+    ) -> EngineResult<()> {
+        use std::collections::BTreeMap;
+        let old_doc = old_text.map(|t| tokenize_for_index(ff, t));
+        let new_doc = new_text.map(|t| tokenize_for_index(ff, t));
+        let old_terms: BTreeMap<&str, &Vec<u32>> = old_doc
+            .iter()
+            .flat_map(|d| d.terms.iter().map(|(t, p)| (t.as_str(), p)))
+            .collect();
+        let new_terms: BTreeMap<&str, &Vec<u32>> = new_doc
+            .iter()
+            .flat_map(|d| d.terms.iter().map(|(t, p)| (t.as_str(), p)))
+            .collect();
+        let old_len = old_doc.as_ref().map(|d| d.doc_len);
+        let new_len = new_doc.as_ref().map(|d| d.doc_len);
+
+        for term in old_terms.keys() {
+            if !new_terms.contains_key(term) {
+                self.storage.delete(
+                    txn,
+                    &KeyBuilder::fulltext_posting(
+                        type_id,
+                        ff.field_id,
+                        ff.generation,
+                        &encode_term(term),
+                        object_id,
+                    ),
+                )?;
+            }
+        }
+        if let Some(new_doc) = &new_doc {
+            for (term, positions) in &new_doc.terms {
+                let unchanged =
+                    old_terms.get(term.as_str()) == Some(&positions) && old_len == new_len;
+                if unchanged {
+                    continue;
+                }
+                self.storage.put(
+                    txn,
+                    &KeyBuilder::fulltext_posting(
+                        type_id,
+                        ff.field_id,
+                        ff.generation,
+                        &encode_term(term),
+                        object_id,
+                    ),
+                    crate::fulltext::posting::encode_posting(
+                        new_doc.doc_len,
+                        positions,
+                        ff.positions,
+                    ),
+                )?;
+            }
+        }
+        let doc_key = KeyBuilder::fulltext_doc(type_id, ff.field_id, ff.generation, object_id);
+        match (old_len, new_len) {
+            (_, Some(len)) if old_len != new_len => {
+                self.storage
+                    .put(txn, &doc_key, crate::fulltext::encode_doc_len(len))?;
+            }
+            (Some(_), None) => self.storage.delete(txn, &doc_key)?,
+            _ => {}
+        }
+        ft_delta.add(
+            type_id,
+            ff.field_id,
+            new_len.is_some() as i64 - old_len.is_some() as i64,
+            new_len.unwrap_or(0) as i64 - old_len.unwrap_or(0) as i64,
+        );
+        Ok(())
+    }
+
+    /// Ranked full-text search over one `@fulltext` field.
+    ///
+    /// `query_text` uses the `.matches` mini-language (`+required`,
+    /// `"a phrase"`, see [`crate::fulltext::query`]); results are the top
+    /// `k` by BM25 (score desc, id asc). `restrict`, when given, limits the
+    /// candidates to that id set BEFORE the top-k cut. Reads one snapshot.
+    ///
+    /// Errors: [`EngineError::FulltextNotEnabled`] when the field has no
+    /// `@fulltext`; [`EngineError::FulltextQuery`] for a malformed query or a
+    /// phrase against a `positions: false` field; the usual type/field
+    /// resolution errors; [`EngineError::FulltextIndexCorrupt`] if a posting
+    /// row fails to decode.
+    pub fn fulltext_search(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        query_text: &str,
+        k: usize,
+        restrict: Option<&std::collections::HashSet<u64>>,
+    ) -> EngineResult<FulltextSearchResult> {
+        self.check_not_migrated()?;
+        let type_id = self.resolve_type_id(type_name)?;
+        let Some(ff) = self.fulltext_field(type_name, field_name) else {
+            // Distinguish "no such field" from "field without the directive".
+            let type_def = self
+                .schema
+                .get_type(type_name)
+                .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+            if let Some(err) = self.field_retired_error(type_name, field_name) {
+                return Err(err);
+            }
+            if type_def.get_field(field_name).is_none() {
+                return Err(EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                });
+            }
+            return Err(EngineError::FulltextNotEnabled {
+                type_name: type_name.into(),
+                field: field_name.into(),
+            });
+        };
+        let parsed = crate::fulltext::query::parse_query(query_text, ff.analyzer)
+            .map_err(|e| EngineError::FulltextQuery(e.to_string()))?;
+        if parsed.needs_positions() && !ff.positions {
+            return Err(EngineError::FulltextQuery(format!(
+                "phrase queries need stored positions, but '{type_name}.{field_name}' is declared \
+                 @fulltext(positions: false)"
+            )));
+        }
+        let snapshot = self.storage.read_snapshot();
+        let mut postings: HashMap<&str, crate::fulltext::search::PostingList> = HashMap::new();
+        let mut postings_scanned = 0u64;
+        for term in parsed.distinct_terms() {
+            let prefix = KeyBuilder::fulltext_term_prefix(
+                type_id,
+                ff.field_id,
+                ff.generation,
+                &encode_term(term),
+            );
+            let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
+            postings_scanned += entries.len() as u64;
+            let mut list = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                let corrupt = |detail: String| EngineError::FulltextIndexCorrupt {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                    detail,
+                };
+                let object_id = KeyBuilder::fulltext_object_id(&key)
+                    .ok_or_else(|| corrupt(format!("posting key too short ({} bytes)", key.len())))?;
+                let posting = crate::fulltext::posting::decode_posting(&value)
+                    .map_err(|e| corrupt(format!("posting for term {term:?}, object {object_id}: {e}")))?;
+                list.push((object_id, posting));
+            }
+            postings.insert(term, list);
+        }
+        let hits = crate::fulltext::search::score_query(
+            &parsed,
+            &postings,
+            ff.stats.snapshot(),
+            restrict,
+            k,
+        );
+        Ok(FulltextSearchResult {
+            hits,
+            postings_scanned,
+        })
+    }
 }
 
 #[cfg(test)]

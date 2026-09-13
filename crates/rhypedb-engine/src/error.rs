@@ -64,6 +64,25 @@ pub enum EngineError {
     #[error("write conflict")]
     WriteConflict,
 
+    /// `.matches` named a field that has no `@fulltext` directive (or is not
+    /// a String). Mirrors the `@vectorize` requirement on `.similar`.
+    #[error(
+        "full-text search requires a @fulltext field: '{type_name}.{field}' has no @fulltext          directive (add `@fulltext` to the schema, or use `.filter(.{field}.contains(...))` for          an unindexed substring match)"
+    )]
+    FulltextNotEnabled { type_name: String, field: String },
+
+    /// The `.matches` query text is malformed or unusable on this field.
+    #[error("invalid full-text query: {0}")]
+    FulltextQuery(String),
+
+    /// A posting row could not be decoded — on-disk corruption of the index.
+    #[error("full-text index corrupt for '{type_name}.{field}': {detail}")]
+    FulltextIndexCorrupt {
+        type_name: String,
+        field: String,
+        detail: String,
+    },
+
     /// The named type was retired (tombstoned) via a previous
     /// schema-shrink open. Its on-disk data is unreachable through
     /// every public API. The error carries enough metadata that the

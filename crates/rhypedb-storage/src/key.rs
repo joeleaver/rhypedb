@@ -31,9 +31,61 @@ pub enum KeyPrefix {
     /// (`F` format, `I` initialized, `M` metadata, `D` digest, `T` type,
     /// `E` field, `R` relation, `N` counter) and value-encoding format.
     Catalog = b'c',
+    /// Full-text posting: `f:<type_id>:<field_id>:<generation u32>:<encoded_term><object_id>`.
+    /// `encoded_term` is the engine's escape-encoded term bytes carrying its
+    /// own `\x00\x00` terminator (same convention as the var-length
+    /// `FieldIndex` layout), so a term-prefix scan never bleeds into a longer
+    /// term. Value = the engine's posting payload (doc length, term
+    /// frequency, positions). The generation namespaces one build of the
+    /// index: an analyzer change bumps it so writers and the background
+    /// rebuild never share keys with the previous build.
+    Fulltext = b'f',
+    /// Full-text per-document row: `l:<type_id>:<field_id>:<generation u32>:<object_id>`
+    /// → the document's token count. One row per indexed (object, field);
+    /// drives the in-memory BM25 corpus stats rebuild at open and the
+    /// backfill's "already indexed" skip.
+    FulltextDoc = b'l',
 }
 
 pub const SEPARATOR: u8 = b':';
+
+/// Byte length of `<prefix>:<type_id>:<field_id>:<generation>:` — the common
+/// head of every full-text key.
+const FULLTEXT_PREFIX_LEN: usize = 1 + 1 + 8 + 1 + 8 + 1 + 4 + 1;
+
+fn put_fulltext_prefix(
+    buf: &mut BytesMut,
+    prefix: KeyPrefix,
+    type_id: u64,
+    field_id: u64,
+    generation: u32,
+) {
+    buf.put_u8(prefix as u8);
+    buf.put_u8(SEPARATOR);
+    buf.put_u64(type_id);
+    buf.put_u8(SEPARATOR);
+    buf.put_u64(field_id);
+    buf.put_u8(SEPARATOR);
+    buf.put_u32(generation);
+    buf.put_u8(SEPARATOR);
+}
+
+fn push_fulltext_prefix(
+    buf: &mut Vec<u8>,
+    prefix: KeyPrefix,
+    type_id: u64,
+    field_id: u64,
+    generation: u32,
+) {
+    buf.push(prefix as u8);
+    buf.push(SEPARATOR);
+    buf.extend_from_slice(&type_id.to_be_bytes());
+    buf.push(SEPARATOR);
+    buf.extend_from_slice(&field_id.to_be_bytes());
+    buf.push(SEPARATOR);
+    buf.extend_from_slice(&generation.to_be_bytes());
+    buf.push(SEPARATOR);
+}
 
 /// Encodes an internal key with a version suffix for MVCC.
 ///
@@ -316,6 +368,125 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.put_slice(encoded_value);
         buf.freeze()
+    }
+
+    /// Full-text posting key: `f:<type_id>:<field_id>:<generation>:<encoded_term><object_id>`.
+    /// `encoded_term` MUST embed its own end-of-term terminator (the engine's
+    /// `\x00\x00`-terminated escape encoding); no separator sits between it
+    /// and the object id.
+    pub fn fulltext_posting(
+        type_id: u64,
+        field_id: u64,
+        generation: u32,
+        encoded_term: &[u8],
+        object_id: u64,
+    ) -> Bytes {
+        let mut buf = BytesMut::with_capacity(FULLTEXT_PREFIX_LEN + encoded_term.len() + 8);
+        put_fulltext_prefix(&mut buf, KeyPrefix::Fulltext, type_id, field_id, generation);
+        buf.put_slice(encoded_term);
+        buf.put_u64(object_id);
+        buf.freeze()
+    }
+
+    /// Every posting of one term: `f:<type_id>:<field_id>:<generation>:<encoded_term>`.
+    /// The embedded terminator makes this an exact-term prefix.
+    pub fn fulltext_term_prefix(
+        type_id: u64,
+        field_id: u64,
+        generation: u32,
+        encoded_term: &[u8],
+    ) -> Bytes {
+        let mut buf = BytesMut::with_capacity(FULLTEXT_PREFIX_LEN + encoded_term.len());
+        put_fulltext_prefix(&mut buf, KeyPrefix::Fulltext, type_id, field_id, generation);
+        buf.put_slice(encoded_term);
+        buf.freeze()
+    }
+
+    /// Every posting of one field's index generation: `f:<type_id>:<field_id>:<generation>:`.
+    pub fn fulltext_field_prefix(type_id: u64, field_id: u64, generation: u32) -> Bytes {
+        let mut buf = BytesMut::with_capacity(FULLTEXT_PREFIX_LEN);
+        put_fulltext_prefix(&mut buf, KeyPrefix::Fulltext, type_id, field_id, generation);
+        buf.freeze()
+    }
+
+    /// Every posting of one field across ALL generations: `f:<type_id>:<field_id>:`.
+    pub fn fulltext_field_all_generations_prefix(type_id: u64, field_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1);
+        buf.put_u8(KeyPrefix::Fulltext as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_id);
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// Full-text per-document row: `l:<type_id>:<field_id>:<generation>:<object_id>`.
+    pub fn fulltext_doc(type_id: u64, field_id: u64, generation: u32, object_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(FULLTEXT_PREFIX_LEN + 8);
+        put_fulltext_prefix(&mut buf, KeyPrefix::FulltextDoc, type_id, field_id, generation);
+        buf.put_u64(object_id);
+        buf.freeze()
+    }
+
+    /// Every per-document row of one field's index generation:
+    /// `l:<type_id>:<field_id>:<generation>:`. Sorted by object id.
+    pub fn fulltext_doc_prefix(type_id: u64, field_id: u64, generation: u32) -> Bytes {
+        let mut buf = BytesMut::with_capacity(FULLTEXT_PREFIX_LEN);
+        put_fulltext_prefix(&mut buf, KeyPrefix::FulltextDoc, type_id, field_id, generation);
+        buf.freeze()
+    }
+
+    /// Every per-document row of one field across ALL generations: `l:<type_id>:<field_id>:`.
+    pub fn fulltext_doc_all_generations_prefix(type_id: u64, field_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8 + 1);
+        buf.put_u8(KeyPrefix::FulltextDoc as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(field_id);
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// The object id carried in the last 8 bytes of a `fulltext_posting` /
+    /// `fulltext_doc` key. `None` if the key is too short to hold one.
+    pub fn fulltext_object_id(key: &[u8]) -> Option<u64> {
+        if key.len() < FULLTEXT_PREFIX_LEN + 8 {
+            return None;
+        }
+        let tail: [u8; 8] = key[key.len() - 8..].try_into().ok()?;
+        Some(u64::from_be_bytes(tail))
+    }
+
+    /// Arena variant of [`Self::fulltext_posting`] (same layout).
+    pub fn fulltext_posting_into(
+        buf: &mut Vec<u8>,
+        type_id: u64,
+        field_id: u64,
+        generation: u32,
+        encoded_term: &[u8],
+        object_id: u64,
+    ) -> (u32, u32) {
+        let start = buf.len() as u32;
+        push_fulltext_prefix(buf, KeyPrefix::Fulltext, type_id, field_id, generation);
+        buf.extend_from_slice(encoded_term);
+        buf.extend_from_slice(&object_id.to_be_bytes());
+        (start, buf.len() as u32)
+    }
+
+    /// Arena variant of [`Self::fulltext_doc`] (same layout).
+    pub fn fulltext_doc_into(
+        buf: &mut Vec<u8>,
+        type_id: u64,
+        field_id: u64,
+        generation: u32,
+        object_id: u64,
+    ) -> (u32, u32) {
+        let start = buf.len() as u32;
+        push_fulltext_prefix(buf, KeyPrefix::FulltextDoc, type_id, field_id, generation);
+        buf.extend_from_slice(&object_id.to_be_bytes());
+        (start, buf.len() as u32)
     }
 
     /// Vectorization queue entry: `q:<job_id>`
@@ -891,6 +1062,48 @@ mod tests {
         let prefix = KeyBuilder::edge_prefix(10, 20);
         let full = KeyBuilder::edge(10, 20, 30);
         assert!(full.starts_with(&prefix));
+    }
+
+    #[test]
+    fn fulltext_keys_layout_prefixes_and_arena_parity() {
+        let term = b"invoice\x00\x00"; // engine-encoded term carries its terminator
+        let posting = KeyBuilder::fulltext_posting(7, 3, 2, term, 99);
+        // f : type(8) : field(8) : gen(4) : term obj(8)
+        assert_eq!(posting[0], b'f');
+        assert_eq!(posting.len(), 1 + 1 + 8 + 1 + 8 + 1 + 4 + 1 + term.len() + 8);
+        assert_eq!(&posting[2..10], &7u64.to_be_bytes());
+        assert_eq!(&posting[11..19], &3u64.to_be_bytes());
+        assert_eq!(&posting[20..24], &2u32.to_be_bytes());
+        assert_eq!(KeyBuilder::fulltext_object_id(&posting), Some(99));
+
+        let term_prefix = KeyBuilder::fulltext_term_prefix(7, 3, 2, term);
+        assert!(posting.starts_with(&term_prefix));
+        // A longer term sharing the bytes does NOT match the exact-term prefix.
+        let longer = KeyBuilder::fulltext_posting(7, 3, 2, b"invoices\x00\x00", 99);
+        assert!(!longer.starts_with(&term_prefix));
+        let field_prefix = KeyBuilder::fulltext_field_prefix(7, 3, 2);
+        assert!(posting.starts_with(&field_prefix));
+        assert!(term_prefix.starts_with(&field_prefix));
+        // A different generation is a different namespace.
+        assert!(!KeyBuilder::fulltext_posting(7, 3, 3, term, 99).starts_with(&field_prefix));
+        let all = KeyBuilder::fulltext_field_all_generations_prefix(7, 3);
+        assert!(KeyBuilder::fulltext_posting(7, 3, 3, term, 99).starts_with(&all));
+        assert!(field_prefix.starts_with(&all));
+
+        let doc = KeyBuilder::fulltext_doc(7, 3, 2, 99);
+        assert_eq!(doc[0], b'l');
+        assert_eq!(KeyBuilder::fulltext_object_id(&doc), Some(99));
+        assert!(doc.starts_with(&KeyBuilder::fulltext_doc_prefix(7, 3, 2)));
+        assert!(doc.starts_with(&KeyBuilder::fulltext_doc_all_generations_prefix(7, 3)));
+        assert!(!KeyBuilder::fulltext_doc(7, 3, 1, 99).starts_with(&KeyBuilder::fulltext_doc_prefix(7, 3, 2)));
+        assert_eq!(KeyBuilder::fulltext_object_id(b"short"), None);
+
+        // Arena builders produce byte-identical keys.
+        let mut buf = Vec::new();
+        let (s, e) = KeyBuilder::fulltext_posting_into(&mut buf, 7, 3, 2, term, 99);
+        assert_eq!(&buf[s as usize..e as usize], &posting[..]);
+        let (s, e) = KeyBuilder::fulltext_doc_into(&mut buf, 7, 3, 2, 99);
+        assert_eq!(&buf[s as usize..e as usize], &doc[..]);
     }
 
     #[test]
