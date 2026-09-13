@@ -23,7 +23,13 @@
 //!   characters after analysis; `*` alone, a one-character prefix, and a
 //!   `*` inside a phrase are errors. Bare text that analyzes to several
 //!   tokens (`e-mail*`) yields plain terms for all but the last, which is
-//!   the prefix.
+//!   the prefix. Under a stemming analyzer the prefix is stemmed too and
+//!   matched against stored STEMS, so a partial word whose stem is shorter
+//!   than what was typed (`securit*` vs the stem `secur`) finds nothing —
+//!   an inherent stem+prefix trade-off (a dictionary sweep put stemming the
+//!   prefix at 88% of partial prefixes matched vs 83% for leaving it
+//!   unstemmed, so this is the better single strategy); `simple` gives
+//!   exact character-by-character type-ahead.
 //! * Clauses that analyze to nothing (punctuation, emoji) are dropped; a
 //!   query left with no clauses is an error rather than a silent empty set.
 
@@ -106,9 +112,12 @@ pub enum QuerySyntaxError {
     /// After analysis nothing searchable remained.
     NoSearchableTerms,
     /// A prefix clause whose analyzed prefix is shorter than
-    /// [`MIN_PREFIX_CHARS`] — includes a bare `*` and text that analyzes to
-    /// nothing (`!!*`). Carries the raw text before the `*`.
-    PrefixTooShort { raw: String },
+    /// [`MIN_PREFIX_CHARS`] — includes a bare `*`, text that analyzes to
+    /// nothing (`!!*`, an over-long word), and multi-word text whose LAST
+    /// word is short (`東京*`: one ideograph per word, so the prefix is `京`).
+    /// `raw` is the text before the `*` (truncated for the message),
+    /// `prefix` the analyzed last word (possibly empty).
+    PrefixTooShort { raw: String, prefix: String },
     /// A `*` inside a quoted phrase; phrases take exact terms only.
     PrefixInPhrase { phrase: String },
 }
@@ -121,11 +130,20 @@ impl std::fmt::Display for QuerySyntaxError {
                 f,
                 "query contains no searchable terms (only punctuation, or every clause was empty)"
             ),
-            Self::PrefixTooShort { raw } => write!(
-                f,
-                "prefix term \"{raw}*\" is too short: a prefix needs at least {MIN_PREFIX_CHARS} \
-                 searchable characters before the *"
-            ),
+            Self::PrefixTooShort { raw, prefix } => {
+                let shown: String = if raw.chars().count() > 40 {
+                    format!("{}…", raw.chars().take(40).collect::<String>())
+                } else {
+                    raw.clone()
+                };
+                let n = prefix.chars().count();
+                write!(
+                    f,
+                    "prefix term \"{shown}*\" is too short: the word before the * analyzes to \
+                     \"{prefix}\" ({n} character{}); a prefix needs at least {MIN_PREFIX_CHARS}",
+                    if n == 1 { "" } else { "s" },
+                )
+            }
             Self::PrefixInPhrase { phrase } => write!(
                 f,
                 "prefix terms (word*) are not supported inside a phrase: \"{phrase}\""
@@ -206,9 +224,10 @@ pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySy
                 let last = tokens.pop();
                 match last {
                     Some(t) if t.term.chars().count() >= MIN_PREFIX_CHARS => Some(t.term),
-                    _ => {
+                    other => {
                         return Err(QuerySyntaxError::PrefixTooShort {
                             raw: stem.to_string(),
+                            prefix: other.map(|t| t.term).unwrap_or_default(),
                         });
                     }
                 }
@@ -366,7 +385,25 @@ mod tests {
             );
         }
         let err = parse_query("c*", Analyzer::Simple).unwrap_err();
-        assert_eq!(err.to_string(), "prefix term \"c*\" is too short: a prefix needs at least 2 searchable characters before the *");
+        assert_eq!(
+            err.to_string(),
+            "prefix term \"c*\" is too short: the word before the * analyzes to \"c\" (1 character); a prefix needs at least 2"
+        );
+        // Multi-word text names the analyzed LAST word, so a two-ideograph
+        // CJK prefix explains itself; nothing-analyzable says so too.
+        assert_eq!(
+            parse_query("東京*", Analyzer::Simple).unwrap_err().to_string(),
+            "prefix term \"東京*\" is too short: the word before the * analyzes to \"京\" (1 character); a prefix needs at least 2"
+        );
+        assert_eq!(
+            parse_query("!!*", Analyzer::Simple).unwrap_err().to_string(),
+            "prefix term \"!!*\" is too short: the word before the * analyzes to \"\" (0 characters); a prefix needs at least 2"
+        );
+        // An over-long word (dropped by the analyzer) is echoed truncated.
+        let long = "x".repeat(300);
+        let msg = parse_query(&format!("{long}*"), Analyzer::Simple).unwrap_err().to_string();
+        assert!(msg.starts_with(&format!("prefix term \"{}…*\"", "x".repeat(40))), "{msg}");
+        assert!(msg.len() < 200, "{msg}");
         // `*` inside a phrase.
         for raw in ["\"security cam*\"", "\"* x\"", "+\"a*b\""] {
             assert!(

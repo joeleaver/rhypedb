@@ -7,7 +7,7 @@ rhypedb treats objects, relationships, and vectors as core primitives — not af
 - **Objects, not rows.** You define typed schemas; stored objects conform to their type. No impedance mismatch between your data model and your domain model.
 - **Relationships are properties.** You declare links between objects in the schema. The database stores, traverses, and maintains them — and enforces referential integrity. No foreign keys, no junction tables, no `JOIN`s.
 - **Vectors are native.** `Vector<N>` is a field type like `String` or `i64`. Vectors are compressed at rest with [TurboQuant](https://github.com/0xSero/turboquant)-adapted quantization, indexed with HNSW, and queried with a `.similar(...)` operator — optionally with server-side text embedding so you never have to compute embeddings yourself.
-- **Full-text search is built in.** A `String @fulltext` field gets a BM25-ranked inverted index — required terms, phrases, diacritic-insensitive — maintained inside each object's transaction, queried with `.matches(...)` right next to `.similar(...)`.
+- **Full-text search is built in.** A `String @fulltext` field gets a BM25-ranked inverted index — required terms, phrases, prefix terms, diacritic-insensitive, with an optional English stemmer — maintained inside each object's transaction, queried with `.matches(...)` right next to `.similar(...)`.
 - **One path-based query language** for lookups, filters, relationship traversal, mutations, vector similarity, and full-text search.
 - **Real-time subscriptions.** Subscribe to query patterns and get semantically meaningful change events.
 
