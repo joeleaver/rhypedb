@@ -109,6 +109,21 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                 )));
             }
 
+            // Two `@fulltext` directives could carry conflicting analyzer /
+            // positions settings with the first silently winning — reject.
+            if field
+                .directives
+                .iter()
+                .filter(|d| matches!(d, Directive::Fulltext(_)))
+                .count()
+                > 1
+            {
+                return Err(SchemaError::Validation(format!(
+                    "duplicate @fulltext directive on '{}.{}'",
+                    type_def.name, field.name
+                )));
+            }
+
             // `@fulltext` tokenizes a String value into an inverted index;
             // there is nothing to tokenize on any other field type.
             if field.fulltext().is_some()
@@ -1277,8 +1292,17 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("duplicate @fulltext parameter: analyzer"));
 
-        // Empty parens is a syntax error (the bare form has no parens).
+        // An unterminated parameter list is a syntax error; empty parens are
+        // just the defaults.
         assert!(parse_schema(r#"type P { t: String @fulltext( }"#).is_err());
+        assert_eq!(
+            parse_schema(r#"type P { t: String @fulltext() }"#).unwrap(),
+            parse_schema(r#"type P { t: String @fulltext }"#).unwrap()
+        );
+        // A second @fulltext on one field (conflicting config) is rejected.
+        let err = parse_schema(r#"type P { t: String @fulltext(positions: false) @fulltext }"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate @fulltext directive"), "{err}");
         // Missing comma between parameters.
         assert!(
             parse_schema(r#"type P { t: String @fulltext(analyzer: "simple" positions: true) }"#)

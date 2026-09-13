@@ -12,7 +12,6 @@
 //! mixing token streams produced by two different analyzers.
 
 use unicode_normalization::UnicodeNormalization;
-use unicode_normalization::char::is_combining_mark;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Longest term (in UTF-8 bytes, after normalization) that is indexed. Longer
@@ -41,10 +40,17 @@ pub enum Analyzer {
     ///    and punctuation, keeps `don't`, `3.14`, `e-mail` → `e`,`mail`;
     ///    CJK ideographs are one word each.
     /// 2. Unicode lowercase.
-    /// 3. NFKD decomposition, then every combining mark is dropped — this is
-    ///    the ASCII folding of diacritics (`café` → `cafe`, `naïve` →
-    ///    `naive`) and also folds compatibility forms (`ﬁ` → `fi`, full-width
-    ///    `１２３` → `123`).
+    /// 3. NFKD decomposition, then the **diacritic** combining marks are
+    ///    dropped (the Combining Diacritical Marks blocks: U+0300–036F,
+    ///    U+1AB0–1AFF, U+1DC0–1DFF, U+20D0–20FF) — this is the ASCII folding
+    ///    of diacritics (`café` → `cafe`, `naïve` → `naive`) and also folds
+    ///    compatibility forms (`ﬁ` → `fi`, full-width `１２３` → `123`).
+    ///    Script-bearing combining marks (Devanagari matras and virama, Thai
+    ///    vowels/tones, Arabic harakat, Hebrew niqqud, …) are NOT diacritics
+    ///    and are kept — stripping them would merge distinct words.
+    /// 4. Default-ignorable format characters (soft hyphen, zero-width
+    ///    space/joiners, bidi marks, BOM, variation selectors) are dropped so
+    ///    pasted text matches typed text.
     ///
     /// No stemming, no stop words.
     Simple,
@@ -98,10 +104,55 @@ fn analyze_simple(text: &str) -> Vec<Token> {
     out
 }
 
-/// Lowercase, NFKD-decompose and strip combining marks from one word.
+/// Lowercase, NFKD-decompose, strip diacritic marks and ignorable format
+/// characters from one word.
 fn fold_simple(word: &str) -> String {
     let lowered = word.to_lowercase();
-    lowered.nfkd().filter(|c| !is_combining_mark(*c)).collect()
+    lowered
+        .nfkd()
+        .filter(|&c| !is_diacritic_mark(c) && !is_default_ignorable(c))
+        .collect()
+}
+
+/// The four Combining Diacritical Marks blocks (UTR#30 "diacritic folding"
+/// scope). Deliberately NOT `is_combining_mark`, which also covers the vowel
+/// signs of abugida scripts.
+fn is_diacritic_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}' | '\u{1DC0}'..='\u{1DFF}' | '\u{20D0}'..='\u{20FF}'
+    )
+}
+
+/// Default_Ignorable_Code_Point members that show up in pasted text: soft
+/// hyphen, combining grapheme joiner, Arabic letter mark, Hangul fillers,
+/// Khmer/Mongolian format controls, zero-width space / ZWNJ / ZWJ / bidi
+/// marks, bidi embeddings, word joiner + invisible operators, variation
+/// selectors, BOM, interlinear annotation controls, tag characters.
+/// ZWNJ (U+200C) is stripped on purpose: Persian/Indic text is written both
+/// with and without it, and folding both spellings to one term is the
+/// search-friendly choice.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
 }
 
 #[cfg(test)]
@@ -171,6 +222,37 @@ mod tests {
         assert_eq!(terms("İstanbul"), vec!["istanbul"]);
         // ß has no diacritic to strip; it stays (no case-fold expansion).
         assert_eq!(terms("Straße"), vec!["straße"]);
+    }
+
+    #[test]
+    fn keeps_script_vowel_marks_but_drops_diacritics() {
+        // Devanagari matras + virama are Mn/Mc but NOT diacritics: four
+        // different words must stay four different terms.
+        assert_eq!(terms("कल काल कील कुल"), vec!["कल", "काल", "कील", "कुल"]);
+        assert_eq!(terms("हिन्दी"), vec!["हिन्दी"]);
+        // Thai has no word boundaries and UAX#29 has no dictionary
+        // segmentation, so `simple` yields one token per grapheme cluster —
+        // but every vowel/tone mark stays attached to its base (Mn marks are
+        // NOT stripped): the tokens concatenate back to the exact input.
+        assert_eq!(terms("ที่"), vec!["ที่"]);
+        assert_eq!(terms("ภาษาไทย").concat(), "ภาษาไทย");
+        // Arabic harakat and Hebrew niqqud survive (no language-specific
+        // normalization in `simple`).
+        assert_eq!(terms("مُحَمَّد"), vec!["مُحَمَّد"]);
+        assert_eq!(terms("שָׁלוֹם"), vec!["שָׁלוֹם"]);
+        // …while Latin/Greek/Cyrillic diacritics still fold.
+        assert_eq!(terms("Ñandú Ελληνικά Ёлка"), vec!["nandu", "ελληνικα", "елка"]);
+        // Combining-only input folds away to nothing rather than panicking.
+        assert!(terms("\u{301}\u{308}").is_empty());
+    }
+
+    #[test]
+    fn drops_invisible_format_characters() {
+        assert_eq!(terms("hello\u{200F} co\u{AD}operate a\u{200D}b \u{FEFF}bom"), vec!["hello", "cooperate", "ab", "bom"]);
+        // ZWNJ folds both Persian spellings to one term.
+        assert_eq!(terms("می\u{200C}خواهم"), terms("میخواهم"));
+        // Emoji variation selectors don't survive into a term either.
+        assert_eq!(terms("x\u{FE0F}y"), vec!["xy"]);
     }
 
     #[test]

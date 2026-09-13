@@ -1147,9 +1147,9 @@ fn validate_predicate_for_type(
             Ok(())
         }
         // `.contains` is a String-only substring predicate. Any other scalar
-        // kind (or a path descent into one) would silently match nothing, so
-        // reject loudly; a relation head (no scalar type) is left alone like
-        // `Compare`, and fails later as an unknown field at evaluation.
+        // kind, a path descent, a relation head, or an unknown field would
+        // silently match nothing (evaluation just reads the FieldMap), so
+        // every one of them is rejected loudly here.
         Predicate::Contains { field_path, .. } => {
             let descends = field_path.contains('.');
             let head = field_path.split('.').next().unwrap_or(field_path);
@@ -1161,7 +1161,22 @@ fn validate_predicate_for_type(
                 Some(other) => Err(QueryError::Type(format!(
                     "`.contains(...)` requires a String field; `{type_name}.{head}` is {other:?}"
                 ))),
-                None => Ok(()),
+                None => {
+                    let exists = db
+                        .schema()
+                        .get_type(type_name)
+                        .is_some_and(|t| t.get_field(head).is_some());
+                    if exists {
+                        Err(QueryError::Type(format!(
+                            "`.contains(...)` requires a String field; `{type_name}.{head}` is a \
+                             relation or vector field"
+                        )))
+                    } else {
+                        Err(QueryError::Type(format!(
+                            "`.contains(...)`: unknown field `{type_name}.{head}`"
+                        )))
+                    }
+                }
             }
         }
         Predicate::And(l, r) | Predicate::Or(l, r) => {
@@ -2309,6 +2324,13 @@ mod tests {
             r#"Note.filter(.blob.contains("aGVs"))"#,
             r#"Note.filter(.n == 1 && .meta.contains("k"))"#,
             r#"Note.filter(.title.sub.contains("x"))"#,
+            // Unknown field, relation head, relation descent — all loud, not
+            // silently empty, in single and compound positions.
+            r#"Note.filter(.nosuch.contains("x"))"#,
+            r#"Note.filter(.n == 1 && .nosuch.contains("x"))"#,
+            r#"Note.filter(.parent.contains("x"))"#,
+            r#"Note.filter(.parent.title.contains("x"))"#,
+            r#"Note.filter(.n == 1 || .parent.contains("x"))"#,
         ] {
             let err = run(q).unwrap_err();
             assert!(matches!(err, QueryError::Type(_)), "{q}: {err:?}");
