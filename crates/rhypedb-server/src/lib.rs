@@ -570,6 +570,17 @@ async fn handle_status(
         result["vectorizer"] = serde_json::json!({
             "pending": status.pending,
             "indexes": indexes,
+            // Issue #18: the embedding model's fail-soft load state. `model_loaded`
+            // is true once ANY model has loaded successfully; `model_error` is the
+            // most recent load failure, if one is currently in effect (cleared as
+            // soon as a load succeeds). See `Vectorizer::model_loaded`/`model_error`.
+            "model_loaded": status.model_loaded,
+            "model_error": status.model_error,
+            // The cross-encoder reranker's own (separate) fail-soft load
+            // state — only ever non-default when `[vectorizer] cross_encoder`
+            // names a reranker model (it is `"off"` by default). See `Vectorizer::reranker_loaded`/`reranker_error`.
+            "reranker_loaded": status.reranker_loaded,
+            "reranker_error": status.reranker_error,
         });
     } else {
         // No `@vectorize` fields → no vector index → zero indexed vectors.
@@ -994,12 +1005,39 @@ pub async fn run() {
         .values()
         .any(|td| td.vector_fields().next().is_some());
 
+    // The cross-encoder used to run by default (opt-OUT via
+    // RHYPEDB_DISABLE_RERANK); since issue #18 it is opt-IN via
+    // `[vectorizer] cross_encoder`. Say so at startup for anyone still
+    // carrying the old env vars, rather than letting a redeploy silently lose
+    // (or fail to disable) reranking.
+    if has_vector_field {
+        use rhypedb_engine::vectorizer::{CrossEncoder, DEFAULT_RERANKER_MODEL};
+        if std::env::var_os("RHYPEDB_DISABLE_RERANK").is_some() {
+            eprintln!(
+                "WARNING: RHYPEDB_DISABLE_RERANK is no longer honoured: the cross-encoder \
+                 is OFF unless `[vectorizer] cross_encoder` is set in rhypedb.toml; \
+                 the variable can be dropped."
+            );
+        }
+        if cfg.vectorizer.cross_encoder == CrossEncoder::Off
+            && std::env::var_os("RHYPEDB_RERANKER_DIR").is_some()
+        {
+            eprintln!(
+                "WARNING: RHYPEDB_RERANKER_DIR is set but the cross-encoder is OFF \
+                 (it is opt-in since #18): `.similar` text search will NOT be reranked. \
+                 Set `[vectorizer] cross_encoder = \"{DEFAULT_RERANKER_MODEL}\"` in \
+                 rhypedb.toml (--config / RHYPEDB_CONFIG) to turn it back on."
+            );
+        }
+    }
+
     let vectorizer = if has_vector_field {
-        let vectorizer = match Vectorizer::new(
+        let vectorizer = match Vectorizer::with_config(
             Arc::clone(db.storage()),
             schema.clone(),
             db.type_ids().clone(),
             db.field_ids().clone(),
+            cfg.vectorizer.clone(),
         ) {
             Ok(v) => v,
             // A misconfigured vector index (e.g. an invalid `@index` directive)

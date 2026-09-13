@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -25,12 +26,54 @@ use crate::EngineResult;
 pub struct IndexingStatus {
     pub pending: usize,
     pub index_stats: Vec<IndexStat>,
+    /// The most recent embedding-model load failure, if any is currently in
+    /// effect (cleared as soon as a load succeeds). See
+    /// [`Vectorizer::model_error`].
+    pub model_error: Option<String>,
+    /// Whether at least one embedding model has been loaded successfully
+    /// since this `Vectorizer` was created. See [`Vectorizer::model_loaded`].
+    pub model_loaded: bool,
+    /// The most recent cross-encoder reranker load failure, if any is
+    /// currently in effect. Always `None` while `cross_encoder` is `Off`.
+    /// See [`Vectorizer::reranker_error`].
+    pub reranker_error: Option<String>,
+    /// Whether the cross-encoder reranker has loaded successfully at least
+    /// once. See [`Vectorizer::reranker_loaded`].
+    pub reranker_loaded: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct IndexStat {
     pub name: String,
     pub vectors: usize,
+}
+
+/// One ranked hit from [`Vectorizer::search_text`]/[`Vectorizer::search_vector`].
+///
+/// `distance` is the index metric's distance between the query and this
+/// object — the full-precision exact distance when `exact_rescore` ran (or
+/// the brute-force exact path was used), otherwise the ANN's TurboQuant
+/// estimate. LOWER is closer, in both cases.
+///
+/// `rerank_score` is `Some` only when the cross-encoder ran for this hit (see
+/// [`CrossEncoder`]) — a text-relevance score on a DIFFERENT, unrelated scale
+/// from `distance`, where HIGHER is more relevant. `search_vector` never sets
+/// it (there is no query text to rank against).
+///
+/// A result `Vec` is ordered by `rerank_score` descending where present
+/// (i.e. cross-encoder-ranked hits sort first, among themselves by score),
+/// then by `distance` ascending for the rest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimilarHit {
+    pub object_id: u64,
+    pub distance: f32,
+    pub rerank_score: Option<f32>,
+}
+
+impl SimilarHit {
+    fn by_distance(object_id: u64, distance: f32) -> Self {
+        Self { object_id, distance, rerank_score: None }
+    }
 }
 
 /// State of a vector field on an object.
@@ -113,7 +156,141 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     Some(s)
 }
 
-const BATCH_SIZE: usize = 256;
+/// Background embedding pipeline knobs — batch size, the embedder's own
+/// build-time options, and the model-load retry backoff. All fields have
+/// defaults chosen for an application that embeds in the background next to a
+/// UI (see each field's doc comment).
+#[derive(Debug, Clone)]
+pub struct VectorizerConfig {
+    /// Jobs claimed per embed call. Default 32. Was a hard-coded 256, which
+    /// at 512 tokens/text took a desktop process to 15 GB resident during a
+    /// large backfill; 32 keeps peak memory bounded at a modest throughput
+    /// cost (more, smaller batches).
+    pub batch_size: usize,
+    /// Passed to `FastEmbedder::with_options` for every lazily created
+    /// embedder (cache dir, max token length, ONNX intra-op threads,
+    /// int8-quantized model preference).
+    pub embed: rhypedb_embed::EmbedOptions,
+    /// Delay before the FIRST retry after a model load failure. Default 2s.
+    pub model_retry_initial: Duration,
+    /// Retries double this delay each consecutive failure, capped here.
+    /// Default 60s.
+    pub model_retry_max: Duration,
+    /// Whether `.similar` text search also runs a cross-encoder rerank pass
+    /// over the ANN candidates' source text. Default `Off`. This is separate
+    /// from — and used ALONGSIDE — the per-query full-precision
+    /// `exact_rescore` (`.similar(..., rerank: N)` in the query language):
+    /// `exact_rescore` re-scores candidates against the exact `f32` vectors
+    /// (cheap, always available); the cross-encoder additionally re-scores
+    /// them against the query TEXT with a second model (a ~280MB download,
+    /// one forward pass per candidate — expensive enough that it must be an
+    /// explicit opt-in, never an implicit default).
+    pub cross_encoder: CrossEncoder,
+}
+
+/// Whether and how `.similar` text search cross-encoder-reranks its ANN
+/// candidates. See [`VectorizerConfig::cross_encoder`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CrossEncoder {
+    /// No cross-encoder. `.similar` text search returns ANN order (optionally
+    /// full-precision-rescored by `exact_rescore`) only. No reranker model is
+    /// ever downloaded or loaded.
+    #[default]
+    Off,
+    /// Cross-encoder-rerank every text `.similar` query whose field has a
+    /// readable source text. `model` names the reranker model; today exactly
+    /// one is supported (see [`DEFAULT_RERANKER_MODEL`]) and any other value
+    /// fails the (lazy, fail-soft) load with `UnsupportedModel` — the field
+    /// exists so a future rhypedb-embed release can add more without an API
+    /// change here.
+    On { model: String },
+}
+
+/// The only reranker model this build knows how to load. `CrossEncoder::On`'s
+/// `model` must equal this (today); see [`CrossEncoder::On`].
+pub const DEFAULT_RERANKER_MODEL: &str = "bge-reranker-base";
+
+impl Default for VectorizerConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 32,
+            embed: rhypedb_embed::EmbedOptions::default(),
+            model_retry_initial: Duration::from_secs(2),
+            model_retry_max: Duration::from_secs(60),
+            cross_encoder: CrossEncoder::default(),
+        }
+    }
+}
+
+// Hand-rolled rather than `#[derive(PartialEq)]`: `rhypedb_embed::EmbedOptions`
+// doesn't implement `PartialEq` (its `cache_dir`/`max_length`/`intra_threads`/
+// `quantized` fields all do, so compare those directly instead). Lets a
+// consumer's own config struct (e.g. `rhypedb-server`'s `ServerConfig`) derive
+// `PartialEq` while embedding a `VectorizerConfig`.
+impl PartialEq for VectorizerConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.batch_size == other.batch_size
+            && self.model_retry_initial == other.model_retry_initial
+            && self.model_retry_max == other.model_retry_max
+            && self.cross_encoder == other.cross_encoder
+            && self.embed.cache_dir == other.embed.cache_dir
+            && self.embed.max_length == other.embed.max_length
+            && self.embed.intra_threads == other.embed.intra_threads
+            && self.embed.quantized == other.embed.quantized
+    }
+}
+
+/// How a fresh [`Embedder`] is constructed for a model name. In production
+/// this calls `FastEmbedder::with_options` (behind the `fastembed` feature);
+/// tests substitute a `FailingLoader`-style closure to exercise the fail-soft
+/// model-load retry logic deterministically, without touching the network.
+/// See `Vectorizer::get_or_load_embedder` and the `tests` module below.
+type LoadedEmbedder = Result<Box<dyn Embedder>, rhypedb_embed::EmbedError>;
+type EmbedderLoader = dyn Fn(&str, &rhypedb_embed::EmbedOptions) -> LoadedEmbedder + Send + Sync;
+
+#[cfg(feature = "fastembed")]
+fn default_embedder_loader() -> Box<EmbedderLoader> {
+    Box::new(|model_name: &str, options: &rhypedb_embed::EmbedOptions| {
+        FastEmbedder::with_options(model_name, options)
+            .map(|e| Box::new(e) as Box<dyn Embedder>)
+    })
+}
+
+#[cfg(not(feature = "fastembed"))]
+fn default_embedder_loader() -> Box<EmbedderLoader> {
+    Box::new(|_model_name: &str, _options: &rhypedb_embed::EmbedOptions| {
+        Err(rhypedb_embed::EmbedError::Unavailable(
+            "no embedder available (built without the `fastembed` feature)".into(),
+        ))
+    })
+}
+
+/// How a fresh cross-encoder [`Reranker`] is constructed for
+/// `CrossEncoder::On`'s `model` name. Mirrors [`EmbedderLoader`]: production
+/// resolves to `default_reranker_loader()` (real `FastReranker::new()`, after
+/// checking `model` against [`DEFAULT_RERANKER_MODEL`]); tests substitute a
+/// `FailingLoader`-style closure. See `Vectorizer::get_or_load_reranker`.
+type LoadedReranker = Result<Box<dyn Reranker>, rhypedb_embed::EmbedError>;
+type RerankerLoader = dyn Fn(&str) -> LoadedReranker + Send + Sync;
+
+#[cfg(feature = "fastembed")]
+fn default_reranker_loader() -> Box<RerankerLoader> {
+    Box::new(|model_name: &str| {
+        if model_name != DEFAULT_RERANKER_MODEL {
+            return Err(rhypedb_embed::EmbedError::UnsupportedModel(model_name.into()));
+        }
+        FastReranker::new().map(|r| Box::new(r) as Box<dyn Reranker>)
+    })
+}
+
+#[cfg(not(feature = "fastembed"))]
+fn default_reranker_loader() -> Box<RerankerLoader> {
+    Box::new(|_model_name: &str| {
+        Err(rhypedb_embed::EmbedError::Unavailable(
+            "no reranker available (built without the `fastembed` feature)".into(),
+        ))
+    })
+}
 
 /// Manages vector indexes and the async vectorization pipeline.
 pub struct Vectorizer {
@@ -128,6 +305,59 @@ pub struct Vectorizer {
     running: Arc<AtomicBool>,
     worker_handles: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
     claim_mutex: parking_lot::Mutex<()>,
+    config: VectorizerConfig,
+    /// Factory for lazily-created embedders. A `parking_lot::Mutex` (not a
+    /// plain field) so tests can swap it after construction — production code
+    /// never re-assigns it once `new`/`with_config` returns.
+    embedder_loader: parking_lot::Mutex<Box<EmbedderLoader>>,
+    /// The most recent model-load failure message, or `None` once a load has
+    /// succeeded (or none has ever failed). See [`Self::model_error`].
+    model_error: parking_lot::Mutex<Option<String>>,
+    /// Whether ANY embedding model has ever loaded successfully. See
+    /// [`Self::model_loaded`].
+    model_loaded: AtomicBool,
+    /// Backoff for the NEXT model-load retry; doubles (capped at
+    /// `config.model_retry_max`) on each consecutive failure and resets to
+    /// `config.model_retry_initial` on success. See
+    /// [`Self::record_model_load_failure`].
+    next_retry_delay: parking_lot::Mutex<Duration>,
+    /// Earliest instant at which another model LOAD may be attempted, set on
+    /// every load failure. Both the worker and the query path honour it
+    /// (see [`Self::get_or_load_embedder`]): while it is in the future a
+    /// load is refused up front with `Unavailable`, so a `.similar` text
+    /// query never re-runs a (network-bound) download under the shared
+    /// embedders lock on every call while the model is known-bad. `None` =
+    /// no failure in effect.
+    next_retry_at: parking_lot::Mutex<Option<Instant>>,
+    /// Set by `process_batch` when it indexed something; cleared by
+    /// [`Self::save_snapshots`]. Drives the worker's snapshot cadence.
+    snapshots_dirty: AtomicBool,
+    /// When [`Self::save_snapshots`] last ran. See [`SNAPSHOT_INTERVAL`].
+    last_snapshot_save: parking_lot::Mutex<Instant>,
+    /// Queue position: the smallest job id that might still be live. Every
+    /// queue entry below it has been claimed (deleted), so `claim_batch` can
+    /// seek past the tombstones instead of materializing the whole prefix.
+    /// See [`Self::claim_batch`] for the invariant that makes this sound.
+    claim_cursor: AtomicU64,
+    /// First job id of every `enqueue_many` transaction that has allocated
+    /// its ids but not yet committed (or aborted). `claim_batch` never moves
+    /// its cursor past the smallest of these: such an entry may commit
+    /// AFTER the claim's snapshot, so a window scan that found it empty
+    /// proves nothing. Ids are allocated and registered under this lock, and
+    /// the claim reads `next_job_id` under it too, so no allocation can slip
+    /// between the two reads. See [`Self::claim_bound`].
+    inflight_enqueues: parking_lot::Mutex<std::collections::BTreeSet<u64>>,
+    /// Factory for the lazily-created cross-encoder reranker. Only ever
+    /// consulted when `config.cross_encoder` is `On`; see
+    /// [`Self::get_or_load_reranker`].
+    reranker_loader: parking_lot::Mutex<Box<RerankerLoader>>,
+    /// The most recent reranker-load failure message, or `None` once a load
+    /// has succeeded (or none has ever failed, or `cross_encoder` is `Off`).
+    /// See [`Self::reranker_error`].
+    reranker_error: parking_lot::Mutex<Option<String>>,
+    /// Whether the cross-encoder reranker has ever loaded successfully. See
+    /// [`Self::reranker_loaded`].
+    reranker_loaded: AtomicBool,
 }
 
 /// Effective index config for a Vector field with no (or a partial) `@index`
@@ -225,12 +455,64 @@ fn index_config_mismatch(target: &QuantizedIndex, loaded: &QuantizedIndex) -> Op
     }
 }
 
+/// Distinguishes, in `process_batch`, why an embed attempt for a model group
+/// failed: loading the model itself (fault of the model, not the jobs — they
+/// get re-enqueued) vs. the embed call on an already-loaded model (fault of
+/// this batch's input — the existing `mark_batch_failed` path).
+enum BatchFailure {
+    ModelLoad(rhypedb_embed::EmbedError),
+    Embed(rhypedb_embed::EmbedError),
+}
+
+/// What one `process_batch` call did. `model_load_failed` is true when at
+/// least one model group in THIS batch could not load its embedder (those
+/// jobs were re-enqueued) — the worker loop backs off on this, and only on
+/// this, rather than on the aggregate `model_error` flag: that flag is also
+/// set by a failed query-path load and is not cleared by a batch that embeds
+/// with an already-cached embedder, so keying the backoff on it would throttle
+/// a healthy model's backfill (up to `model_retry_max` per batch) whenever a
+/// DIFFERENT model is unavailable.
+struct BatchOutcome {
+    processed: usize,
+    model_load_failed: bool,
+}
+
+/// Job ids per `claim_batch` scan window. See [`Vectorizer::claim_batch`].
+const CLAIM_WINDOW: u64 = 256;
+
+/// The job id encoded in a queue-entry key (`q:` + big-endian `u64`).
+fn queue_entry_id(key: &[u8]) -> u64 {
+    let start = key.len() - 8;
+    u64::from_be_bytes(key[start..].try_into().expect("queue key ends in a u64"))
+}
+
+/// How often the worker persists HNSW snapshots while a backfill is in
+/// progress. A snapshot is a cold-start accelerator only (the index is
+/// rebuilt from the `v:` keyspace without one — see `rebuild_indexes` and the
+/// crash-fuzz harness), but writing one serializes the ENTIRE index to a temp
+/// file + rename, so doing it after every batch — 8× more often now that the
+/// default batch is 32, not 256 — would rewrite a large index continuously.
+/// The worker saves when this much time has passed since the last save AND
+/// something was indexed since, and always when the queue drains or the
+/// worker stops.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+
 impl Vectorizer {
     pub fn new(
         storage: Arc<LsmTree>,
         schema: Schema,
         type_ids: HashMap<String, u64>,
         field_ids: HashMap<String, u64>,
+    ) -> EngineResult<Self> {
+        Self::with_config(storage, schema, type_ids, field_ids, VectorizerConfig::default())
+    }
+
+    pub fn with_config(
+        storage: Arc<LsmTree>,
+        schema: Schema,
+        type_ids: HashMap<String, u64>,
+        field_ids: HashMap<String, u64>,
+        config: VectorizerConfig,
     ) -> EngineResult<Self> {
         // Create HNSW indexes for each @vectorize field.
         let mut indexes = HashMap::new();
@@ -269,6 +551,7 @@ impl Vectorizer {
             }
         }
 
+        let next_retry_delay = config.model_retry_initial;
         let vectorizer = Self {
             storage,
             schema,
@@ -281,12 +564,30 @@ impl Vectorizer {
             running: Arc::new(AtomicBool::new(false)),
             worker_handles: parking_lot::Mutex::new(Vec::new()),
             claim_mutex: parking_lot::Mutex::new(()),
+            embedder_loader: parking_lot::Mutex::new(default_embedder_loader()),
+            model_error: parking_lot::Mutex::new(None),
+            model_loaded: AtomicBool::new(false),
+            next_retry_delay: parking_lot::Mutex::new(next_retry_delay),
+            next_retry_at: parking_lot::Mutex::new(None),
+            snapshots_dirty: AtomicBool::new(false),
+            last_snapshot_save: parking_lot::Mutex::new(Instant::now()),
+            claim_cursor: AtomicU64::new(0),
+            inflight_enqueues: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
+            reranker_loader: parking_lot::Mutex::new(default_reranker_loader()),
+            reranker_error: parking_lot::Mutex::new(None),
+            reranker_loaded: AtomicBool::new(false),
+            config,
         };
 
         vectorizer.rebuild_indexes()?;
         vectorizer.reconcile_pending_jobs()?;
 
         Ok(vectorizer)
+    }
+
+    /// The effective configuration this `Vectorizer` was built with.
+    pub fn config(&self) -> &VectorizerConfig {
+        &self.config
     }
 
     /// Re-enqueue vectorize jobs orphaned by a crash between `claim_batch`
@@ -438,12 +739,11 @@ impl Vectorizer {
             })?;
         }
 
-        // Re-enqueue recoverable orphans (each writes a fresh queue entry, and
-        // re-asserts the Pending state). Idempotent: a later store_and_index for
-        // an already-indexed object just re-inserts the same object_id.
-        for job in to_enqueue {
-            self.enqueue(job)?;
-        }
+        // Re-enqueue recoverable orphans in one txn (each gets a fresh queue
+        // entry and its Pending state re-asserted). Idempotent: a later
+        // store_and_index for an already-indexed object just re-inserts the
+        // same object_id.
+        self.enqueue_many(&to_enqueue)?;
 
         Ok(())
     }
@@ -630,6 +930,20 @@ impl Vectorizer {
         for (index_key, index) in indexes.iter() {
             self.save_single_snapshot(index_key, index);
         }
+        self.snapshots_dirty.store(false, Ordering::SeqCst);
+        *self.last_snapshot_save.lock() = Instant::now();
+    }
+
+    /// Save snapshots if something was indexed since the last save and
+    /// either `force` (queue drained / shutting down) or [`SNAPSHOT_INTERVAL`]
+    /// has elapsed. See `SNAPSHOT_INTERVAL` for why not after every batch.
+    fn save_snapshots_if_due(&self, force: bool) {
+        if !self.snapshots_dirty.load(Ordering::SeqCst) {
+            return;
+        }
+        if force || self.last_snapshot_save.lock().elapsed() >= SNAPSHOT_INTERVAL {
+            self.save_snapshots();
+        }
     }
 
     fn save_single_snapshot(&self, index_key: &str, index: &QuantizedIndex) {
@@ -664,30 +978,75 @@ impl Vectorizer {
 
     /// Enqueue a vectorization job for an object.
     pub fn enqueue(&self, job: VectorizeJob) -> EngineResult<()> {
-        let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-        let key = KeyBuilder::queue_entry(job_id);
-        let value = job.serialize();
+        self.enqueue_many(std::slice::from_ref(&job))
+    }
 
-        // Set vector state to pending.
-        let type_id = self.type_ids[&job.type_name];
-        let field_key = format!("{}.{}", job.type_name, job.vector_field);
-        let field_id = self.field_ids[&field_key];
-        let state_key = KeyBuilder::vector_state(type_id, job.object_id, field_id);
+    /// Enqueue several jobs in ONE transaction (one commit, one WAL sync) —
+    /// each gets a fresh queue entry and its vector state re-asserted as
+    /// `Pending`. Used by the worker's model-unavailable re-enqueue and by the
+    /// open-time orphan reconcile, where a per-job commit would both cost a
+    /// sync per job and, worse, leave a half-processed batch stranded
+    /// (`Pending`, no queue row) if a later job's commit failed. All-or-nothing:
+    /// on `Err` no job was enqueued.
+    ///
+    /// A `WriteConflict` here means a foreground write (the server's
+    /// `enqueue_vectorize` for one of these objects) committed the same `s:`
+    /// key first — i.e. that object just got a NEWER job of its own. Retrying
+    /// re-asserts `Pending` and adds this (now redundant, harmless: a later
+    /// `store_and_index` is idempotent) entry; bounded so a pathological
+    /// conflict storm surfaces as an error rather than a hang.
+    pub fn enqueue_many(&self, jobs: &[VectorizeJob]) -> EngineResult<()> {
+        const MAX_CONFLICT_RETRIES: usize = 8;
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        // Allocate this txn's contiguous id range and register it as
+        // in-flight, atomically w.r.t. `claim_bound` (see `inflight_enqueues`).
+        let first_id = {
+            let mut inflight = self.inflight_enqueues.lock();
+            let first = self.next_job_id.fetch_add(jobs.len() as u64, Ordering::SeqCst);
+            inflight.insert(first);
+            first
+        };
+        struct Unregister<'a>(&'a Vectorizer, u64);
+        impl Drop for Unregister<'_> {
+            fn drop(&mut self) {
+                self.0.inflight_enqueues.lock().remove(&self.1);
+            }
+        }
+        let _unregister = Unregister(self, first_id);
 
-        let mut txn = self.storage.begin_txn();
-        self.storage
-            .put(&mut txn, &key, value)?;
-        self.storage.put(
-            &mut txn,
-            &state_key,
-            Bytes::from(vec![VectorState::Pending as u8]),
-        )?;
-        self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
-            other => crate::EngineError::Storage(other),
-        })?;
+        let mut attempt = 0;
+        loop {
+            let mut txn = self.storage.begin_txn();
+            for (i, job) in jobs.iter().enumerate() {
+                let job_id = first_id + i as u64;
+                let key = KeyBuilder::queue_entry(job_id);
+                self.storage.put(&mut txn, &key, job.serialize())?;
 
-        Ok(())
+                // Set vector state to pending.
+                let type_id = self.type_ids[&job.type_name];
+                let field_key = format!("{}.{}", job.type_name, job.vector_field);
+                let field_id = self.field_ids[&field_key];
+                let state_key = KeyBuilder::vector_state(type_id, job.object_id, field_id);
+                self.storage.put(
+                    &mut txn,
+                    &state_key,
+                    Bytes::from(vec![VectorState::Pending as u8]),
+                )?;
+            }
+            match self.storage.commit(&mut txn) {
+                Ok(_) => return Ok(()),
+                Err(rhypedb_storage::Error::WriteConflict) if attempt < MAX_CONFLICT_RETRIES => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(5 * attempt as u64));
+                }
+                Err(rhypedb_storage::Error::WriteConflict) => {
+                    return Err(crate::EngineError::WriteConflict)
+                }
+                Err(other) => return Err(crate::EngineError::Storage(other)),
+            }
+        }
     }
 
     /// Get the vectorization state of a specific vector field on an object.
@@ -734,39 +1093,243 @@ impl Vectorizer {
         IndexingStatus {
             pending,
             index_stats,
+            model_error: self.model_error(),
+            model_loaded: self.model_loaded(),
+            reranker_error: self.reranker_error(),
+            reranker_loaded: self.reranker_loaded(),
+        }
+    }
+
+    /// The most recent embedding-model load failure, if one is currently in
+    /// effect. Cleared as soon as any model loads successfully afterward
+    /// (including a DIFFERENT model than the one that failed — this is an
+    /// aggregate signal, not per-model). `None` if no load has ever failed,
+    /// or the last failure has since been superseded by a success.
+    pub fn model_error(&self) -> Option<String> {
+        self.model_error.lock().clone()
+    }
+
+    /// Whether at least one embedding model has loaded successfully since
+    /// this `Vectorizer` was created. Once true, stays true — a LATER load
+    /// failure (see `model_error`) means the model is unavailable again
+    /// right now, not that it never worked.
+    pub fn model_loaded(&self) -> bool {
+        self.model_loaded.load(Ordering::SeqCst)
+    }
+
+    fn record_model_load_success(&self) {
+        *self.model_error.lock() = None;
+        self.model_loaded.store(true, Ordering::SeqCst);
+        *self.next_retry_delay.lock() = self.config.model_retry_initial;
+        *self.next_retry_at.lock() = None;
+    }
+
+    /// Record a load failure: remember the message, schedule the next
+    /// permitted attempt `next_retry_delay` from now, and double that delay
+    /// (capped at `config.model_retry_max`) so consecutive failures back off
+    /// exponentially. Reset by [`Self::record_model_load_success`].
+    fn record_model_load_failure(&self, message: &str) {
+        *self.model_error.lock() = Some(message.to_string());
+        let mut delay = self.next_retry_delay.lock();
+        *self.next_retry_at.lock() = Some(Instant::now() + *delay);
+        *delay = (*delay * 2).min(self.config.model_retry_max);
+    }
+
+    /// How long until the next model-load attempt is permitted (zero if one
+    /// is permitted now). The worker sleeps this long after a batch that hit
+    /// a load failure, so it wakes exactly when a retry is allowed.
+    fn time_until_next_retry(&self) -> Duration {
+        match *self.next_retry_at.lock() {
+            Some(at) => at.saturating_duration_since(Instant::now()),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Get the embedder for `model_name` from the shared cache, lazily
+    /// constructing it via `embedder_loader` if absent (in production,
+    /// `FastEmbedder::with_options`; see [`default_embedder_loader`] and the
+    /// `tests` module's `FailingLoader`-style seam). On success, records
+    /// `model_loaded`/clears `model_error` and resets the retry backoff. On
+    /// failure, nothing is inserted — so the NEXT call from any caller
+    /// retries the load — and `model_error` is recorded; the caller decides
+    /// what to do with any in-flight work (the worker re-enqueues its claimed
+    /// jobs rather than marking them `Failed`, since the model — not the
+    /// input — is at fault).
+    fn get_or_load_embedder<'a>(
+        &self,
+        embedders: &'a mut HashMap<String, Box<dyn Embedder>>,
+        model_name: &str,
+    ) -> Result<&'a mut Box<dyn Embedder>, rhypedb_embed::EmbedError> {
+        if !embedders.contains_key(model_name) {
+            // Backoff gate: a failure is in effect and its retry time hasn't
+            // come — refuse without touching the loader (which may be a
+            // network-bound download held under the embedders lock). Not a
+            // new failure, so the backoff is NOT escalated here.
+            let wait = self.time_until_next_retry();
+            if wait > Duration::ZERO {
+                let last = self.model_error().unwrap_or_default();
+                return Err(rhypedb_embed::EmbedError::Unavailable(format!(
+                    "{last} (next load attempt in {wait:.1?})"
+                )));
+            }
+            let loader = self.embedder_loader.lock();
+            match (loader)(model_name, &self.config.embed) {
+                Ok(embedder) => {
+                    embedders.insert(model_name.to_string(), embedder);
+                    drop(loader);
+                    self.record_model_load_success();
+                }
+                Err(e) => {
+                    drop(loader);
+                    self.record_model_load_failure(&e.to_string());
+                    return Err(e);
+                }
+            }
+        }
+        Ok(embedders.get_mut(model_name).unwrap())
+    }
+
+    /// The most recent cross-encoder reranker load failure, if one is
+    /// currently in effect. `None` if `cross_encoder` is `Off`, no load has
+    /// ever failed, or a later load succeeded. See [`Self::model_error`] for
+    /// the analogous embedder signal.
+    pub fn reranker_error(&self) -> Option<String> {
+        self.reranker_error.lock().clone()
+    }
+
+    /// Whether the cross-encoder reranker has loaded successfully at least
+    /// once. Always `false` while `cross_encoder` is `Off`.
+    pub fn reranker_loaded(&self) -> bool {
+        self.reranker_loaded.load(Ordering::SeqCst)
+    }
+
+    /// Get the cross-encoder reranker, lazily constructing it via
+    /// `reranker_loader` if absent (in production, `FastReranker::new()`
+    /// after validating the configured model name; tests substitute a
+    /// `FailingLoader`-style closure — see `default_reranker_loader` and the
+    /// `tests` module). Mirrors [`Self::get_or_load_embedder`]'s fail-soft
+    /// contract exactly: on success, records `reranker_loaded`/clears
+    /// `reranker_error`; on failure nothing is cached, so the NEXT call (the
+    /// next `.similar` text query) retries, and `reranker_error` is recorded.
+    /// Callers must check `config.cross_encoder` themselves — this method
+    /// always attempts a load and never panics.
+    fn get_or_load_reranker(&self, model: &str) -> Result<(), rhypedb_embed::EmbedError> {
+        let mut reranker = self.reranker.lock();
+        if reranker.is_some() {
+            return Ok(());
+        }
+        let loader = self.reranker_loader.lock();
+        match (loader)(model) {
+            Ok(r) => {
+                *reranker = Some(r);
+                drop(loader);
+                *self.reranker_error.lock() = None;
+                self.reranker_loaded.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(e) => {
+                drop(loader);
+                *self.reranker_error.lock() = Some(e.to_string());
+                Err(e)
+            }
         }
     }
 
     /// Process pending jobs using the shared embedder (for single-threaded use / tests).
+    /// Claim and embed one batch. Returns the number of objects indexed —
+    /// `Ok(0)` means the queue was empty. If the batch's model could not be
+    /// loaded and NOTHING was indexed, returns `Err(ModelUnavailable)` (the
+    /// jobs were re-enqueued, not lost) rather than an `Ok(0)` a host
+    /// looping "until 0" could not tell apart from an empty queue — an
+    /// embedded caller should back off (see `VectorizerConfig::model_retry_*`
+    /// and [`Self::model_error`]) and try again later.
     pub fn process_pending(&self) -> EngineResult<usize> {
         let batch = self.claim_batch()?;
         if batch.is_empty() {
             return Ok(0);
         }
-        self.process_batch(batch)
+        let outcome = self.process_batch(batch)?;
+        if outcome.model_load_failed && outcome.processed == 0 {
+            return Err(crate::EngineError::ModelUnavailable(
+                self.model_error().unwrap_or_else(|| "model failed to load".into()),
+            ));
+        }
+        Ok(outcome.processed)
     }
 
     /// Atomically claim a batch of jobs from the queue.
     /// Deletes queue entries upfront so parallel workers don't double-claim.
+    /// The smallest job id that might still be uncommitted: the lowest
+    /// in-flight `enqueue_many` range start, else `next_job_id`. Every id
+    /// below the returned value is already durably committed (or was
+    /// claimed), so a snapshot taken AFTER this call sees all of them.
+    fn claim_bound(&self) -> u64 {
+        let inflight = self.inflight_enqueues.lock();
+        let next = self.next_job_id.load(Ordering::SeqCst);
+        inflight.iter().next().copied().unwrap_or(next).min(next)
+    }
+
+    /// Claim the next `config.batch_size` jobs (lowest ids first).
+    ///
+    /// The queue is scanned in fixed windows of [`CLAIM_WINDOW`] job ids
+    /// starting at `claim_cursor`, each window an EXACT prefix scan (the key
+    /// is `q:` + big-endian `u64`, so a 7-byte id prefix is a 256-id range),
+    /// rather than materializing the whole `q:` prefix per claim — which made
+    /// a backfill of N jobs O(N²/batch) and, worse, walked every tombstone of
+    /// every prior claim each time. Windows are exact merges across layers
+    /// (no per-layer cap), so a live entry can never be skipped; a window
+    /// that yields nothing live is finished for good (ids only grow, and
+    /// entries are only ever deleted by this method, lowest-first), so the
+    /// cursor moves past it. The walk stops at [`Self::claim_bound`]: nothing
+    /// COMMITTED can exist at or beyond it, and an enqueue still in flight
+    /// below `next_job_id` holds the bound back so its window is re-scanned
+    /// next time. After a reopen the cursor restarts at 0 and walks the old
+    /// tombstones once.
     fn claim_batch(&self) -> EngineResult<Vec<(VectorizeJob, u64)>> {
         let _lock = self.claim_mutex.lock();
 
+        // Read the bound BEFORE taking the snapshot: every id below it was
+        // committed before now (hence visible in the snapshot) — see
+        // `claim_bound`. Reading it after `begin_txn` would let an enqueue
+        // commit between the snapshot and the read, invisible yet below the
+        // bound, and the cursor would walk past it.
+        let bound = self.claim_bound();
         let mut txn = self.storage.begin_txn();
-        let prefix = KeyBuilder::queue_prefix();
-        let entries = self.storage.scan_prefix(&txn, &prefix)?;
-
-        if entries.is_empty() {
-            return Ok(Vec::new());
+        let mut jobs: Vec<(Bytes, VectorizeJob)> = Vec::new();
+        let mut cursor = self.claim_cursor.load(Ordering::SeqCst);
+        while cursor < bound && jobs.len() < self.config.batch_size {
+            let window = cursor / CLAIM_WINDOW;
+            let entries = self
+                .storage
+                .scan_prefix(&txn, &KeyBuilder::queue_window_prefix(window))?;
+            let mut last_live: Option<u64> = None;
+            for (key, value) in entries {
+                let id = queue_entry_id(&key);
+                if id < cursor {
+                    continue;
+                }
+                if id >= bound || jobs.len() >= self.config.batch_size {
+                    // At/after the bound an in-flight enqueue may still land
+                    // below this id; leave everything from here for the next
+                    // claim so the cursor never passes it.
+                    break;
+                }
+                if let Some(job) = VectorizeJob::deserialize(&value) {
+                    jobs.push((key, job));
+                    last_live = Some(id);
+                }
+            }
+            cursor = match last_live {
+                // Claimed through `last_live`; anything after it in this
+                // window (or later windows) is still live for the next claim.
+                Some(id) if jobs.len() >= self.config.batch_size => id + 1,
+                // Took everything live in this window; move to the next.
+                _ => (window + 1) * CLAIM_WINDOW,
+            };
         }
-
-        let jobs: Vec<(Bytes, VectorizeJob)> = entries
-            .into_iter()
-            .filter_map(|(key, value)| {
-                let job = VectorizeJob::deserialize(&value)?;
-                Some((key, job))
-            })
-            .take(BATCH_SIZE)
-            .collect();
+        // A window walk that found nothing may still have advanced the
+        // cursor past dead windows — persist that even on an empty claim.
+        self.claim_cursor.store(cursor.min(bound), Ordering::SeqCst);
 
         if jobs.is_empty() {
             return Ok(Vec::new());
@@ -801,7 +1364,7 @@ impl Vectorizer {
     fn process_batch(
         &self,
         jobs: Vec<(VectorizeJob, u64)>,
-    ) -> EngineResult<usize> {
+    ) -> EngineResult<BatchOutcome> {
         // Group by model.
         let mut jobs_by_model: HashMap<String, Vec<VectorizeJob>> = HashMap::new();
         for (job, _) in jobs {
@@ -812,61 +1375,96 @@ impl Vectorizer {
         }
 
         let mut processed = 0;
+        let mut model_load_failed = false;
 
         for (model_name, batch_jobs) in &jobs_by_model {
-            let texts: Vec<String> = batch_jobs
+            // Pair each job with its source text, DROPPING jobs whose text
+            // can't be read (object gone, type unresolvable, source not a
+            // string). Everything below iterates these pairs, never
+            // `batch_jobs`, so a dropped job can't shift its neighbours'
+            // embeddings onto the wrong objects. A dropped job keeps its
+            // `Pending` state with no queue row; the open-time
+            // `reconcile_pending_jobs` cleans that up.
+            let snapshot = self.storage.read_snapshot();
+            let with_text: Vec<(&VectorizeJob, String)> = batch_jobs
                 .iter()
                 .filter_map(|job| {
                     let type_id = self.type_ids.get(&job.type_name)?;
                     let obj_key = KeyBuilder::object(*type_id, job.object_id);
-                    let snapshot = self.storage.read_snapshot();
                     let data = self.storage.get_at(snapshot, &obj_key).ok()??;
                     let fields = deserialize_fields(&data);
                     match fields.get(&job.source_field)? {
-                        Value::String(s) => Some(s.clone()),
+                        Value::String(s) => Some((job, s.clone())),
                         _ => None,
                     }
                 })
                 .collect();
 
-            if texts.is_empty() {
+            if with_text.is_empty() {
                 continue;
             }
 
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+            let text_refs: Vec<&str> = with_text.iter().map(|(_, s)| s.as_str()).collect();
+            let jobs_with_text: Vec<VectorizeJob> =
+                with_text.iter().map(|(job, _)| (*job).clone()).collect();
 
             // Lock the shared embedder only for the embed; release before the
             // insert/commit phase so concurrent query-path embeds don't block.
-            let embed_result = {
-                let mut embedders = self.embedders.lock();
-                // Lazily load the fastembed-backed embedder for this model. When
-                // built without the `fastembed` feature there's no built-in
-                // embedder to construct, so an absent entry yields a clear error.
-                #[cfg(feature = "fastembed")]
-                embedders.entry(model_name.clone()).or_insert_with(|| {
-                    Box::new(FastEmbedder::new(model_name).expect("failed to load model"))
-                });
-                match embedders.get_mut(model_name) {
-                    Some(embedder) => embedder.embed(&text_refs),
-                    None => Err(rhypedb_embed::EmbedError::Model(
-                        "no embedder available (built without the `fastembed` feature)".into(),
-                    )),
-                }
+            // Loading and embedding are distinguished: a LOAD failure means the
+            // model, not these jobs, is at fault — re-enqueue below rather than
+            // marking them Failed. An embed-call failure on an already-loaded
+            // model (e.g. unexpected input) is the pre-existing Failed path.
+            let mut embedders = self.embedders.lock();
+            let embed_result = match self.get_or_load_embedder(&mut embedders, model_name) {
+                Ok(embedder) => embedder.embed(&text_refs).map_err(BatchFailure::Embed),
+                Err(e) => Err(BatchFailure::ModelLoad(e)),
             };
+            drop(embedders);
             let embeddings = match embed_result {
                 Ok(e) => e,
-                Err(e) => {
-                    self.mark_batch_failed(batch_jobs, &format!("{e}"))?;
+                Err(BatchFailure::ModelLoad(e)) => {
+                    eprintln!(
+                        "vectorizer: model '{model_name}' unavailable, re-enqueuing \
+                         {} job(s): {e}",
+                        jobs_with_text.len()
+                    );
+                    // One txn for the whole group. On a hard storage error do
+                    // NOT `?` out: that would strand every group not yet
+                    // iterated (Pending, no queue row) as well. Log, and let
+                    // the open-time reconcile repair this group's orphans —
+                    // the other groups still get their turn.
+                    if let Err(e) = self.enqueue_many(&jobs_with_text) {
+                        eprintln!(
+                            "vectorizer: failed to re-enqueue {} job(s) for model \
+                             '{model_name}' (they will be recovered at next open): {e}",
+                            jobs_with_text.len()
+                        );
+                    }
+                    model_load_failed = true;
+                    continue;
+                }
+                Err(BatchFailure::Embed(e)) => {
+                    self.mark_batch_failed(&jobs_with_text, &format!("{e}"))?;
                     continue;
                 }
             };
 
-            for (emb_idx, job) in batch_jobs.iter().enumerate() {
-                if emb_idx >= embeddings.len() {
-                    break;
-                }
+            if embeddings.len() != jobs_with_text.len() {
+                // An embedder must return exactly one vector per input; a
+                // short/long answer would otherwise pair vectors with the
+                // wrong objects. Treat it as a batch-level embed failure.
+                self.mark_batch_failed(
+                    &jobs_with_text,
+                    &format!(
+                        "embedder returned {} vector(s) for {} text(s)",
+                        embeddings.len(),
+                        jobs_with_text.len()
+                    ),
+                )?;
+                continue;
+            }
 
-                let embedding = &embeddings[emb_idx];
+            for (job, embedding) in jobs_with_text.iter().zip(embeddings.iter()) {
                 self.store_and_index(
                     &job.type_name,
                     job.object_id,
@@ -877,10 +1475,21 @@ impl Vectorizer {
             }
         }
 
-        Ok(processed)
+        if processed > 0 {
+            self.snapshots_dirty.store(true, Ordering::SeqCst);
+        }
+        Ok(BatchOutcome { processed, model_load_failed })
     }
 
     /// Search a vector index with a text query (encodes text first).
+    ///
+    /// `exact_rescore` re-scores the ANN candidates against the exact `f32`
+    /// vectors before returning (see [`Self::rerank_candidates`]) — cheap,
+    /// always available. This is UNRELATED to the cross-encoder ([`CrossEncoder`]),
+    /// which text search additionally runs, over the query TEXT, whenever
+    /// `config.cross_encoder` is `On` and this field has readable source
+    /// text — regardless of `exact_rescore`. See [`SimilarHit`] for how the
+    /// two combine in the result.
     #[allow(clippy::too_many_arguments)]
     pub fn search_text(
         &self,
@@ -889,9 +1498,9 @@ impl Vectorizer {
         query_text: &str,
         k: usize,
         ef: usize,
-        rerank: bool,
+        exact_rescore: bool,
         restrict: Option<&HashSet<u64>>,
-    ) -> EngineResult<Vec<(u64, f32)>> {
+    ) -> EngineResult<Vec<SimilarHit>> {
         let index_key = format!("{type_name}.{vector_field}");
         let index = self
             .indexes
@@ -917,38 +1526,34 @@ impl Vectorizer {
 
         let query_vec = {
             let mut embedders = self.embedders.lock();
-            #[cfg(feature = "fastembed")]
-            embedders.entry(model.clone()).or_insert_with(|| {
-                Box::new(FastEmbedder::new(&model).expect("failed to load model"))
-            });
-            match embedders.get_mut(&model) {
-                Some(embedder) => embedder
-                    .embed(&[query_text])
-                    .map_err(|e| crate::EngineError::TypeNotFound(e.to_string()))?,
-                None => {
-                    return Err(crate::EngineError::TypeNotFound(
-                        "no embedder available (built without the `fastembed` feature)".into(),
-                    ))
-                }
-            }
+            let embedder = self
+                .get_or_load_embedder(&mut embedders, &model)
+                .map_err(|e| crate::EngineError::ModelUnavailable(e.to_string()))?;
+            embedder
+                .embed(&[query_text])
+                .map_err(|e| crate::EngineError::ModelUnavailable(e.to_string()))?
         };
 
         if query_vec.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Whether cross-encoder reranking is active. RHYPEDB_DISABLE_RERANK
-        // turns it off entirely (no reranker model is loaded) — raw HNSW
-        // results, much faster and a far smaller memory/image footprint.
-        let rerank_disabled = std::env::var_os("RHYPEDB_DISABLE_RERANK").is_some();
+        // Whether the cross-encoder runs at all: an explicit opt-in
+        // (`config.cross_encoder = On { model }`), never an implicit default —
+        // `Off` (the default) never loads the reranker model, so a plain
+        // deployment pays no cross-encoder cost at all.
+        let cross_encoder_model = match &self.config.cross_encoder {
+            CrossEncoder::On { model } => Some(model.clone()),
+            CrossEncoder::Off => None,
+        };
 
-        // How many HNSW candidates to retrieve. With reranking off we only need
-        // the top k. With it on we over-retrieve a *bounded* pool to feed the
-        // cross-encoder — it runs one forward pass per candidate, so this is the
-        // dominant query cost. Capped (overridable via RHYPEDB_RERANK_CANDIDATES)
-        // rather than the old uncapped `k * 10`, which reranked ~120 verses for
-        // a 12-result query.
-        let retrieval_k = if rerank_disabled {
+        // How many HNSW candidates to retrieve. With the cross-encoder off we
+        // only need the top k. With it on we over-retrieve a *bounded* pool to
+        // feed the cross-encoder — it runs one forward pass per candidate, so
+        // this is the dominant query cost. Capped (overridable via
+        // RHYPEDB_RERANK_CANDIDATES) rather than an uncapped `k * 10`, which
+        // reranked ~120 candidates for a 12-result query.
+        let retrieval_k = if cross_encoder_model.is_none() {
             k
         } else {
             std::env::var("RHYPEDB_RERANK_CANDIDATES")
@@ -982,113 +1587,131 @@ impl Vectorizer {
             index.search(&query_vec[0], retrieval_k, ef.max(retrieval_k))
         };
 
-        // Full-precision rerank: replace the TurboQuant estimates with exact
-        // distances against the f32 vectors in the LSM. When a cross-encoder
-        // reranker also runs below it re-sorts by semantic score (so this is a
-        // no-op for that path); when it does not, the exactly-reranked order is
-        // what we return. Skipped on the brute path (already exact).
-        if rerank && !use_brute {
+        // Full-precision rescore: replace the TurboQuant estimates with exact
+        // distances against the f32 vectors in the LSM. When the cross-encoder
+        // also runs below it re-sorts by relevance score (so this only changes
+        // each hit's `distance`, not the final order); when it does not, this
+        // exact order IS what we return. Skipped on the brute path (already
+        // exact).
+        if exact_rescore && !use_brute {
             candidates = self.rerank_candidates(&index_key, &index, &query_vec[0], candidates);
         }
 
-        // Find the source field for this vector field.
-        let source_field = self
-            .schema
-            .get_type(type_name)
-            .and_then(|td| td.get_field(vector_field))
-            .and_then(|fd| fd.vectorize())
-            .map(|v| v.source_field.clone());
+        // Cross-encoder rerank: only when explicitly enabled AND we can read
+        // the field's source text.
+        if let Some(model) = cross_encoder_model {
+            let source_field = self
+                .schema
+                .get_type(type_name)
+                .and_then(|td| td.get_field(vector_field))
+                .and_then(|fd| fd.vectorize())
+                .map(|v| v.source_field.clone());
 
-        // Rerank if enabled and we can read the source text.
-        if let Some(source_field) = source_field.filter(|_| !rerank_disabled) {
-            let type_id = self.type_ids.get(type_name).copied();
+            if let Some(source_field) = source_field {
+                let type_id = self.type_ids.get(type_name).copied();
 
-            // Fetch original text for each candidate, all under ONE snapshot.
-            let mut candidate_texts: Vec<(u64, String)> = Vec::new();
-            if let Some(type_id) = type_id {
-                let snapshot = self.storage.read_snapshot();
-                for (obj_id, _dist) in &candidates {
-                    let obj_key = KeyBuilder::object(type_id, *obj_id);
-                    if let Ok(Some(data)) = self.storage.get_at(snapshot, &obj_key) {
-                        let fields = deserialize_fields(&data);
-                        if let Some(Value::String(text)) = fields.get(&source_field) {
-                            candidate_texts.push((*obj_id, text.clone()));
-                        }
-                    }
-                }
-            }
-
-            if !candidate_texts.is_empty() {
-                // Lazily initialize the reranker.
-                let mut reranker = self.reranker.lock();
-                if reranker.is_none() {
-                    #[cfg(feature = "fastembed")]
-                    match FastReranker::new() {
-                        Ok(r) => *reranker = Some(Box::new(r)),
-                        Err(_) => {
-                            // Reranker unavailable — return HNSW results as-is.
-                            return Ok(candidates.into_iter().take(k).collect());
-                        }
-                    }
-                    // Still none — either the load above failed, or this build has
-                    // no `fastembed` feature (no built-in reranker). Return the
-                    // raw HNSW results rather than reranking.
-                    if reranker.is_none() {
-                        return Ok(candidates.into_iter().take(k).collect());
-                    }
-                }
-
-                if let Some(ref mut ranker) = *reranker {
-                    let doc_refs: Vec<&str> =
-                        candidate_texts.iter().map(|(_, t)| t.as_str()).collect();
-
-                    if let Ok(reranked) = ranker.rerank(query_text, &doc_refs, k) {
-                        let mut out: Vec<(u64, f32)> = reranked
-                            .into_iter()
-                            .map(|r| (candidate_texts[r.index].0, r.score))
-                            .collect();
-                        // The cross-encoder can only rank candidates whose source
-                        // text was readable; a candidate with missing/non-string
-                        // text is invisible to it. Don't silently drop those —
-                        // append any not already chosen (in candidate order, i.e.
-                        // exact-distance order on the brute path) up to k, so a
-                        // reranked result never under-fills relative to the
-                        // no-reranker fallback. No-op when every candidate has
-                        // text (the normal @vectorize case), so global searches
-                        // are unaffected.
-                        if out.len() < k {
-                            let chosen: HashSet<u64> = out.iter().map(|(id, _)| *id).collect();
-                            for (id, dist) in &candidates {
-                                if out.len() >= k {
-                                    break;
-                                }
-                                if !chosen.contains(id) {
-                                    out.push((*id, *dist));
-                                }
+                // Fetch original text for each candidate, all under ONE snapshot.
+                let mut candidate_texts: Vec<(u64, String)> = Vec::new();
+                if let Some(type_id) = type_id {
+                    let snapshot = self.storage.read_snapshot();
+                    for (obj_id, _dist) in &candidates {
+                        let obj_key = KeyBuilder::object(type_id, *obj_id);
+                        if let Ok(Some(data)) = self.storage.get_at(snapshot, &obj_key) {
+                            let fields = deserialize_fields(&data);
+                            if let Some(Value::String(text)) = fields.get(&source_field) {
+                                candidate_texts.push((*obj_id, text.clone()));
                             }
                         }
-                        return Ok(out);
                     }
                 }
+
+                // Lazily load the reranker (fail-soft: on load failure, fall
+                // through to the plain distance-ordered result below rather
+                // than erroring the query — matches the embedder's philosophy
+                // of "rerank is best-effort", but here the query itself is
+                // never blocked on it).
+                if !candidate_texts.is_empty() && self.get_or_load_reranker(&model).is_ok() {
+                    let mut reranker = self.reranker.lock();
+                    if let Some(ref mut ranker) = *reranker {
+                        let doc_refs: Vec<&str> =
+                            candidate_texts.iter().map(|(_, t)| t.as_str()).collect();
+
+                        if let Ok(reranked) = ranker.rerank(query_text, &doc_refs, k) {
+                            // Distance lookup by object id, for both the
+                            // ranked hits and the appended tail below.
+                            let distance_by_id: HashMap<u64, f32> =
+                                candidates.iter().copied().collect();
+
+                            let mut out: Vec<SimilarHit> = reranked
+                                .into_iter()
+                                .map(|r| {
+                                    let object_id = candidate_texts[r.index].0;
+                                    SimilarHit {
+                                        object_id,
+                                        distance: distance_by_id
+                                            .get(&object_id)
+                                            .copied()
+                                            .unwrap_or(f32::INFINITY),
+                                        rerank_score: Some(r.score),
+                                    }
+                                })
+                                .collect();
+                            // The cross-encoder can only rank candidates whose source
+                            // text was readable; a candidate with missing/non-string
+                            // text is invisible to it. Don't silently drop those —
+                            // append any not already chosen (in candidate order, i.e.
+                            // exact-distance order on the brute path) up to k, so a
+                            // reranked result never under-fills relative to the
+                            // no-reranker fallback. No-op when every candidate has
+                            // text (the normal @vectorize case), so global searches
+                            // are unaffected. Appended hits carry NO rerank score —
+                            // the cross-encoder never saw them.
+                            if out.len() < k {
+                                let chosen: HashSet<u64> =
+                                    out.iter().map(|h| h.object_id).collect();
+                                for (id, dist) in &candidates {
+                                    if out.len() >= k {
+                                        break;
+                                    }
+                                    if !chosen.contains(id) {
+                                        out.push(SimilarHit::by_distance(*id, *dist));
+                                    }
+                                }
+                            }
+                            return Ok(out);
+                        }
+                    }
+                }
+                // Reranker unavailable (load failed, or no fastembed feature),
+                // or it had no candidate text, or the `ranker.rerank(...)` call
+                // itself failed — fall through to the plain distance-ordered
+                // result below.
             }
         }
 
-        // Fallback: return HNSW results without reranking.
-        Ok(candidates.into_iter().take(k).collect())
+        // Fallback: distance-ordered results, no cross-encoder.
+        Ok(candidates
+            .into_iter()
+            .take(k)
+            .map(|(id, dist)| SimilarHit::by_distance(id, dist))
+            .collect())
     }
 
     /// Search a vector index with a raw vector.
     ///
-    /// When `rerank` is set, the `k` ANN candidates are re-scored against the
-    /// full-precision f32 vectors in the LSM and returned sorted by exact
-    /// distance (see [`Vectorizer::rerank_candidates`]). The caller is expected
-    /// to have sized `k` to the desired rerank pool and to trim to the final
-    /// top-k itself.
+    /// When `exact_rescore` is set, the `k` ANN candidates are re-scored
+    /// against the full-precision f32 vectors in the LSM and returned sorted
+    /// by exact distance (see [`Self::rerank_candidates`]). The caller is
+    /// expected to have sized `k` to the desired rescore pool and to trim to
+    /// the final top-k itself. There is no cross-encoder path here — a
+    /// raw-vector query has no query TEXT to rank source text against (see
+    /// [`Self::search_text`], [`CrossEncoder`]) — every hit's `rerank_score`
+    /// is `None`.
     ///
     /// A non-empty `restrict` of at most [`EXACT_FILTER_MAX`] ids takes the exact
-    /// brute-force path over that set (see [`Vectorizer::brute_force_restricted`]),
-    /// ignoring `ef`/`rerank` (the result is already exact); `restrict = None`
-    /// leaves the global HNSW path unchanged.
+    /// brute-force path over that set (see [`Self::brute_force_restricted`]),
+    /// ignoring `ef`/`exact_rescore` (the result is already exact); `restrict =
+    /// None` leaves the global HNSW path unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn search_vector(
         &self,
@@ -1097,9 +1720,9 @@ impl Vectorizer {
         query_vec: &[f32],
         k: usize,
         ef: usize,
-        rerank: bool,
+        exact_rescore: bool,
         restrict: Option<&HashSet<u64>>,
-    ) -> EngineResult<Vec<(u64, f32)>> {
+    ) -> EngineResult<Vec<SimilarHit>> {
         let index_key = format!("{type_name}.{vector_field}");
         let index = self
             .indexes
@@ -1114,22 +1737,30 @@ impl Vectorizer {
         // Exact small-set path: a selective filter restricts the search to a
         // bounded set — brute-force exact distances over just those vectors.
         // Exact recall, never under-fills, and (for a small set) cheaper than
-        // the graph. `ef`/`rerank` are moot here (the result is already exact).
+        // the graph. `ef`/`exact_rescore` are moot here (already exact).
         if let Some(set) = restrict
             && set.len() <= EXACT_FILTER_MAX
         {
             if std::env::var_os("RHYPEDB_DEBUG_RERANK").is_some() {
                 eprintln!("[brute] key={index_key} restrict={} (exact small-set path)", set.len());
             }
-            return Ok(self.brute_force_restricted(&index_key, &index, query_vec, set));
+            return Ok(self
+                .brute_force_restricted(&index_key, &index, query_vec, set)
+                .into_iter()
+                .map(|(id, dist)| SimilarHit::by_distance(id, dist))
+                .collect());
         }
 
         let results = index.search(query_vec, k, ef);
-        if rerank {
-            Ok(self.rerank_candidates(&index_key, &index, query_vec, results))
+        let results = if exact_rescore {
+            self.rerank_candidates(&index_key, &index, query_vec, results)
         } else {
-            Ok(results)
-        }
+            results
+        };
+        Ok(results
+            .into_iter()
+            .map(|(id, dist)| SimilarHit::by_distance(id, dist))
+            .collect())
     }
 
     /// Re-score ANN candidates against the full-precision f32 vectors stored in
@@ -1406,8 +2037,9 @@ impl Vectorizer {
         Ok(rows.len())
     }
 
-    /// Start background worker threads for vectorization.
-    /// Each worker loads its own embedding model (~300MB per worker).
+    /// Start background worker threads for vectorization. Workers share one
+    /// lazily-loaded embedder per model name (`embedders`), so extra workers
+    /// add parallel claim/commit work, not extra model copies.
     pub fn start_worker(self: &Arc<Self>, num_workers: usize) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
@@ -1416,33 +2048,56 @@ impl Vectorizer {
         let mut handles = self.worker_handles.lock();
         for worker_id in 0..num_workers {
             let vectorizer = Arc::clone(self);
-            let handle = std::thread::spawn(move || {
-                while vectorizer.running.load(Ordering::SeqCst) {
-                    let batch = match vectorizer.claim_batch() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            eprintln!("vectorizer worker {worker_id} claim error: {e}");
-                            std::thread::sleep(std::time::Duration::from_millis(500));
+            let handle = std::thread::Builder::new()
+                .name(format!("rhypedb-vectorize-{worker_id}"))
+                .spawn(move || {
+                    while vectorizer.running.load(Ordering::SeqCst) {
+                        let batch = match vectorizer.claim_batch() {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("vectorizer worker {worker_id} claim error: {e}");
+                                let delay = Duration::from_millis(500);
+                                interruptible_sleep(&vectorizer.running, delay);
+                                continue;
+                            }
+                        };
+
+                        if batch.is_empty() {
+                            // Queue drained: persist whatever the last batches
+                            // indexed, then idle.
+                            vectorizer.save_snapshots_if_due(true);
+                            interruptible_sleep(&vectorizer.running, Duration::from_millis(100));
                             continue;
                         }
-                    };
 
-                    if batch.is_empty() {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        continue;
-                    }
-
-                    match vectorizer.process_batch(batch) {
-                        Ok(_) => {
-                            vectorizer.save_snapshots();
+                        match vectorizer.process_batch(batch) {
+                            Ok(outcome) => {
+                                vectorizer.save_snapshots_if_due(false);
+                                // A model failed to load in THIS batch; its jobs
+                                // were re-enqueued (not lost). Sleep until the
+                                // next load attempt is permitted so a persistently
+                                // unavailable model doesn't spin the worker hot.
+                                // (See `BatchOutcome` for why this is not keyed on
+                                // `model_error()`.)
+                                if outcome.model_load_failed {
+                                    let err = vectorizer.model_error().unwrap_or_default();
+                                    let delay = vectorizer.time_until_next_retry();
+                                    eprintln!(
+                                        "vectorizer worker {worker_id}: model unavailable \
+                                         ({err}); retrying in {delay:.1?}"
+                                    );
+                                    interruptible_sleep(&vectorizer.running, delay);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("vectorizer worker {worker_id} error: {e}");
+                                let delay = Duration::from_millis(500);
+                                interruptible_sleep(&vectorizer.running, delay);
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("vectorizer worker {worker_id} error: {e}");
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
                     }
-                }
-            });
+                })
+                .expect("failed to spawn vectorizer worker thread");
             handles.push(handle);
         }
     }
@@ -1526,6 +2181,21 @@ fn validate_vector(vector_field: &str, vector: &[f32], expected: usize) -> Engin
         });
     }
     Ok(())
+}
+
+/// Sleep for `duration`, but in short slices so a worker loop notices
+/// `running` flipping to `false` (via `stop_worker`) well before the full
+/// duration elapses — matters here because a model-load backoff can be up to
+/// `model_retry_max` (default 60s), and shutdown shouldn't have to wait that
+/// long.
+fn interruptible_sleep(running: &AtomicBool, duration: Duration) {
+    const STEP: Duration = Duration::from_millis(100);
+    let mut remaining = duration;
+    while remaining > Duration::ZERO && running.load(Ordering::SeqCst) {
+        let this_step = remaining.min(STEP);
+        std::thread::sleep(this_step);
+        remaining -= this_step;
+    }
 }
 
 fn serialize_f32_vec(vec: &[f32]) -> Bytes {
@@ -1836,7 +2506,7 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         // The ML-related posts (1 and 3) should rank above the cooking post (2).
-        let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<u64> = results.iter().map(|h| h.object_id).collect();
         assert!(
             ids.contains(&1) || ids.contains(&3),
             "expected ML-related posts in top 2, got {ids:?}"
@@ -1940,7 +2610,7 @@ mod tests {
             );
 
             // The ML document should rank above the cooking document.
-            assert_eq!(results[0].0, 1, "ML document should be the top result");
+            assert_eq!(results[0].object_id, 1, "ML document should be the top result");
         }
     }
 
@@ -2042,7 +2712,7 @@ mod tests {
                 .search_text("Post", "embedding", "artificial intelligence", 2, 50, false, None)
                 .unwrap();
             assert_eq!(results.len(), 2);
-            let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+            let ids: Vec<u64> = results.iter().map(|h| h.object_id).collect();
             assert!(
                 ids.contains(&1) || ids.contains(&3),
                 "ML posts should rank high after snapshot restore, got {ids:?}"
@@ -2179,7 +2849,7 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].0, 1,
+            results[0].object_id, 1,
             "nearest to [0.9,0.1,0,0] must be id 1, got {results:?}"
         );
         assert_eq!(
@@ -2214,7 +2884,7 @@ mod tests {
             .search_vector("Doc", "embedding", &[0.1, 0.9, 0.0, 0.0], 1, 16, false, None)
             .unwrap();
         assert_eq!(
-            results[0].0, 2,
+            results[0].object_id, 2,
             "after restart, nearest to [0.1,0.9,0,0] must be id 2, got {results:?}"
         );
     }
@@ -2354,13 +3024,13 @@ mod tests {
         assert_eq!(reranked.len(), n as usize, "rerank must keep the full pool");
         for (r, e) in reranked.iter().zip(exact.iter()) {
             assert!(
-                (r.1 - e.1).abs() < 1e-6,
+                (r.distance - e.1).abs() < 1e-6,
                 "reranked distance {} != exact {}",
-                r.1,
+                r.distance,
                 e.1
             );
         }
-        assert_eq!(reranked[0].0, exact[0].0, "top-1 id must match the exact NN");
+        assert_eq!(reranked[0].object_id, exact[0].0, "top-1 id must match the exact NN");
     }
 
     // Reproduces the benchmark conditions in-process: a higher-dim index, a
@@ -2416,8 +3086,8 @@ mod tests {
             let rr = v
                 .search_vector("Doc", "embedding", &query, pool, pool, true, None)
                 .unwrap();
-            ann_hits += ann.iter().take(k).filter(|(id, _)| gt_set.contains(id)).count();
-            rr_hits += rr.iter().take(k).filter(|(id, _)| gt_set.contains(id)).count();
+            ann_hits += ann.iter().take(k).filter(|h| gt_set.contains(&h.object_id)).count();
+            rr_hits += rr.iter().take(k).filter(|h| gt_set.contains(&h.object_id)).count();
             total += k;
         }
         let ann_recall = ann_hits as f32 / total as f32;
@@ -2445,7 +3115,7 @@ mod tests {
             .search_vector("Doc", "embedding", &synth_vec(2.0), 100, 200, true, None)
             .unwrap();
         assert_eq!(reranked.len(), 5);
-        assert_eq!(reranked[0].0, 2, "exact nearest to query(seed=2) is id 2");
+        assert_eq!(reranked[0].object_id, 2, "exact nearest to query(seed=2) is id 2");
     }
 
     // --- @index SDL directive → per-index config (Knob A) ---
@@ -2577,7 +3247,7 @@ mod tests {
             let hits = v
                 .search_vector("Doc", "embedding", &synth_vec(5.0), 3, 64, false, None)
                 .unwrap();
-            assert!(hits.iter().any(|(id, _)| *id == 5), "got {hits:?}");
+            assert!(hits.iter().any(|h| h.object_id == 5), "got {hits:?}");
         }
     }
 
@@ -2606,7 +3276,7 @@ mod tests {
             .search_vector("Doc", "embedding", &query, 2, 64, false, Some(&restrict))
             .unwrap();
 
-        let got_ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
+        let got_ids: Vec<u64> = got.iter().map(|h| h.object_id).collect();
         let exp_ids: Vec<u64> = expected.iter().map(|(id, _)| *id).collect();
         assert_eq!(
             got_ids, exp_ids,
@@ -2633,7 +3303,7 @@ mod tests {
         let global = v
             .search_vector("Doc", "embedding", &query, 8, 64, false, None)
             .unwrap();
-        let global_ids: HashSet<u64> = global.iter().map(|(id, _)| *id).collect();
+        let global_ids: HashSet<u64> = global.iter().map(|h| h.object_id).collect();
         assert!(
             restrict.is_disjoint(&global_ids),
             "precondition: restrict set must lie outside the global top-8, got {global_ids:?}"
@@ -2644,7 +3314,7 @@ mod tests {
         let got = v
             .search_vector("Doc", "embedding", &query, 2, 64, false, Some(&restrict))
             .unwrap();
-        let got_ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
+        let got_ids: HashSet<u64> = got.iter().map(|h| h.object_id).collect();
         assert_eq!(
             got_ids, restrict,
             "filtered search must return the set's members, not under-fill to the global top-k"
@@ -2671,9 +3341,9 @@ mod tests {
         // and sorts last — parity with rerank's never-under-fill rule. id 2 is
         // the exact self-match to the query.
         assert_eq!(got.len(), 3);
-        assert_eq!(got[0].0, 2, "self-match is nearest");
-        assert_eq!(got.last().unwrap().0, 99, "missing-vector member sorts last");
-        assert!(got.last().unwrap().1.is_infinite());
+        assert_eq!(got[0].object_id, 2, "self-match is nearest");
+        assert_eq!(got.last().unwrap().object_id, 99, "missing-vector member sorts last");
+        assert!(got.last().unwrap().distance.is_infinite());
     }
 
     #[test]
@@ -2696,7 +3366,7 @@ mod tests {
             let got = v
                 .search_vector("Doc", "embedding", &shared, 2, 64, false, Some(&restrict))
                 .unwrap();
-            let ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
+            let ids: Vec<u64> = got.iter().map(|h| h.object_id).collect();
             assert_eq!(ids, vec![10, 20], "tie-break by id must be deterministic");
         }
     }
@@ -2808,11 +3478,29 @@ mod tests {
         *v.reranker.lock() = Some(Box::new(MockReranker));
     }
 
+    /// Config used by tests that exercise the cross-encoder path: `On` plus a
+    /// `MockEmbedder`/`MockReranker` pre-injected via `inject_mocks` (which
+    /// bypasses the loaders entirely), so the `model` name here is never
+    /// actually looked up against `DEFAULT_RERANKER_MODEL`.
+    fn cross_encoder_on_config() -> VectorizerConfig {
+        VectorizerConfig {
+            cross_encoder: CrossEncoder::On { model: "mock".into() },
+            ..VectorizerConfig::default()
+        }
+    }
+
     #[test]
     fn filtered_text_search_keeps_textless_candidate_via_append() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
-        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema,
+            type_ids,
+            field_ids,
+            cross_encoder_on_config(),
+        )
+        .unwrap();
 
         // ids 1,2,3 all get vectors; only 1 and 2 get source text. id 3 has a
         // vector but NO body → invisible to the cross-encoder.
@@ -2833,7 +3521,7 @@ mod tests {
             .search_text("Doc", "embedding", "q", 3, 64, false, Some(&restrict))
             .unwrap();
 
-        let ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
+        let ids: HashSet<u64> = got.iter().map(|h| h.object_id).collect();
         // Without the append-fill, the cross-encoder would drop id 3 (no text)
         // and return only {1,2}. The result must still contain the textless
         // member, so a reranked result never under-fills.
@@ -2847,7 +3535,14 @@ mod tests {
     fn filtered_text_search_runs_cross_encoder_over_brute_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
-        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema,
+            type_ids,
+            field_ids,
+            cross_encoder_on_config(),
+        )
+        .unwrap();
 
         let rows = vec![
             (1u64, vec![1.0f32, 0.0, 0.0, 0.0]),
@@ -2866,8 +3561,449 @@ mod tests {
         let got = v
             .search_text("Doc", "embedding", "q", 5, 64, false, Some(&restrict))
             .unwrap();
-        let ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
+        let ids: HashSet<u64> = got.iter().map(|h| h.object_id).collect();
         assert_eq!(ids, restrict, "filtered text search returns the filter's members");
+    }
+
+    /// Regression test for the bug this config was added to fix: with the
+    /// default `CrossEncoder::Off`, `search_text` must never attempt to load
+    /// or run the cross-encoder — previously it ran unconditionally (gated
+    /// only by an env var), so `search_text(..., exact_rescore: false, ...)`
+    /// still downloaded and ran the ~280MB reranker model.
+    #[test]
+    fn cross_encoder_off_by_default_never_loads_reranker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        assert_eq!(v.config().cross_encoder, CrossEncoder::Off, "Off must be the default");
+
+        let rows = vec![(1u64, vec![1.0f32, 0.0, 0.0, 0.0]), (2, vec![0.0, 1.0, 0.0, 0.0])];
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+        for (id, _) in &rows {
+            store_object(&storage, 1, *id, &format!("doc {id}"));
+        }
+        // Only the embedder is injected, not the reranker — if search_text
+        // tried the cross-encoder path it would fall through to the REAL
+        // (network) loader, which this test would rather fail loudly on
+        // than silently succeed via a mock.
+        v.embedders
+            .lock()
+            .insert("mock".into(), Box::new(MockEmbedder { vec: vec![1.0, 0.0, 0.0, 0.0] }));
+
+        let got = v
+            .search_text("Doc", "embedding", "q", 2, 64, false, None)
+            .unwrap();
+        assert!(
+            got.iter().all(|h| h.rerank_score.is_none()),
+            "CrossEncoder::Off must never attach a rerank score: {got:?}"
+        );
+        assert!(
+            !v.reranker_loaded(),
+            "the reranker must never be loaded while cross_encoder is Off"
+        );
+    }
+
+    /// A reranked `search_text` result is a DIFFERENT ordering than plain
+    /// vector distance (`MockReranker` ranks by candidate order, i.e. the
+    /// reverse of the synthetic vectors' distance-from-query order below),
+    /// and every hit must carry a `rerank_score`, sorted strictly descending.
+    #[test]
+    fn cross_encoder_reranked_results_are_ordered_by_rerank_score_descending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema,
+            type_ids,
+            field_ids,
+            cross_encoder_on_config(),
+        )
+        .unwrap();
+
+        let rows = vec![
+            (1u64, vec![1.0f32, 0.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0, 0.0]),
+            (4, vec![0.0, 0.0, 0.0, 1.0]),
+        ];
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+        for (id, _) in &rows {
+            store_object(&storage, 1, *id, &format!("doc {id}"));
+        }
+        inject_mocks(&v, vec![1.0, 0.0, 0.0, 0.0]);
+
+        let got = v
+            .search_text("Doc", "embedding", "q", 4, 64, false, None)
+            .unwrap();
+
+        assert_eq!(got.len(), 4, "every candidate has source text, so all 4 are ranked");
+        assert!(
+            got.iter().all(|h| h.rerank_score.is_some()),
+            "the cross-encoder ran, so every hit must carry a rerank score: {got:?}"
+        );
+        let scores: Vec<f32> = got.iter().map(|h| h.rerank_score.unwrap()).collect();
+        let mut sorted_desc = scores.clone();
+        sorted_desc.sort_by(|a, b| b.total_cmp(a));
+        assert_eq!(
+            scores, sorted_desc,
+            "a cross-encoder-reranked result must be ordered by rerank_score descending: {got:?}"
+        );
+    }
+
+    // --- Vectorizer hardening (issue #18): config knobs + fail-soft model load ---
+    //
+    // `embedder_loader` is a private, test-visible seam (same pattern as
+    // `embedders`/`reranker` above): production always resolves it to
+    // `default_embedder_loader()` (real `FastEmbedder::with_options`); these
+    // tests substitute a closure that fails a chosen number of times before
+    // "recovering", so the fail-soft retry logic is exercised deterministically
+    // and without touching the network.
+
+    /// A config whose model-load backoff never delays, for tests that want
+    /// the very next load attempt to be permitted immediately.
+    fn no_backoff_config() -> VectorizerConfig {
+        VectorizerConfig {
+            model_retry_initial: Duration::ZERO,
+            model_retry_max: Duration::ZERO,
+            ..VectorizerConfig::default()
+        }
+    }
+
+    /// A `FailingLoader`: fails the first `fail_times` calls with
+    /// `EmbedError::Unavailable`, then returns a `MockEmbedder` on every call
+    /// after that.
+    fn failing_then_ok_loader(fail_times: usize, vec: Vec<f32>) -> Box<EmbedderLoader> {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        Box::new(move |_model_name: &str, _options: &rhypedb_embed::EmbedOptions| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            if call < fail_times {
+                Err(rhypedb_embed::EmbedError::Unavailable(format!(
+                    "simulated model load failure {}/{fail_times}",
+                    call + 1
+                )))
+            } else {
+                Ok(Box::new(MockEmbedder { vec: vec.clone() }) as Box<dyn Embedder>)
+            }
+        })
+    }
+
+    /// A `FailingLoader` that never recovers.
+    fn always_failing_loader() -> Box<EmbedderLoader> {
+        Box::new(|_model_name: &str, _options: &rhypedb_embed::EmbedOptions| {
+            Err(rhypedb_embed::EmbedError::Unavailable(
+                "simulated: this model can never load".into(),
+            ))
+        })
+    }
+
+    #[test]
+    fn model_load_failure_reenqueues_jobs_and_recovers_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema,
+            type_ids,
+            field_ids,
+            no_backoff_config(),
+        )
+        .unwrap();
+
+        store_object(&storage, 1, 1, "doc one");
+        v.enqueue(VectorizeJob {
+            type_name: "Doc".into(),
+            object_id: 1,
+            source_field: "body".into(),
+            vector_field: "embedding".into(),
+            model: "mock".into(),
+        })
+        .unwrap();
+
+        // Fail the first load attempt only.
+        *v.embedder_loader.lock() = failing_then_ok_loader(1, vec![1.0, 0.0, 0.0, 0.0]);
+
+        // First attempt: the load fails. The job must be re-enqueued (left
+        // Pending), NOT marked Failed — the model is at fault, not the input.
+        // And the caller is TOLD (not handed an `Ok(0)` indistinguishable from
+        // an empty queue).
+        let err = v.process_pending().unwrap_err();
+        assert!(
+            matches!(err, crate::EngineError::ModelUnavailable(_)),
+            "nothing embeds while the model is unavailable, and the caller must \
+             be able to tell: {err:?}"
+        );
+        assert!(v.model_error().is_some(), "a load failure must set model_error");
+        assert!(!v.model_loaded(), "no model has loaded successfully yet");
+        assert_eq!(
+            v.get_state("Doc", 1, "embedding").unwrap(),
+            VectorState::Pending,
+            "a model-load failure must leave the job Pending, not Failed"
+        );
+        assert_eq!(
+            v.status().pending,
+            1,
+            "the re-enqueued job must still be visible on the queue"
+        );
+
+        // Second attempt: the loader "recovers" — the re-enqueued job embeds,
+        // and model_error clears.
+        let processed = v.process_pending().unwrap();
+        assert_eq!(processed, 1);
+        assert!(v.model_error().is_none(), "a later success must clear model_error");
+        assert!(v.model_loaded());
+        assert_eq!(v.get_state("Doc", 1, "embedding").unwrap(), VectorState::Indexed);
+    }
+
+    #[test]
+    fn claim_batch_honours_configured_batch_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        // A NON-default size, so this proves the configured value is what
+        // `claim_batch` uses (32 is the default and would pass vacuously).
+        let config = VectorizerConfig {
+            batch_size: 7,
+            ..VectorizerConfig::default()
+        };
+        assert_ne!(config.batch_size, VectorizerConfig::default().batch_size);
+        let v = Vectorizer::with_config(Arc::clone(&storage), schema, type_ids, field_ids, config)
+            .unwrap();
+        assert_eq!(v.config().batch_size, 7);
+        inject_mocks(&v, vec![1.0, 0.0, 0.0, 0.0]);
+
+        for id in 1..=100u64 {
+            store_object(&storage, 1, id, &format!("doc {id}"));
+            v.enqueue(VectorizeJob {
+                type_name: "Doc".into(),
+                object_id: id,
+                source_field: "body".into(),
+                vector_field: "embedding".into(),
+                model: "mock".into(),
+            })
+            .unwrap();
+        }
+        assert_eq!(v.status().pending, 100);
+
+        let processed = v.process_pending().unwrap();
+        assert_eq!(processed, 7, "claim_batch must claim exactly config.batch_size jobs");
+        assert_eq!(v.status().pending, 93, "the rest stay queued for the next claim");
+    }
+
+    /// The worker's backoff is keyed on whether THIS batch hit a model-load
+    /// failure, not on the aggregate `model_error` flag. Here `model_error`
+    /// is in effect (a failed query-path load) but the batch's model is
+    /// already cached, so the batch embeds normally and must NOT report a
+    /// load failure — otherwise a healthy model's backfill would sleep up to
+    /// `model_retry_max` after every batch.
+    #[test]
+    fn cached_embedder_batch_does_not_report_load_failure_while_model_error_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+
+        // "mock" is cached; any OTHER model can never load.
+        inject_mocks(&v, vec![1.0, 0.0, 0.0, 0.0]);
+        *v.embedder_loader.lock() = always_failing_loader();
+        let mut scratch = HashMap::new();
+        assert!(v.get_or_load_embedder(&mut scratch, "other-model").is_err());
+        assert!(v.model_error().is_some(), "precondition: aggregate flag is set");
+
+        store_object(&storage, 1, 1, "doc one");
+        v.enqueue(VectorizeJob {
+            type_name: "Doc".into(),
+            object_id: 1,
+            source_field: "body".into(),
+            vector_field: "embedding".into(),
+            model: "mock".into(),
+        })
+        .unwrap();
+
+        let batch = v.claim_batch().unwrap();
+        let outcome = v.process_batch(batch).unwrap();
+        assert_eq!(outcome.processed, 1);
+        assert!(
+            !outcome.model_load_failed,
+            "a batch served from the cached embedder must not trigger the backoff"
+        );
+        assert_eq!(v.get_state("Doc", 1, "embedding").unwrap(), VectorState::Indexed);
+
+        // And the converse: a batch whose model genuinely can't load reports it.
+        store_object(&storage, 1, 2, "doc two");
+        v.enqueue(VectorizeJob {
+            type_name: "Doc".into(),
+            object_id: 2,
+            source_field: "body".into(),
+            vector_field: "embedding".into(),
+            model: "other-model".into(),
+        })
+        .unwrap();
+        let batch = v.claim_batch().unwrap();
+        let outcome = v.process_batch(batch).unwrap();
+        assert_eq!(outcome.processed, 0);
+        assert!(outcome.model_load_failed);
+        assert_eq!(v.get_state("Doc", 2, "embedding").unwrap(), VectorState::Pending);
+    }
+
+    /// After a load failure, the next attempt is refused WITHOUT calling the
+    /// loader until the backoff elapses — on the query path too, so a
+    /// `.similar` while the model is known-bad doesn't re-run a download
+    /// under the shared embedders lock on every call.
+    #[test]
+    fn model_load_retry_is_gated_by_backoff_on_query_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let config = VectorizerConfig {
+            model_retry_initial: Duration::from_secs(60),
+            model_retry_max: Duration::from_secs(60),
+            ..VectorizerConfig::default()
+        };
+        let v = Vectorizer::with_config(Arc::clone(&storage), schema, type_ids, field_ids, config)
+            .unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        *v.embedder_loader.lock() =
+            Box::new(move |_m: &str, _o: &rhypedb_embed::EmbedOptions| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(rhypedb_embed::EmbedError::Unavailable("simulated".into()))
+            });
+
+        for _ in 0..3 {
+            let err = v
+                .search_text("Doc", "embedding", "q", 5, 64, false, None)
+                .unwrap_err();
+            assert!(matches!(err, crate::EngineError::ModelUnavailable(_)), "{err:?}");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the FIRST query may attempt the load; the rest are refused by the backoff gate"
+        );
+        assert!(v.time_until_next_retry() > Duration::ZERO);
+        let msg = v.model_error().unwrap();
+        assert!(msg.contains("simulated"), "gate keeps the original failure message: {msg}");
+    }
+
+    /// `claim_batch` seeks from a cursor past already-claimed (tombstoned)
+    /// entries. Draining a queue in small batches must yield every job exactly
+    /// once, in id order — including across a reopen, where the cursor
+    /// restarts at 0 above a run of tombstones (the full-scan fallback).
+    #[test]
+    fn claim_batch_drains_in_order_across_tombstones_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let config = VectorizerConfig { batch_size: 7, ..VectorizerConfig::default() };
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema.clone(),
+            type_ids.clone(),
+            field_ids.clone(),
+            config.clone(),
+        )
+        .unwrap();
+        for id in 1..=50u64 {
+            v.enqueue(VectorizeJob {
+                type_name: "Doc".into(),
+                object_id: id,
+                source_field: "body".into(),
+                vector_field: "embedding".into(),
+                model: "mock".into(),
+            })
+            .unwrap();
+        }
+
+        let mut claimed: Vec<u64> = Vec::new();
+        // Claim 3 batches (21 jobs) on the first instance...
+        for _ in 0..3 {
+            let b = v.claim_batch().unwrap();
+            assert_eq!(b.len(), 7);
+            claimed.extend(b.iter().map(|(_, oid)| *oid));
+        }
+        drop(v);
+
+        // ...then reopen: the new instance's cursor starts at 0, below 21
+        // tombstones, and must still find the remaining 29 live entries.
+        let v2 = Vectorizer::with_config(Arc::clone(&storage), schema, type_ids, field_ids, config)
+            .unwrap();
+        loop {
+            let b = v2.claim_batch().unwrap();
+            if b.is_empty() {
+                break;
+            }
+            claimed.extend(b.iter().map(|(_, oid)| *oid));
+        }
+        assert_eq!(claimed, (1..=50u64).collect::<Vec<_>>(), "every job once, in order");
+        assert!(v2.claim_batch().unwrap().is_empty());
+    }
+
+    /// An enqueue that has allocated ids but not committed must hold the
+    /// claim cursor back: otherwise a claim whose snapshot predates that
+    /// commit would scan the window empty and skip it for good.
+    #[test]
+    fn claim_batch_never_passes_an_inflight_enqueue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let job = |id: u64| VectorizeJob {
+            type_name: "Doc".into(),
+            object_id: id,
+            source_field: "body".into(),
+            vector_field: "embedding".into(),
+            model: "mock".into(),
+        };
+        v.enqueue(job(1)).unwrap();
+        v.enqueue(job(2)).unwrap();
+
+        // Simulate a foreground enqueue that allocated id 3 but has not yet
+        // committed, then more enqueues that DID commit after it.
+        let inflight_id = {
+            let mut inflight = v.inflight_enqueues.lock();
+            let id = v.next_job_id.fetch_add(1, Ordering::SeqCst);
+            inflight.insert(id);
+            id
+        };
+        v.enqueue(job(4)).unwrap();
+        v.enqueue(job(5)).unwrap();
+
+        // The claim sees 1 and 2 (committed, below the in-flight id)...
+        let got: Vec<u64> = v.claim_batch().unwrap().iter().map(|(_, o)| *o).collect();
+        assert_eq!(got, vec![1, 2]);
+        // ...and must not have advanced past the in-flight id, even though 4
+        // and 5 are committed beyond it.
+        assert!(
+            v.claim_cursor.load(Ordering::SeqCst) <= inflight_id,
+            "cursor {} passed in-flight id {inflight_id}",
+            v.claim_cursor.load(Ordering::SeqCst)
+        );
+        let got: Vec<u64> = v.claim_batch().unwrap().iter().map(|(_, o)| *o).collect();
+        assert!(got.is_empty(), "nothing claimable yet: {got:?}");
+
+        // The in-flight enqueue lands (out of id order w.r.t. 4 and 5).
+        let mut txn = storage.begin_txn();
+        storage.put(&mut txn, &KeyBuilder::queue_entry(inflight_id), job(3).serialize()).unwrap();
+        storage.commit(&mut txn).unwrap();
+        v.inflight_enqueues.lock().remove(&inflight_id);
+
+        let got: Vec<u64> = v.claim_batch().unwrap().iter().map(|(_, o)| *o).collect();
+        assert_eq!(got, vec![3, 4, 5], "late commit is claimed, in id order, nothing lost");
+    }
+
+    #[test]
+    fn search_text_with_unloadable_model_returns_model_unavailable_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+
+        // No embedder pre-injected, and the loader can never succeed.
+        *v.embedder_loader.lock() = always_failing_loader();
+
+        let err = v
+            .search_text("Doc", "embedding", "q", 5, 64, false, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::EngineError::ModelUnavailable(_)),
+            "expected ModelUnavailable, got {err:?}"
+        );
+        assert!(v.model_error().is_some());
     }
 }
 

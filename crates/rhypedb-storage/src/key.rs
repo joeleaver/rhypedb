@@ -524,6 +524,18 @@ impl KeyBuilder {
         buf.freeze()
     }
 
+    /// Prefix covering exactly the 256 queue entries whose job id lies in
+    /// `[window * 256, window * 256 + 256)`: the queue prefix plus the top 7
+    /// bytes of the big-endian id. Lets the vectorizer claim from a bounded,
+    /// exact range instead of scanning the whole queue.
+    pub fn queue_window_prefix(window: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(2 + 7);
+        buf.put_u8(KeyPrefix::Queue as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_slice(&(window << 8).to_be_bytes()[..7]);
+        buf.freeze()
+    }
+
     /// Vector state key: `s:<type_id>:<object_id>:<field_id>`
     /// Value: state byte (0=pending, 1=indexed, 2=failed)
     pub fn vector_state(type_id: u64, object_id: u64, field_id: u64) -> Bytes {
