@@ -570,6 +570,12 @@ async fn handle_status(
         result["vectorizer"] = serde_json::json!({
             "pending": status.pending,
             "indexes": indexes,
+            // Issue #18: the embedding model's fail-soft load state. `model_loaded`
+            // is true once ANY model has loaded successfully; `model_error` is the
+            // most recent load failure, if one is currently in effect (cleared as
+            // soon as a load succeeds). See `Vectorizer::model_loaded`/`model_error`.
+            "model_loaded": status.model_loaded,
+            "model_error": status.model_error,
         });
     } else {
         // No `@vectorize` fields → no vector index → zero indexed vectors.
@@ -995,11 +1001,12 @@ pub async fn run() {
         .any(|td| td.vector_fields().next().is_some());
 
     let vectorizer = if has_vector_field {
-        let vectorizer = match Vectorizer::new(
+        let vectorizer = match Vectorizer::with_config(
             Arc::clone(db.storage()),
             schema.clone(),
             db.type_ids().clone(),
             db.field_ids().clone(),
+            cfg.vectorizer.clone(),
         ) {
             Ok(v) => v,
             // A misconfigured vector index (e.g. an invalid `@index` directive)

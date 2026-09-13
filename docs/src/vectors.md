@@ -42,13 +42,36 @@ Now you only supply the text — the server fills in the vector on create and re
 Post.create({ body: "distributed systems are hard" })
 ```
 
-The embedding is computed asynchronously by a background worker. `GET /status` reports how many embeddings are pending and how many vectors each index holds:
+The embedding is computed asynchronously by a background worker. `GET /status` reports how many embeddings are pending, how many vectors each index holds, and whether the embedding model is currently loaded:
 
 ```json
-{ "vectorizer": { "pending": 3, "indexes": [ { "name": "Post.embedding", "vectors": 1000 } ] } }
+{
+  "vectorizer": {
+    "pending": 3,
+    "indexes": [ { "name": "Post.embedding", "vectors": 1000 } ],
+    "model_loaded": true,
+    "model_error": null
+  }
+}
 ```
 
+`model_loaded` is `true` once the model has loaded successfully at least once. `model_error` carries the most recent load-failure message while one is in effect (for example, the model is still downloading, or this binary was built without the `fastembed` feature) and goes back to `null` as soon as a load succeeds. A model-load failure does not lose or fail any pending jobs — they stay queued and are retried with a backoff; see [Embedding pipeline settings](#embedding-pipeline-settings) below.
+
 > The `Vector<N>` dimension must match the model's output size (e.g. `all-MiniLM-L6-v2` produces 384-dimensional vectors).
+
+## Embedding pipeline settings
+
+The background embed worker (and the query-time embedder used by a text `.similar`) can be tuned via the `[vectorizer]` table in `rhypedb.toml` (see [Running rhypedb](operations.md#configuration-file)):
+
+| Key | Default | What it costs |
+| --- | --- | --- |
+| `batch_size` | `32` | Jobs claimed and embedded per pass. Higher batches trade memory for throughput — at 512-token texts, a batch of 256 (the old hard-coded value) could take a desktop process to 15 GB resident; 32 keeps peak memory bounded. |
+| `max_length` | `256` | Token limit per text. MiniLM/BGE-small were trained at 256; attention memory grows with the *square* of this, so raising it is expensive. |
+| `intra_threads` | half the CPU cores | ONNX Runtime intra-op threads used by each lazily-loaded model. |
+| `quantized` | `true` | Prefer the int8-quantized model variant when fastembed has one (`all-MiniLM-L6-v2`, `bge-small-en-v1.5`); smaller and faster, a small quality cost. Base/large BGE models have no quantized variant and always use fp32 regardless of this setting. |
+| `cache_dir` | fastembed's own default | Where downloaded model files are cached on disk. |
+
+If the model fails to load — a network hiccup mid-download, a cold cache on first boot, or simply the time it takes to download and initialize a ~100MB+ ONNX model — the background worker does **not** fail or drop the affected jobs. It puts them back on the queue, records the failure under `vectorizer.model_error` on `GET /status`, and retries with an exponential backoff (starting at 2s, doubling up to a 60s cap) until a load succeeds, at which point `model_error` clears and the backoff resets. A `.similar` text query made while the model is unavailable gets a clear `ModelUnavailable` error rather than blocking or panicking.
 
 ## Indexing for search — `@index(hnsw, ...)`
 

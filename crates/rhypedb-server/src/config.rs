@@ -66,6 +66,29 @@ pub struct FileConfig {
     /// Optional issuer / audience pins (defense-in-depth on top of per-project `kid` scoping).
     pub auth_iss: Option<String>,
     pub auth_aud: Option<String>,
+    /// `[vectorizer]` — background embedding pipeline knobs (issue #18). Absent
+    /// or any absent sub-key falls back to `VectorizerConfig::default()` /
+    /// `EmbedOptions::default()`. See [`VectorizerFileConfig`].
+    pub vectorizer: Option<VectorizerFileConfig>,
+}
+
+/// The `[vectorizer]` table of `rhypedb.toml`. Every field optional; an
+/// out-of-range value (e.g. `batch_size = 0`) is warned about and ignored,
+/// same convention as the other tuning knobs in [`FileConfig`].
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VectorizerFileConfig {
+    /// Jobs claimed per embed call. See `VectorizerConfig::batch_size`.
+    pub batch_size: Option<i64>,
+    /// Token limit per text, forwarded to `EmbedOptions::max_length`.
+    pub max_length: Option<i64>,
+    /// ONNX intra-op threads, forwarded to `EmbedOptions::intra_threads`.
+    pub intra_threads: Option<i64>,
+    /// Where model files are cached, forwarded to `EmbedOptions::cache_dir`.
+    pub cache_dir: Option<PathBuf>,
+    /// Prefer the int8-quantized model variant, forwarded to
+    /// `EmbedOptions::quantized`.
+    pub quantized: Option<bool>,
 }
 
 /// A snapshot of the relevant env vars (raw, unparsed). Built once via
@@ -165,6 +188,10 @@ pub struct ServerConfig {
     pub auth_jwks: Option<PathBuf>,
     pub auth_iss: Option<String>,
     pub auth_aud: Option<String>,
+    /// Background embedding pipeline knobs (issue #18), resolved from the
+    /// `[vectorizer]` config-file table (no CLI/env layer, like the query
+    /// governor). Threaded into `Vectorizer::with_config` at startup.
+    pub vectorizer: rhypedb_engine::vectorizer::VectorizerConfig,
 }
 
 fn env_truthy(v: &str) -> bool {
@@ -250,6 +277,57 @@ fn positive_or_default(name: &str, v: Option<i64>, default: u64) -> u64 {
         }
         None => default,
     }
+}
+
+/// Resolve the `[vectorizer]` table (file-only, no CLI/env layer) into an
+/// engine `VectorizerConfig`, starting from `VectorizerConfig::default()` and
+/// overriding only the sub-keys that are present and in range. An out-of-range
+/// value (e.g. `batch_size = 0`) is warned about and the default for that ONE
+/// knob is kept — matches the file's other tuning knobs.
+fn resolve_vectorizer_config(
+    file: Option<&FileConfig>,
+) -> rhypedb_engine::vectorizer::VectorizerConfig {
+    let mut cfg = rhypedb_engine::vectorizer::VectorizerConfig::default();
+    let Some(vz) = file.and_then(|f| f.vectorizer.as_ref()) else {
+        return cfg;
+    };
+    if let Some(n) = vz.batch_size {
+        if n >= 1 {
+            cfg.batch_size = n as usize;
+        } else {
+            eprintln!(
+                "WARNING: vectorizer.batch_size must be >= 1 (got {n}); using the default {}.",
+                cfg.batch_size
+            );
+        }
+    }
+    if let Some(n) = vz.max_length {
+        if n >= 1 {
+            cfg.embed.max_length = n as usize;
+        } else {
+            eprintln!(
+                "WARNING: vectorizer.max_length must be >= 1 (got {n}); using the default {}.",
+                cfg.embed.max_length
+            );
+        }
+    }
+    if let Some(n) = vz.intra_threads {
+        if n >= 1 {
+            cfg.embed.intra_threads = n as usize;
+        } else {
+            eprintln!(
+                "WARNING: vectorizer.intra_threads must be >= 1 (got {n}); using the default {}.",
+                cfg.embed.intra_threads
+            );
+        }
+    }
+    if let Some(dir) = &vz.cache_dir {
+        cfg.embed.cache_dir = Some(dir.clone());
+    }
+    if let Some(q) = vz.quantized {
+        cfg.embed.quantized = q;
+    }
+    cfg
 }
 
 /// Resolve the effective config from the three layers. No env / fs / exit (the
@@ -419,6 +497,7 @@ pub fn resolve(
             .clone()
             .or_else(|| file.and_then(|f| f.auth_aud.clone()))
             .filter(|s| !s.is_empty()),
+        vectorizer: resolve_vectorizer_config(file),
     }
 }
 
@@ -776,5 +855,53 @@ mod tests {
         };
         let c = resolve(&CliLayer::default(), &env, None);
         assert_eq!(c.restore_from, Some(PathBuf::from("/snap/from/env")));
+    }
+
+    #[test]
+    fn vectorizer_defaults_with_no_file() {
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), None);
+        let d = rhypedb_engine::vectorizer::VectorizerConfig::default();
+        assert_eq!(c.vectorizer.batch_size, d.batch_size);
+        assert_eq!(c.vectorizer.embed.max_length, d.embed.max_length);
+        assert_eq!(c.vectorizer.embed.intra_threads, d.embed.intra_threads);
+        assert_eq!(c.vectorizer.embed.quantized, d.embed.quantized);
+        assert_eq!(c.vectorizer.embed.cache_dir, None);
+    }
+
+    #[test]
+    fn vectorizer_file_overrides_and_out_of_range_warns_and_defaults() {
+        let f = file(
+            r#"
+            [vectorizer]
+            batch_size = 64
+            max_length = 128
+            intra_threads = 4
+            cache_dir = "/var/cache/rhypedb-models"
+            quantized = false
+        "#,
+        );
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.vectorizer.batch_size, 64);
+        assert_eq!(c.vectorizer.embed.max_length, 128);
+        assert_eq!(c.vectorizer.embed.intra_threads, 4);
+        assert_eq!(c.vectorizer.embed.cache_dir, Some(PathBuf::from("/var/cache/rhypedb-models")));
+        assert!(!c.vectorizer.embed.quantized);
+
+        // Out-of-range batch_size warns and falls back to the default rather
+        // than a fatal error (consistent with ef/rerank/cache_max_entries).
+        let f = file("[vectorizer]\nbatch_size = 0");
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(
+            c.vectorizer.batch_size,
+            rhypedb_engine::vectorizer::VectorizerConfig::default().batch_size
+        );
+    }
+
+    #[test]
+    fn vectorizer_unknown_key_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, "[vectorizer]\nbatch_sizee = 32").unwrap();
+        assert!(load_config_file(&p).is_err());
     }
 }

@@ -56,3 +56,14 @@
 # formats are always readable; changing this migrates files over time via
 # compaction. Also settable via --block-compression / RHYPEDB_BLOCK_COMPRESSION.
 # block_compression = "none"
+
+# Background embedding pipeline (issue #18; only used when the schema has
+# @vectorize fields). Config-file only, no flag/env. Every key optional; an
+# out-of-range value (e.g. batch_size = 0) is warned-about and falls back to
+# the default shown. See "Embedding pipeline settings" in docs/src/vectors.md.
+# [vectorizer]
+# batch_size = 32            # jobs claimed per embed call; higher = more memory, more throughput
+# max_length = 256           # token limit per text (attention memory grows with the square of this)
+# intra_threads = 4          # ONNX intra-op threads per worker; default is half the CPU cores
+# quantized = true           # prefer the int8-quantized model variant when one exists
+# cache_dir = "/var/cache/rhypedb-models"   # where model files are cached; default is fastembed's own default

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -25,6 +26,13 @@ use crate::EngineResult;
 pub struct IndexingStatus {
     pub pending: usize,
     pub index_stats: Vec<IndexStat>,
+    /// The most recent embedding-model load failure, if any is currently in
+    /// effect (cleared as soon as a load succeeds). See
+    /// [`Vectorizer::model_error`].
+    pub model_error: Option<String>,
+    /// Whether at least one embedding model has been loaded successfully
+    /// since this `Vectorizer` was created. See [`Vectorizer::model_loaded`].
+    pub model_loaded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +121,80 @@ fn read_string(data: &[u8], pos: &mut usize) -> Option<String> {
     Some(s)
 }
 
-const BATCH_SIZE: usize = 256;
+/// Background embedding pipeline knobs — batch size, the embedder's own
+/// build-time options, and the model-load retry backoff. All fields have
+/// defaults chosen for an application that embeds in the background next to a
+/// UI (see each field's doc comment).
+#[derive(Debug, Clone)]
+pub struct VectorizerConfig {
+    /// Jobs claimed per embed call. Default 32. Was a hard-coded 256, which
+    /// at 512 tokens/text took a desktop process to 15 GB resident during a
+    /// large backfill; 32 keeps peak memory bounded at a modest throughput
+    /// cost (more, smaller batches).
+    pub batch_size: usize,
+    /// Passed to `FastEmbedder::with_options` for every lazily created
+    /// embedder (cache dir, max token length, ONNX intra-op threads,
+    /// int8-quantized model preference).
+    pub embed: rhypedb_embed::EmbedOptions,
+    /// Delay before the FIRST retry after a model load failure. Default 2s.
+    pub model_retry_initial: Duration,
+    /// Retries double this delay each consecutive failure, capped here.
+    /// Default 60s.
+    pub model_retry_max: Duration,
+}
+
+impl Default for VectorizerConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 32,
+            embed: rhypedb_embed::EmbedOptions::default(),
+            model_retry_initial: Duration::from_secs(2),
+            model_retry_max: Duration::from_secs(60),
+        }
+    }
+}
+
+// Hand-rolled rather than `#[derive(PartialEq)]`: `rhypedb_embed::EmbedOptions`
+// doesn't implement `PartialEq` (its `cache_dir`/`max_length`/`intra_threads`/
+// `quantized` fields all do, so compare those directly instead). Lets a
+// consumer's own config struct (e.g. `rhypedb-server`'s `ServerConfig`) derive
+// `PartialEq` while embedding a `VectorizerConfig`.
+impl PartialEq for VectorizerConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.batch_size == other.batch_size
+            && self.model_retry_initial == other.model_retry_initial
+            && self.model_retry_max == other.model_retry_max
+            && self.embed.cache_dir == other.embed.cache_dir
+            && self.embed.max_length == other.embed.max_length
+            && self.embed.intra_threads == other.embed.intra_threads
+            && self.embed.quantized == other.embed.quantized
+    }
+}
+
+/// How a fresh [`Embedder`] is constructed for a model name. In production
+/// this calls `FastEmbedder::with_options` (behind the `fastembed` feature);
+/// tests substitute a `FailingLoader`-style closure to exercise the fail-soft
+/// model-load retry logic deterministically, without touching the network.
+/// See `Vectorizer::get_or_load_embedder` and the `tests` module below.
+type LoadedEmbedder = Result<Box<dyn Embedder>, rhypedb_embed::EmbedError>;
+type EmbedderLoader = dyn Fn(&str, &rhypedb_embed::EmbedOptions) -> LoadedEmbedder + Send + Sync;
+
+#[cfg(feature = "fastembed")]
+fn default_embedder_loader() -> Box<EmbedderLoader> {
+    Box::new(|model_name: &str, options: &rhypedb_embed::EmbedOptions| {
+        FastEmbedder::with_options(model_name, options)
+            .map(|e| Box::new(e) as Box<dyn Embedder>)
+    })
+}
+
+#[cfg(not(feature = "fastembed"))]
+fn default_embedder_loader() -> Box<EmbedderLoader> {
+    Box::new(|_model_name: &str, _options: &rhypedb_embed::EmbedOptions| {
+        Err(rhypedb_embed::EmbedError::Unavailable(
+            "no embedder available (built without the `fastembed` feature)".into(),
+        ))
+    })
+}
 
 /// Manages vector indexes and the async vectorization pipeline.
 pub struct Vectorizer {
@@ -128,6 +209,21 @@ pub struct Vectorizer {
     running: Arc<AtomicBool>,
     worker_handles: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
     claim_mutex: parking_lot::Mutex<()>,
+    config: VectorizerConfig,
+    /// Factory for lazily-created embedders. A `parking_lot::Mutex` (not a
+    /// plain field) so tests can swap it after construction — production code
+    /// never re-assigns it once `new`/`with_config` returns.
+    embedder_loader: parking_lot::Mutex<Box<EmbedderLoader>>,
+    /// The most recent model-load failure message, or `None` once a load has
+    /// succeeded (or none has ever failed). See [`Self::model_error`].
+    model_error: parking_lot::Mutex<Option<String>>,
+    /// Whether ANY embedding model has ever loaded successfully. See
+    /// [`Self::model_loaded`].
+    model_loaded: AtomicBool,
+    /// Backoff for the NEXT model-load retry; doubles (capped at
+    /// `config.model_retry_max`) on each consecutive failure and resets to
+    /// `config.model_retry_initial` on success. See [`Self::backoff_delay`].
+    next_retry_delay: parking_lot::Mutex<Duration>,
 }
 
 /// Effective index config for a Vector field with no (or a partial) `@index`
@@ -225,12 +321,31 @@ fn index_config_mismatch(target: &QuantizedIndex, loaded: &QuantizedIndex) -> Op
     }
 }
 
+/// Distinguishes, in `process_batch`, why an embed attempt for a model group
+/// failed: loading the model itself (fault of the model, not the jobs — they
+/// get re-enqueued) vs. the embed call on an already-loaded model (fault of
+/// this batch's input — the existing `mark_batch_failed` path).
+enum BatchFailure {
+    ModelLoad(rhypedb_embed::EmbedError),
+    Embed(rhypedb_embed::EmbedError),
+}
+
 impl Vectorizer {
     pub fn new(
         storage: Arc<LsmTree>,
         schema: Schema,
         type_ids: HashMap<String, u64>,
         field_ids: HashMap<String, u64>,
+    ) -> EngineResult<Self> {
+        Self::with_config(storage, schema, type_ids, field_ids, VectorizerConfig::default())
+    }
+
+    pub fn with_config(
+        storage: Arc<LsmTree>,
+        schema: Schema,
+        type_ids: HashMap<String, u64>,
+        field_ids: HashMap<String, u64>,
+        config: VectorizerConfig,
     ) -> EngineResult<Self> {
         // Create HNSW indexes for each @vectorize field.
         let mut indexes = HashMap::new();
@@ -269,6 +384,7 @@ impl Vectorizer {
             }
         }
 
+        let next_retry_delay = config.model_retry_initial;
         let vectorizer = Self {
             storage,
             schema,
@@ -281,12 +397,22 @@ impl Vectorizer {
             running: Arc::new(AtomicBool::new(false)),
             worker_handles: parking_lot::Mutex::new(Vec::new()),
             claim_mutex: parking_lot::Mutex::new(()),
+            embedder_loader: parking_lot::Mutex::new(default_embedder_loader()),
+            model_error: parking_lot::Mutex::new(None),
+            model_loaded: AtomicBool::new(false),
+            next_retry_delay: parking_lot::Mutex::new(next_retry_delay),
+            config,
         };
 
         vectorizer.rebuild_indexes()?;
         vectorizer.reconcile_pending_jobs()?;
 
         Ok(vectorizer)
+    }
+
+    /// The effective configuration this `Vectorizer` was built with.
+    pub fn config(&self) -> &VectorizerConfig {
+        &self.config
     }
 
     /// Re-enqueue vectorize jobs orphaned by a crash between `claim_batch`
@@ -734,7 +860,81 @@ impl Vectorizer {
         IndexingStatus {
             pending,
             index_stats,
+            model_error: self.model_error(),
+            model_loaded: self.model_loaded(),
         }
+    }
+
+    /// The most recent embedding-model load failure, if one is currently in
+    /// effect. Cleared as soon as any model loads successfully afterward
+    /// (including a DIFFERENT model than the one that failed — this is an
+    /// aggregate signal, not per-model). `None` if no load has ever failed,
+    /// or the last failure has since been superseded by a success.
+    pub fn model_error(&self) -> Option<String> {
+        self.model_error.lock().clone()
+    }
+
+    /// Whether at least one embedding model has loaded successfully since
+    /// this `Vectorizer` was created. Once true, stays true — a LATER load
+    /// failure (see `model_error`) means the model is unavailable again
+    /// right now, not that it never worked.
+    pub fn model_loaded(&self) -> bool {
+        self.model_loaded.load(Ordering::SeqCst)
+    }
+
+    fn record_model_load_success(&self) {
+        *self.model_error.lock() = None;
+        self.model_loaded.store(true, Ordering::SeqCst);
+        *self.next_retry_delay.lock() = self.config.model_retry_initial;
+    }
+
+    fn record_model_load_failure(&self, message: &str) {
+        *self.model_error.lock() = Some(message.to_string());
+    }
+
+    /// Delay to sleep before the NEXT model-load retry. Returns the current
+    /// backoff value, then doubles it (capped at `config.model_retry_max`)
+    /// for the following call, so consecutive failures back off
+    /// exponentially. Reset to `config.model_retry_initial` by
+    /// [`Self::record_model_load_success`].
+    fn backoff_delay(&self) -> Duration {
+        let mut guard = self.next_retry_delay.lock();
+        let delay = *guard;
+        *guard = (*guard * 2).min(self.config.model_retry_max);
+        delay
+    }
+
+    /// Get the embedder for `model_name` from the shared cache, lazily
+    /// constructing it via `embedder_loader` if absent (in production,
+    /// `FastEmbedder::with_options`; see [`default_embedder_loader`] and the
+    /// `tests` module's `FailingLoader`-style seam). On success, records
+    /// `model_loaded`/clears `model_error` and resets the retry backoff. On
+    /// failure, nothing is inserted — so the NEXT call from any caller
+    /// retries the load — and `model_error` is recorded; the caller decides
+    /// what to do with any in-flight work (the worker re-enqueues its claimed
+    /// jobs rather than marking them `Failed`, since the model — not the
+    /// input — is at fault).
+    fn get_or_load_embedder<'a>(
+        &self,
+        embedders: &'a mut HashMap<String, Box<dyn Embedder>>,
+        model_name: &str,
+    ) -> Result<&'a mut Box<dyn Embedder>, rhypedb_embed::EmbedError> {
+        if !embedders.contains_key(model_name) {
+            let loader = self.embedder_loader.lock();
+            match (loader)(model_name, &self.config.embed) {
+                Ok(embedder) => {
+                    embedders.insert(model_name.to_string(), embedder);
+                    drop(loader);
+                    self.record_model_load_success();
+                }
+                Err(e) => {
+                    drop(loader);
+                    self.record_model_load_failure(&e.to_string());
+                    return Err(e);
+                }
+            }
+        }
+        Ok(embedders.get_mut(model_name).unwrap())
     }
 
     /// Process pending jobs using the shared embedder (for single-threaded use / tests).
@@ -765,7 +965,7 @@ impl Vectorizer {
                 let job = VectorizeJob::deserialize(&value)?;
                 Some((key, job))
             })
-            .take(BATCH_SIZE)
+            .take(self.config.batch_size)
             .collect();
 
         if jobs.is_empty() {
@@ -837,25 +1037,30 @@ impl Vectorizer {
 
             // Lock the shared embedder only for the embed; release before the
             // insert/commit phase so concurrent query-path embeds don't block.
-            let embed_result = {
-                let mut embedders = self.embedders.lock();
-                // Lazily load the fastembed-backed embedder for this model. When
-                // built without the `fastembed` feature there's no built-in
-                // embedder to construct, so an absent entry yields a clear error.
-                #[cfg(feature = "fastembed")]
-                embedders.entry(model_name.clone()).or_insert_with(|| {
-                    Box::new(FastEmbedder::new(model_name).expect("failed to load model"))
-                });
-                match embedders.get_mut(model_name) {
-                    Some(embedder) => embedder.embed(&text_refs),
-                    None => Err(rhypedb_embed::EmbedError::Model(
-                        "no embedder available (built without the `fastembed` feature)".into(),
-                    )),
-                }
+            // Loading and embedding are distinguished: a LOAD failure means the
+            // model, not these jobs, is at fault — re-enqueue below rather than
+            // marking them Failed. An embed-call failure on an already-loaded
+            // model (e.g. unexpected input) is the pre-existing Failed path.
+            let mut embedders = self.embedders.lock();
+            let embed_result = match self.get_or_load_embedder(&mut embedders, model_name) {
+                Ok(embedder) => embedder.embed(&text_refs).map_err(BatchFailure::Embed),
+                Err(e) => Err(BatchFailure::ModelLoad(e)),
             };
+            drop(embedders);
             let embeddings = match embed_result {
                 Ok(e) => e,
-                Err(e) => {
+                Err(BatchFailure::ModelLoad(e)) => {
+                    eprintln!(
+                        "vectorizer: model '{model_name}' unavailable, re-enqueuing \
+                         {} job(s): {e}",
+                        batch_jobs.len()
+                    );
+                    for job in batch_jobs {
+                        self.enqueue(job.clone())?;
+                    }
+                    continue;
+                }
+                Err(BatchFailure::Embed(e)) => {
                     self.mark_batch_failed(batch_jobs, &format!("{e}"))?;
                     continue;
                 }
@@ -917,20 +1122,12 @@ impl Vectorizer {
 
         let query_vec = {
             let mut embedders = self.embedders.lock();
-            #[cfg(feature = "fastembed")]
-            embedders.entry(model.clone()).or_insert_with(|| {
-                Box::new(FastEmbedder::new(&model).expect("failed to load model"))
-            });
-            match embedders.get_mut(&model) {
-                Some(embedder) => embedder
-                    .embed(&[query_text])
-                    .map_err(|e| crate::EngineError::TypeNotFound(e.to_string()))?,
-                None => {
-                    return Err(crate::EngineError::TypeNotFound(
-                        "no embedder available (built without the `fastembed` feature)".into(),
-                    ))
-                }
-            }
+            let embedder = self
+                .get_or_load_embedder(&mut embedders, &model)
+                .map_err(|e| crate::EngineError::ModelUnavailable(e.to_string()))?;
+            embedder
+                .embed(&[query_text])
+                .map_err(|e| crate::EngineError::ModelUnavailable(e.to_string()))?
         };
 
         if query_vec.is_empty() {
@@ -1416,33 +1613,50 @@ impl Vectorizer {
         let mut handles = self.worker_handles.lock();
         for worker_id in 0..num_workers {
             let vectorizer = Arc::clone(self);
-            let handle = std::thread::spawn(move || {
-                while vectorizer.running.load(Ordering::SeqCst) {
-                    let batch = match vectorizer.claim_batch() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            eprintln!("vectorizer worker {worker_id} claim error: {e}");
-                            std::thread::sleep(std::time::Duration::from_millis(500));
+            let handle = std::thread::Builder::new()
+                .name(format!("rhypedb-vectorize-{worker_id}"))
+                .spawn(move || {
+                    while vectorizer.running.load(Ordering::SeqCst) {
+                        let batch = match vectorizer.claim_batch() {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("vectorizer worker {worker_id} claim error: {e}");
+                                let delay = Duration::from_millis(500);
+                                interruptible_sleep(&vectorizer.running, delay);
+                                continue;
+                            }
+                        };
+
+                        if batch.is_empty() {
+                            interruptible_sleep(&vectorizer.running, Duration::from_millis(100));
                             continue;
                         }
-                    };
 
-                    if batch.is_empty() {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        continue;
-                    }
-
-                    match vectorizer.process_batch(batch) {
-                        Ok(_) => {
-                            vectorizer.save_snapshots();
+                        match vectorizer.process_batch(batch) {
+                            Ok(_) => {
+                                vectorizer.save_snapshots();
+                                // A model failed to load somewhere in this batch;
+                                // its jobs were re-enqueued (not lost). Back off
+                                // before the next claim so a persistently
+                                // unavailable model doesn't spin the worker hot.
+                                if let Some(err) = vectorizer.model_error() {
+                                    eprintln!(
+                                        "vectorizer worker {worker_id}: model unavailable \
+                                         ({err}); backing off before retrying"
+                                    );
+                                    let delay = vectorizer.backoff_delay();
+                                    interruptible_sleep(&vectorizer.running, delay);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("vectorizer worker {worker_id} error: {e}");
+                                let delay = Duration::from_millis(500);
+                                interruptible_sleep(&vectorizer.running, delay);
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("vectorizer worker {worker_id} error: {e}");
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                        }
                     }
-                }
-            });
+                })
+                .expect("failed to spawn vectorizer worker thread");
             handles.push(handle);
         }
     }
@@ -1526,6 +1740,21 @@ fn validate_vector(vector_field: &str, vector: &[f32], expected: usize) -> Engin
         });
     }
     Ok(())
+}
+
+/// Sleep for `duration`, but in short slices so a worker loop notices
+/// `running` flipping to `false` (via `stop_worker`) well before the full
+/// duration elapses — matters here because a model-load backoff can be up to
+/// `model_retry_max` (default 60s), and shutdown shouldn't have to wait that
+/// long.
+fn interruptible_sleep(running: &AtomicBool, duration: Duration) {
+    const STEP: Duration = Duration::from_millis(100);
+    let mut remaining = duration;
+    while remaining > Duration::ZERO && running.load(Ordering::SeqCst) {
+        let this_step = remaining.min(STEP);
+        std::thread::sleep(this_step);
+        remaining -= this_step;
+    }
 }
 
 fn serialize_f32_vec(vec: &[f32]) -> Bytes {
@@ -2868,6 +3097,137 @@ mod tests {
             .unwrap();
         let ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, restrict, "filtered text search returns the filter's members");
+    }
+
+    // --- Vectorizer hardening (issue #18): config knobs + fail-soft model load ---
+    //
+    // `embedder_loader` is a private, test-visible seam (same pattern as
+    // `embedders`/`reranker` above): production always resolves it to
+    // `default_embedder_loader()` (real `FastEmbedder::with_options`); these
+    // tests substitute a closure that fails a chosen number of times before
+    // "recovering", so the fail-soft retry logic is exercised deterministically
+    // and without touching the network.
+
+    /// A `FailingLoader`: fails the first `fail_times` calls with
+    /// `EmbedError::Unavailable`, then returns a `MockEmbedder` on every call
+    /// after that.
+    fn failing_then_ok_loader(fail_times: usize, vec: Vec<f32>) -> Box<EmbedderLoader> {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        Box::new(move |_model_name: &str, _options: &rhypedb_embed::EmbedOptions| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            if call < fail_times {
+                Err(rhypedb_embed::EmbedError::Unavailable(format!(
+                    "simulated model load failure {}/{fail_times}",
+                    call + 1
+                )))
+            } else {
+                Ok(Box::new(MockEmbedder { vec: vec.clone() }) as Box<dyn Embedder>)
+            }
+        })
+    }
+
+    /// A `FailingLoader` that never recovers.
+    fn always_failing_loader() -> Box<EmbedderLoader> {
+        Box::new(|_model_name: &str, _options: &rhypedb_embed::EmbedOptions| {
+            Err(rhypedb_embed::EmbedError::Unavailable(
+                "simulated: this model can never load".into(),
+            ))
+        })
+    }
+
+    #[test]
+    fn model_load_failure_reenqueues_jobs_and_recovers_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+
+        store_object(&storage, 1, 1, "doc one");
+        v.enqueue(VectorizeJob {
+            type_name: "Doc".into(),
+            object_id: 1,
+            source_field: "body".into(),
+            vector_field: "embedding".into(),
+            model: "mock".into(),
+        })
+        .unwrap();
+
+        // Fail the first load attempt only.
+        *v.embedder_loader.lock() = failing_then_ok_loader(1, vec![1.0, 0.0, 0.0, 0.0]);
+
+        // First attempt: the load fails. The job must be re-enqueued (left
+        // Pending), NOT marked Failed — the model is at fault, not the input.
+        let processed = v.process_pending().unwrap();
+        assert_eq!(processed, 0, "nothing embeds while the model is unavailable");
+        assert!(v.model_error().is_some(), "a load failure must set model_error");
+        assert!(!v.model_loaded(), "no model has loaded successfully yet");
+        assert_eq!(
+            v.get_state("Doc", 1, "embedding").unwrap(),
+            VectorState::Pending,
+            "a model-load failure must leave the job Pending, not Failed"
+        );
+        assert_eq!(
+            v.status().pending,
+            1,
+            "the re-enqueued job must still be visible on the queue"
+        );
+
+        // Second attempt: the loader "recovers" — the re-enqueued job embeds,
+        // and model_error clears.
+        let processed = v.process_pending().unwrap();
+        assert_eq!(processed, 1);
+        assert!(v.model_error().is_none(), "a later success must clear model_error");
+        assert!(v.model_loaded());
+        assert_eq!(v.get_state("Doc", 1, "embedding").unwrap(), VectorState::Indexed);
+    }
+
+    #[test]
+    fn claim_batch_honours_configured_batch_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let config = VectorizerConfig {
+            batch_size: 32,
+            ..VectorizerConfig::default()
+        };
+        let v = Vectorizer::with_config(Arc::clone(&storage), schema, type_ids, field_ids, config)
+            .unwrap();
+        assert_eq!(v.config().batch_size, 32);
+        inject_mocks(&v, vec![1.0, 0.0, 0.0, 0.0]);
+
+        for id in 1..=100u64 {
+            store_object(&storage, 1, id, &format!("doc {id}"));
+            v.enqueue(VectorizeJob {
+                type_name: "Doc".into(),
+                object_id: id,
+                source_field: "body".into(),
+                vector_field: "embedding".into(),
+                model: "mock".into(),
+            })
+            .unwrap();
+        }
+        assert_eq!(v.status().pending, 100);
+
+        let processed = v.process_pending().unwrap();
+        assert_eq!(processed, 32, "claim_batch must claim exactly config.batch_size jobs");
+        assert_eq!(v.status().pending, 68, "the rest stay queued for the next claim");
+    }
+
+    #[test]
+    fn search_text_with_unloadable_model_returns_model_unavailable_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+
+        // No embedder pre-injected, and the loader can never succeed.
+        *v.embedder_loader.lock() = always_failing_loader();
+
+        let err = v
+            .search_text("Doc", "embedding", "q", 5, 64, false, None)
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::EngineError::ModelUnavailable(_)),
+            "expected ModelUnavailable, got {err:?}"
+        );
+        assert!(v.model_error().is_some());
     }
 }
 

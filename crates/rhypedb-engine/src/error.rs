@@ -25,6 +25,17 @@ pub enum EngineError {
     #[error("type not found: {0}")]
     TypeNotFound(String),
 
+    /// The embedding model for a `.similar` text query (or a `@vectorize`
+    /// field's background embed) could not be loaded or used — e.g. the
+    /// model is still downloading, the load previously failed and is in
+    /// backoff, or this binary was built without the `fastembed` feature.
+    /// Distinct from `TypeNotFound`/`FieldNotFound`: the field and model name
+    /// are valid, the model itself is unavailable right now. See
+    /// `Vectorizer::model_error`/`model_loaded` (surfaced under `vectorizer`
+    /// on `GET /status`) for the background worker's view of the same state.
+    #[error("embedding model unavailable: {0}")]
+    ModelUnavailable(String),
+
     #[error("object not found: {type_name}:{object_id}")]
     ObjectNotFound { type_name: String, object_id: u64 },
 
