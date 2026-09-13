@@ -89,16 +89,15 @@ pub struct VectorizerFileConfig {
     /// Prefer the int8-quantized model variant, forwarded to
     /// `EmbedOptions::quantized`.
     pub quantized: Option<bool>,
-    /// Turn on cross-encoder reranking of `.similar` text search (a second,
-    /// ~280MB model, one forward pass per candidate — expensive enough that
-    /// it defaults to `false`/absent). See `VectorizerConfig::cross_encoder`.
-    pub cross_encoder: Option<bool>,
-    /// The cross-encoder model name, required when `cross_encoder = true`;
+    /// Cross-encoder reranking of `.similar` text search (a second, ~280MB
+    /// model, one forward pass per candidate — expensive enough that it
+    /// defaults to off). `"off"` or absent = `CrossEncoder::Off`; any other
+    /// string is the reranker model name (`CrossEncoder::On { model }`) —
     /// today exactly one is supported
     /// (`rhypedb_engine::vectorizer::DEFAULT_RERANKER_MODEL`, currently
-    /// `"bge-reranker-base"`) and any other value fails the (lazy, fail-soft)
-    /// load. Ignored when `cross_encoder` is absent or `false`.
-    pub cross_encoder_model: Option<String>,
+    /// `"bge-reranker-base"`); any other value fails the (lazy, fail-soft)
+    /// load. See `VectorizerConfig::cross_encoder`.
+    pub cross_encoder: Option<String>,
 }
 
 /// A snapshot of the relevant env vars (raw, unparsed). Built once via
@@ -337,17 +336,17 @@ fn resolve_vectorizer_config(
     if let Some(q) = vz.quantized {
         cfg.embed.quantized = q;
     }
-    // `cross_encoder_model` is only meaningful alongside `cross_encoder = true`
-    // — a bare `cross_encoder = true` defaults to the one supported model
-    // (validated lazily on first use, not here: a bad name fails soft with
-    // `UnsupportedModel`, recorded under `vectorizer.reranker_error` on
-    // `GET /status`, exactly like every other model-load failure).
-    if vz.cross_encoder == Some(true) {
-        let model = vz
-            .cross_encoder_model
-            .clone()
-            .unwrap_or_else(|| rhypedb_engine::vectorizer::DEFAULT_RERANKER_MODEL.to_string());
-        cfg.cross_encoder = rhypedb_engine::vectorizer::CrossEncoder::On { model };
+    // `"off"` (or absent, handled by the `let Some(vz)` above returning early)
+    // means Off; any other string is the reranker model name. The name is NOT
+    // validated here — a bad name fails soft with `UnsupportedModel` when the
+    // reranker is first lazily loaded, recorded under `vectorizer.reranker_error`
+    // on `GET /status`, exactly like every other model-load failure.
+    match vz.cross_encoder.as_deref() {
+        None | Some("off") => {}
+        Some(model) => {
+            cfg.cross_encoder =
+                rhypedb_engine::vectorizer::CrossEncoder::On { model: model.to_string() };
+        }
     }
     cfg
 }
@@ -927,40 +926,31 @@ mod tests {
         let c = resolve(&CliLayer::default(), &EnvLayer::default(), None);
         assert_eq!(c.vectorizer.cross_encoder, CrossEncoder::Off);
 
-        // `cross_encoder = true` with an explicit model.
-        let f = file(
-            r#"
-            [vectorizer]
-            cross_encoder = true
-            cross_encoder_model = "bge-reranker-base"
-        "#,
-        );
+        // Explicit `"off"` -> Off.
+        let f = file(r#"[vectorizer]
+cross_encoder = "off""#);
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.vectorizer.cross_encoder, CrossEncoder::Off);
+
+        // Any other string is the reranker model name.
+        let f = file(r#"[vectorizer]
+cross_encoder = "bge-reranker-base""#);
         let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
         assert_eq!(
             c.vectorizer.cross_encoder,
             CrossEncoder::On { model: "bge-reranker-base".into() }
         );
 
-        // `cross_encoder = true` with NO model given defaults to the one
-        // supported model, so a bare `cross_encoder = true` "just works".
-        let f = file("[vectorizer]\ncross_encoder = true");
+        // The value is passed through verbatim, even an unsupported name —
+        // validated lazily on first use (fails soft with `UnsupportedModel`,
+        // not here).
+        let f = file(r#"[vectorizer]
+cross_encoder = "some-other-model""#);
         let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
         assert_eq!(
             c.vectorizer.cross_encoder,
-            CrossEncoder::On { model: rhypedb_engine::vectorizer::DEFAULT_RERANKER_MODEL.into() }
+            CrossEncoder::On { model: "some-other-model".into() }
         );
-
-        // `cross_encoder = false` (explicit off) stays Off even with a model
-        // name present — the model key is ignored unless cross_encoder = true.
-        let f = file(
-            r#"
-            [vectorizer]
-            cross_encoder = false
-            cross_encoder_model = "bge-reranker-base"
-        "#,
-        );
-        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
-        assert_eq!(c.vectorizer.cross_encoder, CrossEncoder::Off);
     }
 
     #[test]

@@ -73,7 +73,6 @@
 # embedder above, and is unrelated to a per-query `rerank:` (which only means
 # "full-precision rescore against the exact vectors" — cheap, always
 # available). Turn this on only if the extra relevance is worth the cost.
-# cross_encoder = false
-# The only supported value today; a bare `cross_encoder = true` with no model
-# defaults to it.
-# cross_encoder_model = "bge-reranker-base"
+# "off" (the default) or the reranker model name; "bge-reranker-base" is the
+# only supported value today.
+# cross_encoder = "off"

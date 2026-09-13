@@ -70,8 +70,7 @@ The background embed worker (and the query-time embedder used by a text `.simila
 | `intra_threads` | half the CPU cores | ONNX Runtime intra-op threads used by each lazily-loaded model. |
 | `quantized` | `true` | Prefer the int8-quantized model variant when fastembed has one (`all-MiniLM-L6-v2`, `bge-small-en-v1.5`); smaller and faster, a small quality cost. Base/large BGE models have no quantized variant and always use fp32 regardless of this setting. |
 | `cache_dir` | fastembed's own default | Where downloaded model files are cached on disk. |
-| `cross_encoder` | `false` | Turn on cross-encoder reranking of `.similar` text search (see [Cross-encoder reranking](#cross-encoder-reranking) below). A second model, off by default. |
-| `cross_encoder_model` | `"bge-reranker-base"` | The cross-encoder model name; only used when `cross_encoder = true`. Today exactly one model is supported — see below. |
+| `cross_encoder` | `"off"` | `"off"` disables cross-encoder reranking of `.similar` text search; any other string names the reranker model to turn it on with (see [Cross-encoder reranking](#cross-encoder-reranking) below). A second model, off by default. |
 
 If the model fails to load — a network hiccup mid-download, a cold cache on first boot, or simply the time it takes to download and initialize a ~100MB+ ONNX model — the background worker does **not** fail or drop the affected jobs. It puts them back on the queue, records the failure under `vectorizer.model_error` on `GET /status`, and retries with an exponential backoff (starting at 2s, doubling up to a 60s cap) until a load succeeds, at which point `model_error` clears and the backoff resets. A `.similar` text query made while the model is unavailable gets a clear `ModelUnavailable` error rather than blocking or panicking.
 
@@ -82,12 +81,12 @@ candidates: a cross-encoder model scores each candidate's source text
 directly against your query text, which typically ranks results more
 accurately than vector distance alone — at the cost of one extra model
 (~280MB) and one forward pass per candidate. It is **off by default**
-(`cross_encoder = false`); turn it on with:
+(`cross_encoder = "off"`); turn it on by naming the reranker model — today
+exactly one is supported:
 
 ```toml
 [vectorizer]
-cross_encoder = true
-# cross_encoder_model = "bge-reranker-base"   # optional; this is the default (and only supported) value
+cross_encoder = "bge-reranker-base"
 ```
 
 This is a **separate knob from the per-query `rerank:` argument** (see
