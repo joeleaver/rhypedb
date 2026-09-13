@@ -75,6 +75,19 @@ pub enum EngineError {
     #[error("invalid full-text query: {0}")]
     FulltextQuery(String),
 
+    /// A search would examine more posting rows than the caller's budget
+    /// allows (the query governor's examined-rows cap). Raised before any
+    /// posting is decoded.
+    #[error(
+        "full-text search on '{type_name}.{field}' would examine more than {limit} posting rows; \
+         use rarer terms, `+` required terms, or a narrower candidate set"
+    )]
+    FulltextScanBudgetExceeded {
+        type_name: String,
+        field: String,
+        limit: u64,
+    },
+
     /// A posting row could not be decoded — on-disk corruption of the index.
     #[error("full-text index corrupt for '{type_name}.{field}': {detail}")]
     FulltextIndexCorrupt {

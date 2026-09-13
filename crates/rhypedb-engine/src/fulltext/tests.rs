@@ -50,7 +50,7 @@ fn note(db: &Database, title: &str, body: &str, tag: &str) -> u64 {
 }
 
 fn ids(db: &Database, field: &str, q: &str, k: usize) -> Vec<u64> {
-    db.fulltext_search("Note", field, q, k, None)
+    db.fulltext_search("Note", field, q, k, None, None)
         .unwrap()
         .hits
         .into_iter()
@@ -101,7 +101,7 @@ fn create_indexes_and_search_ranks() {
     assert_eq!(both, vec![a, b, c]);
     assert!(ids(&db, "title", "nowhere", 10).is_empty());
     // Scores are finite and descending.
-    let hits = db.fulltext_search("Note", "body", "invoice", 10, None).unwrap().hits;
+    let hits = db.fulltext_search("Note", "body", "invoice", 10, None, None).unwrap().hits;
     assert!(hits[0].score > hits[1].score && hits[1].score > 0.0);
 
     // Stats: 3 docs per field; body has 3 + 6 + 3 tokens.
@@ -128,28 +128,28 @@ fn required_terms_phrases_and_field_errors() {
     assert_eq!(both, vec![a, b]);
 
     // Phrase on a positions:false field is a clear error, not a silent miss.
-    let err = db.fulltext_search("Note", "body", "\"a b\"", 10, None).unwrap_err();
+    let err = db.fulltext_search("Note", "body", "\"a b\"", 10, None, None).unwrap_err();
     assert!(matches!(err, EngineError::FulltextQuery(ref m) if m.contains("positions: false")), "{err}");
     // A malformed / empty query too.
     assert!(matches!(
-        db.fulltext_search("Note", "title", "\"open", 10, None).unwrap_err(),
+        db.fulltext_search("Note", "title", "\"open", 10, None, None).unwrap_err(),
         EngineError::FulltextQuery(_)
     ));
     assert!(matches!(
-        db.fulltext_search("Note", "title", "...", 10, None).unwrap_err(),
+        db.fulltext_search("Note", "title", "...", 10, None, None).unwrap_err(),
         EngineError::FulltextQuery(_)
     ));
     // Field without @fulltext / unknown field / unknown type.
     assert!(matches!(
-        db.fulltext_search("Note", "tag", "a", 10, None).unwrap_err(),
+        db.fulltext_search("Note", "tag", "a", 10, None, None).unwrap_err(),
         EngineError::FulltextNotEnabled { ref type_name, ref field } if type_name == "Note" && field == "tag"
     ));
     assert!(matches!(
-        db.fulltext_search("Note", "nosuch", "a", 10, None).unwrap_err(),
+        db.fulltext_search("Note", "nosuch", "a", 10, None, None).unwrap_err(),
         EngineError::FieldNotFound { .. }
     ));
     assert!(matches!(
-        db.fulltext_search("Nope", "title", "a", 10, None).unwrap_err(),
+        db.fulltext_search("Nope", "title", "a", 10, None, None).unwrap_err(),
         EngineError::TypeNotFound(_)
     ));
     // k = 0 → nothing, no error.
@@ -303,13 +303,13 @@ fn reopen_preserves_index_and_rebuilds_stats_exactly() {
         db.update("Note", b, fields(&[("title", s("invoice 4471 overdue"))])).unwrap();
         let _d = note(&db, "gone soon", "w", "d");
         db.delete("Note", _d).unwrap();
-        (a, b, db.fulltext_search("Note", "title", "invoice +4471", 10, None).unwrap())
+        (a, b, db.fulltext_search("Note", "title", "invoice +4471", 10, None, None).unwrap())
     };
     let db = open(&dir);
     // Stats re-derived from the `l:` rows equal the live-maintained ones
     // (3 docs: 6 + 3 + 1 tokens), so every score is bit-identical.
     assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 3, total_tokens: 10 });
-    let after = db.fulltext_search("Note", "title", "invoice +4471", 10, None).unwrap();
+    let after = db.fulltext_search("Note", "title", "invoice +4471", 10, None, None).unwrap();
     assert_eq!(before, after);
     assert_eq!(after.hits[0].object_id, b);
     assert_eq!(ids(&db, "title", "invoice", 10), vec![a, b]);
@@ -329,12 +329,12 @@ fn restrict_set_applies_before_top_k_and_scan_count_is_reported() {
     let d = note(&db, "x", "b", "d");
     assert_eq!(ids(&db, "title", "x", 2), vec![a, b]);
     let restrict: HashSet<u64> = [c, d].into_iter().collect();
-    let res = db.fulltext_search("Note", "title", "x", 2, Some(&restrict)).unwrap();
+    let res = db.fulltext_search("Note", "title", "x", 2, Some(&restrict), None).unwrap();
     assert_eq!(res.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(), vec![c, d]);
     // Four postings for `x` were examined regardless of the restriction.
     assert_eq!(res.postings_scanned, 4);
     let none: HashSet<u64> = HashSet::new();
-    assert!(db.fulltext_search("Note", "title", "x", 2, Some(&none)).unwrap().hits.is_empty());
+    assert!(db.fulltext_search("Note", "title", "x", 2, Some(&none), None).unwrap().hits.is_empty());
 }
 
 #[test]
@@ -355,4 +355,73 @@ fn restore_objects_rebuilds_the_index_like_create() {
     assert_eq!(found, vec![10, 20]);
     assert_eq!(ids(&db, "title", "beta", 10), vec![20]);
     assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 2, total_tokens: 4 });
+}
+
+const SCHEMA_WITHOUT_TITLE_INDEX: &str = r#"
+    type Owner {
+        name: String
+    }
+    type Note {
+        title: String
+        body: String @fulltext(positions: false)
+        tag: String @unique
+        n: i64
+        owner: Owner @on_delete(cascade)
+    }
+"#;
+
+/// Objects written before `@fulltext` was added have a value but no index
+/// rows. An update must index the NEW value in full (not diff against a
+/// never-indexed old one) and a delete must not move stats it never joined.
+#[test]
+fn pre_directive_objects_are_unindexed_until_written_again() {
+    let dir = TempDir::new().unwrap();
+    let (a, b) = {
+        let db = Database::open(parse_schema(SCHEMA_WITHOUT_TITLE_INDEX).unwrap(), dir.path())
+            .unwrap();
+        (note(&db, "alpha beta", "x", "a"), note(&db, "keep me", "y", "b"))
+    };
+    // Reopen with `title: String @fulltext`.
+    let db = open(&dir);
+    assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 0, total_tokens: 0 });
+    assert_eq!(raw_rows(&db, "title"), (0, 0));
+    assert!(ids(&db, "title", "alpha", 10).is_empty());
+
+    // Update A: the shared term `alpha` MUST be indexed too, and the l: row
+    // written even though old and new lengths are equal.
+    db.update("Note", a, fields(&[("title", s("alpha gamma"))])).unwrap();
+    assert_eq!(ids(&db, "title", "alpha", 10), vec![a]);
+    assert_eq!(ids(&db, "title", "gamma", 10), vec![a]);
+    assert_eq!(raw_rows(&db, "title"), (2, 1));
+    assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 1, total_tokens: 2 });
+
+    // Delete B (never indexed): no tombstones, and the stats — which never
+    // counted it — stay put.
+    db.delete("Note", b).unwrap();
+    assert_eq!(raw_rows(&db, "title"), (2, 1));
+    assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 1, total_tokens: 2 });
+    // Delete A (indexed): everything goes.
+    db.delete("Note", a).unwrap();
+    assert_eq!(raw_rows(&db, "title"), (0, 0));
+    assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 0, total_tokens: 0 });
+}
+
+#[test]
+fn scan_budget_refuses_before_decoding() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    for t in ["a", "b", "c", "d"] {
+        note(&db, "common word", "z", t);
+    }
+    let err = db
+        .fulltext_search("Note", "title", "common", 10, None, Some(3))
+        .unwrap_err();
+    assert!(matches!(err, EngineError::FulltextScanBudgetExceeded { limit: 3, .. }), "{err}");
+    // Exactly at the budget is fine; a second term adds to the same budget.
+    assert_eq!(db.fulltext_search("Note", "title", "common", 10, None, Some(4)).unwrap().hits.len(), 4);
+    assert!(db.fulltext_search("Note", "title", "common word", 10, None, Some(7)).is_err());
+    assert_eq!(
+        db.fulltext_search("Note", "title", "common word", 10, None, Some(8)).unwrap().postings_scanned,
+        8
+    );
 }

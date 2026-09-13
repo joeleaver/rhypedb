@@ -1260,7 +1260,10 @@ impl Database {
         let mut fulltext_fields: HashMap<String, Vec<FulltextField>> = HashMap::new();
         let mut fulltext_stats: HashMap<(u64, u64), Arc<FulltextStats>> = HashMap::new();
         {
-            let stats_txn = storage.begin_txn();
+            // A plain read snapshot (not a Transaction): a `Transaction` pins
+            // its snapshot in the active set until commit/abort, and this one
+            // would live for the process.
+            let stats_snapshot = storage.read_snapshot();
             for (type_name, type_def) in &schema.types {
                 let type_id = type_ids[type_name];
                 let mut list = Vec::new();
@@ -1282,19 +1285,27 @@ impl Database {
                     let generation = 0u32;
                     let mut doc_count = 0u64;
                     let mut total_tokens = 0u64;
-                    for (_, value) in storage.scan_prefix(
-                        &stats_txn,
+                    for (doc_key, value) in storage.scan_prefix_at(
+                        stats_snapshot,
                         &KeyBuilder::fulltext_doc_prefix(type_id, field_id, generation),
                     )? {
-                        let len = crate::fulltext::decode_doc_len(&value).map_err(|e| {
-                            EngineError::FulltextIndexCorrupt {
-                                type_name: type_name.clone(),
-                                field: field.name.clone(),
-                                detail: format!("doc-length row: {e}"),
-                            }
-                        })?;
                         doc_count += 1;
-                        total_tokens += len as u64;
+                        match crate::fulltext::decode_doc_len(&value) {
+                            Ok(len) => total_tokens += len as u64,
+                            // A corrupt doc-length row is derived state: it only
+                            // skews the field's average length. Count the doc
+                            // (its postings still exist) at length 0 and keep
+                            // opening — a bad byte must not take the whole
+                            // database offline. The posting rows themselves
+                            // fail the SEARCH that reads them, not the open.
+                            Err(e) => eprintln!(
+                                "warning: full-text doc-length row for {type_name}.{} object {} is \
+                                 corrupt ({e}); counting it at length 0 — rebuild the index by \
+                                 removing and re-adding @fulltext",
+                                field.name,
+                                KeyBuilder::fulltext_object_id(&doc_key).unwrap_or(0),
+                            ),
+                        }
                     }
                     let stats = Arc::new(FulltextStats::new(doc_count, total_tokens));
                     fulltext_stats.insert((type_id, field_id), Arc::clone(&stats));
@@ -1311,7 +1322,6 @@ impl Database {
                     fulltext_fields.insert(type_name.clone(), list);
                 }
             }
-            drop(stats_txn);
         }
 
         // Override the born-bit seed with persisted generations for objects
@@ -4164,8 +4174,8 @@ impl Database {
         for (object_id, fields) in &rows {
             // Additive (online) restore: refuse an id that already exists rather
             // than overwriting it — restore_objects is an insert path and would
-            // leave the prior object's unique/index/edge entries stale. A
-            // deleted id reads as absent here, so it is reusable.
+            // leave the prior object's unique/index/edge/fulltext entries stale.
+            // A deleted id reads as absent here, so it is reusable.
             if reject_existing {
                 let key = KeyBuilder::object(type_id, *object_id);
                 if self.storage.get(&txn, &key).map_err(EngineError::Storage)?.is_some() {
@@ -6162,6 +6172,21 @@ impl Database {
                 if let Some(ft_fields) = self.fulltext_fields.get(&meta.type_name) {
                     for ff in ft_fields {
                         if let Some(Value::String(text)) = fields.get(&ff.name) {
+                            // An object written BEFORE `@fulltext` was added to the
+                            // schema has a value but no index rows (until the
+                            // backfill reaches it). The `l:` row is the "is this
+                            // object indexed?" witness: without it there is
+                            // nothing to tombstone and the stats never counted
+                            // the document, so moving them would under-count.
+                            let doc_key = KeyBuilder::fulltext_doc(
+                                type_id,
+                                ff.field_id,
+                                ff.generation,
+                                object_id,
+                            );
+                            if self.storage.get(txn, &doc_key)?.is_none() {
+                                continue;
+                            }
                             let doc = tokenize_for_index(ff, text);
                             arena.reserve(doc.terms.len() + 1);
                             for (term, _) in &doc.terms {
@@ -8496,6 +8521,17 @@ impl Database {
         ft_delta: &mut StatsDelta,
     ) -> EngineResult<()> {
         use std::collections::BTreeMap;
+        let doc_key = KeyBuilder::fulltext_doc(type_id, ff.field_id, ff.generation, object_id);
+        // The old value is only "indexed" if its `l:` row exists. An object
+        // written before `@fulltext` was added (not yet backfilled) has a
+        // value but no rows: diffing against its text would skip the terms it
+        // shares with the new value (never indexed → never findable) and
+        // charge the stats for a document they never counted. Treat it as
+        // `None` so the new value is staged in full — which also makes a
+        // concurrent backfill of the same object a harmless (conflict-
+        // detected) duplicate rather than a divergence.
+        let old_indexed = old_text.is_some() && self.storage.get(txn, &doc_key)?.is_some();
+        let old_text = if old_indexed { old_text } else { None };
         let old_doc = old_text.map(|t| tokenize_for_index(ff, t));
         let new_doc = new_text.map(|t| tokenize_for_index(ff, t));
         let old_terms: BTreeMap<&str, &Vec<u32>> = old_doc
@@ -8547,7 +8583,6 @@ impl Database {
                 )?;
             }
         }
-        let doc_key = KeyBuilder::fulltext_doc(type_id, ff.field_id, ff.generation, object_id);
         match (old_len, new_len) {
             (_, Some(len)) if old_len != new_len => {
                 self.storage
@@ -8572,6 +8607,14 @@ impl Database {
     /// `k` by BM25 (score desc, id asc). `restrict`, when given, limits the
     /// candidates to that id set BEFORE the top-k cut. Reads one snapshot.
     ///
+    /// `max_postings`, when given, caps the posting rows the search may
+    /// examine across all its terms: the check runs after each term's prefix
+    /// scan and BEFORE any posting is decoded, so a stop-word query over a
+    /// huge corpus fails closed with
+    /// [`EngineError::FulltextScanBudgetExceeded`] instead of materializing
+    /// every posting (the scan itself hands back zero-copy slices; decoding
+    /// is where the per-posting allocation happens).
+    ///
     /// Errors: [`EngineError::FulltextNotEnabled`] when the field has no
     /// `@fulltext`; [`EngineError::FulltextQuery`] for a malformed query or a
     /// phrase against a `positions: false` field; the usual type/field
@@ -8584,6 +8627,7 @@ impl Database {
         query_text: &str,
         k: usize,
         restrict: Option<&std::collections::HashSet<u64>>,
+        max_postings: Option<u64>,
     ) -> EngineResult<FulltextSearchResult> {
         self.check_not_migrated()?;
         let type_id = self.resolve_type_id(type_name)?;
@@ -8627,6 +8671,15 @@ impl Database {
             );
             let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
             postings_scanned += entries.len() as u64;
+            if let Some(limit) = max_postings
+                && postings_scanned > limit
+            {
+                return Err(EngineError::FulltextScanBudgetExceeded {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                    limit,
+                });
+            }
             let mut list = Vec::with_capacity(entries.len());
             for (key, value) in entries {
                 let corrupt = |detail: String| EngineError::FulltextIndexCorrupt {

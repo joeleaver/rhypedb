@@ -135,6 +135,14 @@ impl Governor {
         (self.enabled && self.limits.max_rows_scanned != 0).then_some(self.limits.max_rows_scanned)
     }
 
+    /// Rows this query may still examine before `charge` fails closed, or
+    /// `None` when unbounded. Lets an engine call refuse an over-budget scan
+    /// up front instead of materializing it and failing afterwards.
+    pub fn remaining_scan_budget(&self) -> Option<u64> {
+        let cap = self.scan_cap()? as u64;
+        Some(cap.saturating_sub(self.rows_examined.get()))
+    }
+
     /// Charge `n` rows against the examined-rows budget and re-check the deadline.
     /// Call this as rows are consumed by scans / traversals / mutations. Prefer
     /// charging in bulk (one call per batch) so the deadline's `Instant::now()`

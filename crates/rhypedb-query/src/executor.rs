@@ -929,9 +929,24 @@ fn run_matches(
     }
     let k = ctx.governor.clamp_limit(k);
     ctx.governor.check_deadline()?;
+    // The engine refuses (before decoding a single posting) a search that
+    // would examine more rows than the governor's remaining budget.
     let result = ctx
         .db
-        .fulltext_search(type_name, field_name, query_text, k, restrict)?;
+        .fulltext_search(
+            type_name,
+            field_name,
+            query_text,
+            k,
+            restrict,
+            ctx.governor.remaining_scan_budget(),
+        )
+        .map_err(|e| match e {
+            rhypedb_engine::EngineError::FulltextScanBudgetExceeded { .. } => {
+                QueryError::ResourceLimitExceeded(e.to_string())
+            }
+            other => QueryError::Engine(other),
+        })?;
     ctx.governor.charge(result.postings_scanned)?;
     let rows: Vec<(Object, f32)> = result
         .hits

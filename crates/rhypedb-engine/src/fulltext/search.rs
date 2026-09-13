@@ -15,7 +15,7 @@
 //! ```
 //!
 //! with `k1 = 1.2`, `b = 0.75`. A phrase clause contributes the sum of its
-//! terms' scores when (and only when) the terms occur consecutively.
+//! DISTINCT terms' scores when (and only when) the terms occur consecutively.
 //! Ties break on ascending object id so results are deterministic.
 
 use std::collections::{HashMap, HashSet};
@@ -181,10 +181,21 @@ fn score_phrase(
             })
         });
         if matched {
+            // Sum over the DISTINCT terms of the phrase: "to be or not to be"
+            // scores `to` and `be` once each, not once per occurrence.
+            let mut seen: Vec<&str> = Vec::with_capacity(clause.terms.len());
             let contribution: f32 = clause
                 .terms
                 .iter()
                 .zip(&per_term)
+                .filter(|(t, _)| {
+                    if seen.contains(&t.as_str()) {
+                        false
+                    } else {
+                        seen.push(t.as_str());
+                        true
+                    }
+                })
                 .map(|(t, p)| idf[t.as_str()] * tfnorm(p))
                 .sum();
             add(id, contribution, clause);
@@ -290,6 +301,15 @@ mod tests {
         // Three-term phrase and a repeated-word phrase.
         assert_eq!(ids(&run(DOCS, "\"the invoice run\"", 10, None)), vec![1]);
         assert_eq!(ids(&run(DOCS, "\"invoice for the invoice\"", 10, None)), vec![1]);
+        // A repeated term inside a phrase is scored once: the phrase with the
+        // repeat scores the same as its distinct-term set would.
+        let repeated = run(DOCS, "\"invoice for the invoice\"", 10, None)[0].score;
+        let distinct = run(DOCS, "+invoice +for +the", 10, None)
+            .iter()
+            .find(|h| h.object_id == 1)
+            .unwrap()
+            .score;
+        assert!((repeated - distinct).abs() < 1e-6, "{repeated} vs {distinct}");
         // Phrase as an optional clause alongside a term: union.
         let hits = run(DOCS, "\"distributed consensus\" overdue", 10, None);
         assert_eq!(ids(&hits).len(), 2);
