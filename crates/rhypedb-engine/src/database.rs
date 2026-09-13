@@ -404,6 +404,25 @@ pub struct Database {
     /// same lock instance through to the rebuilt handle (both old and
     /// new Databases serialize through it).
     migration_lock: Arc<parking_lot::RwLock<()>>,
+    /// Excludes BACKGROUND MAINTENANCE commits from straddling a foreground
+    /// write's transaction. Every user-facing write verb (`create` /
+    /// `create_batch` / `restore_objects` / `update` / `delete` / `link` /
+    /// `unlink`) holds the READ side from before `begin_txn` until after
+    /// `commit`; every background writer that touches keys a foreground
+    /// write can also touch — the cover-refresh worker (rev-edge covers) and
+    /// the full-text builder (`f:`/`l:` rows) — holds the WRITE side around
+    /// its own `begin_txn` … `commit`. MVCC's conflict check is
+    /// first-committer-wins on overlapping keys, so without this a
+    /// maintenance commit landing between a user txn's begin and commit
+    /// made the USER the conflict loser (`WriteConflict` surfaced to a
+    /// caller who raced nothing but the engine's own housekeeping — e.g. a
+    /// `delete` right after an `update` that had queued a cover refresh).
+    /// With it, maintenance and foreground transactions never interleave,
+    /// so neither side can lose to the other; user-vs-user conflicts are
+    /// untouched (readers never take it). Lock order: `migration_lock`
+    /// (read) → `maintenance_lock`. `Arc`-shared across rebuilt handles
+    /// (CarryState) because the OLD handle's worker may still be draining.
+    maintenance_lock: Arc<parking_lot::RwLock<()>>,
     /// The `OpenOptions` this handle was constructed with. Stored so the
     /// `_consuming` migrate variants can re-spawn workers with matching
     /// settings on the rebuilt handle.
@@ -599,6 +618,9 @@ pub(crate) struct CarryState {
     pub version_counters: Arc<RwLock<HashMap<(u64, u64), u64>>>,
     pub version_counter_count: Arc<std::sync::atomic::AtomicUsize>,
     pub migration_lock: Arc<parking_lot::RwLock<()>>,
+    /// SAME lock the OLD handle's cover-refresh worker takes, so it cannot
+    /// straddle a write on the NEW handle either (see `Database::maintenance_lock`).
+    pub maintenance_lock: Arc<parking_lot::RwLock<()>>,
     /// SAME registry Arc the OLD handle holds, so converters registered
     /// before a `_consuming` verb stay resolvable on the new handle.
     pub converters: Arc<parking_lot::RwLock<HashMap<String, (u32, crate::catalog::RegisteredConverter)>>>,
@@ -1380,6 +1402,10 @@ impl Database {
                 Some(c) => Arc::clone(&c.migration_lock),
                 None => Arc::new(parking_lot::RwLock::new(())),
             },
+            maintenance_lock: match &carry {
+                Some(c) => Arc::clone(&c.maintenance_lock),
+                None => Arc::new(parking_lot::RwLock::new(())),
+            },
             zone_field_id_lookup,
             // Card 2: double-write hooks — start empty, rebuilt from `c:P:` by
             // `auto_resume_migrations` on the open path (below) / armed by
@@ -1991,6 +2017,7 @@ impl Database {
             version_counters: Arc::clone(&self.version_counters),
             version_counter_count: Arc::clone(&self.version_counter_count),
             migration_lock: Arc::clone(&self.migration_lock),
+            maintenance_lock: Arc::clone(&self.maintenance_lock),
             converters: Arc::clone(&self.converters),
         };
         // Poison the OLD handle BEFORE rebuilding. If `rebuild_with_arc_storage`
@@ -2068,6 +2095,7 @@ impl Database {
             version_counters: Arc::clone(&self.version_counters),
             version_counter_count: Arc::clone(&self.version_counter_count),
             migration_lock: Arc::clone(&self.migration_lock),
+            maintenance_lock: Arc::clone(&self.maintenance_lock),
             converters: Arc::clone(&self.converters),
         };
         // NON-poisoning: self.migrated stays false (see doc comment).
@@ -3690,6 +3718,7 @@ impl Database {
         // create observes the post-migration schema (and writes a
         // FieldMap whose keys match the catalog's view of the field).
         let _migration_guard = self.migration_lock.read();
+        let _maintenance_guard = self.maintenance_lock.read();
         // Check catalog state FIRST — a retired type isn't in `self.schema`
         // anymore (the operator removed it), so falling through to
         // `schema.get_type` would yield `TypeNotFound` for retired
@@ -4003,6 +4032,7 @@ impl Database {
             return Ok(Vec::new());
         }
         let _migration_guard = self.migration_lock.read();
+        let _maintenance_guard = self.maintenance_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
         // Card 2d: no quiesce — the per-row double-write hook in
         // stage_create_writes carries each migrating field forward.
@@ -4136,6 +4166,7 @@ impl Database {
             return Ok(());
         }
         let _migration_guard = self.migration_lock.read();
+        let _maintenance_guard = self.maintenance_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
         let type_def = self
             .schema
@@ -4251,6 +4282,7 @@ impl Database {
             return Ok(());
         }
         let _migration_guard = self.migration_lock.read();
+        let _maintenance_guard = self.maintenance_lock.read();
         let (type_id, field_id) = self.resolve_field_id(type_name, field_name)?;
 
         let type_def = self
@@ -5591,6 +5623,7 @@ impl Database {
         origin: Option<u64>,
     ) -> EngineResult<Object> {
         let _migration_guard = self.migration_lock.read();
+        let _maintenance_guard = self.maintenance_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
         // Card 2d: no quiesce — the double-write hook re-stamps the migrating
         // field's shadow over the merged blob (apply_migrating_field_hook).
@@ -5909,6 +5942,7 @@ impl Database {
         origin: Option<u64>,
     ) -> EngineResult<()> {
         let _migration_guard = self.migration_lock.read();
+        let _maintenance_guard = self.maintenance_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
 
         let mut txn = self.storage.begin_txn();
@@ -6367,6 +6401,7 @@ impl Database {
         edge_fields: Option<FieldMap>,
     ) -> EngineResult<()> {
         let _migration_guard = self.migration_lock.read();
+        let _maintenance_guard = self.maintenance_lock.read();
         let source_type_id = self.resolve_type_id(source_type)?;
         let type_def = self
             .schema
@@ -6499,6 +6534,7 @@ impl Database {
         target_id: u64,
     ) -> EngineResult<()> {
         let _migration_guard = self.migration_lock.read();
+        let _maintenance_guard = self.maintenance_lock.read();
         let _ = self.resolve_type_id(source_type)?;
         let rel_key = format!("{source_type}.{field_name}");
         let rel_id = *self
@@ -7395,6 +7431,11 @@ impl Database {
         // txn so commit is atomic. We collect the source bytes inside the
         // same txn that does the put so a concurrent S-update doesn't get
         // overwritten with stale cover content.
+        //
+        // Held from before `begin_txn` to after `commit`: no foreground write
+        // can straddle this commit, so this maintenance pass can never turn a
+        // user's `delete`/`unlink`/`link`/`update` into the conflict loser.
+        let _maintenance_guard = self.maintenance_lock.write();
         let mut txn = self.storage.begin_txn();
         for (s_type_id, s_id) in sources {
             let Some(s_type_name) = self.type_name_by_id.get(&s_type_id) else {
@@ -15434,6 +15475,50 @@ mod tests {
     /// Issue #13: the `*_with_origin` write verbs stamp their opaque origin onto
     /// every emitted `ChangeEvent`; the plain verbs stamp `None`; and a cascade
     /// delete fans the SAME origin onto every event it produces.
+    /// Regression (found 2026-09-13, flaky ~30%): an `update` queues the
+    /// cover-refresh worker for its target; the worker's rev-edge rewrite
+    /// then raced the user's very next `delete` of that target (both write
+    /// `r:<target>:<rel>:<source>`) and, being first to commit, made the USER
+    /// the `WriteConflict` loser. The maintenance lock excludes the two, so a
+    /// foreground write can never lose to background housekeeping. Loops the
+    /// exact sequence many times: any single failure is the bug.
+    #[test]
+    fn background_cover_refresh_never_fails_a_foreground_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User { name: String }
+            type Post { title: String  author: User @on_delete(cascade) }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        for i in 0..150 {
+            let mut uf = FieldMap::new();
+            uf.insert("name".into(), Value::String(format!("u{i}")));
+            let user = db.create("User", uf).unwrap();
+            let mut pf = FieldMap::new();
+            pf.insert("title".into(), Value::String("p".into()));
+            let post = db.create("Post", pf).unwrap();
+            db.link("Post", post.id, "author", user.id, None).unwrap();
+            let mut uf2 = FieldMap::new();
+            uf2.insert("name".into(), Value::String(format!("u{i}-renamed")));
+            // The update queues a cover refresh of `user`; the worker rewrites
+            // post's rev edge under user concurrently with what follows.
+            db.update("User", user.id, uf2).unwrap();
+            db.unlink("Post", post.id, "author", user.id)
+                .unwrap_or_else(|e| panic!("iteration {i}: unlink lost to maintenance: {e}"));
+            db.link("Post", post.id, "author", user.id, None)
+                .unwrap_or_else(|e| panic!("iteration {i}: link lost to maintenance: {e}"));
+            let mut uf3 = FieldMap::new();
+            uf3.insert("name".into(), Value::String(format!("u{i}-again")));
+            db.update("User", user.id, uf3).unwrap();
+            db.delete("User", user.id)
+                .unwrap_or_else(|e| panic!("iteration {i}: delete lost to maintenance: {e}"));
+            assert!(db.get("Post", post.id).is_err(), "cascade removed the post");
+        }
+    }
+
     #[test]
     fn write_origin_stamps_change_events() {
         use rhypedb_subscribe::{ChangeKind, SubscriptionFilter};

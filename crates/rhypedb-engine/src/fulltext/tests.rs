@@ -743,13 +743,13 @@ fn scan_budget_refuses_before_decoding() {
     );
 }
 
-/// Review finding: a delete / set-to-null of an object INSIDE a backfill
-/// chunk's window must conflict with the chunk (the write paths tombstone the
-/// `l:` row even when it does not exist yet), so the builder retries and never
-/// resurrects a deleted / nulled document. Uses the builder's test seam to
-/// race the writes against exactly the first chunk.
+/// A delete / set-to-null / rewrite racing the first backfill chunk from
+/// another thread: the writer blocks on the maintenance lock until the chunk
+/// has committed (proven by observing the chunk's rows before its own write
+/// lands), then its write undoes the chunk's rows for that object — the final
+/// index equals a clean build of the final state, and no user write fails.
 #[test]
-fn deletes_and_null_sets_inside_a_backfill_chunk_do_not_resurrect_documents() {
+fn deletes_and_null_sets_racing_a_backfill_chunk_never_fail_or_resurrect() {
     let rows = sample_rows(700);
     let dir = TempDir::new().unwrap();
     {
@@ -768,24 +768,51 @@ fn deletes_and_null_sets_inside_a_backfill_chunk_do_not_resurrect_documents() {
     }
     let db = open_no_build(&dir, SCHEMA);
     assert_eq!(state_of(&db, "title"), crate::fulltext::BuildState::Building);
-    // Inside the first chunk's window (ids 1..=512): delete 300, null 301,
-    // rewrite 302. Fire once; the builder's retry calls the hook again.
+    // Racing the first chunk (ids 1..=512) from another thread: delete 300,
+    // null 301, rewrite 302. The hook fires while the chunk HOLDS the
+    // maintenance lock, so the racer's first write parks until the chunk
+    // commits; the hook only waits for the racer to have started.
+    let racer_handle: std::sync::Arc<parking_lot::Mutex<Option<std::thread::JoinHandle<bool>>>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
     {
         let racer = std::sync::Arc::clone(&db);
+        let holder = std::sync::Arc::clone(&racer_handle);
         let mut fired = false;
         *db.fulltext_builder_test_hook() = Some(Box::new(move |cursor: u64| {
             if fired || cursor != 0 {
                 return;
             }
             fired = true;
-            racer.delete("Note", 300).unwrap();
-            racer.update("Note", 301, fields(&[("title", Value::Null)])).unwrap();
-            racer.update("Note", 302, fields(&[("title", s("rewritten inside window"))])).unwrap();
+            let racer = std::sync::Arc::clone(&racer);
+            let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+            *holder.lock() = Some(std::thread::spawn(move || {
+                let type_id = racer.type_ids()["Note"];
+                let field_id = racer.field_ids()["Note.title"];
+                started_tx.send(()).unwrap();
+                // Blocks on the maintenance lock until the chunk commits.
+                racer.delete("Note", 300).unwrap();
+                // Proof the delete ran AFTER the chunk: its neighbours' `l:`
+                // rows (written by that chunk) are visible now.
+                let snap = racer.storage().read_snapshot();
+                let neighbours_indexed = racer
+                    .storage()
+                    .get_at(snap, &KeyBuilder::fulltext_doc(type_id, field_id, 0, 299))
+                    .unwrap()
+                    .is_some();
+                racer.update("Note", 301, fields(&[("title", Value::Null)])).unwrap();
+                racer.update("Note", 302, fields(&[("title", s("rewritten after chunk"))])).unwrap();
+                neighbours_indexed
+            }));
+            started_rx.recv().unwrap();
+            // Let the racer reach (and park on) the lock this chunk holds.
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }));
     }
     db.run_fulltext_tasks_inline();
     assert_eq!(state_of(&db, "title"), crate::fulltext::BuildState::Built);
     assert_eq!(db.fulltext_tasks_failed(), 0);
+    let waited_for_chunk = racer_handle.lock().take().unwrap().join().unwrap();
+    assert!(waited_for_chunk, "the racing writer must have waited for the chunk to commit");
 
     // Expected final state = rows minus 300, 301 nulled, 302 rewritten.
     let mut expected: Vec<(u64, Option<String>, String)> =
@@ -795,7 +822,7 @@ fn deletes_and_null_sets_inside_a_backfill_chunk_do_not_resurrect_documents() {
             r.1 = None;
         }
         if r.0 == 302 {
-            r.1 = Some("rewritten inside window".into());
+            r.1 = Some("rewritten after chunk".into());
         }
     }
     let borrowed: Vec<(u64, Option<&str>, &str)> =
@@ -807,7 +834,7 @@ fn deletes_and_null_sets_inside_a_backfill_chunk_do_not_resurrect_documents() {
     assert!(ids(&db, "title", "+invoice +300", 10).is_empty());
     assert!(ids(&db, "title", "+invoice +301", 10).is_empty());
     assert!(ids(&db, "title", "+invoice +302", 10).is_empty());
-    assert_eq!(ids(&db, "title", "+rewritten +window", 10), vec![302]);
+    assert_eq!(ids(&db, "title", "+rewritten +chunk", 10), vec![302]);
     assert_eq!(scored(&db, "title", "invoice"), scored(&clean, "title", "invoice"));
 }
 

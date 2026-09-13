@@ -26,7 +26,11 @@
 //! The backfill never gives up to foreground traffic: every conflict halves
 //! its chunk (down to one object), and a one-object chunk can only conflict
 //! with a write to that very object — which the retry then resolves — so
-//! progress is guaranteed under any write load.
+//! progress is guaranteed under any write load. On top of that, each chunk
+//! holds `Database::maintenance_lock` (write) from begin to commit while
+//! every foreground write holds it (read) across its own transaction, so in
+//! practice the two never interleave at all and a user write can never lose
+//! to the builder; the conflict retry is the belt to that suspenders.
 //!
 //! The thread holds only a `Weak<Database>` between chunks (upgraded per
 //! chunk, like the migration driver), so dropping the last external `Arc`
@@ -98,10 +102,11 @@ pub(super) struct FulltextBuilder {
     pub(super) stop: AtomicBool,
     pub(super) handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
     pub(super) drops: Vec<DropEntry>,
-    /// Test seam: called once per backfill chunk INSIDE the conflict window
-    /// (after the chunk's txn began and its objects were read, before its
-    /// commit) with the chunk's cursor, so a test can race a foreground
-    /// write against exactly that chunk.
+    /// Test seam: called once per backfill chunk INSIDE the exclusion window
+    /// (maintenance lock held, txn begun, objects read, nothing committed)
+    /// with the chunk's cursor, so a test can start a foreground write on
+    /// another thread and prove it waits for exactly that chunk. Must not
+    /// take engine locks itself.
     #[cfg(test)]
     pub(crate) chunk_hook: parking_lot::Mutex<Option<ChunkHook>>,
 }
@@ -462,12 +467,20 @@ fn run_build(
             if builder.stop.load(Ordering::Acquire) {
                 return Ok(false);
             }
-            // Begin the txn FIRST and scan at ITS snapshot: a delete / null
-            // between an earlier read snapshot and the txn's own would be
-            // invisible to the conflict check (it predates the txn) yet its
-            // object would still be in the chunk.
+            // Exclude foreground writes for the whole chunk (begin → commit):
+            // no user transaction can straddle this commit, so the chunk can
+            // never make a user write the conflict loser (see
+            // `Database::maintenance_lock`). Begin the txn INSIDE the window
+            // and scan at ITS snapshot, so every write that finished before
+            // us is visible and nothing commits behind our back.
+            let _maintenance_guard = db.maintenance_lock.write();
             let mut txn = db.storage.begin_txn();
             let chunk = db.scan_chunk(type_name, txn.snapshot(), cursor, chunk_size)?;
+            // Test seam INSIDE the exclusion window (lock held, chunk read,
+            // nothing committed): a hook that starts a foreground write on
+            // another thread sees it park on the maintenance lock until this
+            // chunk commits — the property under test. The hook itself must
+            // not take engine locks (it runs on the builder's thread).
             #[cfg(test)]
             if let Some(hook) = builder.chunk_hook.lock().as_mut() {
                 hook(cursor);
@@ -560,6 +573,10 @@ fn run_drop(
                 return Ok(false);
             };
             let _migration_guard = db.migration_lock.read();
+            // Stale/orphan rows are never written by a foreground txn, so a
+            // sweep cannot make a user write lose; the lock still keeps the
+            // two from interleaving.
+            let _maintenance_guard = db.maintenance_lock.write();
             let snapshot = db.storage.read_snapshot();
             let chunk = db.storage.scan_chunk_raw(snapshot, &prefix, &start, FULLTEXT_DROP_CHUNK)?;
             let deletes: Vec<Bytes> = chunk
