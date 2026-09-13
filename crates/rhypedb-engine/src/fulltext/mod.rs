@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use analyzer::{Analyzer, MAX_TERM_BYTES, Token};
 pub use posting::Posting;
-pub use query::{Clause, ParsedQuery, QuerySyntaxError};
+pub use query::{Clause, MIN_PREFIX_CHARS, ParsedQuery, QuerySyntaxError};
 pub use build::{BuildProgress, BuildState, FulltextIndexStatus};
 pub use search::{CorpusStats, FulltextHit};
 
@@ -169,6 +169,22 @@ pub fn encode_term(term: &str) -> Vec<u8> {
     crate::database::encode_str_for_index(term)
 }
 
+/// Key bytes covering every term that STARTS with `prefix`: the same
+/// escaping as [`encode_term`] without the terminator. The escape rewrites
+/// bytes one at a time (`\x00` → `\x00\x01`, everything else verbatim), so
+/// `encode_term(t)` starts with `encode_term_prefix(p)` exactly when `t`
+/// starts with `p`.
+pub fn encode_term_prefix(prefix: &str) -> Vec<u8> {
+    let mut bytes = encode_term(prefix);
+    bytes.truncate(bytes.len() - 2);
+    bytes
+}
+
+/// Most distinct indexed terms a prefix clause (`cam*`) may expand to. A
+/// longer expansion is refused with a clear error instead of turning a
+/// two-letter prefix into a scan of half the index.
+pub const MAX_PREFIX_EXPANSION: usize = 64;
+
 /// Value of an `l:` row: the document's token count as a varint.
 pub fn encode_doc_len(doc_len: u32) -> bytes::Bytes {
     let mut out = Vec::with_capacity(5);
@@ -236,6 +252,20 @@ mod stats_tests {
         assert_eq!(s.snapshot(), CorpusStats { doc_count: 0, total_tokens: 0 });
         s.apply(0, 0);
         assert_eq!(s.snapshot(), CorpusStats { doc_count: 0, total_tokens: 0 });
+    }
+
+    #[test]
+    fn term_prefix_encoding_is_prefix_preserving() {
+        assert_eq!(encode_term_prefix(""), Vec::<u8>::new());
+        assert_eq!(encode_term_prefix("cam"), b"cam".to_vec());
+        assert!(encode_term("camera").starts_with(&encode_term_prefix("cam")));
+        assert!(encode_term("cam").starts_with(&encode_term_prefix("cam")));
+        assert!(!encode_term("ca").starts_with(&encode_term_prefix("cam")));
+        assert!(!encode_term("dam").starts_with(&encode_term_prefix("cam")));
+        // Escaped NULs stay prefix-preserving.
+        assert_eq!(encode_term_prefix("a\0"), b"a\0\x01".to_vec());
+        assert!(encode_term("a\0b").starts_with(&encode_term_prefix("a\0")));
+        assert!(!encode_term("a").starts_with(&encode_term_prefix("a\0")));
     }
 
     #[test]

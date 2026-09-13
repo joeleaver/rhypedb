@@ -2513,6 +2513,55 @@ mod tests {
     }
 
     #[test]
+    fn matches_step_passes_prefix_terms_and_english_analyzer_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Post {
+                title: String @fulltext(analyzer: "english")
+                body: String @fulltext
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let ctx = ExecContext::new(&db, None);
+        let run = |q: &str| execute(&ctx, &parse_query(q).unwrap());
+        let single_id = |out: QueryOutput| match out {
+            QueryOutput::Single(o) => o.id,
+            other => panic!("expected Single, got {other:?}"),
+        };
+        let p1 = single_id(run(r#"Post.create({ title: "the security cameras", body: "camera" })"#).unwrap());
+        let p2 = single_id(run(r#"Post.create({ title: "a campaign", body: "campaign trail" })"#).unwrap());
+        let p3 = single_id(run(r#"Post.create({ title: "calm seas", body: "calm" })"#).unwrap());
+        let ids = |out| scored_ids(out).into_iter().map(|r| r.0).collect::<Vec<u64>>();
+        let plain_ids = |out: QueryOutput| match out {
+            QueryOutput::Objects(v) => v.into_iter().map(|o| o.id).collect::<Vec<u64>>(),
+            other => panic!("expected Objects, got {other:?}"),
+        };
+
+        // english: inflections match; the phrase stems both sides.
+        assert_eq!(ids(run(r#"Post.matches(.title, "camera", k: 10)"#).unwrap()), vec![p1]);
+        assert_eq!(ids(run(r#"Post.matches(.title, "\"security camera\"", k: 10)"#).unwrap()), vec![p1]);
+        // `.contains` stays literal (and unscored) on the same field.
+        assert_eq!(plain_ids(run(r#"Post.filter(.title.contains("camera"))"#).unwrap()), vec![p1]);
+        assert_eq!(plain_ids(run(r#"Post.filter(.title.contains("cameras"))"#).unwrap()), vec![p1]);
+        assert!(plain_ids(run(r#"Post.filter(.title.contains("Camera"))"#).unwrap()).is_empty());
+        // Prefix terms pass through the QL string literal untouched.
+        let mut got = ids(run(r#"Post.matches(.body, "cam*", k: 10)"#).unwrap());
+        got.sort_unstable();
+        assert_eq!(got, vec![p1, p2]);
+        assert_eq!(ids(run(r#"Post.matches(.body, "ca*", k: 10)"#).unwrap()).len(), 3);
+        assert_eq!(ids(run(r#"Post.matches(.title, "+cam* +campaign", k: 10)"#).unwrap()), vec![p2]);
+        let _ = p3;
+        // Syntax errors are query errors carrying the engine's message.
+        let err = run(r#"Post.matches(.body, "c*", k: 10)"#).unwrap_err().to_string();
+        assert!(err.contains("too short"), "{err}");
+        let err = run(r#"Post.matches(.body, "\"cam* trail\"", k: 10)"#).unwrap_err().to_string();
+        assert!(err.contains("inside a phrase"), "{err}");
+    }
+
+    #[test]
     fn matches_step_is_governed_by_k_clamp_and_posting_budget() {
         let dir = tempfile::tempdir().unwrap();
         let schema = parse_schema(r#"type Post { title: String @fulltext }"#).unwrap();

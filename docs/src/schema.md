@@ -145,7 +145,7 @@ Parameters (both optional):
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `analyzer` | `"simple"` | How text is split into terms. `simple`: Unicode word segmentation, lowercase, diacritics folded to ASCII (`Café` → `cafe`), no stemming. The analyzer name is part of the index; changing it rebuilds the index. |
+| `analyzer` | `"simple"` | How text is split into terms. `simple`: Unicode word segmentation, lowercase, diacritics folded to ASCII (`Café` → `cafe`), no stemming. `english`: the same, then English stemming (Snowball/Porter2), so `camera`, `cameras` and `Camera's` are one term and `run` finds `running` — on indexed text and on query terms alike, phrases included. Use `english` for prose in English; `simple` for identifiers, codes, or mixed-language text. The analyzer name is part of the index; changing it rebuilds the index. |
 | `positions` | `true` | Store term positions. Required for phrase queries (`"distributed consensus"`); costs roughly the size of the text again. `positions: false` halves the index and makes a phrase query on the field an error. |
 
 `@fulltext` stacks with `@unique` and `@indexed`. It is rejected on any non-`String` field. Substring matching without an index is a separate predicate: `.filter(.title.contains("invoice"))` works on every `String` field.

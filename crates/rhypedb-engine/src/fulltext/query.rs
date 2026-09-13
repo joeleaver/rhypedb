@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! query   = clause*
-//! clause  = ["+"] ( '"' phrase-text '"' | bare-text )
+//! clause  = ["+"] ( '"' phrase-text '"' | bare-text ["*"] )
 //! ```
 //!
 //! * Bare text is analyzed with the field's analyzer; every token it yields
@@ -14,21 +14,52 @@
 //! * `"quoted words"` is a **phrase clause**: the analyzed tokens must occur
 //!   consecutively in the document (needs stored positions). A phrase that
 //!   analyzes to a single token is just a term clause.
+//! * Bare text ending in `*` is a **prefix clause** (`camera*`): it matches
+//!   every indexed term that starts with the analyzed text before the `*`
+//!   — analyzed like any other term, so under `english` `cameras*` is the
+//!   prefix `camera`, which is what the index holds. The expansion scores
+//!   as ONE term (its postings merged, see `search`), so a rare misspelling
+//!   among the expansions cannot dominate. The prefix must be at least two
+//!   characters after analysis; `*` alone, a one-character prefix, and a
+//!   `*` inside a phrase are errors. Bare text that analyzes to several
+//!   tokens (`e-mail*`) yields plain terms for all but the last, which is
+//!   the prefix.
 //! * Clauses that analyze to nothing (punctuation, emoji) are dropped; a
 //!   query left with no clauses is an error rather than a silent empty set.
 
 use super::analyzer::Analyzer;
 
-/// One parsed clause. `terms.len() == 1` is a term clause, `> 1` a phrase.
+/// Shortest prefix (in characters, after analysis) a prefix clause accepts.
+pub const MIN_PREFIX_CHARS: usize = 2;
+
+/// One parsed clause. `terms.len() == 1` is a term clause (or, with
+/// `prefix`, a prefix clause), `> 1` a phrase.
+///
+/// A prefix clause's single entry is its **posting key**: the analyzed
+/// prefix with the `*` kept (`"camera*"`). The key is what the search layer
+/// looks the merged expansion up by, and it can never collide with a real
+/// term — `*` is punctuation to UAX#29, so no analyzer emits it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clause {
     pub required: bool,
     pub terms: Vec<String>,
+    /// `terms[0]` is a prefix key (`"camera*"`), not an exact term.
+    pub prefix: bool,
 }
 
 impl Clause {
     pub fn is_phrase(&self) -> bool {
         self.terms.len() > 1
+    }
+
+    /// The analyzed prefix text of a prefix clause (`"camera"` for the key
+    /// `"camera*"`); `None` for term and phrase clauses.
+    pub fn prefix_text(&self) -> Option<&str> {
+        if self.prefix {
+            self.terms[0].strip_suffix('*')
+        } else {
+            None
+        }
     }
 }
 
@@ -47,7 +78,13 @@ impl ParsedQuery {
         self.clauses.iter().any(Clause::is_phrase)
     }
 
-    /// Every distinct term across all clauses, in first-seen order.
+    /// Whether any clause is a prefix clause.
+    pub fn has_prefix(&self) -> bool {
+        self.clauses.iter().any(|c| c.prefix)
+    }
+
+    /// Every distinct posting key across all clauses, in first-seen order:
+    /// exact terms, plus one `"prefix*"` key per distinct prefix clause.
     pub fn distinct_terms(&self) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::new();
         for c in &self.clauses {
@@ -68,6 +105,12 @@ pub enum QuerySyntaxError {
     UnterminatedPhrase,
     /// After analysis nothing searchable remained.
     NoSearchableTerms,
+    /// A prefix clause whose analyzed prefix is shorter than
+    /// [`MIN_PREFIX_CHARS`] — includes a bare `*` and text that analyzes to
+    /// nothing (`!!*`). Carries the raw text before the `*`.
+    PrefixTooShort { raw: String },
+    /// A `*` inside a quoted phrase; phrases take exact terms only.
+    PrefixInPhrase { phrase: String },
 }
 
 impl std::fmt::Display for QuerySyntaxError {
@@ -77,6 +120,15 @@ impl std::fmt::Display for QuerySyntaxError {
             Self::NoSearchableTerms => write!(
                 f,
                 "query contains no searchable terms (only punctuation, or every clause was empty)"
+            ),
+            Self::PrefixTooShort { raw } => write!(
+                f,
+                "prefix term \"{raw}*\" is too short: a prefix needs at least {MIN_PREFIX_CHARS} \
+                 searchable characters before the *"
+            ),
+            Self::PrefixInPhrase { phrase } => write!(
+                f,
+                "prefix terms (word*) are not supported inside a phrase: \"{phrase}\""
             ),
         }
     }
@@ -116,10 +168,23 @@ pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySy
             let Some(end) = text_end else {
                 return Err(QuerySyntaxError::UnterminatedPhrase);
             };
-            let tokens = analyzer.analyze(&raw[text_start..end]);
+            let text = &raw[text_start..end];
+            if text.contains('*') {
+                // The analyzer would silently drop the `*` (it is
+                // punctuation) and the user would get an exact phrase they
+                // did not ask for.
+                return Err(QuerySyntaxError::PrefixInPhrase {
+                    phrase: text.to_string(),
+                });
+            }
+            let tokens = analyzer.analyze(text);
             let terms: Vec<String> = tokens.into_iter().map(|t| t.term).collect();
             if !terms.is_empty() {
-                clauses.push(Clause { required, terms });
+                clauses.push(Clause {
+                    required,
+                    terms,
+                    prefix: false,
+                });
             }
         } else {
             let mut end = raw.len();
@@ -130,12 +195,40 @@ pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySy
                 }
                 chars.next();
             }
+            let word = &raw[start..end];
+            // A trailing `*` (one or more) makes the LAST analyzed token a
+            // prefix clause. Anywhere else `*` is punctuation to the
+            // analyzer and simply splits words (`cam*era` → `cam`, `era`).
+            let stem = word.trim_end_matches('*');
+            let is_prefix = stem.len() != word.len();
+            let mut tokens = analyzer.analyze(stem);
+            let prefix_token = if is_prefix {
+                let last = tokens.pop();
+                match last {
+                    Some(t) if t.term.chars().count() >= MIN_PREFIX_CHARS => Some(t.term),
+                    _ => {
+                        return Err(QuerySyntaxError::PrefixTooShort {
+                            raw: stem.to_string(),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
             // A bare word is one OR-ed term per analyzed token (no implicit
             // phrase — `e-mail` finds documents with either word).
-            for t in analyzer.analyze(&raw[start..end]) {
+            for t in tokens {
                 clauses.push(Clause {
                     required,
                     terms: vec![t.term],
+                    prefix: false,
+                });
+            }
+            if let Some(prefix) = prefix_token {
+                clauses.push(Clause {
+                    required,
+                    terms: vec![format!("{prefix}*")],
+                    prefix: true,
                 });
             }
         }
@@ -157,12 +250,21 @@ mod tests {
         Clause {
             required,
             terms: vec![t.into()],
+            prefix: false,
         }
     }
     fn phrase(ts: &[&str], required: bool) -> Clause {
         Clause {
             required,
             terms: ts.iter().map(|s| s.to_string()).collect(),
+            prefix: false,
+        }
+    }
+    fn prefix(p: &str, required: bool) -> Clause {
+        Clause {
+            required,
+            terms: vec![format!("{p}*")],
+            prefix: true,
         }
     }
 
@@ -220,6 +322,69 @@ mod tests {
     fn distinct_terms_dedupes_across_clauses() {
         let q = parse(r#"a "a b" b +a"#);
         assert_eq!(q.distinct_terms(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn trailing_star_makes_a_prefix_clause() {
+        let q = parse("cam* +Invoice* draft");
+        assert_eq!(
+            q.clauses,
+            vec![prefix("cam", false), prefix("invoice", true), term("draft", false)]
+        );
+        assert!(q.has_prefix());
+        assert!(q.has_required());
+        assert!(!q.needs_positions());
+        assert_eq!(q.clauses[0].prefix_text(), Some("cam"));
+        assert_eq!(q.clauses[2].prefix_text(), None);
+        // The key carries the star, so a term and a prefix of the same text
+        // are distinct posting keys.
+        assert_eq!(parse("cam cam*").distinct_terms(), vec!["cam", "cam*"]);
+        assert_eq!(parse("cam* cam*").distinct_terms(), vec!["cam*"]);
+        // The prefix is analyzed: folded like a term.
+        assert_eq!(parse("CAFÉ*").clauses, vec![prefix("cafe", false)]);
+        assert_eq!(
+            parse_query("Cameras*", Analyzer::English).unwrap().clauses,
+            vec![prefix("camera", false)]
+        );
+        // Several stars are one star; multi-token text: last token is the prefix.
+        assert_eq!(parse("cam**").clauses, vec![prefix("cam", false)]);
+        assert_eq!(parse("e-mail*").clauses, vec![term("e", false), prefix("mail", false)]);
+        // A star that is not trailing is just punctuation (splits the word).
+        assert_eq!(parse("cam*era").clauses, vec![term("cam", false), term("era", false)]);
+        // Exactly the minimum length is accepted; a stray `+` before is still stray.
+        assert_eq!(parse("ca*").clauses, vec![prefix("ca", false)]);
+        assert_eq!(parse("+ ca*").clauses, vec![prefix("ca", false)]);
+    }
+
+    #[test]
+    fn prefix_errors_are_loud() {
+        for raw in ["*", "**", "c*", "é*", "!!*", "+*", "x c*", "\"ok\" *"] {
+            assert!(
+                matches!(parse_query(raw, Analyzer::Simple), Err(QuerySyntaxError::PrefixTooShort { .. })),
+                "{raw:?} → {:?}",
+                parse_query(raw, Analyzer::Simple)
+            );
+        }
+        let err = parse_query("c*", Analyzer::Simple).unwrap_err();
+        assert_eq!(err.to_string(), "prefix term \"c*\" is too short: a prefix needs at least 2 searchable characters before the *");
+        // `*` inside a phrase.
+        for raw in ["\"security cam*\"", "\"* x\"", "+\"a*b\""] {
+            assert!(
+                matches!(parse_query(raw, Analyzer::Simple), Err(QuerySyntaxError::PrefixInPhrase { .. })),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            parse_query("\"security cam*\"", Analyzer::Simple).unwrap_err().to_string(),
+            "prefix terms (word*) are not supported inside a phrase: \"security cam*\""
+        );
+        // Length is counted in characters after analysis, not bytes: a
+        // two-byte, one-character prefix is too short; two folded
+        // characters are enough. CJK ideographs are one token each under
+        // UAX#29, so `東京*` is the one-character prefix `京`.
+        assert!(matches!(parse_query("é*", Analyzer::Simple), Err(QuerySyntaxError::PrefixTooShort { .. })));
+        assert_eq!(parse("ça*").clauses, vec![prefix("ca", false)]);
+        assert!(matches!(parse_query("東京*", Analyzer::Simple), Err(QuerySyntaxError::PrefixTooShort { .. })));
     }
 
     #[test]

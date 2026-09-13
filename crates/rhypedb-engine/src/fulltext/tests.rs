@@ -959,3 +959,127 @@ fn switching_the_analyzer_bumps_the_generation_and_rebuilds() {
     assert_eq!(ids(&db, "title", "cameras", 1000).len(), 300);
     assert_eq!(ids(&db, "title", "flying", 10), vec![n]);
 }
+
+// ---- prefix terms `cam*` (issue #17) ----
+
+#[test]
+fn prefix_terms_expand_over_the_index_and_score_as_one_term() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let a = note(&db, "camera", "x", "a");
+    let b = note(&db, "cameras and a camera", "x", "b");
+    let c = note(&db, "the campaign", "x", "c");
+    let d = note(&db, "calm", "x", "d");
+    let _e = note(&db, "nothing here", "x", "e");
+
+    // `cam*` covers camera / cameras / campaign, not calm. Ranking is
+    // BM25 over the merged expansion: a (tf 1, len 1) beats b (tf 2, len 4)
+    // on length normalization, and both beat c (tf 1, len 2).
+    assert_eq!(ids(&db, "title", "cam*", 10), vec![a, b, c]);
+    assert_eq!(ids(&db, "title", "cam*", 1), vec![a]);
+    // `ca*` widens to calm too; `camp*` narrows to the campaign; exact prefix
+    // of a whole term still matches that term.
+    assert_eq!(ids(&db, "title", "ca*", 10).len(), 4);
+    assert_eq!(ids(&db, "title", "camp*", 10), vec![c]);
+    assert_eq!(ids(&db, "title", "campaign*", 10), vec![c]);
+    // Case/diacritics fold on the prefix too.
+    assert_eq!(ids(&db, "title", "CAMP*", 10), vec![c]);
+    // Required prefix intersects; optional prefix unions; both with terms.
+    assert_eq!(ids(&db, "title", "+cam* +campaign", 10), vec![c]);
+    let mut got = ids(&db, "title", "cam* calm", 10);
+    got.sort_unstable();
+    assert_eq!(got, vec![a, b, c, d]);
+    // Prefix and exact term of the same text are different clauses.
+    assert!(ids(&db, "title", "cam", 10).is_empty());
+    assert_eq!(ids(&db, "title", "+cam +cam*", 10), Vec::<u64>::new());
+    // Nothing under the prefix → empty, not an error.
+    assert!(ids(&db, "title", "zz*", 10).is_empty());
+    // Restrict applies before top-k, as for terms.
+    let restrict: HashSet<u64> = [c, d].into_iter().collect();
+    let hits = db.fulltext_search("Note", "title", "cam*", 10, Some(&restrict), None).unwrap();
+    assert_eq!(hits.hits.iter().map(|h| h.object_id).collect::<Vec<_>>(), vec![c]);
+    // Posting rows are charged to the budget: 4 rows under cam* (a, b×2, c).
+    assert_eq!(hits.postings_scanned, 4);
+    assert!(matches!(
+        db.fulltext_search("Note", "title", "cam*", 10, None, Some(3)).unwrap_err(),
+        EngineError::FulltextScanBudgetExceeded { limit: 3, .. }
+    ));
+    assert!(db.fulltext_search("Note", "title", "cam*", 10, None, Some(4)).is_ok());
+
+    // ONE idf for the expansion: `cam*` scores document a exactly like an
+    // index where every expansion were the same word would.
+    let prefix_score = |q: &str, id: u64| {
+        db.fulltext_search("Note", "title", q, 10, None, None)
+            .unwrap()
+            .hits
+            .into_iter()
+            .find(|h| h.object_id == id)
+            .map(|h| h.score)
+    };
+    // df(cam*) = 3 docs vs df(camera) = 2: the exact term is rarer, so it
+    // scores a HIGHER than the prefix does (a single-clause idf, not a sum
+    // over expansions — a sum would make the prefix score exceed the term's).
+    assert!(prefix_score("camera", a).unwrap() > prefix_score("cam*", a).unwrap());
+
+    // Writes keep the expansion live: a delete and an update are reflected.
+    db.delete("Note", c).unwrap();
+    let mut got = ids(&db, "title", "cam*", 10);
+    got.sort_unstable();
+    assert_eq!(got, vec![a, b]);
+    db.update("Note", d, fields(&[("title", s("camcorder"))])).unwrap();
+    assert!(ids(&db, "title", "camc*", 10) == vec![d]);
+}
+
+#[test]
+fn prefix_terms_under_english_are_stemmed_like_terms() {
+    let dir = TempDir::new().unwrap();
+    let db = open_sdl(&dir, ENGLISH);
+    let a = note(&db, "security cameras", "x", "a");
+    let b = note(&db, "tables and chairs", "x", "b");
+    // The index holds stems (camera, tabl); the prefix text is stemmed the
+    // same way, so a whole inflected word plus `*` still finds them —
+    // where an unstemmed `cameras`/`tables` prefix would miss.
+    assert_eq!(ids(&db, "title", "cameras*", 10), vec![a]);
+    assert_eq!(ids(&db, "title", "tables*", 10), vec![b]);
+    assert_eq!(ids(&db, "title", "table*", 10), vec![b]);
+    assert_eq!(ids(&db, "title", "tab*", 10), vec![b]);
+    assert_eq!(ids(&db, "title", "secur*", 10), vec![a]);
+}
+
+#[test]
+fn prefix_expansion_cap_and_syntax_errors_are_clear() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    // 64 distinct terms under `tx*` is fine; the 65th tips it over.
+    for i in 0..crate::fulltext::MAX_PREFIX_EXPANSION {
+        note(&db, &format!("tx{i:03}"), "x", &format!("k{i}"));
+    }
+    assert_eq!(ids(&db, "title", "tx*", 1000).len(), crate::fulltext::MAX_PREFIX_EXPANSION);
+    note(&db, "tx999", "x", "last");
+    let err = db.fulltext_search("Note", "title", "tx*", 1000, None, None).unwrap_err();
+    assert!(
+        matches!(err, EngineError::FulltextQuery(ref m) if m.contains("\"tx*\"") && m.contains("more than 64") && m.contains("longer prefix")),
+        "{err}"
+    );
+    // A longer prefix under the cap works again; the cap counts DISTINCT
+    // terms, so many documents sharing a term are fine.
+    assert_eq!(ids(&db, "title", "tx00*", 1000).len(), 10);
+    for i in 0..100 {
+        note(&db, "tx000", "x", &format!("dup{i}"));
+    }
+    assert_eq!(ids(&db, "title", "tx00*", 1000).len(), 110);
+    assert_eq!(ids(&db, "title", "tx000*", 1000).len(), 101);
+    // Syntax errors surface verbatim as FulltextQuery.
+    for (q, needle) in [
+        ("*", "too short"),
+        ("c*", "too short"),
+        ("tx000 x*", "too short"),
+        ("\"tx000 tx*\"", "inside a phrase"),
+    ] {
+        let err = db.fulltext_search("Note", "title", q, 10, None, None).unwrap_err();
+        assert!(matches!(err, EngineError::FulltextQuery(ref m) if m.contains(needle)), "{q:?}: {err}");
+    }
+    // A prefix on a positions:false field is fine (no positions needed).
+    note(&db, "x", "camera", "pf");
+    assert_eq!(ids(&db, "body", "cam*", 10).len(), 1);
+}

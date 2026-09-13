@@ -121,18 +121,21 @@ User.get(1).posts.matches(.title, "+draft budget", k: 5)
 | `"query"` | the search text (syntax below) |
 | `k:` | number of results to return (most relevant first) |
 
-**Query syntax.** The text is analyzed with the field's analyzer (lowercased, diacritics folded, split into words), then:
+**Query syntax.** The text is analyzed with the field's analyzer (lowercased, diacritics folded, split into words; stemmed too under `analyzer: "english"`), then:
 
 | Form | Meaning |
 | --- | --- |
 | `invoice 4471` | terms are **OR-ed**: a document matches if it contains any of them, and every term it contains adds to its score |
 | `+invoice` | a `+` prefix makes the term **required** |
 | `"distributed consensus"` | quoted words are a **phrase**: they must appear consecutively (the field must store positions — the default) |
-| `+"exact phrase" extra` | modifiers combine: the phrase is required, `extra` is optional |
+| `camera*` | a trailing `*` makes a **prefix term**: it matches every indexed term that starts with `camera` (`camera`, `cameras`, `camerawork`, …) and scores as one term — the type-ahead case |
+| `+"exact phrase" cam* extra` | modifiers combine: the phrase is required, the prefix and `extra` are optional |
 
 Results are ranked by **BM25** (k1 = 1.2, b = 0.75): rarer terms count more, repeated terms count more with diminishing returns, and shorter documents win ties. Each returned object carries its `score` (higher is better) — see [Ranked results](#ranked-results).
 
-A query with no searchable terms (only punctuation), an unterminated quote, or a phrase against a field declared `@fulltext(positions: false)` is an error. So is `.matches` on a field without `@fulltext`; for an unindexed substring test use [`.contains`](#filter--filterpredicate) instead. While the index of a freshly-declared (or reconfigured) field is still being built for existing objects, `.matches` on it is an error that reports the progress — see [`@fulltext`](schema.md#fulltext--fulltextanalyzer-simple-positions-false).
+A prefix term is analyzed like any other term before it is expanded, so under the `english` analyzer `cameras*` searches for the stem `camera` — which is what the index holds. The prefix needs at least two characters after analysis (`*` and `c*` are errors), it cannot appear inside a phrase, and an expansion of more than **64 distinct indexed terms** is refused with an error asking for a longer prefix — so a one- or two-letter prefix over a large vocabulary fails fast instead of scanning half the index. A `*` anywhere but the end of a word is ordinary punctuation and splits the word.
+
+A query with no searchable terms (only punctuation), an unterminated quote, or a phrase against a field declared `@fulltext(positions: false)` is an error. So is `.matches` on a field without `@fulltext`; for an unindexed substring test use [`.contains`](#filter--filterpredicate) instead — `.contains` is literal and never stems, whatever the field's analyzer. While the index of a freshly-declared (or reconfigured) field is still being built for existing objects, `.matches` on it is an error that reports the progress — see [`@fulltext`](schema.md#fulltext--fulltextanalyzer-simple-positions-false).
 
 `.matches` after a filter or traversal restricts the ranking to those candidates *before* taking the top `k`, so you always get up to `k` results from within the narrowed set.
 

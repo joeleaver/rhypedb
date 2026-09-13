@@ -8635,9 +8635,17 @@ impl Database {
     /// Ranked full-text search over one `@fulltext` field.
     ///
     /// `query_text` uses the `.matches` mini-language (`+required`,
-    /// `"a phrase"`, see [`crate::fulltext::query`]); results are the top
-    /// `k` by BM25 (score desc, id asc). `restrict`, when given, limits the
-    /// candidates to that id set BEFORE the top-k cut. Reads one snapshot.
+    /// `"a phrase"`, `prefix*`, see [`crate::fulltext::query`]); results are
+    /// the top `k` by BM25 (score desc, id asc). `restrict`, when given,
+    /// limits the candidates to that id set BEFORE the top-k cut. Reads one
+    /// snapshot.
+    ///
+    /// A prefix clause expands to every indexed term starting with the
+    /// prefix (one range scan) and is scored as a single term over the
+    /// merged postings; more than
+    /// [`MAX_PREFIX_EXPANSION`](crate::fulltext::MAX_PREFIX_EXPANSION)
+    /// distinct terms is an [`EngineError::FulltextQuery`] asking for a
+    /// longer prefix. Its rows count against `max_postings` like any other.
     ///
     /// `max_postings`, when given, caps the posting rows the search may
     /// examine across all its terms: the check runs after each term's prefix
@@ -8713,76 +8721,123 @@ impl Database {
             .filter(|c| c.is_phrase())
             .flat_map(|c| c.terms.iter().map(String::as_str))
             .collect();
+        // Prefix clauses' posting keys (`"cam*"`) → their analyzed prefix.
+        let prefix_keys: HashMap<&str, &str> = parsed
+            .clauses
+            .iter()
+            .filter_map(|c| c.prefix_text().map(|p| (c.terms[0].as_str(), p)))
+            .collect();
+        let corrupt = |detail: String| EngineError::FulltextIndexCorrupt {
+            type_name: type_name.into(),
+            field: field_name.into(),
+            detail,
+        };
         let mut postings: HashMap<&str, crate::fulltext::search::PostingList> = HashMap::new();
         let mut postings_scanned = 0u64;
-        for term in parsed.distinct_terms() {
-            let prefix = KeyBuilder::fulltext_term_prefix(
-                type_id,
-                ff.field_id,
-                ff.generation,
-                &encode_term(term),
-            );
-            // Walk the term's postings in bounded, tombstone-correct chunks
-            // (`scan_chunk_raw`, never the under-returning `*_limited`
-            // scans), so the budget check runs after at most one chunk past
-            // it — a stop-word over a huge corpus is refused after ~one chunk
-            // of merge work, not after the storage layer has merged every key.
-            const POSTING_SCAN_CHUNK: usize = 4096;
-            let mut entries: Vec<(Bytes, Bytes)> = Vec::new();
-            let mut start = prefix.clone();
-            loop {
-                let want = match max_postings {
-                    Some(limit) => {
-                        let remaining = limit.saturating_sub(postings_scanned) as usize;
-                        remaining.saturating_add(1).min(POSTING_SCAN_CHUNK)
-                    }
-                    None => POSTING_SCAN_CHUNK,
-                };
-                let chunk = self.storage.scan_chunk_raw(snapshot, &prefix, &start, want)?;
-                postings_scanned += chunk.live.len() as u64;
-                if let Some(limit) = max_postings
-                    && postings_scanned > limit
-                {
-                    return Err(EngineError::FulltextScanBudgetExceeded {
-                        type_name: type_name.into(),
-                        field: field_name.into(),
-                        limit,
-                    });
-                }
-                entries.extend(chunk.live);
-                match chunk.high_water {
-                    Some(hw) if chunk.more => {
-                        let mut next = hw.to_vec();
-                        next.push(0);
-                        start = Bytes::from(next);
-                    }
-                    _ => break,
-                }
-            }
-            let mut list = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                let corrupt = |detail: String| EngineError::FulltextIndexCorrupt {
-                    type_name: type_name.into(),
-                    field: field_name.into(),
-                    detail,
-                };
-                let object_id = KeyBuilder::fulltext_object_id(&key)
-                    .ok_or_else(|| corrupt(format!("posting key too short ({} bytes)", key.len())))?;
-                let posting = if phrase_terms.contains(term) {
-                    crate::fulltext::posting::decode_posting(&value)
-                } else {
-                    crate::fulltext::posting::decode_posting_header(&value).map(|(doc_len, tf)| {
-                        crate::fulltext::Posting {
-                            doc_len,
-                            tf,
-                            positions: Vec::new(),
+        for key in parsed.distinct_terms() {
+            let list = if let Some(&prefix) = prefix_keys.get(key) {
+                // Prefix expansion: one range scan over every term starting
+                // with the prefix (the escaping is prefix-preserving, see
+                // `encode_term_prefix`), grouped by term to enforce the
+                // expansion cap and merged per document into ONE posting
+                // list — the clause scores as a single term (see `search`).
+                // Prefixes never take part in a phrase, so header-only decode.
+                let range = KeyBuilder::fulltext_term_prefix(
+                    type_id,
+                    ff.field_id,
+                    ff.generation,
+                    &crate::fulltext::encode_term_prefix(prefix),
+                );
+                let mut merged: HashMap<u64, crate::fulltext::Posting> = HashMap::new();
+                let mut current_term: Option<Bytes> = None;
+                let mut distinct_terms = 0usize;
+                self.scan_fulltext_postings(
+                    snapshot,
+                    &range,
+                    max_postings,
+                    &mut postings_scanned,
+                    type_name,
+                    field_name,
+                    |key_bytes, value| {
+                        let term = KeyBuilder::fulltext_posting_term(&key_bytes)
+                            .ok_or_else(|| corrupt(format!("posting key without a terminated term ({} bytes)", key_bytes.len())))?;
+                        if current_term.as_deref() != Some(term) {
+                            distinct_terms += 1;
+                            if distinct_terms > crate::fulltext::MAX_PREFIX_EXPANSION {
+                                return Err(EngineError::FulltextQuery(format!(
+                                    "prefix term \"{prefix}*\" matches more than {} indexed terms; use a longer prefix",
+                                    crate::fulltext::MAX_PREFIX_EXPANSION
+                                )));
+                            }
+                            current_term = Some(key_bytes.slice_ref(term));
                         }
-                    })
-                }
-                .map_err(|e| corrupt(format!("posting for term {term:?}, object {object_id}: {e}")))?;
-                list.push((object_id, posting));
-            }
-            postings.insert(term, list);
+                        let object_id = KeyBuilder::fulltext_object_id(&key_bytes)
+                            .ok_or_else(|| corrupt(format!("posting key too short ({} bytes)", key_bytes.len())))?;
+                        let (doc_len, tf) = crate::fulltext::posting::decode_posting_header(&value)
+                            .map_err(|e| corrupt(format!("posting for prefix {prefix:?}*, object {object_id}: {e}")))?;
+                        match merged.entry(object_id) {
+                            std::collections::hash_map::Entry::Vacant(v) => {
+                                v.insert(crate::fulltext::Posting {
+                                    doc_len,
+                                    tf,
+                                    positions: Vec::new(),
+                                });
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut o) => {
+                                // Every posting of one document in one
+                                // generation carries the same doc_len (an
+                                // update rewrites them together).
+                                if o.get().doc_len != doc_len {
+                                    return Err(corrupt(format!(
+                                        "object {object_id} has postings with doc_len {} and {doc_len} under prefix {prefix:?}*",
+                                        o.get().doc_len
+                                    )));
+                                }
+                                o.get_mut().tf = o.get().tf.saturating_add(tf);
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+                merged.into_iter().collect()
+            } else {
+                let prefix = KeyBuilder::fulltext_term_prefix(
+                    type_id,
+                    ff.field_id,
+                    ff.generation,
+                    &encode_term(key),
+                );
+                let with_positions = phrase_terms.contains(key);
+                let mut list = Vec::new();
+                self.scan_fulltext_postings(
+                    snapshot,
+                    &prefix,
+                    max_postings,
+                    &mut postings_scanned,
+                    type_name,
+                    field_name,
+                    |key_bytes, value| {
+                        let object_id = KeyBuilder::fulltext_object_id(&key_bytes)
+                            .ok_or_else(|| corrupt(format!("posting key too short ({} bytes)", key_bytes.len())))?;
+                        let posting = if with_positions {
+                            crate::fulltext::posting::decode_posting(&value)
+                        } else {
+                            crate::fulltext::posting::decode_posting_header(&value).map(|(doc_len, tf)| {
+                                crate::fulltext::Posting {
+                                    doc_len,
+                                    tf,
+                                    positions: Vec::new(),
+                                }
+                            })
+                        }
+                        .map_err(|e| corrupt(format!("posting for term {key:?}, object {object_id}: {e}")))?;
+                        list.push((object_id, posting));
+                        Ok(())
+                    },
+                )?;
+                list
+            };
+            postings.insert(key, list);
         }
         let hits = crate::fulltext::search::score_query(
             &parsed,
@@ -8795,6 +8850,62 @@ impl Database {
             hits,
             postings_scanned,
         })
+    }
+
+    /// Walk every live posting row under `prefix` at `snapshot` in bounded,
+    /// tombstone-correct chunks (`scan_chunk_raw`, never the under-returning
+    /// `*_limited` scans) and hand each `(key, value)` to `visit`.
+    ///
+    /// `postings_scanned` is charged per live row and checked against
+    /// `max_postings` after each chunk BEFORE any of that chunk's rows are
+    /// visited (decoding is where the per-posting allocation happens), so a
+    /// stop-word over a huge corpus is refused after ~one chunk of merge
+    /// work with [`EngineError::FulltextScanBudgetExceeded`]. The chunk size
+    /// shrinks to the remaining budget (+1, to detect the overrun).
+    #[allow(clippy::too_many_arguments)]
+    fn scan_fulltext_postings(
+        &self,
+        snapshot: u64,
+        prefix: &Bytes,
+        max_postings: Option<u64>,
+        postings_scanned: &mut u64,
+        type_name: &str,
+        field_name: &str,
+        mut visit: impl FnMut(Bytes, Bytes) -> EngineResult<()>,
+    ) -> EngineResult<()> {
+        const POSTING_SCAN_CHUNK: usize = 4096;
+        let mut start = prefix.clone();
+        loop {
+            let want = match max_postings {
+                Some(limit) => {
+                    let remaining = limit.saturating_sub(*postings_scanned) as usize;
+                    remaining.saturating_add(1).min(POSTING_SCAN_CHUNK)
+                }
+                None => POSTING_SCAN_CHUNK,
+            };
+            let chunk = self.storage.scan_chunk_raw(snapshot, prefix, &start, want)?;
+            *postings_scanned += chunk.live.len() as u64;
+            if let Some(limit) = max_postings
+                && *postings_scanned > limit
+            {
+                return Err(EngineError::FulltextScanBudgetExceeded {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                    limit,
+                });
+            }
+            for (key, value) in chunk.live {
+                visit(key, value)?;
+            }
+            match chunk.high_water {
+                Some(hw) if chunk.more => {
+                    let mut next = hw.to_vec();
+                    next.push(0);
+                    start = Bytes::from(next);
+                }
+                _ => return Ok(()),
+            }
+        }
     }
 }
 
@@ -11934,11 +12045,12 @@ mod tests {
                 MigrationEvent::PartitionDone { .. } => part_done += 1,
                 MigrationEvent::CutoverStarted { .. } => cutover_started += 1,
                 MigrationEvent::CutoverDone { .. } => cutover_done += 1,
-                MigrationEvent::StatusChanged { status, .. } => {
-                    if status == crate::catalog::MigrationStatus::Completed {
-                        completed += 1;
-                        break; // terminal
-                    }
+                MigrationEvent::StatusChanged {
+                    status: crate::catalog::MigrationStatus::Completed,
+                    ..
+                } => {
+                    completed += 1;
+                    break; // terminal
                 }
                 _ => {}
             }

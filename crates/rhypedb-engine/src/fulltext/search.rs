@@ -17,6 +17,14 @@
 //! with `k1 = 1.2`, `b = 0.75`. A phrase clause contributes the sum of its
 //! DISTINCT terms' scores when (and only when) the terms occur consecutively.
 //! Ties break on ascending object id so results are deterministic.
+//!
+//! A prefix clause (`cam*`) is scored as ONE term: the caller hands in its
+//! expansion already merged into a single posting list under the clause's
+//! key (`"cam*"`) — per document `tf` is the sum over the matching terms
+//! and `df` the number of distinct documents — so a prefix behaves like a
+//! word with several spellings. Expanding into one clause per term instead
+//! would let a rare misspelling among the expansions dominate with a huge
+//! idf (Lucene's `SCORING_BOOLEAN_REWRITE` pathology).
 
 use std::collections::{HashMap, HashSet};
 
@@ -317,6 +325,53 @@ mod tests {
         assert_eq!(ids(&run(DOCS, "+\"distributed consensus\" overdue", 10, None)), vec![4]);
         // A phrase term absent from the corpus matches nothing (no panic).
         assert!(run(DOCS, "\"distributed nowhere\"", 10, None).is_empty());
+    }
+
+    #[test]
+    fn prefix_clause_scores_its_merged_expansion_as_one_term() {
+        // Corpus: 1 "camera", 2 "cameras", 3 "camera cameras" (both), 4 "cam".
+        let (owned, stats) = corpus(&[(1, "camera x"), (2, "cameras x"), (3, "camera cameras"), (4, "cam x")]);
+        let mut postings: HashMap<&str, PostingList> =
+            owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        // What the storage layer produces for `cam*`: the union of camera /
+        // cameras / cam merged per document (tf summed, doc_len shared).
+        let mut merged: HashMap<u64, Posting> = HashMap::new();
+        for t in ["camera", "cameras", "cam"] {
+            for (id, p) in &owned[t] {
+                let e = merged.entry(*id).or_insert(Posting { doc_len: p.doc_len, tf: 0, positions: vec![] });
+                e.tf += p.tf;
+            }
+        }
+        postings.insert("cam*", merged.into_iter().collect());
+
+        let query = parse_query("cam*", Analyzer::Simple).unwrap();
+        let hits = score_query(&query, &postings, stats, None, 10);
+        // Every document matches; doc 3 (tf 2) ranks first; the rest tie on
+        // tf 1 / len 2 and break on id.
+        assert_eq!(ids(&hits), vec![3, 1, 2, 4]);
+        assert!(hits[0].score > hits[1].score);
+        assert_eq!(hits[1].score, hits[2].score);
+        // ONE idf for the whole expansion: the score of doc 1 equals what a
+        // plain term with df 4 / tf 1 would get — i.e. the same as querying
+        // a synthetic term with the merged list.
+        let mut only: HashMap<&str, PostingList> = HashMap::new();
+        only.insert("cam", postings["cam*"].clone());
+        let plain = score_query(&parse_query("cam", Analyzer::Simple).unwrap(), &only, stats, None, 10);
+        assert_eq!(plain, hits);
+        // Required prefix + optional term: everything with the prefix
+        // matches; the three that also have `x` outrank doc 3, which has
+        // the prefix twice but no `x`.
+        let hits = score_query(&parse_query("+cam* x", Analyzer::Simple).unwrap(), &postings, stats, None, 10);
+        assert_eq!(ids(&hits), vec![1, 2, 4, 3]);
+        // Required term the prefix docs lack: intersection empties.
+        let hits = score_query(&parse_query("cam* +zzz", Analyzer::Simple).unwrap(), &postings, stats, None, 10);
+        assert!(hits.is_empty());
+        // A prefix and the exact term of the same text are different keys.
+        let hits = score_query(&parse_query("+cam +cam*", Analyzer::Simple).unwrap(), &postings, stats, None, 10);
+        assert_eq!(ids(&hits), vec![4]);
+        // An unexpanded prefix (nothing in the index) matches nothing.
+        let query = parse_query("zzz*", Analyzer::Simple).unwrap();
+        assert!(score_query(&query, &postings, stats, None, 10).is_empty());
     }
 
     #[test]

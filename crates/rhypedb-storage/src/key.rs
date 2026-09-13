@@ -459,6 +459,23 @@ impl KeyBuilder {
         Some(u64::from_be_bytes(tail))
     }
 
+    /// The encoded term of a `fulltext_posting` key — the engine's escaped
+    /// bytes INCLUDING their `\0\0` terminator — as a slice into the key.
+    /// Two postings belong to the same term iff these slices are equal, so a
+    /// prefix expansion can group a range scan without decoding. `None` if
+    /// the key is too short to hold a term, its terminator and an object id,
+    /// or the two bytes before the object id are not the terminator.
+    pub fn fulltext_posting_term(key: &[u8]) -> Option<&[u8]> {
+        if key.len() < FULLTEXT_PREFIX_LEN + 2 + 8 {
+            return None;
+        }
+        let term = &key[FULLTEXT_PREFIX_LEN..key.len() - 8];
+        if !term.ends_with(&[0, 0]) {
+            return None;
+        }
+        Some(term)
+    }
+
     /// Arena variant of [`Self::fulltext_posting`] (same layout).
     pub fn fulltext_posting_into(
         buf: &mut Vec<u8>,
@@ -1144,6 +1161,20 @@ mod tests {
         assert!(doc.starts_with(&KeyBuilder::fulltext_doc_all_generations_prefix(7, 3)));
         assert!(!KeyBuilder::fulltext_doc(7, 3, 1, 99).starts_with(&KeyBuilder::fulltext_doc_prefix(7, 3, 2)));
         assert_eq!(KeyBuilder::fulltext_object_id(b"short"), None);
+
+        // The encoded term (with its terminator) slices back out of a posting
+        // key; an unterminated prefix scan key is not a posting.
+        assert_eq!(KeyBuilder::fulltext_posting_term(&posting), Some(&term[..]));
+        assert_eq!(KeyBuilder::fulltext_posting_term(&longer), Some(&b"invoices\x00\x00"[..]));
+        let escaped = KeyBuilder::fulltext_posting(7, 3, 2, b"a\x00\x01b\x00\x00", 5);
+        assert_eq!(KeyBuilder::fulltext_posting_term(&escaped), Some(&b"a\x00\x01b\x00\x00"[..]));
+        assert_eq!(KeyBuilder::fulltext_posting_term(&KeyBuilder::fulltext_term_prefix(7, 3, 2, b"inv")), None);
+        assert_eq!(KeyBuilder::fulltext_posting_term(&KeyBuilder::fulltext_posting(7, 3, 2, b"x", 5)), None);
+        assert_eq!(KeyBuilder::fulltext_posting_term(&doc), None);
+        // The unterminated prefix `inv` covers every term starting with it.
+        let scan = KeyBuilder::fulltext_term_prefix(7, 3, 2, b"inv");
+        assert!(posting.starts_with(&scan) && longer.starts_with(&scan));
+        assert!(!KeyBuilder::fulltext_posting(7, 3, 2, b"in\x00\x00", 1).starts_with(&scan));
 
         // Generation decodes from either key shape; marker ids round-trip.
         assert_eq!(KeyBuilder::fulltext_generation(&posting), Some(2));
