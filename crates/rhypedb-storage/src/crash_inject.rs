@@ -126,11 +126,23 @@ pub enum Site {
     /// `LsmTree::snapshot_to`: after every SST is in the destination, immediately
     /// before `wal.log` is copied — the destination has all SSTs but no WAL.
     SnapshotBeforeWalCopy,
+    // --- Full-text backfill sites (rhypedb-engine `database/fulltext_build.rs`) ---
+    /// `run_build`: a chunk's postings + `l:` rows + marker are staged in the
+    /// txn buffer, immediately BEFORE its commit. Nothing durable changed: on
+    /// reopen the marker still names the previous cursor and the chunk is
+    /// redone (idempotently — objects already carrying an `l:` row are
+    /// skipped).
+    FulltextBuildBeforeChunkCommit,
+    /// `run_build`: immediately AFTER a chunk's commit returned. The rows AND
+    /// the advanced marker are durable together (one framed txn); reopen
+    /// resumes from the new cursor and must reach a clean-build-identical
+    /// index.
+    FulltextBuildAfterChunkCommit,
 }
 
 /// Number of [`Site`] variants. Kept in sync with the enum by
 /// `tests::site_count_matches_variants` (feature-on build).
-pub const SITE_COUNT: usize = 18;
+pub const SITE_COUNT: usize = 20;
 
 #[cfg(feature = "crash-fuzz")]
 pub use imp::{arm, catch_crash, disarm, hit, Caught, Mode};
@@ -310,6 +322,8 @@ mod tests {
         Site::VectorizeRebuildMidScan,
         Site::SnapshotMidSstCopy,
         Site::SnapshotBeforeWalCopy,
+        Site::FulltextBuildBeforeChunkCommit,
+        Site::FulltextBuildAfterChunkCommit,
     ];
 
     #[test]

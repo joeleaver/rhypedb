@@ -44,6 +44,12 @@ pub use search::{CorpusStats, FulltextHit};
 #[cfg(test)]
 mod tests;
 
+// Crash-recovery fuzz for the index (needs the storage injector): WAL-site
+// sweeps over a write workload + backfill-chunk sites, each cold-reopened and
+// checked against the objects themselves. See the vectorizer's sibling harness.
+#[cfg(all(test, feature = "crash-fuzz"))]
+mod crash_fuzz;
+
 /// Per-field corpus statistics (see the module doc for why they are in
 /// memory). Both counters move together after every commit that adds,
 /// removes or resizes an indexed document.

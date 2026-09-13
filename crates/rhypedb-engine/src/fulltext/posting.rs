@@ -125,6 +125,20 @@ pub fn decode_posting(bytes: &[u8]) -> Result<Posting, PostingError> {
     })
 }
 
+/// Decode only `(doc_len, tf)` — what BM25 needs for a non-phrase term —
+/// without materializing the position list (the per-posting allocation
+/// that dominates a high-df scan). Validates the header the same way as
+/// [`decode_posting`]; the position bytes, if any, are left unread.
+pub fn decode_posting_header(bytes: &[u8]) -> Result<(u32, u32), PostingError> {
+    let mut cur = bytes;
+    let doc_len = get_varint(&mut cur)?;
+    let tf = get_varint(&mut cur)?;
+    if tf == 0 {
+        return Err(PostingError::Inconsistent);
+    }
+    Ok((doc_len, tf))
+}
+
 /// Unsigned LEB128 (u32).
 pub fn put_varint(out: &mut Vec<u8>, mut v: u32) {
     while v >= 0x80 {
@@ -208,6 +222,16 @@ mod tests {
         // Position 0 is a legal first position.
         let z = encode_posting(1, &[0], true);
         assert_eq!(decode_posting(&z).unwrap().positions, vec![0]);
+    }
+
+    #[test]
+    fn header_decode_matches_full_decode() {
+        let full = encode_posting(9, &[1, 5, 6], true);
+        assert_eq!(decode_posting_header(&full).unwrap(), (9, 3));
+        let no_pos = encode_posting(9, &[1, 5, 6], false);
+        assert_eq!(decode_posting_header(&no_pos).unwrap(), (9, 3));
+        assert_eq!(decode_posting_header(&[5, 0]), Err(PostingError::Inconsistent));
+        assert_eq!(decode_posting_header(&[5]), Err(PostingError::Truncated));
     }
 
     #[test]

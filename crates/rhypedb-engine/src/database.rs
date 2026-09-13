@@ -8644,6 +8644,15 @@ impl Database {
             )));
         }
         let snapshot = self.storage.read_snapshot();
+        // Positions are only needed for terms that take part in a phrase;
+        // every other posting decodes header-only (no per-posting Vec), which
+        // is what keeps a high-df term's scan allocation-free.
+        let phrase_terms: std::collections::HashSet<&str> = parsed
+            .clauses
+            .iter()
+            .filter(|c| c.is_phrase())
+            .flat_map(|c| c.terms.iter().map(String::as_str))
+            .collect();
         let mut postings: HashMap<&str, crate::fulltext::search::PostingList> = HashMap::new();
         let mut postings_scanned = 0u64;
         for term in parsed.distinct_terms() {
@@ -8673,8 +8682,18 @@ impl Database {
                 };
                 let object_id = KeyBuilder::fulltext_object_id(&key)
                     .ok_or_else(|| corrupt(format!("posting key too short ({} bytes)", key.len())))?;
-                let posting = crate::fulltext::posting::decode_posting(&value)
-                    .map_err(|e| corrupt(format!("posting for term {term:?}, object {object_id}: {e}")))?;
+                let posting = if phrase_terms.contains(term) {
+                    crate::fulltext::posting::decode_posting(&value)
+                } else {
+                    crate::fulltext::posting::decode_posting_header(&value).map(|(doc_len, tf)| {
+                        crate::fulltext::Posting {
+                            doc_len,
+                            tf,
+                            positions: Vec::new(),
+                        }
+                    })
+                }
+                .map_err(|e| corrupt(format!("posting for term {term:?}, object {object_id}: {e}")))?;
                 list.push((object_id, posting));
             }
             postings.insert(term, list);

@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use rhypedb_schema::{Schema, SchemaError};
+use rhypedb_storage::crash_inject;
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::LsmTree;
 
@@ -437,8 +438,10 @@ fn run_build(
             };
             puts.push((marker_key.clone(), marker.encode()));
             db.storage.put_batch(&mut txn, &puts)?;
+            crash_inject::hit(crash_inject::Site::FulltextBuildBeforeChunkCommit);
             match db.storage.commit(&mut txn) {
                 Ok(_) => {
+                    crash_inject::hit(crash_inject::Site::FulltextBuildAfterChunkCommit);
                     db.apply_fulltext_delta(&delta);
                     chunk_size = FULLTEXT_BUILD_CHUNK;
                     break (chunk.objects.len() as u64, next_cursor, done);
@@ -561,6 +564,15 @@ impl Database {
         {
             let _ = handle.join();
         }
+    }
+
+    /// Test hook: run this handle's pending tasks ON THE CALLING THREAD (the
+    /// crash-fuzz injector arms a thread-local, so the builder must run where
+    /// the harness armed it). Requires the handle to have been opened with
+    /// `background_fulltext_build: false` (otherwise the thread owns them).
+    #[cfg(test)]
+    pub(crate) fn run_fulltext_tasks_inline(self: &Arc<Self>) {
+        fulltext_builder_main(Arc::downgrade(self), Arc::clone(&self.fulltext_builder));
     }
 
     /// Per-field build state + progress, sorted by `Type.field` (for
