@@ -982,6 +982,53 @@ impl KeyBuilder {
         buf.freeze()
     }
 
+    /// Full-text index build marker: `c:X:<u64 BE type_id><u64 BE field_id>`.
+    /// Records the field's live index generation, analyzer/positions identity,
+    /// build state and resume cursor (see `rhypedb_engine::fulltext::build`).
+    /// Like `c:P:`/`c:S:`/`c:Q:`, NOT schema-derived → MUST be exempted from
+    /// the torn-write recovery clear. Third byte `X` is distinct from every
+    /// other `c:` subkey.
+    pub fn catalog_fulltext_marker(type_id: u64, field_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(4 + 8 + 8);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'X');
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u64(field_id);
+        buf.freeze()
+    }
+
+    /// Broad scan prefix for EVERY full-text build marker: `c:X:`.
+    pub fn catalog_fulltext_marker_prefix() -> Bytes {
+        let mut buf = BytesMut::with_capacity(4);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'X');
+        buf.put_u8(SEPARATOR);
+        buf.freeze()
+    }
+
+    /// `(type_id, field_id)` of a `catalog_fulltext_marker` key.
+    pub fn catalog_fulltext_marker_ids(key: &[u8]) -> Option<(u64, u64)> {
+        if key.len() != 4 + 8 + 8 {
+            return None;
+        }
+        let t: [u8; 8] = key[4..12].try_into().ok()?;
+        let f: [u8; 8] = key[12..20].try_into().ok()?;
+        Some((u64::from_be_bytes(t), u64::from_be_bytes(f)))
+    }
+
+    /// The index generation carried by a `fulltext_posting` / `fulltext_doc`
+    /// key (bytes 20..24 of the common head).
+    pub fn fulltext_generation(key: &[u8]) -> Option<u32> {
+        if key.len() < FULLTEXT_PREFIX_LEN {
+            return None;
+        }
+        let g: [u8; 4] = key[20..24].try_into().ok()?;
+        Some(u32::from_be_bytes(g))
+    }
+
     /// Quarantine sidecar row: `c:Q:<u64 BE plan_id><u64 BE object_id>`
     /// (shadow-field card 4/5). Records a row whose converter failed under the
     /// Quarantine policy so the operator can triage + retry. Like `c:P:`/`c:S:`,
@@ -1097,6 +1144,16 @@ mod tests {
         assert!(doc.starts_with(&KeyBuilder::fulltext_doc_all_generations_prefix(7, 3)));
         assert!(!KeyBuilder::fulltext_doc(7, 3, 1, 99).starts_with(&KeyBuilder::fulltext_doc_prefix(7, 3, 2)));
         assert_eq!(KeyBuilder::fulltext_object_id(b"short"), None);
+
+        // Generation decodes from either key shape; marker ids round-trip.
+        assert_eq!(KeyBuilder::fulltext_generation(&posting), Some(2));
+        assert_eq!(KeyBuilder::fulltext_generation(&doc), Some(2));
+        assert_eq!(KeyBuilder::fulltext_generation(b"short"), None);
+        let marker = KeyBuilder::catalog_fulltext_marker(7, 3);
+        assert!(marker.starts_with(&KeyBuilder::catalog_fulltext_marker_prefix()));
+        assert!(marker.starts_with(&KeyBuilder::catalog_prefix_all()));
+        assert_eq!(KeyBuilder::catalog_fulltext_marker_ids(&marker), Some((7, 3)));
+        assert_eq!(KeyBuilder::catalog_fulltext_marker_ids(&marker[..10]), None);
 
         // Arena builders produce byte-identical keys.
         let mut buf = Vec::new();

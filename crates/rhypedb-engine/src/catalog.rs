@@ -3148,6 +3148,10 @@ fn recover_partial_into_txn(
     let plan_prefix = KeyBuilder::catalog_migration_plan_prefix();
     let partition_prefix = KeyBuilder::catalog_partition_cursor_prefix();
     let quarantine_prefix = KeyBuilder::catalog_quarantine_prefix();
+    // Full-text build markers (`c:X:`) are not schema-derived either: wiping
+    // one would re-run a (resumable, idempotent) backfill from scratch and,
+    // worse, forget a stale generation that still needs dropping.
+    let fulltext_prefix = KeyBuilder::catalog_fulltext_marker_prefix();
     let counter_key = KeyBuilder::catalog_next_migration();
     let stale = storage.scan_prefix_at(snap, &KeyBuilder::catalog_prefix_all())?;
     let deletes: Vec<Bytes> = stale
@@ -3157,6 +3161,7 @@ fn recover_partial_into_txn(
             !k.starts_with(&plan_prefix)
                 && !k.starts_with(&partition_prefix)
                 && !k.starts_with(&quarantine_prefix)
+                && !k.starts_with(&fulltext_prefix)
                 && k != &counter_key
         })
         .collect();

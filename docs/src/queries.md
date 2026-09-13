@@ -132,7 +132,7 @@ User.get(1).posts.matches(.title, "+draft budget", k: 5)
 
 Results are ranked by **BM25** (k1 = 1.2, b = 0.75): rarer terms count more, repeated terms count more with diminishing returns, and shorter documents win ties. Each returned object carries its `score` (higher is better) — see [Ranked results](#ranked-results).
 
-A query with no searchable terms (only punctuation), an unterminated quote, or a phrase against a field declared `@fulltext(positions: false)` is an error. So is `.matches` on a field without `@fulltext`; for an unindexed substring test use [`.contains`](#filter--filterpredicate) instead.
+A query with no searchable terms (only punctuation), an unterminated quote, or a phrase against a field declared `@fulltext(positions: false)` is an error. So is `.matches` on a field without `@fulltext`; for an unindexed substring test use [`.contains`](#filter--filterpredicate) instead. While the index of a freshly-declared (or reconfigured) field is still being built for existing objects, `.matches` on it is an error that reports the progress — see [`@fulltext`](schema.md#fulltext--fulltextanalyzer-simple-positions-false).
 
 `.matches` after a filter or traversal restricts the ranking to those candidates *before* taking the top `k`, so you always get up to `k` results from within the narrowed set.
 

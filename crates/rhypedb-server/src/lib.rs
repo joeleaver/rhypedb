@@ -529,6 +529,31 @@ async fn handle_status(
         result["rss_bytes"] = serde_json::json!(rss);
     }
 
+    // Full-text index build state per @fulltext field (omitted when the schema
+    // has none): `building` counts fields whose backfill is still running;
+    // `.matches` refuses those with the same progress until they are `built`.
+    let fulltext = db.fulltext_status();
+    if !fulltext.is_empty() {
+        let building = fulltext
+            .iter()
+            .filter(|s| s.state != rhypedb_engine::fulltext::BuildState::Built)
+            .count();
+        let indexes: Vec<serde_json::Value> = fulltext
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name": s.name,
+                    "state": s.state.as_str(),
+                    "generation": s.generation,
+                    "documents": s.documents,
+                    "indexed": s.indexed,
+                    "total": s.total,
+                })
+            })
+            .collect();
+        result["fulltext"] = serde_json::json!({ "building": building, "indexes": indexes });
+    }
+
     if let Some(vectorizer) = &state.vectorizer {
         let status = vectorizer.status();
         let vectors_total: u64 = status.index_stats.iter().map(|s| s.vectors as u64).sum();
@@ -2322,6 +2347,41 @@ mod tcp_tests {
         let _ = handler.await;
     }
 
+    /// `/status` reports each @fulltext field's build state; a fresh (empty)
+    /// type is `built` at open and stays searchable.
+    #[tokio::test]
+    async fn status_reports_fulltext_index_state() {
+        let state = test_state_full("type Post { title: String @fulltext  body: String @fulltext(positions: false) }", None);
+        let anon = rhypedb_authz::Principal::anonymous();
+        execute_query(&state, r#"Post.create({ title: "invoice", body: "x" })"#, &anon).unwrap();
+        let app = Router::new()
+            .route("/status", get(handle_status))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let text = tokio::task::spawn_blocking(move || {
+            ureq::get(&format!("http://{addr}/status"))
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_to_string()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let ft = &body["fulltext"];
+        assert_eq!(ft["building"].as_u64().unwrap(), 0, "{body}");
+        let indexes = ft["indexes"].as_array().unwrap();
+        assert_eq!(indexes.len(), 2);
+        assert_eq!(indexes[0]["name"], "Post.body");
+        assert_eq!(indexes[0]["state"], "built");
+        assert_eq!(indexes[0]["documents"].as_u64().unwrap(), 1);
+        assert_eq!(indexes[1]["name"], "Post.title");
+        assert_eq!(indexes[1]["generation"].as_u64().unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn ping_pong() {
         let state = test_state();
@@ -2793,6 +2853,7 @@ mod tcp_tests {
         assert_eq!(body["objects"].as_u64().unwrap(), 3, "3 users created: {body}");
         assert_eq!(body["edges"].as_u64().unwrap(), 0, "schema has no relations");
         assert_eq!(body["vectors"].as_u64().unwrap(), 0, "no @vectorize fields");
+        assert!(body.get("fulltext").is_none(), "no @fulltext fields → block omitted: {body}");
         assert!(
             body["queries"].as_u64().unwrap() >= 4,
             "3 creates + 1 read = 4 queries: {body}"

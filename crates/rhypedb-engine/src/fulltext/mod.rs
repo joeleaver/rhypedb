@@ -26,6 +26,7 @@
 //! clamps `N ≥ df`).
 
 pub mod analyzer;
+pub mod build;
 pub mod posting;
 pub mod query;
 pub mod search;
@@ -37,6 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use analyzer::{Analyzer, MAX_TERM_BYTES, Token};
 pub use posting::Posting;
 pub use query::{Clause, ParsedQuery, QuerySyntaxError};
+pub use build::{BuildProgress, BuildState, FulltextIndexStatus};
 pub use search::{CorpusStats, FulltextHit};
 
 #[cfg(test)]
@@ -102,6 +104,8 @@ pub struct FulltextField {
     /// Whether postings store positions (phrase queries need them).
     pub positions: bool,
     pub stats: Arc<FulltextStats>,
+    /// Live build state + backfill progress (see [`build`]).
+    pub progress: Arc<BuildProgress>,
 }
 
 /// Corpus-stat deltas accumulated while staging a transaction, keyed by

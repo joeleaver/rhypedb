@@ -7,16 +7,18 @@ use parking_lot::RwLock;
 
 use bytes::Bytes;
 
-use rhypedb_schema::{FieldType, OnDeletePolicy, ScalarType, Schema, SchemaError};
+use rhypedb_schema::{FieldType, OnDeletePolicy, ScalarType, Schema};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::{LsmConfig, LsmTree};
 use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionHub};
 
 use crate::error::{EngineError, EngineResult};
 use crate::fulltext::{
-    Analyzer, FulltextField, FulltextSearchResult, FulltextStats, StatsDelta, encode_term,
+    FulltextField, FulltextSearchResult, FulltextStats, StatsDelta, encode_term,
     tokenize_for_index,
 };
+
+mod fulltext_build;
 use crate::object::{
     FieldMap, Object, Value, deserialize_fields, deserialize_fields_projected, extract_field,
     serialize_fields,
@@ -332,6 +334,10 @@ pub struct Database {
     /// `fulltext_fields` holds, for O(1) post-commit delta application
     /// (deletes cascade across types, so they need the id-keyed lookup).
     fulltext_stats: HashMap<(u64, u64), Arc<FulltextStats>>,
+    /// Background full-text builder (backfills + generation sweeps) for this
+    /// handle; see `database/fulltext_build.rs`. Stopped + joined on drop and
+    /// before any rebuild of the handle.
+    fulltext_builder: Arc<fulltext_build::FulltextBuilder>,
     /// Per-object monotonic generation counter, bumped on every successful
     /// `update`. Lives in-memory for cheap reads (cover-write stamps the
     /// target's current generation into `<name>__cover_v`; executor fusion
@@ -616,6 +622,13 @@ pub struct OpenOptions {
     /// current. Disable for benchmarks that don't want the background
     /// CPU or for tests that need deterministic stale-cover state.
     pub background_cover_refresh: bool,
+    /// `true` (default): run the background full-text index builder — the
+    /// backfill when `@fulltext` is added to (or reconfigured on) a populated
+    /// type, and the sweep of stale index generations. Disable for tests that
+    /// need the pre-backfill state to stay observable; the write paths still
+    /// index every new write regardless, and the next open with the flag on
+    /// resumes the work from the persisted marker.
+    pub background_fulltext_build: bool,
     /// Reserved for the tombstone-migration phase (card 2/5). In phase
     /// 1 this flag is REJECTED at the schema-shrink gate regardless of
     /// its value: opening with a shrinking schema returns
@@ -640,6 +653,7 @@ impl Default for OpenOptions {
         Self {
             sync_on_commit: true,
             background_cover_refresh: true,
+            background_fulltext_build: true,
             allow_schema_shrink: false,
             block_compression: rhypedb_storage::SstCompression::None,
         }
@@ -1251,78 +1265,13 @@ impl Database {
             }
         }
 
-        // Precompute the @fulltext fields per type and rebuild each one's
-        // in-memory corpus statistics from its `l:` rows (doc count + total
-        // tokens). The stats are derived state — never persisted as a shared
-        // row (see `crate::fulltext`) — so every open re-derives them; a
-        // corrupt `l:` value is surfaced rather than skipped (it would skew
-        // every score on the field).
-        let mut fulltext_fields: HashMap<String, Vec<FulltextField>> = HashMap::new();
-        let mut fulltext_stats: HashMap<(u64, u64), Arc<FulltextStats>> = HashMap::new();
-        {
-            // A plain read snapshot (not a Transaction): a `Transaction` pins
-            // its snapshot in the active set until commit/abort, and this one
-            // would live for the process.
-            let stats_snapshot = storage.read_snapshot();
-            for (type_name, type_def) in &schema.types {
-                let type_id = type_ids[type_name];
-                let mut list = Vec::new();
-                for field in &type_def.fields {
-                    let Some(ft) = field.fulltext() else {
-                        continue;
-                    };
-                    let analyzer = Analyzer::from_name(&ft.analyzer).ok_or_else(|| {
-                        EngineError::Schema(SchemaError::Validation(format!(
-                            "@fulltext on '{type_name}.{}': analyzer {:?} is not known to this \
-                             engine build",
-                            field.name, ft.analyzer
-                        )))
-                    })?;
-                    let key = format!("{type_name}.{}", field.name);
-                    let field_id = field_ids[&key];
-                    // Index generation 0 until the build-marker increment
-                    // introduces analyzer-change rebuilds.
-                    let generation = 0u32;
-                    let mut doc_count = 0u64;
-                    let mut total_tokens = 0u64;
-                    for (doc_key, value) in storage.scan_prefix_at(
-                        stats_snapshot,
-                        &KeyBuilder::fulltext_doc_prefix(type_id, field_id, generation),
-                    )? {
-                        doc_count += 1;
-                        match crate::fulltext::decode_doc_len(&value) {
-                            Ok(len) => total_tokens += len as u64,
-                            // A corrupt doc-length row is derived state: it only
-                            // skews the field's average length. Count the doc
-                            // (its postings still exist) at length 0 and keep
-                            // opening — a bad byte must not take the whole
-                            // database offline. The posting rows themselves
-                            // fail the SEARCH that reads them, not the open.
-                            Err(e) => eprintln!(
-                                "warning: full-text doc-length row for {type_name}.{} object {} is \
-                                 corrupt ({e}); counting it at length 0 — rebuild the index by \
-                                 removing and re-adding @fulltext",
-                                field.name,
-                                KeyBuilder::fulltext_object_id(&doc_key).unwrap_or(0),
-                            ),
-                        }
-                    }
-                    let stats = Arc::new(FulltextStats::new(doc_count, total_tokens));
-                    fulltext_stats.insert((type_id, field_id), Arc::clone(&stats));
-                    list.push(FulltextField {
-                        name: field.name.clone(),
-                        field_id,
-                        generation,
-                        analyzer,
-                        positions: ft.positions,
-                        stats,
-                    });
-                }
-                if !list.is_empty() {
-                    fulltext_fields.insert(type_name.clone(), list);
-                }
-            }
-        }
+        // Reconcile every @fulltext field's build marker against the schema
+        // and rebuild its in-memory corpus stats; yields the write-path
+        // tables plus the background task list (see `database/fulltext_build.rs`).
+        let ft_plan = fulltext_build::plan_fulltext_open(&storage, &schema, &type_ids, &field_ids)?;
+        let fulltext_fields = ft_plan.fields;
+        let fulltext_stats = ft_plan.stats;
+        let fulltext_builder = Arc::new(fulltext_build::FulltextBuilder::new(ft_plan.tasks));
 
         // Override the born-bit seed with persisted generations for objects
         // that have been UPDATED at least once. A `g:` key is written only on
@@ -1414,6 +1363,7 @@ impl Database {
             indexed_fields,
             fulltext_fields,
             fulltext_stats,
+            fulltext_builder,
             version_counter_count: match &carry {
                 Some(c) => Arc::clone(&c.version_counter_count),
                 None => Arc::new(std::sync::atomic::AtomicUsize::new(version_counters.len())),
@@ -1465,6 +1415,12 @@ impl Database {
                 .map_err(|e| EngineError::Storage(rhypedb_storage::Error::Io(e)))?;
             *db.cover_refresh_tx.lock() = Some(tx);
             *db.cover_refresh_handle.lock() = Some(handle);
+        }
+
+        // Full-text backfills / generation sweeps, if the marker reconcile
+        // produced any. Same `Weak` discipline as the cover-refresh worker.
+        if options.background_fulltext_build {
+            db.spawn_fulltext_builder()?;
         }
 
         // Auto-resume in-flight chunked field-type migrations (shadow-field
@@ -1941,6 +1897,8 @@ impl Database {
         // error" hazard the adversarial review flagged for the prior
         // `self: Arc<Self>` signature.
         self.check_not_migrated()?;
+        // Stop the builder before the write lock (see `reload_handle`).
+        self.stop_fulltext_builder();
         let _guard = self.migration_lock.write();
         let report = self.rename_type_inner(old, new)?;
         let new_db = self.clone_into_new_handle(post_schema)?;
@@ -1957,6 +1915,8 @@ impl Database {
         post_schema: Schema,
     ) -> EngineResult<(crate::catalog::MigrationReport, Arc<Self>)> {
         self.check_not_migrated()?;
+        // Stop the builder before the write lock (see `reload_handle`).
+        self.stop_fulltext_builder();
         let _guard = self.migration_lock.write();
         let report = self.rename_field_inner(type_name, old, new)?;
         let new_db = self.clone_into_new_handle(post_schema)?;
@@ -1980,6 +1940,8 @@ impl Database {
             + 'static,
     {
         self.check_not_migrated()?;
+        // Stop the builder before the write lock (see `reload_handle`).
+        self.stop_fulltext_builder();
         let _guard = self.migration_lock.write();
         let report =
             self.change_field_type_inner(type_name, field_name, target_field_type, converter)?;
@@ -1995,6 +1957,8 @@ impl Database {
         post_schema: Schema,
     ) -> EngineResult<(crate::catalog::MigrationLogReport, Arc<Self>)> {
         self.check_not_migrated()?;
+        // Stop the builder before the write lock (see `reload_handle`).
+        self.stop_fulltext_builder();
         let _guard = self.migration_lock.write();
         let report = self.run_migrations_inner(migrations)?;
         let new_db = self.clone_into_new_handle(post_schema)?;
@@ -2076,6 +2040,11 @@ impl Database {
     ///   rebuild makes the guard race-free vs a concurrent migration arm/disarm.
     pub fn reload_handle(self: &Arc<Self>, post_schema: Schema) -> EngineResult<Arc<Self>> {
         self.check_not_migrated()?;
+        // Stop this handle's full-text builder BEFORE taking the write lock:
+        // the builder takes `migration_lock.read()` per chunk, so joining it
+        // while holding the write side would deadlock. The rebuilt handle
+        // re-derives and resumes its tasks from the persisted markers.
+        self.stop_fulltext_builder();
         let _guard = self.migration_lock.write();
         let armed = self
             .migrating_field_count
@@ -7448,6 +7417,9 @@ impl Drop for Database {
     /// exit naturally on the next `rx.recv()` (which now returns `Err`
     /// because we just dropped the sender), so we just skip the join.
     fn drop(&mut self) {
+        // Full-text builder first: it holds only a `Weak` between chunks, so
+        // it exits at the next boundary once signalled (self-join guarded).
+        self.stop_fulltext_builder();
         *self.cover_refresh_tx.lock() = None;
         if let Some(handle) = self.cover_refresh_handle.lock().take()
             && handle.thread().id() != std::thread::current().id()
@@ -8651,6 +8623,18 @@ impl Database {
                 field: field_name.into(),
             });
         };
+        // The index is only searchable once the backfill has covered every
+        // object; until then the caller gets the progress (and `GET /status`
+        // reports it). A Dropping state can't occur here — such a field is
+        // no longer in the schema.
+        if ff.progress.state() != crate::fulltext::BuildState::Built {
+            return Err(EngineError::FulltextIndexBuilding {
+                type_name: type_name.into(),
+                field: field_name.into(),
+                indexed: ff.progress.visited(),
+                total: ff.progress.total(),
+            });
+        }
         let parsed = crate::fulltext::query::parse_query(query_text, ff.analyzer)
             .map_err(|e| EngineError::FulltextQuery(e.to_string()))?;
         if parsed.needs_positions() && !ff.positions {

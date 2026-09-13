@@ -345,8 +345,11 @@ async fn events(State(state): State<Arc<AppState>>, Path(id): Path<u64>) -> Resp
 /// type/field drop needs the shrink opt-in. NOTE: like a reopen, NEWLY adding
 /// `@indexed`/`@unique` to an already-populated field does NOT backfill the
 /// secondary index for existing rows — only rows written after the reload are
-/// indexed. The intended use is picking up a post-cutover field-kind flip, not
-/// arbitrary index/constraint changes on populated data.
+/// indexed. (`@fulltext` IS different: adding, reconfiguring or removing it
+/// starts a background backfill / rebuild / drop, reported under `fulltext` on
+/// `GET /status`; `.matches` refuses with progress until the build is done.)
+/// The intended use is picking up a post-cutover field-kind flip, not arbitrary
+/// index/constraint changes on populated data.
 async fn reload(State(state): State<Arc<AppState>>, body: String) -> Response {
     let schema = match parse_schema(&body) {
         Ok(s) => s,

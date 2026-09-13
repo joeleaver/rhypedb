@@ -150,6 +150,8 @@ Parameters (both optional):
 
 `@fulltext` stacks with `@unique` and `@indexed`. It is rejected on any non-`String` field. Substring matching without an index is a separate predicate: `.filter(.title.contains("invoice"))` works on every `String` field.
 
+**Adding, changing or removing the directive on existing data.** Unlike `@indexed`, `@fulltext` backfills: adding it to a populated type (on a reopen or `POST /admin/reload`) starts a background build of the index for every existing object; changing `analyzer` or `positions` rebuilds the index into a fresh generation and sweeps the old rows; removing the directive drops the index. New writes are indexed immediately throughout. While a build is running, `.matches` on that field returns an error carrying the progress, and `GET /status` reports it under `fulltext` (see [Running rhypedb](operations.md#monitoring)). A build interrupted by a restart resumes where it left off.
+
 ### `@on_delete(policy)`
 
 On a relationship, declares what happens to the link (and possibly the target) when an object is deleted. Policies:

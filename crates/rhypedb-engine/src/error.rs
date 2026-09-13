@@ -75,6 +75,20 @@ pub enum EngineError {
     #[error("invalid full-text query: {0}")]
     FulltextQuery(String),
 
+    /// `.matches` on a field whose index is still being built (the directive
+    /// was added to — or reconfigured on — a populated type; the background
+    /// backfill has not finished). Carries progress for the caller.
+    #[error(
+        "full-text index for '{type_name}.{field}' is still building ({indexed} of {total} objects \
+         indexed); retry shortly — progress is reported under `fulltext` on GET /status"
+    )]
+    FulltextIndexBuilding {
+        type_name: String,
+        field: String,
+        indexed: u64,
+        total: u64,
+    },
+
     /// A search would examine more posting rows than the caller's budget
     /// allows (the query governor's examined-rows cap). Raised before any
     /// posting is decoded.
