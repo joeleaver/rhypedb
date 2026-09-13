@@ -57,6 +57,9 @@ sha2 = "0.10"
 # --no-default-features — never reach for fastembed's tokenizers here).
 unicode-segmentation = "1.12"
 unicode-normalization = "0.1"
+# `english` analyzer: the Snowball English (Porter2) stemmer, generated from the
+# reference Snowball sources — pure Rust, table-driven, deterministic.
+rust-stemmers = "1.2"
 # The one net-new asymmetric-crypto dep (P4 data-plane authz): the engine
 # verifies jkbase-Auth EdDSA JWTs offline against a per-project public key.
 # Matches the issuer side (jkbase jkbase-control/src/jose.rs) at 2.2.0.

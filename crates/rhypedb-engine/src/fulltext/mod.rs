@@ -1,9 +1,10 @@
 //! Full-text search (`@fulltext` fields, `Type.matches(.field, "terms", k: N)`).
 //!
 //! * [`analyzer`] — turns a `String` value (or a query clause) into a
-//!   position-stamped token stream. The SAME analyzer runs on the write path
-//!   and the query path; any drift silently breaks matching, so there is
-//!   exactly one implementation.
+//!   position-stamped token stream (`simple`, or `english` = simple +
+//!   stemming). The SAME analyzer runs on the write path and the query path;
+//!   any drift silently breaks matching, so there is exactly one
+//!   implementation per analyzer.
 //! * [`posting`] — the posting payload codec (`doc_len`, `tf`, positions).
 //! * [`query`] — the `.matches` query mini-language (`+term`, `"phrase"`).
 //! * [`search`] — BM25 scoring over decoded postings.

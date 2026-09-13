@@ -1264,7 +1264,7 @@ mod tests {
     #[test]
     fn reject_fulltext_bad_parameters() {
         // Unknown analyzer names the known set.
-        let err = parse_schema(r#"type P { t: String @fulltext(analyzer: "english") }"#)
+        let err = parse_schema(r#"type P { t: String @fulltext(analyzer: "klingon") }"#)
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown @fulltext analyzer"), "{msg}");

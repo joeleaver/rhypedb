@@ -182,10 +182,11 @@ pub enum Directive {
 /// "simple", positions: true)`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FulltextDef {
-    /// Analyzer name. `simple` (the default and, today, the only analyzer):
-    /// Unicode word segmentation, lowercase, ASCII folding of diacritics, no
-    /// stemming. The name is part of the index identity — changing it
-    /// rebuilds the field's index.
+    /// Analyzer name. `simple` (the default): Unicode word segmentation,
+    /// lowercase, ASCII folding of diacritics, no stemming. `english`:
+    /// `simple` followed by the Snowball English stemmer, so inflections of a
+    /// word share one term. The name is part of the index identity — changing
+    /// it rebuilds the field's index.
     pub analyzer: String,
     /// Store term positions (needed for phrase queries `"a b"`). Default
     /// `true`; `positions: false` roughly halves the index but makes phrase
@@ -197,8 +198,9 @@ impl FulltextDef {
     /// The default analyzer name.
     pub const DEFAULT_ANALYZER: &'static str = "simple";
 
-    /// Every analyzer name the parser accepts.
-    pub const KNOWN_ANALYZERS: &'static [&'static str] = &["simple"];
+    /// Every analyzer name the parser accepts. The engine's
+    /// `fulltext::Analyzer::from_name` must resolve each of them.
+    pub const KNOWN_ANALYZERS: &'static [&'static str] = &["simple", "english"];
 }
 
 impl Default for FulltextDef {

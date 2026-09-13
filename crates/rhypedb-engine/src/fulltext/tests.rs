@@ -862,3 +862,100 @@ fn status_lists_a_removed_field_as_dropping_until_swept() {
     assert!(db.fulltext_status().iter().all(|s| s.state == crate::fulltext::BuildState::Built));
     assert_eq!(raw_rows(&db, "title"), (0, 0));
 }
+
+// ---- `english` analyzer (issue #17) ----
+
+const ENGLISH: &str = r#"
+    type Owner { name: String }
+    type Note {
+        title: String @fulltext(analyzer: "english")
+        body: String @fulltext(positions: false)
+        tag: String @unique
+        n: i64
+        owner: Owner @on_delete(cascade)
+    }
+"#;
+
+#[test]
+fn english_analyzer_matches_inflections_on_both_sides() {
+    let dir = TempDir::new().unwrap();
+    let db = open_sdl(&dir, ENGLISH);
+    let a = note(&db, "the security cameras were replaced", "x", "a");
+    let b = note(&db, "Camera's battery", "x", "b");
+    let c = note(&db, "a camera obscura", "x", "c");
+    let d = note(&db, "running shoes", "x", "d");
+
+    // Every inflection of the query finds every inflection in the corpus.
+    for q in ["camera", "cameras", "Camera's", "CAMERAS", "camera\u{2019}s"] {
+        let mut got = ids(&db, "title", q, 10);
+        got.sort_unstable();
+        assert_eq!(got, vec![a, b, c], "{q:?}");
+    }
+    for q in ["run", "runs", "running"] {
+        assert_eq!(ids(&db, "title", q, 10), vec![d], "{q:?}");
+    }
+    // A phrase stems both sides: "security camera" matches "security cameras".
+    assert_eq!(ids(&db, "title", "\"security camera\"", 10), vec![a]);
+    assert_eq!(ids(&db, "title", "+\"security cameras\" +replace", 10), vec![a]);
+    assert!(ids(&db, "title", "\"camera security\"", 10).is_empty());
+    // The index holds ONE term per stem: a has 5 distinct stems (the, secur,
+    // camera, were, replac), b 2 (camera, batteri), c 3 (a, camera, obscura), d 2.
+    assert_eq!(raw_rows(&db, "title"), (5 + 2 + 3 + 2, 4));
+    // Stats count surface tokens, not stems.
+    assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 4, total_tokens: 5 + 2 + 3 + 2 });
+    // Scoring is over the stem: the two "camera" mentions... c has tf 1 and
+    // length 3, b has tf 1 and length 2 → b ranks above c on length norm.
+    let hits = db.fulltext_search("Note", "title", "cameras", 10, None, None).unwrap().hits;
+    assert_eq!(hits[0].object_id, b);
+    // `body` keeps the simple analyzer: no stemming there.
+    let e = note(&db, "x", "cameras", "e");
+    assert_eq!(ids(&db, "body", "cameras", 10), vec![e]);
+    assert!(ids(&db, "body", "camera", 10).is_empty());
+    // Updates re-index through the same analyzer.
+    db.update("Note", d, fields(&[("title", s("walking boots"))])).unwrap();
+    assert!(ids(&db, "title", "running", 10).is_empty());
+    assert_eq!(ids(&db, "title", "walk", 10), vec![d]);
+    assert_eq!(db.fulltext_field("Note", "title").unwrap().analyzer, crate::fulltext::Analyzer::English);
+}
+
+#[test]
+fn switching_the_analyzer_bumps_the_generation_and_rebuilds() {
+    let dir = TempDir::new().unwrap();
+    {
+        let db = open(&dir); // title: simple
+        for i in 0..300 {
+            note(&db, &format!("security cameras {i}"), "b", &format!("t{i}"));
+        }
+        assert!(ids(&db, "title", "camera", 10).is_empty(), "simple: no stemming");
+        assert_eq!(ids(&db, "title", "cameras", 1000).len(), 300);
+        let m = markers(&db).into_iter().find(|(k, _)| k.1 == db.field_ids()["Note.title"]).unwrap().1;
+        assert_eq!((m.generation, m.analyzer.as_str()), (0, "simple"));
+    }
+    // Reopen as english: new generation, backfill through the builder, sweep.
+    let db = open_sdl(&dir, ENGLISH);
+    assert!(db.wait_for_fulltext_builds(BUILD_TIMEOUT));
+    assert_eq!(state_of(&db, "title"), crate::fulltext::BuildState::Built);
+    let ff = db.fulltext_field("Note", "title").unwrap();
+    assert_eq!((ff.generation, ff.analyzer), (1, crate::fulltext::Analyzer::English));
+    assert_eq!(ids(&db, "title", "camera", 1000).len(), 300);
+    assert_eq!(ids(&db, "title", "\"security camera\"", 1000).len(), 300);
+    // Exactly one generation's rows remain: 3 distinct stems per doc.
+    assert_eq!(raw_rows(&db, "title"), (300 * 3, 300));
+    assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 300, total_tokens: 900 });
+    let m = markers(&db).into_iter().find(|(k, _)| k.1 == db.field_ids()["Note.title"]).unwrap().1;
+    assert_eq!((m.generation, m.analyzer.as_str(), m.stale_generations), (1, "english", false));
+    assert_eq!(m.state, crate::fulltext::BuildState::Built);
+    // A write after the switch lands in the new generation only.
+    let n = note(&db, "flying drones", "b", "new");
+    assert_eq!(ids(&db, "title", "flies", 10), vec![n]);
+    assert_eq!(raw_rows(&db, "title"), (300 * 3 + 2, 301));
+
+    // And back to simple: another generation, stems gone.
+    drop(db);
+    let db = open(&dir);
+    assert!(db.wait_for_fulltext_builds(BUILD_TIMEOUT));
+    assert_eq!(db.fulltext_field("Note", "title").unwrap().generation, 2);
+    assert!(ids(&db, "title", "camera", 10).is_empty());
+    assert_eq!(ids(&db, "title", "cameras", 1000).len(), 300);
+    assert_eq!(ids(&db, "title", "flying", 10), vec![n]);
+}

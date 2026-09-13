@@ -11,6 +11,7 @@
 //! index build marker records it so a change rebuilds the index rather than
 //! mixing token streams produced by two different analyzers.
 
+use rust_stemmers::{Algorithm, Stemmer};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -34,7 +35,7 @@ pub struct Token {
 /// without allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Analyzer {
-    /// The default and (today) only analyzer:
+    /// The default analyzer:
     ///
     /// 1. UAX#29 word segmentation (`unicode_words`) — splits on whitespace
     ///    and punctuation, keeps `don't`, `3.14`, `e-mail` → `e`,`mail`;
@@ -54,6 +55,24 @@ pub enum Analyzer {
     ///
     /// No stemming, no stop words.
     Simple,
+    /// [`Simple`](Self::Simple), then English stemming, so the inflections of
+    /// a word share one term (`camera`, `cameras`, `Camera's` → `camera`;
+    /// `run`, `running`, `runs` → `run`):
+    ///
+    /// 5. Typographic apostrophes (`’` U+2019, `‘` U+2018, `ʼ` U+02BC) become
+    ///    the ASCII apostrophe — UAX#29 keeps them word-internal exactly like
+    ///    `'`, and the stemmer's possessive rule only knows `'`.
+    /// 6. The Snowball English stemmer (Porter2): strips `'s`, then the
+    ///    plural / `-ing` / `-ed` / `-ly` / `-ness` / `-ation` … suffix
+    ///    families by the reference algorithm. Words shorter than three
+    ///    letters, numbers and non-Latin words pass through unchanged.
+    ///
+    /// The stem is what the index holds, so the same function runs on query
+    /// terms — including every word of a phrase and the text of a prefix
+    /// term. Still no stop words. Only English inflection is modelled: a
+    /// French or German word gets the English rules applied, which is
+    /// harmless but not stemming.
+    English,
 }
 
 impl Analyzer {
@@ -63,6 +82,7 @@ impl Analyzer {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "simple" => Some(Self::Simple),
+            "english" => Some(Self::English),
             _ => None,
         }
     }
@@ -71,6 +91,7 @@ impl Analyzer {
     pub fn name(self) -> &'static str {
         match self {
             Self::Simple => "simple",
+            Self::English => "english",
         }
     }
 
@@ -79,16 +100,20 @@ impl Analyzer {
     /// locale-driven).
     pub fn analyze(self, text: &str) -> Vec<Token> {
         match self {
-            Self::Simple => analyze_simple(text),
+            Self::Simple => analyze_words(text, fold_simple),
+            Self::English => analyze_words(text, fold_english),
         }
     }
 }
 
-fn analyze_simple(text: &str) -> Vec<Token> {
+/// Split `text` into UAX#29 words, fold each one into its term with `fold`,
+/// and stamp positions. Shared by every analyzer so the position and
+/// length-cap rules can never drift between them.
+fn analyze_words(text: &str, fold: fn(&str) -> String) -> Vec<Token> {
     let mut out = Vec::new();
     let mut position: u32 = 0;
     for word in text.unicode_words() {
-        let term = fold_simple(word);
+        let term = fold(word);
         // Position is consumed whether or not the term is kept, so phrase
         // adjacency in the source text is preserved around a dropped token.
         let pos = position;
@@ -112,6 +137,28 @@ fn fold_simple(word: &str) -> String {
         .nfkd()
         .filter(|&c| !is_diacritic_mark(c) && !is_default_ignorable(c))
         .collect()
+}
+
+/// [`fold_simple`], then apostrophe normalization and the Snowball English
+/// stemmer. The length cap is applied by the caller on the RESULT, so a
+/// stem is measured, not the surface form.
+fn fold_english(word: &str) -> String {
+    let folded: String = fold_simple(word)
+        .chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '\u{02BC}' => '\'',
+            c => c,
+        })
+        .collect();
+    if folded.is_empty() {
+        return folded;
+    }
+    // `Stemmer` is a plain function-pointer wrapper; creating one is free
+    // and keeps the analyzer `Copy` with no shared state.
+    match Stemmer::create(Algorithm::English).stem(&folded) {
+        std::borrow::Cow::Borrowed(_) => folded,
+        std::borrow::Cow::Owned(stemmed) => stemmed,
+    }
 }
 
 /// The four Combining Diacritical Marks blocks (UTR#30 "diacritic folding"
@@ -175,11 +222,22 @@ mod tests {
             .collect()
     }
 
+    fn english(text: &str) -> Vec<String> {
+        Analyzer::English
+            .analyze(text)
+            .into_iter()
+            .map(|t| t.term)
+            .collect()
+    }
+
     #[test]
     fn name_round_trips() {
         assert_eq!(Analyzer::from_name("simple"), Some(Analyzer::Simple));
         assert_eq!(Analyzer::Simple.name(), "simple");
-        assert_eq!(Analyzer::from_name("english"), None);
+        assert_eq!(Analyzer::from_name("english"), Some(Analyzer::English));
+        assert_eq!(Analyzer::English.name(), "english");
+        assert_eq!(Analyzer::from_name("English"), None);
+        assert_eq!(Analyzer::from_name("klingon"), None);
         // Every name the schema parser admits resolves here — the two crates
         // must agree.
         for name in rhypedb_schema::FulltextDef::KNOWN_ANALYZERS {
@@ -299,5 +357,89 @@ mod tests {
     fn is_deterministic() {
         let text = "Déjà vu: the SAME text, analyzed twice — 3.14 東京";
         assert_eq!(Analyzer::Simple.analyze(text), Analyzer::Simple.analyze(text));
+        assert_eq!(Analyzer::English.analyze(text), Analyzer::English.analyze(text));
+    }
+
+    // ---- english ----
+
+    #[test]
+    fn english_folds_inflections_and_possessives_to_one_term() {
+        // The issue's acceptance case: every spelling is the same term.
+        assert_eq!(english("cameras camera Camera's CAMERAS'"), vec!["camera"; 4]);
+        assert_eq!(english("run running runs"), vec!["run"; 3]);
+        assert_eq!(english("fly flying flies"), vec!["fli"; 3]);
+        assert_eq!(english("table tables"), vec!["tabl"; 2]);
+        assert_eq!(english("invoice invoices"), vec!["invoic"; 2]);
+        // Snowball's reference vector.
+        assert_eq!(english("fruitlessly"), vec!["fruitless"]);
+        // A phrase stems word by word, positions intact.
+        assert_eq!(
+            positions_of(Analyzer::English, "security cameras"),
+            vec![("secur".into(), 0), ("camera".into(), 1)]
+        );
+        assert_eq!(english("\"security camera\""), english("security cameras"));
+    }
+
+    #[test]
+    fn english_runs_the_simple_fold_first() {
+        // Case + diacritics fold before stemming, so the stem is of the
+        // folded form.
+        assert_eq!(english("Cafés"), vec!["cafe"]);
+        assert_eq!(english("RÉSUMÉS résumé"), vec!["resum", "resum"]);
+        assert_eq!(english("ﬁles"), vec!["file"]);
+        // Everything the simple analyzer drops, english drops too.
+        assert_eq!(english("... !!! 🎉"), Vec::<String>::new());
+        assert_eq!(english("co\u{AD}operate"), vec!["cooper"]);
+        // Same tokenization: hyphens split, apostrophes stay word-internal.
+        assert_eq!(english("e-mail don't"), vec!["e", "mail", "don't"]);
+    }
+
+    #[test]
+    fn english_normalizes_typographic_apostrophes_before_the_possessive_rule() {
+        // UAX#29 keeps ’ / ‘ / ʼ word-internal like ', but Snowball only
+        // strips an ASCII 's — without normalization "camera’s" would be
+        // its own term.
+        assert_eq!(english("camera\u{2019}s"), vec!["camera"]);
+        assert_eq!(english("camera\u{2018}s"), vec!["camera"]);
+        assert_eq!(english("camera\u{02BC}s"), vec!["camera"]);
+        assert_eq!(english("camera\u{2019}s"), english("camera's"));
+        // Full-width apostrophe folds via NFKD already.
+        assert_eq!(english("camera\u{FF07}s"), vec!["camera"]);
+        // `simple` is untouched by this rule (its index must not shift).
+        assert_eq!(terms("camera\u{2019}s"), vec!["camera\u{2019}s"]);
+    }
+
+    #[test]
+    fn english_leaves_numbers_short_words_and_other_scripts_alone() {
+        assert_eq!(english("3.14 4471 v2"), vec!["3.14", "4471", "v2"]);
+        assert_eq!(english("a is us the"), vec!["a", "is", "us", "the"]);
+        assert_eq!(english("東京都 कल Ελληνικά"), vec!["東", "京", "都", "कल", "ελληνικα"]);
+        assert_eq!(english("Straße"), vec!["straße"]);
+        // Non-English Latin words get the English rules — harmless, but
+        // documented as not-stemming.
+        assert_eq!(english("données"), vec!["donne"]);
+    }
+
+    #[test]
+    fn english_length_cap_measures_the_stem_and_keeps_positions() {
+        // The cap is on the indexed term, i.e. the stem: a 257-byte surface
+        // form whose stem fits is kept ("a" + b×252 + "ings" → step 1a drops
+        // the "s", step 1b the "ing").
+        let long = format!("a{}ings", "b".repeat(MAX_TERM_BYTES - 3));
+        assert_eq!(long.len(), MAX_TERM_BYTES + 2);
+        assert_eq!(terms(&long), Vec::<String>::new(), "simple drops it");
+        let stem = english(&long);
+        assert_eq!(stem.len(), 1, "english keeps the stem");
+        assert!(stem[0].len() <= MAX_TERM_BYTES && stem[0].starts_with("abbb"), "{}", stem[0]);
+        // Over the cap even after stemming: dropped, position consumed.
+        let huge = "y".repeat(MAX_TERM_BYTES + 10);
+        assert_eq!(
+            positions_of(Analyzer::English, &format!("a {huge} c")),
+            vec![("a".into(), 0), ("c".into(), 2)]
+        );
+    }
+
+    fn positions_of(a: Analyzer, text: &str) -> Vec<(String, u32)> {
+        a.analyze(text).into_iter().map(|t| (t.term, t.position)).collect()
     }
 }
