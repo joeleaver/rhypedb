@@ -2038,6 +2038,15 @@ impl Database {
     ///   silently disarm the double-write hook → source-only writes that cutover
     ///   later loses/refuses. Holding `migration_lock.write()` across the check +
     ///   rebuild makes the guard race-free vs a concurrent migration arm/disarm.
+    ///
+    /// * **Old handles keep writing (full-text caveat).** Non-poisoning means a
+    ///   caller that keeps the OLD `Arc` can still write through it, with the
+    ///   OLD schema's `@fulltext` tables. If the reload changed a field's
+    ///   analyzer/positions (a new index generation), such a stale write
+    ///   indexes at the old generation and stays invisible to the new one until
+    ///   the object is written again through the new handle. The server never
+    ///   does this (it drains and swaps under `reload_lock`); embedded callers
+    ///   must drop the old handle after a reload.
     pub fn reload_handle(self: &Arc<Self>, post_schema: Schema) -> EngineResult<Arc<Self>> {
         self.check_not_migrated()?;
         // Stop this handle's full-text builder BEFORE taking the write lock:
@@ -6141,19 +6150,24 @@ impl Database {
                 if let Some(ft_fields) = self.fulltext_fields.get(&meta.type_name) {
                     for ff in ft_fields {
                         if let Some(Value::String(text)) = fields.get(&ff.name) {
-                            // An object written BEFORE `@fulltext` was added to the
-                            // schema has a value but no index rows (until the
-                            // backfill reaches it). The `l:` row is the "is this
-                            // object indexed?" witness: without it there is
-                            // nothing to tombstone and the stats never counted
-                            // the document, so moving them would under-count.
+                            // The `l:` row is ALWAYS tombstoned when the value was a
+                            // String — even for an object written before `@fulltext`
+                            // was added (no rows yet): the tombstone puts the key in
+                            // this txn's write set, so a backfill chunk that is
+                            // indexing this very object right now conflicts with us
+                            // instead of resurrecting a deleted document. The
+                            // posting tombstones and the stats delta, though, are
+                            // gated on the row's presence (the witness that the
+                            // object was indexed and counted).
                             let doc_key = KeyBuilder::fulltext_doc(
                                 type_id,
                                 ff.field_id,
                                 ff.generation,
                                 object_id,
                             );
-                            if self.storage.get(txn, &doc_key)?.is_none() {
+                            let was_indexed = self.storage.get(txn, &doc_key)?.is_some();
+                            if !was_indexed {
+                                arena.push_fulltext_doc(type_id, ff.field_id, ff.generation, object_id);
                                 continue;
                             }
                             let doc = tokenize_for_index(ff, text);
@@ -8502,7 +8516,8 @@ impl Database {
         // `None` so the new value is staged in full — which also makes a
         // concurrent backfill of the same object a harmless (conflict-
         // detected) duplicate rather than a divergence.
-        let old_indexed = old_text.is_some() && self.storage.get(txn, &doc_key)?.is_some();
+        let old_had_string = old_text.is_some();
+        let old_indexed = old_had_string && self.storage.get(txn, &doc_key)?.is_some();
         let old_text = if old_indexed { old_text } else { None };
         let old_doc = old_text.map(|t| tokenize_for_index(ff, t));
         let new_doc = new_text.map(|t| tokenize_for_index(ff, t));
@@ -8560,7 +8575,11 @@ impl Database {
                 self.storage
                     .put(txn, &doc_key, crate::fulltext::encode_doc_len(len))?;
             }
-            (Some(_), None) => self.storage.delete(txn, &doc_key)?,
+            // String → null: tombstone the `l:` row even when the object was
+            // never indexed, so a concurrent backfill of this object conflicts
+            // with us rather than indexing the value we just removed (see
+            // `database/fulltext_build.rs`).
+            (_, None) if old_had_string => self.storage.delete(txn, &doc_key)?,
             _ => {}
         }
         ft_delta.add(
@@ -8662,16 +8681,42 @@ impl Database {
                 ff.generation,
                 &encode_term(term),
             );
-            let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
-            postings_scanned += entries.len() as u64;
-            if let Some(limit) = max_postings
-                && postings_scanned > limit
-            {
-                return Err(EngineError::FulltextScanBudgetExceeded {
-                    type_name: type_name.into(),
-                    field: field_name.into(),
-                    limit,
-                });
+            // Walk the term's postings in bounded, tombstone-correct chunks
+            // (`scan_chunk_raw`, never the under-returning `*_limited`
+            // scans), so the budget check runs after at most one chunk past
+            // it — a stop-word over a huge corpus is refused after ~one chunk
+            // of merge work, not after the storage layer has merged every key.
+            const POSTING_SCAN_CHUNK: usize = 4096;
+            let mut entries: Vec<(Bytes, Bytes)> = Vec::new();
+            let mut start = prefix.clone();
+            loop {
+                let want = match max_postings {
+                    Some(limit) => {
+                        let remaining = limit.saturating_sub(postings_scanned) as usize;
+                        remaining.saturating_add(1).min(POSTING_SCAN_CHUNK)
+                    }
+                    None => POSTING_SCAN_CHUNK,
+                };
+                let chunk = self.storage.scan_chunk_raw(snapshot, &prefix, &start, want)?;
+                postings_scanned += chunk.live.len() as u64;
+                if let Some(limit) = max_postings
+                    && postings_scanned > limit
+                {
+                    return Err(EngineError::FulltextScanBudgetExceeded {
+                        type_name: type_name.into(),
+                        field: field_name.into(),
+                        limit,
+                    });
+                }
+                entries.extend(chunk.live);
+                match chunk.high_water {
+                    Some(hw) if chunk.more => {
+                        let mut next = hw.to_vec();
+                        next.push(0);
+                        start = Bytes::from(next);
+                    }
+                    _ => break,
+                }
             }
             let mut list = Vec::with_capacity(entries.len());
             for (key, value) in entries {

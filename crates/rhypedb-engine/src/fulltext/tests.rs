@@ -742,3 +742,96 @@ fn scan_budget_refuses_before_decoding() {
         8
     );
 }
+
+/// Review finding: a delete / set-to-null of an object INSIDE a backfill
+/// chunk's window must conflict with the chunk (the write paths tombstone the
+/// `l:` row even when it does not exist yet), so the builder retries and never
+/// resurrects a deleted / nulled document. Uses the builder's test seam to
+/// race the writes against exactly the first chunk.
+#[test]
+fn deletes_and_null_sets_inside_a_backfill_chunk_do_not_resurrect_documents() {
+    let rows = sample_rows(700);
+    let dir = TempDir::new().unwrap();
+    {
+        let db = open_sdl(&dir, SCHEMA_WITHOUT_TITLE_INDEX);
+        let batch: Vec<(u64, FieldMap)> = rows
+            .iter()
+            .map(|(id, title, tag)| {
+                let mut f = fields(&[("body", s("b")), ("tag", s(tag)), ("n", Value::I64(1))]);
+                if let Some(t) = title {
+                    f.insert("title".into(), s(t));
+                }
+                (*id, f)
+            })
+            .collect();
+        db.restore_objects("Note", batch, true).unwrap();
+    }
+    let db = open_no_build(&dir, SCHEMA);
+    assert_eq!(state_of(&db, "title"), crate::fulltext::BuildState::Building);
+    // Inside the first chunk's window (ids 1..=512): delete 300, null 301,
+    // rewrite 302. Fire once; the builder's retry calls the hook again.
+    {
+        let racer = std::sync::Arc::clone(&db);
+        let mut fired = false;
+        *db.fulltext_builder_test_hook() = Some(Box::new(move |cursor: u64| {
+            if fired || cursor != 0 {
+                return;
+            }
+            fired = true;
+            racer.delete("Note", 300).unwrap();
+            racer.update("Note", 301, fields(&[("title", Value::Null)])).unwrap();
+            racer.update("Note", 302, fields(&[("title", s("rewritten inside window"))])).unwrap();
+        }));
+    }
+    db.run_fulltext_tasks_inline();
+    assert_eq!(state_of(&db, "title"), crate::fulltext::BuildState::Built);
+    assert_eq!(db.fulltext_tasks_failed(), 0);
+
+    // Expected final state = rows minus 300, 301 nulled, 302 rewritten.
+    let mut expected: Vec<(u64, Option<String>, String)> =
+        rows.iter().filter(|(id, _, _)| *id != 300).cloned().collect();
+    for r in expected.iter_mut() {
+        if r.0 == 301 {
+            r.1 = None;
+        }
+        if r.0 == 302 {
+            r.1 = Some("rewritten inside window".into());
+        }
+    }
+    let borrowed: Vec<(u64, Option<&str>, &str)> =
+        expected.iter().map(|(i, t, g)| (*i, t.as_deref(), g.as_str())).collect();
+    let (_cdir, clean) = clean_build(SCHEMA, &borrowed);
+    assert_eq!(raw_rows(&db, "title"), raw_rows(&clean, "title"));
+    assert_eq!(stats(&db, "title"), stats(&clean, "title"));
+    // 300's and 301's old titles are gone; 302 is findable by its new text only.
+    assert!(ids(&db, "title", "+invoice +300", 10).is_empty());
+    assert!(ids(&db, "title", "+invoice +301", 10).is_empty());
+    assert!(ids(&db, "title", "+invoice +302", 10).is_empty());
+    assert_eq!(ids(&db, "title", "+rewritten +window", 10), vec![302]);
+    assert_eq!(scored(&db, "title", "invoice"), scored(&clean, "title", "invoice"));
+}
+
+#[test]
+fn status_lists_a_removed_field_as_dropping_until_swept() {
+    let dir = TempDir::new().unwrap();
+    let field_id = {
+        let db = open(&dir);
+        for i in 0..20 {
+            note(&db, &format!("gone {i}"), "b", &format!("t{i}"));
+        }
+        db.field_ids()["Note.title"]
+    };
+    let db = open_no_build(&dir, SCHEMA_WITHOUT_TITLE_INDEX);
+    let st = db.fulltext_status();
+    let dropping = st
+        .iter()
+        .find(|s| s.state == crate::fulltext::BuildState::Dropping)
+        .expect("removed field shows as dropping");
+    assert_eq!(dropping.name, format!("Note.field#{field_id}"));
+    assert_eq!(st.iter().filter(|s| s.name == "Note.body").count(), 1);
+    drop(db);
+    let db = open_sdl(&dir, SCHEMA_WITHOUT_TITLE_INDEX);
+    assert!(db.wait_for_fulltext_builds(BUILD_TIMEOUT));
+    assert!(db.fulltext_status().iter().all(|s| s.state == crate::fulltext::BuildState::Built));
+    assert_eq!(raw_rows(&db, "title"), (0, 0));
+}

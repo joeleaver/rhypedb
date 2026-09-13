@@ -10,19 +10,23 @@
 //! ## Convergence with live writers
 //!
 //! The write paths maintain the CURRENT generation's rows for every object
-//! they touch, always. The backfill visits objects in id order at a pinned
-//! snapshot per chunk and indexes only those WITHOUT an `l:` row, committing
-//! `[postings + l: rows …, marker LAST]` so a torn tail loses at most the
-//! cursor advance. A foreground write to an object inside the chunk window
-//! also writes that object's `l:` row, so the two commits conflict on it and
-//! the loser retries: the backfill re-reads (now indexed → skipped); a
-//! foreground loser surfaces `WriteConflict` to its caller exactly like the
-//! field-type migration's backfill does today. Nothing can be indexed twice
-//! with different content, and nothing is left un-indexed. The backfill never
-//! gives up to foreground traffic: every conflict halves its chunk (down to
-//! one object), and a one-object chunk can only conflict with a write that
-//! just indexed that very object — which the retry then skips — so progress
-//! is guaranteed under any write load.
+//! they touch, always. The backfill visits objects in id order at ITS
+//! TRANSACTION'S snapshot per chunk and indexes only those WITHOUT an `l:`
+//! row, committing postings + `l:` rows + the advanced marker as ONE framed
+//! transaction (all-or-nothing on replay; a torn tail redoes the chunk, which
+//! is idempotent). Every foreground write to an object inside the chunk
+//! window touches that object's `l:` key — a create/update puts it, and a
+//! delete or set-to-null tombstones it EVEN WHEN it does not exist yet (that
+//! is what makes the write sets intersect) — so the two commits conflict and
+//! the loser retries: the backfill re-scans at a fresh snapshot (the object
+//! is now indexed → skipped, or gone / null → not a document); a foreground
+//! loser surfaces `WriteConflict` to its caller exactly like the field-type
+//! migration's backfill does today. Nothing can be indexed twice with
+//! different content, nothing is left un-indexed, nothing deleted lingers.
+//! The backfill never gives up to foreground traffic: every conflict halves
+//! its chunk (down to one object), and a one-object chunk can only conflict
+//! with a write to that very object — which the retry then resolves — so
+//! progress is guaranteed under any write load.
 //!
 //! The thread holds only a `Weak<Database>` between chunks (upgraded per
 //! chunk, like the migration driver), so dropping the last external `Arc`
@@ -69,23 +73,66 @@ pub(super) enum FulltextTask {
     },
 }
 
-/// Shared handle between a `Database` and its builder thread.
+/// The builder's per-chunk test seam (see `FulltextBuilder::chunk_hook`).
+#[cfg(test)]
+pub(crate) type ChunkHook = Box<dyn FnMut(u64) + Send>;
+
+/// A drop task's live status (for `GET /status`: a field being swept shows
+/// as `dropping` even though it is no longer in the schema).
 #[derive(Debug)]
+pub(super) struct DropEntry {
+    pub(super) type_id: u64,
+    pub(super) field_id: u64,
+    pub(super) keep: Option<u32>,
+    pub(super) done: AtomicBool,
+}
+
+/// Shared handle between a `Database` and its builder thread.
 pub(super) struct FulltextBuilder {
     pub(super) tasks: parking_lot::Mutex<Vec<FulltextTask>>,
     /// Tasks not yet completed (a stopped build stays pending for the next open).
     pub(super) pending: AtomicUsize,
+    /// Tasks that ended in an error (their durable state is untouched; the
+    /// next open retries them). `wait_for_fulltext_builds` stops waiting.
+    pub(super) failed: AtomicUsize,
     pub(super) stop: AtomicBool,
     pub(super) handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    pub(super) drops: Vec<DropEntry>,
+    /// Test seam: called once per backfill chunk INSIDE the conflict window
+    /// (after the chunk's txn began and its objects were read, before its
+    /// commit) with the chunk's cursor, so a test can race a foreground
+    /// write against exactly that chunk.
+    #[cfg(test)]
+    pub(crate) chunk_hook: parking_lot::Mutex<Option<ChunkHook>>,
 }
 
 impl FulltextBuilder {
     pub(super) fn new(tasks: Vec<FulltextTask>) -> Self {
+        let drops = tasks
+            .iter()
+            .filter_map(|t| match t {
+                FulltextTask::Drop {
+                    type_id,
+                    field_id,
+                    keep,
+                } => Some(DropEntry {
+                    type_id: *type_id,
+                    field_id: *field_id,
+                    keep: *keep,
+                    done: AtomicBool::new(false),
+                }),
+                _ => None,
+            })
+            .collect();
         Self {
             pending: AtomicUsize::new(tasks.len()),
+            failed: AtomicUsize::new(0),
             tasks: parking_lot::Mutex::new(tasks),
             stop: AtomicBool::new(false),
             handle: parking_lot::Mutex::new(None),
+            drops,
+            #[cfg(test)]
+            chunk_hook: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -343,6 +390,16 @@ pub(super) fn fulltext_builder_main(weak: std::sync::Weak<Database>, builder: Ar
         };
         match outcome {
             Ok(true) => {
+                if let FulltextTask::Drop {
+                    type_id, field_id, ..
+                } = &task
+                    && let Some(d) = builder
+                        .drops
+                        .iter()
+                        .find(|d| d.type_id == *type_id && d.field_id == *field_id)
+                {
+                    d.done.store(true, Ordering::Release);
+                }
                 builder.pending.fetch_sub(1, Ordering::AcqRel);
             }
             // Stopped (or the database went away): leave the remaining tasks
@@ -353,6 +410,7 @@ pub(super) fn fulltext_builder_main(weak: std::sync::Weak<Database>, builder: Ar
                 // aborted); the marker stays Building/Dropping so `.matches`
                 // keeps refusing with progress and the next open retries.
                 eprintln!("full-text builder: {task:?} failed: {e}");
+                builder.failed.fetch_add(1, Ordering::AcqRel);
             }
         }
     }
@@ -404,9 +462,16 @@ fn run_build(
             if builder.stop.load(Ordering::Acquire) {
                 return Ok(false);
             }
-            let snapshot = db.storage.read_snapshot();
-            let chunk = db.scan_chunk(type_name, snapshot, cursor, chunk_size)?;
+            // Begin the txn FIRST and scan at ITS snapshot: a delete / null
+            // between an earlier read snapshot and the txn's own would be
+            // invisible to the conflict check (it predates the txn) yet its
+            // object would still be in the chunk.
             let mut txn = db.storage.begin_txn();
+            let chunk = db.scan_chunk(type_name, txn.snapshot(), cursor, chunk_size)?;
+            #[cfg(test)]
+            if let Some(hook) = builder.chunk_hook.lock().as_mut() {
+                hook(cursor);
+            }
             let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
             let mut delta = StatsDelta::default();
             for obj in &chunk.objects {
@@ -425,9 +490,10 @@ fn run_build(
             }
             let done = !chunk.more || chunk.next_cursor.is_none();
             let next_cursor = chunk.next_cursor.unwrap_or(u64::MAX);
-            // Marker LAST in the batch (commit order = batch order), so a torn
-            // tail drops only the cursor advance and the chunk is redone
-            // idempotently.
+            // The marker rides in the same framed txn as the rows: WAL replay
+            // is all-or-nothing per commit, so a torn tail loses the WHOLE
+            // chunk (rows + cursor advance) and the next open redoes it —
+            // idempotently, since indexed objects are skipped.
             let marker = BuildMarker {
                 state: if done { BuildState::Built } else { BuildState::Building },
                 generation: field.generation,
@@ -575,34 +641,84 @@ impl Database {
         fulltext_builder_main(Arc::downgrade(self), Arc::clone(&self.fulltext_builder));
     }
 
-    /// Per-field build state + progress, sorted by `Type.field` (for
-    /// `GET /status`).
+    /// Test seam: the builder's per-chunk hook (see `FulltextBuilder::chunk_hook`).
+    #[cfg(test)]
+    pub(crate) fn fulltext_builder_test_hook(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, Option<ChunkHook>> {
+        self.fulltext_builder.chunk_hook.lock()
+    }
+
+    /// Per-field build state + progress, sorted by name (for `GET /status`).
+    /// Fields in the live schema report their marker state; a field whose
+    /// directive was removed (no longer in the schema) is listed as
+    /// `dropping` until its sweep finishes, named by `<Type>.<field id>`
+    /// (the field name is gone with the schema). `indexed` is clamped to
+    /// `total` — objects created during a backfill are visited too.
     pub fn fulltext_status(&self) -> Vec<FulltextIndexStatus> {
         let mut out: Vec<FulltextIndexStatus> = self
             .fulltext_fields
             .iter()
             .flat_map(|(type_name, fields)| {
-                fields.iter().map(move |ff| FulltextIndexStatus {
-                    name: format!("{type_name}.{}", ff.name),
-                    state: ff.progress.state(),
-                    generation: ff.generation,
-                    documents: ff.stats.snapshot().doc_count,
-                    indexed: ff.progress.visited(),
-                    total: ff.progress.total(),
+                fields.iter().map(move |ff| {
+                    let total = ff.progress.total();
+                    FulltextIndexStatus {
+                        name: format!("{type_name}.{}", ff.name),
+                        state: ff.progress.state(),
+                        generation: ff.generation,
+                        documents: ff.stats.snapshot().doc_count,
+                        indexed: if total == 0 {
+                            ff.progress.visited()
+                        } else {
+                            ff.progress.visited().min(total)
+                        },
+                        total,
+                    }
                 })
             })
             .collect();
+        for d in &self.fulltext_builder.drops {
+            // Only orphan sweeps (`keep: None`) are a field of their own; a
+            // stale-generation sweep belongs to a live field listed above.
+            if d.keep.is_some() || d.done.load(Ordering::Acquire) {
+                continue;
+            }
+            let type_name = self
+                .type_name_by_id
+                .get(&d.type_id)
+                .cloned()
+                .unwrap_or_else(|| format!("type#{}", d.type_id));
+            out.push(FulltextIndexStatus {
+                name: format!("{type_name}.field#{}", d.field_id),
+                state: BuildState::Dropping,
+                generation: 0,
+                documents: 0,
+                indexed: 0,
+                total: 0,
+            });
+        }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
+    /// Number of background full-text tasks that ended in an error on this
+    /// handle (their durable state is untouched; reopen retries them).
+    pub fn fulltext_tasks_failed(&self) -> usize {
+        self.fulltext_builder.failed.load(Ordering::Acquire)
+    }
+
     /// Block until every background full-text task of this handle has
-    /// completed (builds AND drops), or `timeout` elapses. `true` = idle.
-    /// A handle opened with `background_fulltext_build: false` never runs
-    /// its tasks, so this returns `false` unless there were none.
+    /// completed (builds AND drops), or `timeout` elapses. `true` = idle and
+    /// nothing failed. Returns `false` at once if a task failed (see
+    /// [`fulltext_tasks_failed`](Self::fulltext_tasks_failed)); a handle
+    /// opened with `background_fulltext_build: false` never runs its tasks,
+    /// so it returns `false` unless there were none.
     pub fn wait_for_fulltext_builds(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            if self.fulltext_builder.failed.load(Ordering::Acquire) > 0 {
+                return false;
+            }
             if self.fulltext_builder.pending.load(Ordering::Acquire) == 0 {
                 return true;
             }

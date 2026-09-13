@@ -209,7 +209,7 @@ curl -s -X POST http://127.0.0.1:4200/admin/compact \
 ## Monitoring
 
 - **`GET /health`** — liveness. Returns `200 OK` with a short status string.
-- **`GET /status`** — operational snapshot: active subscriptions, pending embeddings, per-index vector counts, and — when the schema has `@fulltext` fields — a `fulltext` block: `building` (fields whose index is still being backfilled) and per-field `indexes` entries with `state` (`building` / `built` / `dropping`), `generation`, `documents` (indexed documents), and backfill progress `indexed` / `total`.
+- **`GET /status`** — operational snapshot: active subscriptions, pending embeddings, per-index vector counts, and — when the schema has `@fulltext` fields — a `fulltext` block: `building` (fields whose index is still being backfilled), `failed` (background index tasks that hit an error — the next restart retries them), and per-field `indexes` entries with `state` (`building` / `built`, or `dropping` for a field whose directive was removed and whose rows are still being swept), `generation`, `documents` (indexed documents), and backfill progress `indexed` / `total`.
 - **`GET /schema`** — live schema introspection (JSON + canonical SDL) for tooling and typed-client codegen. See the [API reference](api-reference.md#get-schema).
 
 ```bash

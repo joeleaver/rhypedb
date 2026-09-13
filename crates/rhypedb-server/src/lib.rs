@@ -551,7 +551,11 @@ async fn handle_status(
                 })
             })
             .collect();
-        result["fulltext"] = serde_json::json!({ "building": building, "indexes": indexes });
+        result["fulltext"] = serde_json::json!({
+            "building": building,
+            "failed": db.fulltext_tasks_failed(),
+            "indexes": indexes,
+        });
     }
 
     if let Some(vectorizer) = &state.vectorizer {
@@ -2373,6 +2377,7 @@ mod tcp_tests {
         let body: serde_json::Value = serde_json::from_str(&text).unwrap();
         let ft = &body["fulltext"];
         assert_eq!(ft["building"].as_u64().unwrap(), 0, "{body}");
+        assert_eq!(ft["failed"].as_u64().unwrap(), 0, "{body}");
         let indexes = ft["indexes"].as_array().unwrap();
         assert_eq!(indexes.len(), 2);
         assert_eq!(indexes[0]["name"], "Post.body");
