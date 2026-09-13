@@ -91,7 +91,7 @@ pub struct VectorizerFileConfig {
     pub quantized: Option<bool>,
     /// Cross-encoder reranking of `.similar` text search (a second, ~280MB
     /// model, one forward pass per candidate — expensive enough that it
-    /// defaults to off). `"off"` or absent = `CrossEncoder::Off`; any other
+    /// defaults to off). `"off"` (any case), empty, or absent = `CrossEncoder::Off`; any other
     /// string is the reranker model name (`CrossEncoder::On { model }`) —
     /// today exactly one is supported
     /// (`rhypedb_engine::vectorizer::DEFAULT_RERANKER_MODEL`, currently
@@ -341,9 +341,28 @@ fn resolve_vectorizer_config(
     // validated here — a bad name fails soft with `UnsupportedModel` when the
     // reranker is first lazily loaded, recorded under `vectorizer.reranker_error`
     // on `GET /status`, exactly like every other model-load failure.
-    match vz.cross_encoder.as_deref() {
-        None | Some("off") => {}
+    match vz.cross_encoder.as_deref().map(str::trim) {
+        None => {}
+        Some(v) if v.eq_ignore_ascii_case("off") => {}
+        Some("") => {
+            eprintln!(
+                "WARNING: vectorizer.cross_encoder is empty; treating it as \"off\" \
+                 (name a reranker model, e.g. \"{}\", to turn the cross-encoder on).",
+                rhypedb_engine::vectorizer::DEFAULT_RERANKER_MODEL
+            );
+        }
         Some(model) => {
+            if model != rhypedb_engine::vectorizer::DEFAULT_RERANKER_MODEL {
+                // Kept as configured (the engine fails the load soft and reports
+                // it under `vectorizer.reranker_error`), but say so NOW rather
+                // than leaving a typo to surface as silently un-reranked results.
+                eprintln!(
+                    "WARNING: vectorizer.cross_encoder = \"{model}\" is not a supported \
+                     reranker model (supported: \"{}\"); the reranker will fail to load \
+                     and `.similar` text search will run WITHOUT the cross-encoder.",
+                    rhypedb_engine::vectorizer::DEFAULT_RERANKER_MODEL
+                );
+            }
             cfg.cross_encoder =
                 rhypedb_engine::vectorizer::CrossEncoder::On { model: model.to_string() };
         }
@@ -926,11 +945,13 @@ mod tests {
         let c = resolve(&CliLayer::default(), &EnvLayer::default(), None);
         assert_eq!(c.vectorizer.cross_encoder, CrossEncoder::Off);
 
-        // Explicit `"off"` -> Off.
-        let f = file(r#"[vectorizer]
-cross_encoder = "off""#);
-        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
-        assert_eq!(c.vectorizer.cross_encoder, CrossEncoder::Off);
+        // Explicit `"off"` -> Off, in any case — `"Off"` must not silently
+        // become a reranker model NAMED "Off" that fails to load on every query.
+        for spelling in ["off", "Off", "OFF"] {
+            let f = file(&format!("[vectorizer]\ncross_encoder = \"{spelling}\""));
+            let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+            assert_eq!(c.vectorizer.cross_encoder, CrossEncoder::Off, "{spelling}");
+        }
 
         // Any other string is the reranker model name.
         let f = file(r#"[vectorizer]
@@ -941,9 +962,15 @@ cross_encoder = "bge-reranker-base""#);
             CrossEncoder::On { model: "bge-reranker-base".into() }
         );
 
-        // The value is passed through verbatim, even an unsupported name —
-        // validated lazily on first use (fails soft with `UnsupportedModel`,
-        // not here).
+        // An empty string is Off (with a warning), not a model named "".
+        let f = file("[vectorizer]
+cross_encoder = \"\"");
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.vectorizer.cross_encoder, CrossEncoder::Off);
+
+        // An unsupported name is passed through verbatim (warned about at
+        // resolve time; the engine fails the load soft with `UnsupportedModel`
+        // and reports it on /status).
         let f = file(r#"[vectorizer]
 cross_encoder = "some-other-model""#);
         let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));

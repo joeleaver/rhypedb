@@ -72,7 +72,9 @@ The background embed worker (and the query-time embedder used by a text `.simila
 | `cache_dir` | fastembed's own default | Where downloaded model files are cached on disk. |
 | `cross_encoder` | `"off"` | `"off"` disables cross-encoder reranking of `.similar` text search; any other string names the reranker model to turn it on with (see [Cross-encoder reranking](#cross-encoder-reranking) below). A second model, off by default. |
 
-If the model fails to load — a network hiccup mid-download, a cold cache on first boot, or simply the time it takes to download and initialize a ~100MB+ ONNX model — the background worker does **not** fail or drop the affected jobs. It puts them back on the queue, records the failure under `vectorizer.model_error` on `GET /status`, and retries with an exponential backoff (starting at 2s, doubling up to a 60s cap) until a load succeeds, at which point `model_error` clears and the backoff resets. A `.similar` text query made while the model is unavailable gets a clear `ModelUnavailable` error rather than blocking or panicking.
+If the model fails to load — a network hiccup mid-download, a cold cache on first boot, or simply the time it takes to download and initialize a ~100MB+ ONNX model — the background worker does **not** fail or drop the affected jobs. It puts them back on the queue, records the failure under `vectorizer.model_error` on `GET /status`, and retries with an exponential backoff (starting at 2s, doubling up to a 60s cap) until a load succeeds, at which point `model_error` clears and the backoff resets. A `.similar` text query made while the model is unavailable gets a clear `ModelUnavailable` error rather than panicking: the first query after a failure attempts the load itself (and waits for that attempt, which for a download can be the network timeout); queries during the backoff window are refused immediately without retrying, so a known-bad model doesn't cost every query a download attempt. Embedded callers driving `process_pending` see the same failure as an `Err(ModelUnavailable)` when a batch could not be embedded at all (its jobs are re-queued), so a "loop until 0" driver can back off rather than spin.
+
+> **Upgrading from a build before this setting existed:** the cross-encoder used to run by default and was opted *out* of with `RHYPEDB_DISABLE_RERANK`. It is now **off unless you set `cross_encoder`** — a deployment that relied on the old default silently loses reranking after upgrading (queries still succeed; `GET /status` shows `reranker_loaded: false`). Add `[vectorizer] cross_encoder = "bge-reranker-base"` to keep it. `RHYPEDB_DISABLE_RERANK` is no longer read (the server warns at startup if it, or `RHYPEDB_RERANKER_DIR` with the cross-encoder off, is set).
 
 ### Cross-encoder reranking
 
@@ -99,6 +101,16 @@ text to score against). Like the embedder, a cross-encoder load failure is
 fail-soft: `.similar` falls back to returning the ANN/rescored order rather
 than erroring, and the failure is visible under `vectorizer.reranker_error`
 on `GET /status` (`vectorizer.reranker_loaded` mirrors `model_loaded`).
+
+Reranker environment knobs (all optional; the config key above is the only
+switch that turns the cross-encoder on):
+
+| Variable | Effect |
+| --- | --- |
+| `RHYPEDB_RERANKER_DIR` | Load the reranker from a local directory (`model.onnx` plus the four tokenizer files) instead of downloading it. |
+| `RHYPEDB_RERANKER_FP32` | Use the full-precision `bge-reranker-base` instead of the default int8-quantized build (larger, slower, marginally more accurate). |
+| `RHYPEDB_RERANK_CANDIDATES` | How many ANN candidates the cross-encoder scores per query (default `min(k * 3, 48)`); this is the dominant query cost when reranking is on. |
+| `RHYPEDB_DEBUG_RERANK` | Log the search path taken (brute-force / ANN / rerank pool) to stderr. |
 
 ## Indexing for search — `@index(hnsw, ...)`
 
@@ -152,7 +164,7 @@ Post.similar(.embedding, "distributed consensus", k: 10, ef: 200, rerank: 50)
 Post.filter(.published == true).similar(.embedding, "rust async", k: 10)
 ```
 
-Every `.similar` result is **ranked** and each carries a `score`, read as `Row.score`. Ordinarily `score` is the index's distance under the field's metric (**lower** is closer) and results come back nearest-first. If the field's vectorizer has [cross-encoder reranking](#cross-encoder-reranking) turned on, `score` is instead the cross-encoder's relevance score (**higher** is more relevant) and results come back most-relevant-first — the two scales are not comparable, so know which one your deployment uses. See [Ranked results](queries.md#ranked-results) and, for keyword search over the same objects, [`.matches`](queries.md#full-text-search--matchesfield-query-k-n).
+Every `.similar` result is **ranked** and each carries a `score`, read as `Row.score`. Ordinarily `score` is the index's distance under the field's metric (**lower** is closer) and results come back nearest-first. When [cross-encoder reranking](#cross-encoder-reranking) is on and the reranker actually scored a row, `score` is instead the cross-encoder's relevance score (**higher** is more relevant) and those rows come back most-relevant-first — the two scales are not comparable, so know which one your deployment uses. Rows the cross-encoder could not score (a raw-vector query, the reranker failed to load, or the object has no readable source text) keep a distance; see [Ranked results](queries.md#ranked-results) for the exact rules. See [Ranked results](queries.md#ranked-results) and, for keyword search over the same objects, [`.matches`](queries.md#full-text-search--matchesfield-query-k-n).
 
 ## Tuning recall vs. latency
 

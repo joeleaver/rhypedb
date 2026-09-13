@@ -103,7 +103,7 @@ Post.similar(.embedding, "databases", k: 10, ef: 200, rerank: 50)
 Post.filter(.published == true).similar(.embedding, "rust", k: 5)
 ```
 
-`.similar` returns a **ranked** result: each object carries a `score` and the rows come back in rank order. Ordinarily `score` is the index's distance under the field's metric (lower is closer); if the field's vectorizer has cross-encoder reranking turned on (see [Vector Search](vectors.md#cross-encoder-reranking)) it is instead the cross-encoder's relevance score (higher is better). See [Ranked results](#ranked-results).
+`.similar` returns a **ranked** result: each object carries a `score` and the rows come back in rank order. Ordinarily `score` is the index's distance under the field's metric (lower is closer); when the [cross-encoder](vectors.md#cross-encoder-reranking) actually scored a row it is instead the cross-encoder's relevance score (higher is better). See [Ranked results](#ranked-results) for exactly when that is.
 
 ### Full-text search — `.matches(.field, "query", k: N)`
 
@@ -149,9 +149,9 @@ A query with no searchable terms (only punctuation), an unterminated quote, or a
 | --- | --- |
 | `.matches` | BM25 relevance — higher is better |
 | `.similar` (default) | the index distance under the field's metric (cosine distance, squared L2, or negated dot product) — lower is closer |
-| `.similar` (field's vectorizer has cross-encoder reranking on) | the cross-encoder's relevance score — higher is better |
+| `.similar`, row scored by the cross-encoder | the cross-encoder's relevance score — higher is better |
 
-A `.similar` step's `score` is therefore only comparable across queries against the SAME field — whether it's a distance or a relevance score (and, if a distance, under which metric) is a property of that field's vectorizer configuration, not of the query. See [Cross-encoder reranking](vectors.md#cross-encoder-reranking) for how a field's vectorizer turns this on.
+The cross-encoder scores a row only when all of these hold: `[vectorizer] cross_encoder` names a model, the query was a **text** query (a raw-vector `.similar` has no text to score against), the reranker model is currently loaded (a load failure is fail-soft — see `reranker_error` on `GET /status`), and the row's object has readable source text. A row that misses any of these carries a distance, and one result set can mix the two: with the cross-encoder on, rows the model scored come first (relevance, descending), then any candidates whose source text was unreadable (distance, ascending). So treat `score` as opaque for ordering purposes — the rows are already in rank order — and, if you read it directly, know which of the two your deployment produces. A `.similar` step's `score` is only comparable across queries against the SAME field with the SAME vectorizer configuration.
 
 A `.filter`, `.limit` or `.offset` after a ranked step keeps the order and the scores; a traversal or a mutation drops them.
 
