@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -318,8 +318,35 @@ pub struct Vectorizer {
     model_loaded: AtomicBool,
     /// Backoff for the NEXT model-load retry; doubles (capped at
     /// `config.model_retry_max`) on each consecutive failure and resets to
-    /// `config.model_retry_initial` on success. See [`Self::backoff_delay`].
+    /// `config.model_retry_initial` on success. See
+    /// [`Self::record_model_load_failure`].
     next_retry_delay: parking_lot::Mutex<Duration>,
+    /// Earliest instant at which another model LOAD may be attempted, set on
+    /// every load failure. Both the worker and the query path honour it
+    /// (see [`Self::get_or_load_embedder`]): while it is in the future a
+    /// load is refused up front with `Unavailable`, so a `.similar` text
+    /// query never re-runs a (network-bound) download under the shared
+    /// embedders lock on every call while the model is known-bad. `None` =
+    /// no failure in effect.
+    next_retry_at: parking_lot::Mutex<Option<Instant>>,
+    /// Set by `process_batch` when it indexed something; cleared by
+    /// [`Self::save_snapshots`]. Drives the worker's snapshot cadence.
+    snapshots_dirty: AtomicBool,
+    /// When [`Self::save_snapshots`] last ran. See [`SNAPSHOT_INTERVAL`].
+    last_snapshot_save: parking_lot::Mutex<Instant>,
+    /// Queue position: the smallest job id that might still be live. Every
+    /// queue entry below it has been claimed (deleted), so `claim_batch` can
+    /// seek past the tombstones instead of materializing the whole prefix.
+    /// See [`Self::claim_batch`] for the invariant that makes this sound.
+    claim_cursor: AtomicU64,
+    /// First job id of every `enqueue_many` transaction that has allocated
+    /// its ids but not yet committed (or aborted). `claim_batch` never moves
+    /// its cursor past the smallest of these: such an entry may commit
+    /// AFTER the claim's snapshot, so a window scan that found it empty
+    /// proves nothing. Ids are allocated and registered under this lock, and
+    /// the claim reads `next_job_id` under it too, so no allocation can slip
+    /// between the two reads. See [`Self::claim_bound`].
+    inflight_enqueues: parking_lot::Mutex<std::collections::BTreeSet<u64>>,
     /// Factory for the lazily-created cross-encoder reranker. Only ever
     /// consulted when `config.cross_encoder` is `On`; see
     /// [`Self::get_or_load_reranker`].
@@ -437,6 +464,39 @@ enum BatchFailure {
     Embed(rhypedb_embed::EmbedError),
 }
 
+/// What one `process_batch` call did. `model_load_failed` is true when at
+/// least one model group in THIS batch could not load its embedder (those
+/// jobs were re-enqueued) — the worker loop backs off on this, and only on
+/// this, rather than on the aggregate `model_error` flag: that flag is also
+/// set by a failed query-path load and is not cleared by a batch that embeds
+/// with an already-cached embedder, so keying the backoff on it would throttle
+/// a healthy model's backfill (up to `model_retry_max` per batch) whenever a
+/// DIFFERENT model is unavailable.
+struct BatchOutcome {
+    processed: usize,
+    model_load_failed: bool,
+}
+
+/// Job ids per `claim_batch` scan window. See [`Vectorizer::claim_batch`].
+const CLAIM_WINDOW: u64 = 256;
+
+/// The job id encoded in a queue-entry key (`q:` + big-endian `u64`).
+fn queue_entry_id(key: &[u8]) -> u64 {
+    let start = key.len() - 8;
+    u64::from_be_bytes(key[start..].try_into().expect("queue key ends in a u64"))
+}
+
+/// How often the worker persists HNSW snapshots while a backfill is in
+/// progress. A snapshot is a cold-start accelerator only (the index is
+/// rebuilt from the `v:` keyspace without one — see `rebuild_indexes` and the
+/// crash-fuzz harness), but writing one serializes the ENTIRE index to a temp
+/// file + rename, so doing it after every batch — 8× more often now that the
+/// default batch is 32, not 256 — would rewrite a large index continuously.
+/// The worker saves when this much time has passed since the last save AND
+/// something was indexed since, and always when the queue drains or the
+/// worker stops.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
+
 impl Vectorizer {
     pub fn new(
         storage: Arc<LsmTree>,
@@ -508,6 +568,11 @@ impl Vectorizer {
             model_error: parking_lot::Mutex::new(None),
             model_loaded: AtomicBool::new(false),
             next_retry_delay: parking_lot::Mutex::new(next_retry_delay),
+            next_retry_at: parking_lot::Mutex::new(None),
+            snapshots_dirty: AtomicBool::new(false),
+            last_snapshot_save: parking_lot::Mutex::new(Instant::now()),
+            claim_cursor: AtomicU64::new(0),
+            inflight_enqueues: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             reranker_loader: parking_lot::Mutex::new(default_reranker_loader()),
             reranker_error: parking_lot::Mutex::new(None),
             reranker_loaded: AtomicBool::new(false),
@@ -674,12 +739,11 @@ impl Vectorizer {
             })?;
         }
 
-        // Re-enqueue recoverable orphans (each writes a fresh queue entry, and
-        // re-asserts the Pending state). Idempotent: a later store_and_index for
-        // an already-indexed object just re-inserts the same object_id.
-        for job in to_enqueue {
-            self.enqueue(job)?;
-        }
+        // Re-enqueue recoverable orphans in one txn (each gets a fresh queue
+        // entry and its Pending state re-asserted). Idempotent: a later
+        // store_and_index for an already-indexed object just re-inserts the
+        // same object_id.
+        self.enqueue_many(&to_enqueue)?;
 
         Ok(())
     }
@@ -866,6 +930,20 @@ impl Vectorizer {
         for (index_key, index) in indexes.iter() {
             self.save_single_snapshot(index_key, index);
         }
+        self.snapshots_dirty.store(false, Ordering::SeqCst);
+        *self.last_snapshot_save.lock() = Instant::now();
+    }
+
+    /// Save snapshots if something was indexed since the last save and
+    /// either `force` (queue drained / shutting down) or [`SNAPSHOT_INTERVAL`]
+    /// has elapsed. See `SNAPSHOT_INTERVAL` for why not after every batch.
+    fn save_snapshots_if_due(&self, force: bool) {
+        if !self.snapshots_dirty.load(Ordering::SeqCst) {
+            return;
+        }
+        if force || self.last_snapshot_save.lock().elapsed() >= SNAPSHOT_INTERVAL {
+            self.save_snapshots();
+        }
     }
 
     fn save_single_snapshot(&self, index_key: &str, index: &QuantizedIndex) {
@@ -900,30 +978,75 @@ impl Vectorizer {
 
     /// Enqueue a vectorization job for an object.
     pub fn enqueue(&self, job: VectorizeJob) -> EngineResult<()> {
-        let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-        let key = KeyBuilder::queue_entry(job_id);
-        let value = job.serialize();
+        self.enqueue_many(std::slice::from_ref(&job))
+    }
 
-        // Set vector state to pending.
-        let type_id = self.type_ids[&job.type_name];
-        let field_key = format!("{}.{}", job.type_name, job.vector_field);
-        let field_id = self.field_ids[&field_key];
-        let state_key = KeyBuilder::vector_state(type_id, job.object_id, field_id);
+    /// Enqueue several jobs in ONE transaction (one commit, one WAL sync) —
+    /// each gets a fresh queue entry and its vector state re-asserted as
+    /// `Pending`. Used by the worker's model-unavailable re-enqueue and by the
+    /// open-time orphan reconcile, where a per-job commit would both cost a
+    /// sync per job and, worse, leave a half-processed batch stranded
+    /// (`Pending`, no queue row) if a later job's commit failed. All-or-nothing:
+    /// on `Err` no job was enqueued.
+    ///
+    /// A `WriteConflict` here means a foreground write (the server's
+    /// `enqueue_vectorize` for one of these objects) committed the same `s:`
+    /// key first — i.e. that object just got a NEWER job of its own. Retrying
+    /// re-asserts `Pending` and adds this (now redundant, harmless: a later
+    /// `store_and_index` is idempotent) entry; bounded so a pathological
+    /// conflict storm surfaces as an error rather than a hang.
+    pub fn enqueue_many(&self, jobs: &[VectorizeJob]) -> EngineResult<()> {
+        const MAX_CONFLICT_RETRIES: usize = 8;
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        // Allocate this txn's contiguous id range and register it as
+        // in-flight, atomically w.r.t. `claim_bound` (see `inflight_enqueues`).
+        let first_id = {
+            let mut inflight = self.inflight_enqueues.lock();
+            let first = self.next_job_id.fetch_add(jobs.len() as u64, Ordering::SeqCst);
+            inflight.insert(first);
+            first
+        };
+        struct Unregister<'a>(&'a Vectorizer, u64);
+        impl Drop for Unregister<'_> {
+            fn drop(&mut self) {
+                self.0.inflight_enqueues.lock().remove(&self.1);
+            }
+        }
+        let _unregister = Unregister(self, first_id);
 
-        let mut txn = self.storage.begin_txn();
-        self.storage
-            .put(&mut txn, &key, value)?;
-        self.storage.put(
-            &mut txn,
-            &state_key,
-            Bytes::from(vec![VectorState::Pending as u8]),
-        )?;
-        self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => crate::EngineError::WriteConflict,
-            other => crate::EngineError::Storage(other),
-        })?;
+        let mut attempt = 0;
+        loop {
+            let mut txn = self.storage.begin_txn();
+            for (i, job) in jobs.iter().enumerate() {
+                let job_id = first_id + i as u64;
+                let key = KeyBuilder::queue_entry(job_id);
+                self.storage.put(&mut txn, &key, job.serialize())?;
 
-        Ok(())
+                // Set vector state to pending.
+                let type_id = self.type_ids[&job.type_name];
+                let field_key = format!("{}.{}", job.type_name, job.vector_field);
+                let field_id = self.field_ids[&field_key];
+                let state_key = KeyBuilder::vector_state(type_id, job.object_id, field_id);
+                self.storage.put(
+                    &mut txn,
+                    &state_key,
+                    Bytes::from(vec![VectorState::Pending as u8]),
+                )?;
+            }
+            match self.storage.commit(&mut txn) {
+                Ok(_) => return Ok(()),
+                Err(rhypedb_storage::Error::WriteConflict) if attempt < MAX_CONFLICT_RETRIES => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(5 * attempt as u64));
+                }
+                Err(rhypedb_storage::Error::WriteConflict) => {
+                    return Err(crate::EngineError::WriteConflict)
+                }
+                Err(other) => return Err(crate::EngineError::Storage(other)),
+            }
+        }
     }
 
     /// Get the vectorization state of a specific vector field on an object.
@@ -998,22 +1121,28 @@ impl Vectorizer {
         *self.model_error.lock() = None;
         self.model_loaded.store(true, Ordering::SeqCst);
         *self.next_retry_delay.lock() = self.config.model_retry_initial;
+        *self.next_retry_at.lock() = None;
     }
 
+    /// Record a load failure: remember the message, schedule the next
+    /// permitted attempt `next_retry_delay` from now, and double that delay
+    /// (capped at `config.model_retry_max`) so consecutive failures back off
+    /// exponentially. Reset by [`Self::record_model_load_success`].
     fn record_model_load_failure(&self, message: &str) {
         *self.model_error.lock() = Some(message.to_string());
+        let mut delay = self.next_retry_delay.lock();
+        *self.next_retry_at.lock() = Some(Instant::now() + *delay);
+        *delay = (*delay * 2).min(self.config.model_retry_max);
     }
 
-    /// Delay to sleep before the NEXT model-load retry. Returns the current
-    /// backoff value, then doubles it (capped at `config.model_retry_max`)
-    /// for the following call, so consecutive failures back off
-    /// exponentially. Reset to `config.model_retry_initial` by
-    /// [`Self::record_model_load_success`].
-    fn backoff_delay(&self) -> Duration {
-        let mut guard = self.next_retry_delay.lock();
-        let delay = *guard;
-        *guard = (*guard * 2).min(self.config.model_retry_max);
-        delay
+    /// How long until the next model-load attempt is permitted (zero if one
+    /// is permitted now). The worker sleeps this long after a batch that hit
+    /// a load failure, so it wakes exactly when a retry is allowed.
+    fn time_until_next_retry(&self) -> Duration {
+        match *self.next_retry_at.lock() {
+            Some(at) => at.saturating_duration_since(Instant::now()),
+            None => Duration::ZERO,
+        }
     }
 
     /// Get the embedder for `model_name` from the shared cache, lazily
@@ -1032,6 +1161,17 @@ impl Vectorizer {
         model_name: &str,
     ) -> Result<&'a mut Box<dyn Embedder>, rhypedb_embed::EmbedError> {
         if !embedders.contains_key(model_name) {
+            // Backoff gate: a failure is in effect and its retry time hasn't
+            // come — refuse without touching the loader (which may be a
+            // network-bound download held under the embedders lock). Not a
+            // new failure, so the backoff is NOT escalated here.
+            let wait = self.time_until_next_retry();
+            if wait > Duration::ZERO {
+                let last = self.model_error().unwrap_or_default();
+                return Err(rhypedb_embed::EmbedError::Unavailable(format!(
+                    "{last} (next load attempt in {wait:.1?})"
+                )));
+            }
             let loader = self.embedder_loader.lock();
             match (loader)(model_name, &self.config.embed) {
                 Ok(embedder) => {
@@ -1096,35 +1236,100 @@ impl Vectorizer {
     }
 
     /// Process pending jobs using the shared embedder (for single-threaded use / tests).
+    /// Claim and embed one batch. Returns the number of objects indexed —
+    /// `Ok(0)` means the queue was empty. If the batch's model could not be
+    /// loaded and NOTHING was indexed, returns `Err(ModelUnavailable)` (the
+    /// jobs were re-enqueued, not lost) rather than an `Ok(0)` a host
+    /// looping "until 0" could not tell apart from an empty queue — an
+    /// embedded caller should back off (see `VectorizerConfig::model_retry_*`
+    /// and [`Self::model_error`]) and try again later.
     pub fn process_pending(&self) -> EngineResult<usize> {
         let batch = self.claim_batch()?;
         if batch.is_empty() {
             return Ok(0);
         }
-        self.process_batch(batch)
+        let outcome = self.process_batch(batch)?;
+        if outcome.model_load_failed && outcome.processed == 0 {
+            return Err(crate::EngineError::ModelUnavailable(
+                self.model_error().unwrap_or_else(|| "model failed to load".into()),
+            ));
+        }
+        Ok(outcome.processed)
     }
 
     /// Atomically claim a batch of jobs from the queue.
     /// Deletes queue entries upfront so parallel workers don't double-claim.
+    /// The smallest job id that might still be uncommitted: the lowest
+    /// in-flight `enqueue_many` range start, else `next_job_id`. Every id
+    /// below the returned value is already durably committed (or was
+    /// claimed), so a snapshot taken AFTER this call sees all of them.
+    fn claim_bound(&self) -> u64 {
+        let inflight = self.inflight_enqueues.lock();
+        let next = self.next_job_id.load(Ordering::SeqCst);
+        inflight.iter().next().copied().unwrap_or(next).min(next)
+    }
+
+    /// Claim the next `config.batch_size` jobs (lowest ids first).
+    ///
+    /// The queue is scanned in fixed windows of [`CLAIM_WINDOW`] job ids
+    /// starting at `claim_cursor`, each window an EXACT prefix scan (the key
+    /// is `q:` + big-endian `u64`, so a 7-byte id prefix is a 256-id range),
+    /// rather than materializing the whole `q:` prefix per claim — which made
+    /// a backfill of N jobs O(N²/batch) and, worse, walked every tombstone of
+    /// every prior claim each time. Windows are exact merges across layers
+    /// (no per-layer cap), so a live entry can never be skipped; a window
+    /// that yields nothing live is finished for good (ids only grow, and
+    /// entries are only ever deleted by this method, lowest-first), so the
+    /// cursor moves past it. The walk stops at [`Self::claim_bound`]: nothing
+    /// COMMITTED can exist at or beyond it, and an enqueue still in flight
+    /// below `next_job_id` holds the bound back so its window is re-scanned
+    /// next time. After a reopen the cursor restarts at 0 and walks the old
+    /// tombstones once.
     fn claim_batch(&self) -> EngineResult<Vec<(VectorizeJob, u64)>> {
         let _lock = self.claim_mutex.lock();
 
+        // Read the bound BEFORE taking the snapshot: every id below it was
+        // committed before now (hence visible in the snapshot) — see
+        // `claim_bound`. Reading it after `begin_txn` would let an enqueue
+        // commit between the snapshot and the read, invisible yet below the
+        // bound, and the cursor would walk past it.
+        let bound = self.claim_bound();
         let mut txn = self.storage.begin_txn();
-        let prefix = KeyBuilder::queue_prefix();
-        let entries = self.storage.scan_prefix(&txn, &prefix)?;
-
-        if entries.is_empty() {
-            return Ok(Vec::new());
+        let mut jobs: Vec<(Bytes, VectorizeJob)> = Vec::new();
+        let mut cursor = self.claim_cursor.load(Ordering::SeqCst);
+        while cursor < bound && jobs.len() < self.config.batch_size {
+            let window = cursor / CLAIM_WINDOW;
+            let entries = self
+                .storage
+                .scan_prefix(&txn, &KeyBuilder::queue_window_prefix(window))?;
+            let mut last_live: Option<u64> = None;
+            for (key, value) in entries {
+                let id = queue_entry_id(&key);
+                if id < cursor {
+                    continue;
+                }
+                if id >= bound || jobs.len() >= self.config.batch_size {
+                    // At/after the bound an in-flight enqueue may still land
+                    // below this id; leave everything from here for the next
+                    // claim so the cursor never passes it.
+                    break;
+                }
+                if let Some(job) = VectorizeJob::deserialize(&value) {
+                    jobs.push((key, job));
+                    last_live = Some(id);
+                }
+            }
+            cursor = match last_live {
+                // Claimed through `last_live`; anything after it in this
+                // window (or later windows) is still live for the next claim.
+                Some(id) if jobs.len() >= self.config.batch_size => id + 1,
+                // Took everything live in this window; move to the next.
+                _ => (window + 1) * CLAIM_WINDOW,
+            };
         }
-
-        let jobs: Vec<(Bytes, VectorizeJob)> = entries
-            .into_iter()
-            .filter_map(|(key, value)| {
-                let job = VectorizeJob::deserialize(&value)?;
-                Some((key, job))
-            })
-            .take(self.config.batch_size)
-            .collect();
+        // A window walk that found nothing may still have advanced the
+        // cursor past dead windows — persist that even on an empty claim.
+        self.claim_cursor.store(cursor.min(bound), Ordering::SeqCst);
 
         if jobs.is_empty() {
             return Ok(Vec::new());
@@ -1159,7 +1364,7 @@ impl Vectorizer {
     fn process_batch(
         &self,
         jobs: Vec<(VectorizeJob, u64)>,
-    ) -> EngineResult<usize> {
+    ) -> EngineResult<BatchOutcome> {
         // Group by model.
         let mut jobs_by_model: HashMap<String, Vec<VectorizeJob>> = HashMap::new();
         for (job, _) in jobs {
@@ -1170,28 +1375,38 @@ impl Vectorizer {
         }
 
         let mut processed = 0;
+        let mut model_load_failed = false;
 
         for (model_name, batch_jobs) in &jobs_by_model {
-            let texts: Vec<String> = batch_jobs
+            // Pair each job with its source text, DROPPING jobs whose text
+            // can't be read (object gone, type unresolvable, source not a
+            // string). Everything below iterates these pairs, never
+            // `batch_jobs`, so a dropped job can't shift its neighbours'
+            // embeddings onto the wrong objects. A dropped job keeps its
+            // `Pending` state with no queue row; the open-time
+            // `reconcile_pending_jobs` cleans that up.
+            let snapshot = self.storage.read_snapshot();
+            let with_text: Vec<(&VectorizeJob, String)> = batch_jobs
                 .iter()
                 .filter_map(|job| {
                     let type_id = self.type_ids.get(&job.type_name)?;
                     let obj_key = KeyBuilder::object(*type_id, job.object_id);
-                    let snapshot = self.storage.read_snapshot();
                     let data = self.storage.get_at(snapshot, &obj_key).ok()??;
                     let fields = deserialize_fields(&data);
                     match fields.get(&job.source_field)? {
-                        Value::String(s) => Some(s.clone()),
+                        Value::String(s) => Some((job, s.clone())),
                         _ => None,
                     }
                 })
                 .collect();
 
-            if texts.is_empty() {
+            if with_text.is_empty() {
                 continue;
             }
 
-            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+            let text_refs: Vec<&str> = with_text.iter().map(|(_, s)| s.as_str()).collect();
+            let jobs_with_text: Vec<VectorizeJob> =
+                with_text.iter().map(|(job, _)| (*job).clone()).collect();
 
             // Lock the shared embedder only for the embed; release before the
             // insert/commit phase so concurrent query-path embeds don't block.
@@ -1211,25 +1426,45 @@ impl Vectorizer {
                     eprintln!(
                         "vectorizer: model '{model_name}' unavailable, re-enqueuing \
                          {} job(s): {e}",
-                        batch_jobs.len()
+                        jobs_with_text.len()
                     );
-                    for job in batch_jobs {
-                        self.enqueue(job.clone())?;
+                    // One txn for the whole group. On a hard storage error do
+                    // NOT `?` out: that would strand every group not yet
+                    // iterated (Pending, no queue row) as well. Log, and let
+                    // the open-time reconcile repair this group's orphans —
+                    // the other groups still get their turn.
+                    if let Err(e) = self.enqueue_many(&jobs_with_text) {
+                        eprintln!(
+                            "vectorizer: failed to re-enqueue {} job(s) for model \
+                             '{model_name}' (they will be recovered at next open): {e}",
+                            jobs_with_text.len()
+                        );
                     }
+                    model_load_failed = true;
                     continue;
                 }
                 Err(BatchFailure::Embed(e)) => {
-                    self.mark_batch_failed(batch_jobs, &format!("{e}"))?;
+                    self.mark_batch_failed(&jobs_with_text, &format!("{e}"))?;
                     continue;
                 }
             };
 
-            for (emb_idx, job) in batch_jobs.iter().enumerate() {
-                if emb_idx >= embeddings.len() {
-                    break;
-                }
+            if embeddings.len() != jobs_with_text.len() {
+                // An embedder must return exactly one vector per input; a
+                // short/long answer would otherwise pair vectors with the
+                // wrong objects. Treat it as a batch-level embed failure.
+                self.mark_batch_failed(
+                    &jobs_with_text,
+                    &format!(
+                        "embedder returned {} vector(s) for {} text(s)",
+                        embeddings.len(),
+                        jobs_with_text.len()
+                    ),
+                )?;
+                continue;
+            }
 
-                let embedding = &embeddings[emb_idx];
+            for (job, embedding) in jobs_with_text.iter().zip(embeddings.iter()) {
                 self.store_and_index(
                     &job.type_name,
                     job.object_id,
@@ -1240,7 +1475,10 @@ impl Vectorizer {
             }
         }
 
-        Ok(processed)
+        if processed > 0 {
+            self.snapshots_dirty.store(true, Ordering::SeqCst);
+        }
+        Ok(BatchOutcome { processed, model_load_failed })
     }
 
     /// Search a vector index with a text query (encodes text first).
@@ -1799,8 +2037,9 @@ impl Vectorizer {
         Ok(rows.len())
     }
 
-    /// Start background worker threads for vectorization.
-    /// Each worker loads its own embedding model (~300MB per worker).
+    /// Start background worker threads for vectorization. Workers share one
+    /// lazily-loaded embedder per model name (`embedders`), so extra workers
+    /// add parallel claim/commit work, not extra model copies.
     pub fn start_worker(self: &Arc<Self>, num_workers: usize) {
         if self.running.swap(true, Ordering::SeqCst) {
             return;
@@ -1824,23 +2063,29 @@ impl Vectorizer {
                         };
 
                         if batch.is_empty() {
+                            // Queue drained: persist whatever the last batches
+                            // indexed, then idle.
+                            vectorizer.save_snapshots_if_due(true);
                             interruptible_sleep(&vectorizer.running, Duration::from_millis(100));
                             continue;
                         }
 
                         match vectorizer.process_batch(batch) {
-                            Ok(_) => {
-                                vectorizer.save_snapshots();
-                                // A model failed to load somewhere in this batch;
-                                // its jobs were re-enqueued (not lost). Back off
-                                // before the next claim so a persistently
+                            Ok(outcome) => {
+                                vectorizer.save_snapshots_if_due(false);
+                                // A model failed to load in THIS batch; its jobs
+                                // were re-enqueued (not lost). Sleep until the
+                                // next load attempt is permitted so a persistently
                                 // unavailable model doesn't spin the worker hot.
-                                if let Some(err) = vectorizer.model_error() {
+                                // (See `BatchOutcome` for why this is not keyed on
+                                // `model_error()`.)
+                                if outcome.model_load_failed {
+                                    let err = vectorizer.model_error().unwrap_or_default();
+                                    let delay = vectorizer.time_until_next_retry();
                                     eprintln!(
                                         "vectorizer worker {worker_id}: model unavailable \
-                                         ({err}); backing off before retrying"
+                                         ({err}); retrying in {delay:.1?}"
                                     );
-                                    let delay = vectorizer.backoff_delay();
                                     interruptible_sleep(&vectorizer.running, delay);
                                 }
                             }
@@ -3414,6 +3659,16 @@ mod tests {
     // "recovering", so the fail-soft retry logic is exercised deterministically
     // and without touching the network.
 
+    /// A config whose model-load backoff never delays, for tests that want
+    /// the very next load attempt to be permitted immediately.
+    fn no_backoff_config() -> VectorizerConfig {
+        VectorizerConfig {
+            model_retry_initial: Duration::ZERO,
+            model_retry_max: Duration::ZERO,
+            ..VectorizerConfig::default()
+        }
+    }
+
     /// A `FailingLoader`: fails the first `fail_times` calls with
     /// `EmbedError::Unavailable`, then returns a `MockEmbedder` on every call
     /// after that.
@@ -3445,7 +3700,14 @@ mod tests {
     fn model_load_failure_reenqueues_jobs_and_recovers_on_retry() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
-        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema,
+            type_ids,
+            field_ids,
+            no_backoff_config(),
+        )
+        .unwrap();
 
         store_object(&storage, 1, 1, "doc one");
         v.enqueue(VectorizeJob {
@@ -3462,8 +3724,14 @@ mod tests {
 
         // First attempt: the load fails. The job must be re-enqueued (left
         // Pending), NOT marked Failed — the model is at fault, not the input.
-        let processed = v.process_pending().unwrap();
-        assert_eq!(processed, 0, "nothing embeds while the model is unavailable");
+        // And the caller is TOLD (not handed an `Ok(0)` indistinguishable from
+        // an empty queue).
+        let err = v.process_pending().unwrap_err();
+        assert!(
+            matches!(err, crate::EngineError::ModelUnavailable(_)),
+            "nothing embeds while the model is unavailable, and the caller must \
+             be able to tell: {err:?}"
+        );
         assert!(v.model_error().is_some(), "a load failure must set model_error");
         assert!(!v.model_loaded(), "no model has loaded successfully yet");
         assert_eq!(
@@ -3490,13 +3758,16 @@ mod tests {
     fn claim_batch_honours_configured_batch_size() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        // A NON-default size, so this proves the configured value is what
+        // `claim_batch` uses (32 is the default and would pass vacuously).
         let config = VectorizerConfig {
-            batch_size: 32,
+            batch_size: 7,
             ..VectorizerConfig::default()
         };
+        assert_ne!(config.batch_size, VectorizerConfig::default().batch_size);
         let v = Vectorizer::with_config(Arc::clone(&storage), schema, type_ids, field_ids, config)
             .unwrap();
-        assert_eq!(v.config().batch_size, 32);
+        assert_eq!(v.config().batch_size, 7);
         inject_mocks(&v, vec![1.0, 0.0, 0.0, 0.0]);
 
         for id in 1..=100u64 {
@@ -3513,8 +3784,207 @@ mod tests {
         assert_eq!(v.status().pending, 100);
 
         let processed = v.process_pending().unwrap();
-        assert_eq!(processed, 32, "claim_batch must claim exactly config.batch_size jobs");
-        assert_eq!(v.status().pending, 68, "the rest stay queued for the next claim");
+        assert_eq!(processed, 7, "claim_batch must claim exactly config.batch_size jobs");
+        assert_eq!(v.status().pending, 93, "the rest stay queued for the next claim");
+    }
+
+    /// The worker's backoff is keyed on whether THIS batch hit a model-load
+    /// failure, not on the aggregate `model_error` flag. Here `model_error`
+    /// is in effect (a failed query-path load) but the batch's model is
+    /// already cached, so the batch embeds normally and must NOT report a
+    /// load failure — otherwise a healthy model's backfill would sleep up to
+    /// `model_retry_max` after every batch.
+    #[test]
+    fn cached_embedder_batch_does_not_report_load_failure_while_model_error_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+
+        // "mock" is cached; any OTHER model can never load.
+        inject_mocks(&v, vec![1.0, 0.0, 0.0, 0.0]);
+        *v.embedder_loader.lock() = always_failing_loader();
+        let mut scratch = HashMap::new();
+        assert!(v.get_or_load_embedder(&mut scratch, "other-model").is_err());
+        assert!(v.model_error().is_some(), "precondition: aggregate flag is set");
+
+        store_object(&storage, 1, 1, "doc one");
+        v.enqueue(VectorizeJob {
+            type_name: "Doc".into(),
+            object_id: 1,
+            source_field: "body".into(),
+            vector_field: "embedding".into(),
+            model: "mock".into(),
+        })
+        .unwrap();
+
+        let batch = v.claim_batch().unwrap();
+        let outcome = v.process_batch(batch).unwrap();
+        assert_eq!(outcome.processed, 1);
+        assert!(
+            !outcome.model_load_failed,
+            "a batch served from the cached embedder must not trigger the backoff"
+        );
+        assert_eq!(v.get_state("Doc", 1, "embedding").unwrap(), VectorState::Indexed);
+
+        // And the converse: a batch whose model genuinely can't load reports it.
+        store_object(&storage, 1, 2, "doc two");
+        v.enqueue(VectorizeJob {
+            type_name: "Doc".into(),
+            object_id: 2,
+            source_field: "body".into(),
+            vector_field: "embedding".into(),
+            model: "other-model".into(),
+        })
+        .unwrap();
+        let batch = v.claim_batch().unwrap();
+        let outcome = v.process_batch(batch).unwrap();
+        assert_eq!(outcome.processed, 0);
+        assert!(outcome.model_load_failed);
+        assert_eq!(v.get_state("Doc", 2, "embedding").unwrap(), VectorState::Pending);
+    }
+
+    /// After a load failure, the next attempt is refused WITHOUT calling the
+    /// loader until the backoff elapses — on the query path too, so a
+    /// `.similar` while the model is known-bad doesn't re-run a download
+    /// under the shared embedders lock on every call.
+    #[test]
+    fn model_load_retry_is_gated_by_backoff_on_query_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let config = VectorizerConfig {
+            model_retry_initial: Duration::from_secs(60),
+            model_retry_max: Duration::from_secs(60),
+            ..VectorizerConfig::default()
+        };
+        let v = Vectorizer::with_config(Arc::clone(&storage), schema, type_ids, field_ids, config)
+            .unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        *v.embedder_loader.lock() =
+            Box::new(move |_m: &str, _o: &rhypedb_embed::EmbedOptions| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Err(rhypedb_embed::EmbedError::Unavailable("simulated".into()))
+            });
+
+        for _ in 0..3 {
+            let err = v
+                .search_text("Doc", "embedding", "q", 5, 64, false, None)
+                .unwrap_err();
+            assert!(matches!(err, crate::EngineError::ModelUnavailable(_)), "{err:?}");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the FIRST query may attempt the load; the rest are refused by the backoff gate"
+        );
+        assert!(v.time_until_next_retry() > Duration::ZERO);
+        let msg = v.model_error().unwrap();
+        assert!(msg.contains("simulated"), "gate keeps the original failure message: {msg}");
+    }
+
+    /// `claim_batch` seeks from a cursor past already-claimed (tombstoned)
+    /// entries. Draining a queue in small batches must yield every job exactly
+    /// once, in id order — including across a reopen, where the cursor
+    /// restarts at 0 above a run of tombstones (the full-scan fallback).
+    #[test]
+    fn claim_batch_drains_in_order_across_tombstones_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let config = VectorizerConfig { batch_size: 7, ..VectorizerConfig::default() };
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema.clone(),
+            type_ids.clone(),
+            field_ids.clone(),
+            config.clone(),
+        )
+        .unwrap();
+        for id in 1..=50u64 {
+            v.enqueue(VectorizeJob {
+                type_name: "Doc".into(),
+                object_id: id,
+                source_field: "body".into(),
+                vector_field: "embedding".into(),
+                model: "mock".into(),
+            })
+            .unwrap();
+        }
+
+        let mut claimed: Vec<u64> = Vec::new();
+        // Claim 3 batches (21 jobs) on the first instance...
+        for _ in 0..3 {
+            let b = v.claim_batch().unwrap();
+            assert_eq!(b.len(), 7);
+            claimed.extend(b.iter().map(|(_, oid)| *oid));
+        }
+        drop(v);
+
+        // ...then reopen: the new instance's cursor starts at 0, below 21
+        // tombstones, and must still find the remaining 29 live entries.
+        let v2 = Vectorizer::with_config(Arc::clone(&storage), schema, type_ids, field_ids, config)
+            .unwrap();
+        loop {
+            let b = v2.claim_batch().unwrap();
+            if b.is_empty() {
+                break;
+            }
+            claimed.extend(b.iter().map(|(_, oid)| *oid));
+        }
+        assert_eq!(claimed, (1..=50u64).collect::<Vec<_>>(), "every job once, in order");
+        assert!(v2.claim_batch().unwrap().is_empty());
+    }
+
+    /// An enqueue that has allocated ids but not committed must hold the
+    /// claim cursor back: otherwise a claim whose snapshot predates that
+    /// commit would scan the window empty and skip it for good.
+    #[test]
+    fn claim_batch_never_passes_an_inflight_enqueue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let job = |id: u64| VectorizeJob {
+            type_name: "Doc".into(),
+            object_id: id,
+            source_field: "body".into(),
+            vector_field: "embedding".into(),
+            model: "mock".into(),
+        };
+        v.enqueue(job(1)).unwrap();
+        v.enqueue(job(2)).unwrap();
+
+        // Simulate a foreground enqueue that allocated id 3 but has not yet
+        // committed, then more enqueues that DID commit after it.
+        let inflight_id = {
+            let mut inflight = v.inflight_enqueues.lock();
+            let id = v.next_job_id.fetch_add(1, Ordering::SeqCst);
+            inflight.insert(id);
+            id
+        };
+        v.enqueue(job(4)).unwrap();
+        v.enqueue(job(5)).unwrap();
+
+        // The claim sees 1 and 2 (committed, below the in-flight id)...
+        let got: Vec<u64> = v.claim_batch().unwrap().iter().map(|(_, o)| *o).collect();
+        assert_eq!(got, vec![1, 2]);
+        // ...and must not have advanced past the in-flight id, even though 4
+        // and 5 are committed beyond it.
+        assert!(
+            v.claim_cursor.load(Ordering::SeqCst) <= inflight_id,
+            "cursor {} passed in-flight id {inflight_id}",
+            v.claim_cursor.load(Ordering::SeqCst)
+        );
+        let got: Vec<u64> = v.claim_batch().unwrap().iter().map(|(_, o)| *o).collect();
+        assert!(got.is_empty(), "nothing claimable yet: {got:?}");
+
+        // The in-flight enqueue lands (out of id order w.r.t. 4 and 5).
+        let mut txn = storage.begin_txn();
+        storage.put(&mut txn, &KeyBuilder::queue_entry(inflight_id), job(3).serialize()).unwrap();
+        storage.commit(&mut txn).unwrap();
+        v.inflight_enqueues.lock().remove(&inflight_id);
+
+        let got: Vec<u64> = v.claim_batch().unwrap().iter().map(|(_, o)| *o).collect();
+        assert_eq!(got, vec![3, 4, 5], "late commit is claimed, in id order, nothing lost");
     }
 
     #[test]
