@@ -109,6 +109,17 @@ fn validate_schema(schema: &Schema) -> SchemaResult<()> {
                 )));
             }
 
+            // `@fulltext` tokenizes a String value into an inverted index;
+            // there is nothing to tokenize on any other field type.
+            if field.fulltext().is_some()
+                && !matches!(field.field_type, FieldType::Scalar(ScalarType::String))
+            {
+                return Err(SchemaError::Validation(format!(
+                    "@fulltext on '{}.{}' requires a String field",
+                    type_def.name, field.name
+                )));
+            }
+
             // Validate @index (the HNSW vector-index config directive). It only
             // makes sense on a Vector field — the engine builds an HNSW index
             // for every Vector field and reads this directive for the metric /
@@ -552,7 +563,82 @@ impl<'a> Parser<'a> {
                 }))
             }
 
+            "fulltext" => {
+                let mut def = FulltextDef::default();
+                self.skip_whitespace();
+                // Bare `@fulltext` takes every default; `@fulltext(...)`
+                // carries `key: value` pairs.
+                if self.peek() != Some('(') {
+                    return Ok(Directive::Fulltext(def));
+                }
+                self.advance();
+                let mut seen_analyzer = false;
+                let mut seen_positions = false;
+                loop {
+                    self.skip_whitespace();
+                    if self.peek() == Some(')') {
+                        self.advance();
+                        break;
+                    }
+                    if seen_analyzer || seen_positions {
+                        self.expect(',')?;
+                    }
+                    let key = self.parse_ident()?;
+                    self.expect(':')?;
+                    match key.as_str() {
+                        "analyzer" => {
+                            if seen_analyzer {
+                                return Err(self.error(
+                                    "duplicate @fulltext parameter: analyzer".into(),
+                                ));
+                            }
+                            seen_analyzer = true;
+                            let name = self.parse_string_value()?;
+                            if !FulltextDef::KNOWN_ANALYZERS.contains(&name.as_str()) {
+                                return Err(self.error(format!(
+                                    "unknown @fulltext analyzer: \"{name}\" (known: {})",
+                                    FulltextDef::KNOWN_ANALYZERS.join(", ")
+                                )));
+                            }
+                            def.analyzer = name;
+                        }
+                        "positions" => {
+                            if seen_positions {
+                                return Err(self.error(
+                                    "duplicate @fulltext parameter: positions".into(),
+                                ));
+                            }
+                            seen_positions = true;
+                            def.positions = self.parse_bool_value()?;
+                        }
+                        _ => {
+                            return Err(
+                                self.error(format!("unknown @fulltext parameter: {key}"))
+                            )
+                        }
+                    }
+                }
+                Ok(Directive::Fulltext(def))
+            }
+
             _ => Err(self.error(format!("unknown directive: @{name}"))),
+        }
+    }
+
+    /// A bare `true` / `false` literal (directive parameter values).
+    fn parse_bool_value(&mut self) -> SchemaResult<bool> {
+        self.skip_whitespace();
+        // A non-identifier start (e.g. a quoted "yes") gets the same clear
+        // message instead of a bare "expected identifier".
+        if !self.peek().is_some_and(|c| c.is_alphabetic()) {
+            let found = self.peek().map(|c| c.to_string()).unwrap_or_default();
+            return Err(self.error(format!("expected `true` or `false`, found `{found}`")));
+        }
+        let word = self.parse_ident()?;
+        match word.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(self.error(format!("expected `true` or `false`, found `{word}`"))),
         }
     }
 
@@ -1095,6 +1181,109 @@ mod tests {
             "#,
         );
         assert!(matches!(result, Err(SchemaError::Validation(_))));
+    }
+
+    #[test]
+    fn parse_fulltext_directive_defaults_and_explicit() {
+        let schema = parse_schema(
+            r#"
+            type Post {
+                title: String @fulltext
+                body: String @fulltext(analyzer: "simple", positions: false)
+                slug: String @unique @fulltext(positions: true)
+            }
+            "#,
+        )
+        .unwrap();
+        let post = schema.get_type("Post").unwrap();
+
+        let title = post.get_field("title").unwrap().fulltext().unwrap();
+        assert_eq!(title, &FulltextDef::default());
+        assert_eq!(title.analyzer, "simple");
+        assert!(title.positions);
+
+        let body = post.get_field("body").unwrap().fulltext().unwrap();
+        assert_eq!(body.analyzer, "simple");
+        assert!(!body.positions);
+
+        // Stacks with other directives; a partial parameter list keeps the
+        // other defaults.
+        let slug = post.get_field("slug").unwrap();
+        assert!(slug.is_unique());
+        assert_eq!(slug.fulltext().unwrap(), &FulltextDef::default());
+
+        // A field without the directive reports none.
+        assert!(post.get_field("title").unwrap().vectorize().is_none());
+    }
+
+    #[test]
+    fn fulltext_bare_and_explicit_defaults_compare_equal() {
+        let bare = parse_schema(r#"type P { t: String @fulltext }"#).unwrap();
+        let explicit =
+            parse_schema(r#"type P { t: String @fulltext(analyzer: "simple", positions: true) }"#)
+                .unwrap();
+        assert_eq!(bare, explicit);
+    }
+
+    #[test]
+    fn reject_fulltext_on_non_string_field() {
+        for sdl in [
+            r#"type P { n: i64 @fulltext }"#,
+            r#"type P { b: Bytes @fulltext }"#,
+            r#"type P { j: Json @fulltext }"#,
+            r#"type P { v: Vector<4> @fulltext }"#,
+            r#"type P { r: P @fulltext }"#,
+            r#"type P { r: [P] @fulltext }"#,
+        ] {
+            let err = parse_schema(sdl).unwrap_err();
+            match err {
+                SchemaError::Validation(msg) => {
+                    assert!(msg.contains("@fulltext"), "{sdl}: {msg}");
+                    assert!(msg.contains("requires a String field"), "{sdl}: {msg}");
+                }
+                other => panic!("{sdl}: expected Validation error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn reject_fulltext_bad_parameters() {
+        // Unknown analyzer names the known set.
+        let err = parse_schema(r#"type P { t: String @fulltext(analyzer: "english") }"#)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown @fulltext analyzer"), "{msg}");
+        assert!(msg.contains("simple"), "{msg}");
+
+        // Unknown parameter.
+        let err = parse_schema(r#"type P { t: String @fulltext(stemming: true) }"#).unwrap_err();
+        assert!(err.to_string().contains("unknown @fulltext parameter: stemming"));
+
+        // positions must be a bool literal.
+        let err = parse_schema(r#"type P { t: String @fulltext(positions: "yes") }"#).unwrap_err();
+        assert!(err.to_string().contains("expected `true` or `false`"), "{err}");
+        let err = parse_schema(r#"type P { t: String @fulltext(positions: yes) }"#).unwrap_err();
+        assert!(err.to_string().contains("expected `true` or `false`"), "{err}");
+
+        // Duplicates.
+        let err = parse_schema(
+            r#"type P { t: String @fulltext(positions: true, positions: false) }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate @fulltext parameter: positions"));
+        let err = parse_schema(
+            r#"type P { t: String @fulltext(analyzer: "simple", analyzer: "simple") }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate @fulltext parameter: analyzer"));
+
+        // Empty parens is a syntax error (the bare form has no parens).
+        assert!(parse_schema(r#"type P { t: String @fulltext( }"#).is_err());
+        // Missing comma between parameters.
+        assert!(
+            parse_schema(r#"type P { t: String @fulltext(analyzer: "simple" positions: true) }"#)
+                .is_err()
+        );
     }
 
     #[test]

@@ -130,6 +130,26 @@ On a scalar field, builds a secondary index so `filter` queries on that field do
 year: i64 @indexed
 ```
 
+### `@fulltext` / `@fulltext(analyzer: "simple", positions: false)`
+
+On a `String` field, builds a **full-text inverted index** so the field can be searched by keyword with `Type.matches(.field, "terms", k: N)` (see [Queries → Full-text search](queries.md#full-text-search--matchesfield-query-k-n)). The index is maintained synchronously inside each object's transaction, like `@unique` and `@indexed`, so it is never stale and survives a crash exactly as the object does.
+
+```
+type Post {
+    title: String @fulltext
+    body:  String @fulltext(analyzer: "simple", positions: false)
+}
+```
+
+Parameters (both optional):
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `analyzer` | `"simple"` | How text is split into terms. `simple`: Unicode word segmentation, lowercase, diacritics folded to ASCII (`Café` → `cafe`), no stemming. The analyzer name is part of the index; changing it rebuilds the index. |
+| `positions` | `true` | Store term positions. Required for phrase queries (`"distributed consensus"`); costs roughly the size of the text again. `positions: false` halves the index and makes a phrase query on the field an error. |
+
+`@fulltext` stacks with `@unique` and `@indexed`. It is rejected on any non-`String` field. Substring matching without an index is a separate predicate: `.filter(.title.contains("invoice"))` works on every `String` field.
+
 ### `@on_delete(policy)`
 
 On a relationship, declares what happens to the link (and possibly the target) when an object is deleted. Policies:

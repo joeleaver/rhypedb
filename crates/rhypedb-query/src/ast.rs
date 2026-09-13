@@ -109,6 +109,10 @@ pub enum Predicate {
         value: Literal,
     },
 
+    /// `.field.contains("needle")` — case-sensitive substring match on a
+    /// `String` field. Never index-eligible; evaluated in memory.
+    Contains { field_path: String, needle: String },
+
     /// `pred AND pred`
     And(Box<Predicate>, Box<Predicate>),
 

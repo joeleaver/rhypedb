@@ -51,6 +51,12 @@ rand = "0.9"
 thiserror = "2"
 tempfile = "3"
 sha2 = "0.10"
+# Full-text analyzer (`@fulltext`, simple analyzer): UAX#29 word segmentation
+# + NFKD decomposition for diacritic folding. Both are pure-Rust, dependency-free
+# table crates, always on (the analyzer runs in every build, including
+# --no-default-features — never reach for fastembed's tokenizers here).
+unicode-segmentation = "1.12"
+unicode-normalization = "0.1"
 # The one net-new asymmetric-crypto dep (P4 data-plane authz): the engine
 # verifies jkbase-Auth EdDSA JWTs offline against a per-project public key.
 # Matches the issuer side (jkbase jkbase-control/src/jose.rs) at 2.2.0.

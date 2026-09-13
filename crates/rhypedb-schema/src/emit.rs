@@ -105,6 +105,16 @@ fn emit_directive(out: &mut String, d: &Directive) {
                 v.source_field, v.model
             );
         }
+        Directive::Fulltext(f) => {
+            // Defaults resolve at parse time, so the full explicit form always
+            // re-parses to the same `FulltextDef`; emit it explicitly rather
+            // than guessing which parameters the author spelled out.
+            let _ = write!(
+                out,
+                "@fulltext(analyzer: \"{}\", positions: {})",
+                f.analyzer, f.positions
+            );
+        }
     }
 }
 
@@ -213,12 +223,27 @@ mod tests {
             }
 
             type Post {
-                title: String @indexed
+                title: String @indexed @fulltext
+                body: String @fulltext(analyzer: "simple", positions: false)
                 author: User @on_delete(deny)
                 vec: Vector<8>
             }
             "#,
         );
+    }
+
+    #[test]
+    fn fulltext_directive_round_trips_every_spelling() {
+        // Bare, partial, and explicit forms all resolve to one FulltextDef and
+        // survive parse → emit → parse; the emitted text is the explicit form.
+        let s = assert_round_trips(r#"type T { t: String @fulltext }"#);
+        let emitted = emit_schema(&s);
+        assert!(
+            emitted.contains(r#"@fulltext(analyzer: "simple", positions: true)"#),
+            "{emitted}"
+        );
+        assert_round_trips(r#"type T { t: String @fulltext(positions: false) }"#);
+        assert_round_trips(r#"type T { t: String @unique @fulltext(analyzer: "simple") @indexed }"#);
     }
 
     #[test]

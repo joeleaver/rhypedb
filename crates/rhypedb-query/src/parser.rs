@@ -22,6 +22,7 @@ use crate::error::{QueryError, QueryResult};
 ///           | "offset(" INT ")"
 ///           | IDENT                          (traverse)
 /// predicate = "." FIELD_PATH OP literal
+///           | "." FIELD_PATH ".contains(" STRING ")"
 /// object    = "{" (IDENT ":" literal ",")* "}"
 /// literal   = STRING | INT | FLOAT | "true" | "false" | "null"
 /// ```
@@ -409,6 +410,12 @@ impl<'a> Parser<'a> {
             if let Some(ch) = self.peek() {
                 if ch.is_alphabetic() || ch == '_' {
                     let next = self.parse_ident()?;
+                    // A `.contains(` segment is the predicate method, not part
+                    // of the path — stop here and let the atom parser take it.
+                    if next == "contains" && self.peek() == Some('(') {
+                        self.pos = saved;
+                        break;
+                    }
                     // Check if the next thing is an operator — if so, this was the field path.
                     self.skip_ws();
                     let ahead = &self.input[self.pos..];
@@ -418,6 +425,7 @@ impl<'a> Parser<'a> {
                         || ahead.starts_with(">=")
                         || ahead.starts_with('<')
                         || ahead.starts_with('>')
+                        || ahead.starts_with(".contains(")
                     {
                         path = format!("{path}.{next}");
                     } else {
@@ -436,6 +444,21 @@ impl<'a> Parser<'a> {
         }
 
         self.skip_ws();
+        // `.field.contains("needle")` — the substring predicate method.
+        if self.input[self.pos..].starts_with(".contains(") {
+            self.pos += ".contains(".len();
+            self.skip_ws();
+            if self.peek() != Some('"') {
+                return Err(self.error("contains() takes a string literal"));
+            }
+            let needle = self.parse_string_literal()?;
+            self.skip_ws();
+            self.expect_char(')')?;
+            return Ok(Predicate::Contains {
+                field_path: path,
+                needle,
+            });
+        }
         let op = self.parse_compare_op()?;
         let value = self.parse_literal()?;
 
@@ -1181,6 +1204,84 @@ mod tests {
             }
             other => panic!("expected And at top, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_contains_predicate() {
+        let q = parse_query(r#"Post.filter(.title.contains("invoice"))"#).unwrap();
+        assert_eq!(
+            q.source,
+            Source::Filter {
+                type_name: "Post".into(),
+                predicate: Predicate::Contains {
+                    field_path: "title".into(),
+                    needle: "invoice".into(),
+                },
+            }
+        );
+
+        // Composes with comparisons and boolean operators, in a step too.
+        let q = parse_query(
+            r#"User.get(1).posts.filter(.published == true && (.body.contains("a b") || .title.contains("x")))"#,
+        )
+        .unwrap();
+        match &q.steps[1] {
+            Step::Filter { predicate } => match predicate {
+                Predicate::And(l, r) => {
+                    assert!(matches!(**l, Predicate::Compare { .. }));
+                    match &**r {
+                        Predicate::Or(a, b) => {
+                            assert_eq!(
+                                **a,
+                                Predicate::Contains {
+                                    field_path: "body".into(),
+                                    needle: "a b".into()
+                                }
+                            );
+                            assert_eq!(
+                                **b,
+                                Predicate::Contains {
+                                    field_path: "title".into(),
+                                    needle: "x".into()
+                                }
+                            );
+                        }
+                        other => panic!("expected Or, got {other:?}"),
+                    }
+                }
+                other => panic!("expected And, got {other:?}"),
+            },
+            other => panic!("expected Filter step, got {other:?}"),
+        }
+
+        // Escapes inside the needle go through the normal string literal
+        // parser; whitespace around the argument is tolerated.
+        let q = parse_query(r#"Post.filter(.title.contains( "a\"q\"" ))"#).unwrap();
+        assert!(matches!(
+            q.source,
+            Source::Filter { predicate: Predicate::Contains { ref needle, .. }, .. } if needle == "a\"q\""
+        ));
+
+        // A dotted path keeps its head as the path and `contains` as the method.
+        let q = parse_query(r#"Post.filter(.meta.k.contains("x"))"#).unwrap();
+        assert!(matches!(
+            q.source,
+            Source::Filter { predicate: Predicate::Contains { ref field_path, .. }, .. } if field_path == "meta.k"
+        ));
+    }
+
+    #[test]
+    fn parse_contains_rejects_non_string_argument() {
+        assert!(parse_query(r#"Post.filter(.title.contains(1))"#).is_err());
+        assert!(parse_query(r#"Post.filter(.title.contains())"#).is_err());
+        assert!(parse_query(r#"Post.filter(.title.contains("a", "b"))"#).is_err());
+        assert!(parse_query(r#"Post.filter(.title.contains "a")"#).is_err());
+        // A field literally named `contains` still works as a comparison.
+        let q = parse_query(r#"Post.filter(.contains == "x")"#).unwrap();
+        assert!(matches!(
+            q.source,
+            Source::Filter { predicate: Predicate::Compare { ref field_path, .. }, .. } if field_path == "contains"
+        ));
     }
 
     #[test]

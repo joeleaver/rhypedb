@@ -996,6 +996,13 @@ fn evaluate_predicate(predicate: &Predicate, fields: &FieldMap) -> bool {
                 None => false,
             }
         }
+        // Case-sensitive substring on a String value; a missing / null /
+        // non-string value never matches (validation already restricts the
+        // field to `String`, so the fall-through is only null).
+        Predicate::Contains { field_path, needle } => match fields.get(field_path.as_str()) {
+            Some(Value::String(s)) => s.contains(needle.as_str()),
+            _ => false,
+        },
         Predicate::And(left, right) => {
             evaluate_predicate(left, fields) && evaluate_predicate(right, fields)
         }
@@ -1138,6 +1145,24 @@ fn validate_predicate_for_type(
                 _ => {}
             }
             Ok(())
+        }
+        // `.contains` is a String-only substring predicate. Any other scalar
+        // kind (or a path descent into one) would silently match nothing, so
+        // reject loudly; a relation head (no scalar type) is left alone like
+        // `Compare`, and fails later as an unknown field at evaluation.
+        Predicate::Contains { field_path, .. } => {
+            let descends = field_path.contains('.');
+            let head = field_path.split('.').next().unwrap_or(field_path);
+            match field_scalar_type(db, type_name, head) {
+                Some(ST::String) if !descends => Ok(()),
+                Some(ST::String) => Err(QueryError::Type(format!(
+                    "`.{field_path}.contains(...)`: cannot descend into a String field"
+                ))),
+                Some(other) => Err(QueryError::Type(format!(
+                    "`.contains(...)` requires a String field; `{type_name}.{head}` is {other:?}"
+                ))),
+                None => Ok(()),
+            }
         }
         Predicate::And(l, r) | Predicate::Or(l, r) => {
             validate_predicate_for_type(db, type_name, l)?;
@@ -1464,8 +1489,9 @@ fn plan_filter_scan(
             flatten_or(predicate, &mut disjuncts);
             plan_or_union(db, snapshot, type_name, predicate, &disjuncts)
         }
-        // `Compare` is handled above; no other predicate shapes exist.
-        Predicate::Compare { .. } => Ok(None),
+        // `Compare` is handled above; `Contains` is never index-eligible
+        // (substring has no ordered-key form) → full scan + in-memory filter.
+        Predicate::Compare { .. } | Predicate::Contains { .. } => Ok(None),
     }
 }
 
@@ -2220,6 +2246,78 @@ mod tests {
             QueryOutput::Objects(objs) => assert_eq!(objs.len(), 1),
             _ => panic!("expected Objects"),
         }
+    }
+
+    #[test]
+    fn contains_predicate_is_case_sensitive_substring_on_strings_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"type Note { title: String  body: String @indexed  n: i64  meta: Json  blob: Bytes  parent: Note }"#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let run = |q: &str| execute(&ExecContext::new(&db, None), &parse_query(q).unwrap());
+        let ids = |out: QueryOutput| -> Vec<u64> {
+            match out {
+                QueryOutput::Objects(objs) => {
+                    let mut v: Vec<u64> = objs.iter().map(|o| o.id).collect();
+                    v.sort_unstable();
+                    v
+                }
+                other => panic!("expected Objects, got {other:?}"),
+            }
+        };
+
+        run(r#"Note.create({ title: "Invoice 4471 draft", body: "pay the invoice", n: 1 })"#)
+            .unwrap();
+        run(r#"Note.create({ title: "groceries", body: "milk, Invoice", n: 2 })"#).unwrap();
+        run(r#"Note.create({ title: "empty body", n: 3 })"#).unwrap();
+
+        // Substring, case-sensitive, as a source predicate.
+        assert_eq!(ids(run(r#"Note.filter(.title.contains("voice 44"))"#).unwrap()), vec![1]);
+        assert_eq!(ids(run(r#"Note.filter(.title.contains("invoice"))"#).unwrap()), Vec::<u64>::new());
+        assert_eq!(ids(run(r#"Note.filter(.body.contains("nvoice"))"#).unwrap()), vec![1, 2]);
+        assert_eq!(ids(run(r#"Note.filter(.body.contains("the invoice"))"#).unwrap()), vec![1]);
+        assert_eq!(ids(run(r#"Note.filter(.body.contains("Invoice"))"#).unwrap()), vec![2]);
+        // Empty needle matches every non-null value (Rust `contains("")`), not
+        // a null one.
+        assert_eq!(ids(run(r#"Note.filter(.body.contains(""))"#).unwrap()), vec![1, 2]);
+        // An @indexed String field still works (no index pushdown, full scan).
+        assert_eq!(ids(run(r#"Note.filter(.body.contains("milk"))"#).unwrap()), vec![2]);
+
+        // Composes under AND / OR with comparisons, and as a step after a
+        // source filter.
+        assert_eq!(
+            ids(run(r#"Note.filter(.n >= 1 && .title.contains("e"))"#).unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            ids(run(r#"Note.filter(.n == 3 || .title.contains("4471"))"#).unwrap()),
+            vec![1, 3]
+        );
+        assert_eq!(
+            ids(run(r#"Note.filter(.n < 3).filter(.title.contains("gro"))"#).unwrap()),
+            vec![2]
+        );
+
+        // Non-String fields are rejected loudly (not a silent empty result),
+        // including inside a compound predicate; descending into a String
+        // field is rejected too.
+        for q in [
+            r#"Note.filter(.n.contains("1"))"#,
+            r#"Note.filter(.meta.contains("k"))"#,
+            r#"Note.filter(.blob.contains("aGVs"))"#,
+            r#"Note.filter(.n == 1 && .meta.contains("k"))"#,
+            r#"Note.filter(.title.sub.contains("x"))"#,
+        ] {
+            let err = run(q).unwrap_err();
+            assert!(matches!(err, QueryError::Type(_)), "{q}: {err:?}");
+        }
+        // The validation applies to the post-traversal type on a step as well.
+        assert!(matches!(
+            run(r#"Note.get(1).parent.filter(.n.contains("1"))"#).unwrap_err(),
+            QueryError::Type(_)
+        ));
     }
 
     // -----------------------------------------------------------------

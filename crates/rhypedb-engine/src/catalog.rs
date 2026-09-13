@@ -2640,6 +2640,17 @@ fn validate_field_type_change(
             },
         ));
     }
+    // A full-text index is keyed by the field's String tokens; the only
+    // target kinds are non-String, which would leave the postings orphaned.
+    if field_def.fulltext().is_some() {
+        return Err(EngineError::Catalog(
+            CatalogError::FieldTypeChangeDirectiveUnsupported {
+                qualified: qual,
+                directive: "@fulltext",
+                planned_phase: "follow-on",
+            },
+        ));
+    }
     if field_entry.type_change_history.len() + 1 > MAX_TYPE_CHANGE_HISTORY {
         return Err(EngineError::Catalog(
             CatalogError::FieldTypeChangeHistoryCapExceeded {
@@ -3680,8 +3691,9 @@ pub(crate) fn compute_schema_digest(schema: &Schema) -> [u8; 32] {
             hasher.update([schema_kind_byte(&field.field_type)]);
 
             // Directive flags: bit 0 indexed, bit 1 unique, bit 2 inverse,
-            // bit 3 vectorize. Other directives (on_delete) are not part
-            // of the digest — they don't affect catalog allocation.
+            // bit 3 vectorize, bit 4 fulltext. Other directives (on_delete)
+            // are not part of the digest — they don't affect catalog
+            // allocation.
             let mut flags: u8 = 0;
             if field.is_indexed() {
                 flags |= 0b0001;
@@ -3695,7 +3707,18 @@ pub(crate) fn compute_schema_digest(schema: &Schema) -> [u8; 32] {
             if field.vectorize().is_some() {
                 flags |= 0b1000;
             }
+            if field.fulltext().is_some() {
+                flags |= 0b1_0000;
+            }
             hasher.update([flags]);
+            // The full-text index identity (analyzer + positions) is part of
+            // the digest too, so an analyzer swap on an otherwise-identical
+            // schema surfaces as a change.
+            if let Some(ft) = field.fulltext() {
+                hasher.update((ft.analyzer.len() as u32).to_be_bytes());
+                hasher.update(ft.analyzer.as_bytes());
+                hasher.update([ft.positions as u8]);
+            }
 
             // For relations, include the target type name so a target
             // swap surfaces as a digest change (which forces reconcile,
@@ -6600,6 +6623,17 @@ mod tests {
         }
     }
 
+    fn scalar_fulltext(name: &str, positions: bool) -> FieldDef {
+        FieldDef {
+            name: name.into(),
+            field_type: FieldType::Scalar(ScalarType::String),
+            directives: vec![Directive::Fulltext(rhypedb_schema::FulltextDef {
+                analyzer: "simple".into(),
+                positions,
+            })],
+        }
+    }
+
     fn scalar_unique(name: &str, st: ScalarType) -> FieldDef {
         FieldDef {
             name: name.into(),
@@ -7194,6 +7228,43 @@ mod tests {
             compute_schema_digest(&plain),
             compute_schema_digest(&indexed)
         );
+    }
+
+    #[test]
+    fn schema_digest_changes_when_fulltext_directive_added_or_reconfigured() {
+        let plain = schema_with(vec![("Post", vec![scalar("body", ScalarType::String)])]);
+        let ft = schema_with(vec![("Post", vec![scalar_fulltext("body", true)])]);
+        let ft_nopos = schema_with(vec![("Post", vec![scalar_fulltext("body", false)])]);
+        assert_ne!(compute_schema_digest(&plain), compute_schema_digest(&ft));
+        // The index identity (positions / analyzer) is part of the digest.
+        assert_ne!(compute_schema_digest(&ft), compute_schema_digest(&ft_nopos));
+        // Stable across runs for the same config.
+        assert_eq!(compute_schema_digest(&ft), compute_schema_digest(&ft));
+    }
+
+    #[test]
+    fn add_fulltext_directive_does_not_renumber_existing() {
+        // Adding @fulltext to a populated catalog is a pure directive change:
+        // reconcile runs (digest changed) but allocates nothing.
+        let dir = TempDir::new().unwrap();
+        let storage = open_lsm(&dir);
+        let before = schema_with(vec![(
+            "Post",
+            vec![scalar("title", ScalarType::String), scalar("body", ScalarType::String)],
+        )]);
+        let cat1 = load_or_initialize(&storage, &before, false).unwrap();
+        let title_id = cat1.field_ids["Post.title"];
+        let body_id = cat1.field_ids["Post.body"];
+
+        let after = schema_with(vec![(
+            "Post",
+            vec![scalar("title", ScalarType::String), scalar_fulltext("body", true)],
+        )]);
+        let cat2 = load_or_initialize(&storage, &after, false).unwrap();
+        assert_eq!(cat2.field_ids["Post.title"], title_id);
+        assert_eq!(cat2.field_ids["Post.body"], body_id);
+        assert_eq!(cat2.type_ids["Post"], cat1.type_ids["Post"]);
+        assert_eq!(cat2.next_field, cat1.next_field);
     }
 
     #[test]

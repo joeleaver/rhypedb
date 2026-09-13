@@ -10775,6 +10775,31 @@ mod tests {
         ));
     }
 
+    /// A `@fulltext` source field is refused like `@indexed` (its postings
+    /// would be orphaned by a non-String target).
+    #[test]
+    fn change_field_type_refuses_fulltext_source() {
+        use rhypedb_schema::{FieldType, ScalarType};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type Post { body: String @fulltext }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let err = db
+            .change_field_type(
+                "Post",
+                "body",
+                FieldType::Scalar(ScalarType::I64),
+                |_, _| Ok(Value::I64(0)),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::Catalog(crate::CatalogError::FieldTypeChangeDirectiveUnsupported {
+                directive: "@fulltext",
+                ..
+            })
+        ));
+    }
+
     /// Same source and target kind → NoOp refusal.
     #[test]
     fn change_field_type_same_kind_is_no_op_refused() {

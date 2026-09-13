@@ -70,6 +70,15 @@ User.filter(.age < 13 || .age >= 65)
 User.filter((.role == "admin" || .role == "mod") && .active == true)
 ```
 
+**Substring — `.field.contains("text")`:** true when a `String` field contains the literal text. It is **case-sensitive**, never uses an index (the type is scanned like any other unindexed filter), and composes with the other operators. A `null` value never matches. Applying it to a non-`String` field is an error.
+
+```
+Post.filter(.title.contains("invoice"))
+Post.filter(.published == true && .body.contains("4471"))
+```
+
+For ranked keyword search that *does* use an index, see [Full-text search](#full-text-search--matchesfield-query-k-n).
+
 ### Vector similarity — `.similar(.field, query, k: N, ...)`
 
 Find the nearest neighbours of a query in a `Vector` field. Covered in depth in **[Vector Search](vectors.md)**.

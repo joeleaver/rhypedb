@@ -93,6 +93,17 @@ impl FieldDef {
         })
     }
 
+    /// The `@fulltext(...)` directive declaring a full-text inverted index on
+    /// this field (analyzer + whether term positions are stored), if present.
+    /// Only meaningful on `String` fields; `validate_schema` rejects it
+    /// elsewhere.
+    pub fn fulltext(&self) -> Option<&FulltextDef> {
+        self.directives.iter().find_map(|d| match d {
+            Directive::Fulltext(f) => Some(f),
+            _ => None,
+        })
+    }
+
     /// The `@index(hnsw, ...)` directive configuring this field's vector index
     /// (metric / quantization bit-width / m / ef_construction), if present.
     /// Only meaningful on `Vector` fields; `validate_schema` rejects it
@@ -158,6 +169,45 @@ pub enum Directive {
     Inverse(InverseDef),
     Index(IndexDef),
     Vectorize(VectorizeDef),
+    /// Full-text inverted index on a `String` field: `@fulltext` /
+    /// `@fulltext(analyzer: "simple", positions: false)`. Maintained
+    /// synchronously in the object's transaction; queried via
+    /// `Type.matches(.field, "terms", k: N)`.
+    Fulltext(FulltextDef),
+}
+
+/// Configuration carried by `@fulltext`. Both parameters are optional in the
+/// SDL and resolve to their defaults at parse time, so two spellings of the
+/// same configuration compare equal (`@fulltext` == `@fulltext(analyzer:
+/// "simple", positions: true)`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FulltextDef {
+    /// Analyzer name. `simple` (the default and, today, the only analyzer):
+    /// Unicode word segmentation, lowercase, ASCII folding of diacritics, no
+    /// stemming. The name is part of the index identity — changing it
+    /// rebuilds the field's index.
+    pub analyzer: String,
+    /// Store term positions (needed for phrase queries `"a b"`). Default
+    /// `true`; `positions: false` roughly halves the index but makes phrase
+    /// queries on the field an error.
+    pub positions: bool,
+}
+
+impl FulltextDef {
+    /// The default analyzer name.
+    pub const DEFAULT_ANALYZER: &'static str = "simple";
+
+    /// Every analyzer name the parser accepts.
+    pub const KNOWN_ANALYZERS: &'static [&'static str] = &["simple"];
+}
+
+impl Default for FulltextDef {
+    fn default() -> Self {
+        Self {
+            analyzer: Self::DEFAULT_ANALYZER.to_string(),
+            positions: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

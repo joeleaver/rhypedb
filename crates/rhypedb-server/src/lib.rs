@@ -566,7 +566,8 @@ fn schema_introspection(schema: &Schema) -> serde_json::Value {
 }
 
 /// One field → its introspection object. `kind` discriminates the shape: a
-/// `scalar` carries `scalar`/`unique`/`indexed`; a `vector` carries `dimensions`
+/// `scalar` carries `scalar`/`unique`/`indexed` plus optional `fulltext`
+/// (`{analyzer, positions}`); a `vector` carries `dimensions`
 /// plus optional `vectorize`/`index`; a `relation` carries `target`/`many` plus
 /// optional `onDelete`/`inverse`/`edgeFields`.
 fn field_introspection(f: &FieldDef) -> serde_json::Value {
@@ -577,6 +578,10 @@ fn field_introspection(f: &FieldDef) -> serde_json::Value {
             field["scalar"] = scalar_name(s).into();
             field["unique"] = f.is_unique().into();
             field["indexed"] = f.is_indexed().into();
+            if let Some(ft) = f.fulltext() {
+                field["fulltext"] =
+                    serde_json::json!({ "analyzer": ft.analyzer, "positions": ft.positions });
+            }
         }
         FieldType::Vector(v) => {
             field["kind"] = "vector".into();
@@ -2548,7 +2553,7 @@ mod tcp_tests {
                 embedding: Vector<384> @vectorize(source: "name", model: "all-MiniLM-L6-v2") @index(hnsw, metric: cosine, quantization: turboquant_3bit, m: 16, ef_construction: 200)
             }
             type Post {
-                title: String @indexed
+                title: String @indexed @fulltext(positions: false)
                 author: User @on_delete(deny)
             }
             "#,
@@ -2584,6 +2589,12 @@ mod tcp_tests {
         let age = field("User", "age");
         assert_eq!(age["scalar"], "i64");
         assert_eq!(age["indexed"], true);
+        assert!(age.get("fulltext").is_none(), "no @fulltext → key absent");
+
+        let title = field("Post", "title");
+        assert_eq!(title["indexed"], true);
+        assert_eq!(title["fulltext"]["analyzer"], "simple");
+        assert_eq!(title["fulltext"]["positions"], false);
 
         let posts = field("User", "posts");
         assert_eq!(posts["kind"], "relation");
