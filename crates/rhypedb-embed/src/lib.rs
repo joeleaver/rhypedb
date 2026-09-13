@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -10,9 +12,53 @@ pub enum EmbedError {
 
     #[error("dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
+
+    /// The model could not be loaded (e.g. a failed download or a corrupt
+    /// cache entry). Distinct from `UnsupportedModel`: the model name was
+    /// valid, but the load itself failed, so a caller may want to retry
+    /// rather than treat this as a permanent configuration error.
+    #[error("model unavailable: {0}")]
+    Unavailable(String),
 }
 
 pub type EmbedResult<T> = Result<T, EmbedError>;
+
+/// How the fastembed/ONNX embedder is built. All fields have defaults chosen
+/// for an application that embeds in the background next to a UI.
+///
+/// This type has no fastembed dependency and is always available, regardless
+/// of whether this crate's `fastembed` feature is enabled, so callers can
+/// build and pass one through even when they don't (yet) depend on the
+/// `FastEmbedder` implementation itself.
+#[derive(Debug, Clone)]
+pub struct EmbedOptions {
+    /// Where model files are cached. `None` = fastembed's default
+    /// (`FASTEMBED_CACHE_PATH` env var, else `./.fastembed_cache`).
+    pub cache_dir: Option<PathBuf>,
+    /// Token limit per text. Default 256 (MiniLM/BGE-small were trained at
+    /// 256; attention memory grows with the square of this).
+    pub max_length: usize,
+    /// ONNX intra-op threads. Default `max(1, available_parallelism / 2)`.
+    pub intra_threads: usize,
+    /// Prefer the int8-quantized variant of the model when fastembed has one
+    /// (`AllMiniLML6V2Q`, `BGESmallENV15Q`); otherwise the fp32 model.
+    /// Default true.
+    pub quantized: bool,
+}
+
+impl Default for EmbedOptions {
+    fn default() -> Self {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        Self {
+            cache_dir: None,
+            max_length: 256,
+            intra_threads: (cores / 2).max(1),
+            quantized: true,
+        }
+    }
+}
 
 /// Trait for text-to-vector encoding.
 pub trait Embedder: Send + Sync {
@@ -21,55 +67,104 @@ pub trait Embedder: Send + Sync {
     fn model_name(&self) -> &str;
 }
 
+/// Serializes fastembed model construction across this process.
+///
+/// hf-hub's local cache uses a per-blob lock file while a file is being
+/// downloaded. When two `FastEmbedder`s are constructed concurrently in the
+/// same process (even for different models, since they can share a cache
+/// dir), the second `TextEmbedding::try_new` has been observed to lose that
+/// race and fail outright with "Failed to retrieve model.onnx" rather than
+/// wait for the first download to finish. Holding this mutex around
+/// `TextEmbedding::try_new` ensures at most one model load is ever in flight
+/// per process, so callers never hit that race.
+#[cfg(feature = "fastembed")]
+static MODEL_LOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Embedder backed by fastembed (ONNX Runtime, CPU-only).
 #[cfg(feature = "fastembed")]
 pub struct FastEmbedder {
     model: fastembed::TextEmbedding,
     dimensions: usize,
     model_name: String,
+    options: EmbedOptions,
 }
 
 #[cfg(feature = "fastembed")]
 impl FastEmbedder {
     pub fn new(model_name: &str) -> EmbedResult<Self> {
-        let model_type = match model_name {
-            "all-MiniLM-L6-v2" => fastembed::EmbeddingModel::AllMiniLML6V2,
-            "BAAI/bge-small-en-v1.5" | "bge-small-en-v1.5" => {
-                fastembed::EmbeddingModel::BGESmallENV15
-            }
-            "BAAI/bge-base-en-v1.5" | "bge-base-en-v1.5" => {
-                fastembed::EmbeddingModel::BGEBaseENV15
-            }
-            "BAAI/bge-large-en-v1.5" | "bge-large-en-v1.5" => {
-                fastembed::EmbeddingModel::BGELargeENV15
-            }
-            _ => return Err(EmbedError::UnsupportedModel(model_name.into())),
+        Self::with_options(model_name, &EmbedOptions::default())
+    }
+
+    pub fn with_options(model_name: &str, options: &EmbedOptions) -> EmbedResult<Self> {
+        let (model_type, dimensions) = Self::resolve_model(model_name, options.quantized)?;
+
+        let mut init_options = fastembed::InitOptions::new(model_type)
+            .with_max_length(options.max_length)
+            .with_intra_threads(options.intra_threads)
+            .with_show_download_progress(false);
+        if let Some(cache_dir) = &options.cache_dir {
+            init_options = init_options.with_cache_dir(cache_dir.clone());
+        }
+
+        let model = {
+            // See `MODEL_LOAD`'s doc comment for why this is serialized.
+            let _guard = MODEL_LOAD.lock().unwrap_or_else(|e| e.into_inner());
+            fastembed::TextEmbedding::try_new(init_options)
+                .map_err(|e| EmbedError::Unavailable(e.to_string()))?
         };
-
-        let dimensions = match model_name {
-            "all-MiniLM-L6-v2" => 384,
-            "BAAI/bge-small-en-v1.5" | "bge-small-en-v1.5" => 384,
-            "BAAI/bge-base-en-v1.5" | "bge-base-en-v1.5" => 768,
-            "BAAI/bge-large-en-v1.5" | "bge-large-en-v1.5" => 1024,
-            _ => 384,
-        };
-
-        let mut init_options = fastembed::InitOptions::default();
-        init_options.model_name = model_type;
-        init_options.show_download_progress = false;
-
-        let model = fastembed::TextEmbedding::try_new(init_options)
-            .map_err(|e| EmbedError::Model(e.to_string()))?;
 
         Ok(Self {
             model,
             dimensions,
             model_name: model_name.to_string(),
+            options: options.clone(),
         })
     }
 
     pub fn with_default_model() -> EmbedResult<Self> {
         Self::new("all-MiniLM-L6-v2")
+    }
+
+    pub fn options(&self) -> &EmbedOptions {
+        &self.options
+    }
+
+    /// Map a supported model name (and its aliases) plus the `quantized`
+    /// preference to the fastembed model variant and its embedding
+    /// dimension.
+    ///
+    /// fastembed ships true int8-quantized ONNX builds only for
+    /// `all-MiniLM-L6-v2` and `bge-small-en-v1.5` (`AllMiniLML6V2Q`,
+    /// `BGESmallENV15Q`); the "Q" variants it has for the base/large BGE
+    /// models are graph-optimized rather than int8-quantized. So for those
+    /// two, `quantized` has no matching variant to prefer and this falls
+    /// back to the fp32 model regardless of the option's value.
+    fn resolve_model(
+        model_name: &str,
+        quantized: bool,
+    ) -> EmbedResult<(fastembed::EmbeddingModel, usize)> {
+        use fastembed::EmbeddingModel::*;
+
+        let (fp32, int8, dimensions): (
+            fastembed::EmbeddingModel,
+            Option<fastembed::EmbeddingModel>,
+            usize,
+        ) = match model_name {
+            "all-MiniLM-L6-v2" => (AllMiniLML6V2, Some(AllMiniLML6V2Q), 384),
+            "BAAI/bge-small-en-v1.5" | "bge-small-en-v1.5" => {
+                (BGESmallENV15, Some(BGESmallENV15Q), 384)
+            }
+            "BAAI/bge-base-en-v1.5" | "bge-base-en-v1.5" => (BGEBaseENV15, None, 768),
+            "BAAI/bge-large-en-v1.5" | "bge-large-en-v1.5" => (BGELargeENV15, None, 1024),
+            _ => return Err(EmbedError::UnsupportedModel(model_name.into())),
+        };
+
+        let model = if quantized {
+            int8.unwrap_or(fp32)
+        } else {
+            fp32
+        };
+        Ok((model, dimensions))
     }
 }
 
@@ -144,7 +239,8 @@ impl FastReranker {
         } else if std::env::var_os("RHYPEDB_RERANKER_FP32").is_some() {
             let mut init_options = fastembed::RerankInitOptions::default();
             init_options.show_download_progress = false;
-            fastembed::TextRerank::try_new(init_options).map_err(|e| EmbedError::Model(e.to_string()))?
+            fastembed::TextRerank::try_new(init_options)
+                .map_err(|e| EmbedError::Model(e.to_string()))?
         } else {
             Self::load_quantized_default()?
         };
@@ -164,7 +260,10 @@ impl FastReranker {
             special_tokens_map_file: read("special_tokens_map.json")?,
             tokenizer_config_file: read("tokenizer_config.json")?,
         };
-        Self::build(fastembed::OnnxSource::File(dir.join("model.onnx")), tokenizer_files)
+        Self::build(
+            fastembed::OnnxSource::File(dir.join("model.onnx")),
+            tokenizer_files,
+        )
     }
 
     /// Default reranker: the int8-quantized bge-reranker-base, fetched from the
@@ -183,7 +282,8 @@ impl FastReranker {
                 .map_err(|e| EmbedError::Model(format!("download '{name}': {e}")))
         };
         let read = |name: &str| -> EmbedResult<Vec<u8>> {
-            std::fs::read(fetch(name)?).map_err(|e| EmbedError::Model(format!("read '{name}': {e}")))
+            std::fs::read(fetch(name)?)
+                .map_err(|e| EmbedError::Model(format!("read '{name}': {e}")))
         };
         let tokenizer_files = fastembed::TokenizerFiles {
             tokenizer_file: read("tokenizer.json")?,
@@ -191,7 +291,10 @@ impl FastReranker {
             special_tokens_map_file: read("special_tokens_map.json")?,
             tokenizer_config_file: read("tokenizer_config.json")?,
         };
-        Self::build(fastembed::OnnxSource::File(fetch("onnx/model_quantized.onnx")?), tokenizer_files)
+        Self::build(
+            fastembed::OnnxSource::File(fetch("onnx/model_quantized.onnx")?),
+            tokenizer_files,
+        )
     }
 
     fn build(
@@ -330,5 +433,97 @@ mod tests {
         let documents = ["doc1", "doc2", "doc3", "doc4", "doc5"];
         let results = reranker.rerank("query", &documents, 2).unwrap();
         assert_eq!(results.len(), 2);
+    }
+}
+
+// Pure-Rust tests for `EmbedOptions` and `EmbedError`: no fastembed
+// dependency, no network. These compile and run regardless of the
+// `fastembed` feature, since the types themselves are not feature-gated.
+#[cfg(test)]
+mod options_tests {
+    use super::*;
+
+    #[test]
+    fn default_options_have_expected_values() {
+        let opts = EmbedOptions::default();
+        assert_eq!(opts.cache_dir, None);
+        assert_eq!(opts.max_length, 256);
+        assert!(opts.intra_threads >= 1);
+        assert!(opts.quantized);
+    }
+
+    #[test]
+    fn unavailable_error_formats_message() {
+        let err = EmbedError::Unavailable("model.onnx missing".to_string());
+        assert_eq!(err.to_string(), "model unavailable: model.onnx missing");
+    }
+}
+
+// Model-name resolution tests: these need the `fastembed` dependency for
+// `fastembed::EmbeddingModel`, but exercise only `FastEmbedder::resolve_model`
+// and the name-validation path of `with_options`, neither of which
+// constructs a `TextEmbedding` — so no model download and no network access,
+// unlike the tests in `mod tests` above.
+#[cfg(all(test, feature = "fastembed"))]
+mod no_network_tests {
+    use super::*;
+    use fastembed::EmbeddingModel;
+
+    #[test]
+    fn resolve_model_prefers_int8_when_available() {
+        let (model, dims) = FastEmbedder::resolve_model("all-MiniLM-L6-v2", true).unwrap();
+        assert!(matches!(model, EmbeddingModel::AllMiniLML6V2Q));
+        assert_eq!(dims, 384);
+
+        let (model, dims) = FastEmbedder::resolve_model("BAAI/bge-small-en-v1.5", true).unwrap();
+        assert!(matches!(model, EmbeddingModel::BGESmallENV15Q));
+        assert_eq!(dims, 384);
+    }
+
+    #[test]
+    fn resolve_model_uses_fp32_when_quantized_is_false() {
+        let (model, dims) = FastEmbedder::resolve_model("all-MiniLM-L6-v2", false).unwrap();
+        assert!(matches!(model, EmbeddingModel::AllMiniLML6V2));
+        assert_eq!(dims, 384);
+
+        let (model, dims) = FastEmbedder::resolve_model("bge-small-en-v1.5", false).unwrap();
+        assert!(matches!(model, EmbeddingModel::BGESmallENV15));
+        assert_eq!(dims, 384);
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_fp32_for_base_and_large() {
+        // bge-base and bge-large have no true int8-quantized variant in
+        // fastembed (their "Q" builds are graph-optimized, not
+        // int8-quantized), so `quantized: true` still resolves to the fp32
+        // model rather than erroring or silently picking the wrong build.
+        let (model, dims) = FastEmbedder::resolve_model("BAAI/bge-base-en-v1.5", true).unwrap();
+        assert!(matches!(model, EmbeddingModel::BGEBaseENV15));
+        assert_eq!(dims, 768);
+
+        let (model, dims) = FastEmbedder::resolve_model("bge-large-en-v1.5", true).unwrap();
+        assert!(matches!(model, EmbeddingModel::BGELargeENV15));
+        assert_eq!(dims, 1024);
+
+        // quantized: false resolves the same way (there's nothing to fall
+        // back from).
+        let (model, _) = FastEmbedder::resolve_model("BAAI/bge-large-en-v1.5", false).unwrap();
+        assert!(matches!(model, EmbeddingModel::BGELargeENV15));
+    }
+
+    #[test]
+    fn resolve_model_rejects_unknown_names() {
+        let result = FastEmbedder::resolve_model("nonexistent-model", true);
+        assert!(matches!(result, Err(EmbedError::UnsupportedModel(_))));
+    }
+
+    #[test]
+    fn with_options_rejects_unknown_model_before_touching_network() {
+        // If this reached `TextEmbedding::try_new` it would try to download
+        // a model, which would hang or fail in a network-less sandbox.
+        // Asserting the error variant here proves `with_options` returns
+        // from name resolution instead of ever reaching that call.
+        let result = FastEmbedder::with_options("nonexistent-model", &EmbedOptions::default());
+        assert!(matches!(result, Err(EmbedError::UnsupportedModel(_))));
     }
 }
