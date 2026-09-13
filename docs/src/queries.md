@@ -103,7 +103,7 @@ Post.similar(.embedding, "databases", k: 10, ef: 200, rerank: 50)
 Post.filter(.published == true).similar(.embedding, "rust", k: 5)
 ```
 
-`.similar` returns a **ranked** result: each object carries a `score` — the index's distance under the field's metric (lower is closer) — and the rows come back in rank order. See [Ranked results](#ranked-results).
+`.similar` returns a **ranked** result: each object carries a `score` and the rows come back in rank order. Ordinarily `score` is the index's distance under the field's metric (lower is closer); if the field's vectorizer has cross-encoder reranking turned on (see [Vector Search](vectors.md#cross-encoder-reranking)) it is instead the cross-encoder's relevance score (higher is better). See [Ranked results](#ranked-results).
 
 ### Full-text search — `.matches(.field, "query", k: N)`
 
@@ -148,7 +148,10 @@ A query with no searchable terms (only punctuation), an unterminated quote, or a
 | Step | `score` |
 | --- | --- |
 | `.matches` | BM25 relevance — higher is better |
-| `.similar` | the index distance under the field's metric (cosine distance, squared L2, or negated dot product) — lower is closer |
+| `.similar` (default) | the index distance under the field's metric (cosine distance, squared L2, or negated dot product) — lower is closer |
+| `.similar` (field's vectorizer has cross-encoder reranking on) | the cross-encoder's relevance score — higher is better |
+
+A `.similar` step's `score` is therefore only comparable across queries against the SAME field — whether it's a distance or a relevance score (and, if a distance, under which metric) is a property of that field's vectorizer configuration, not of the query. See [Cross-encoder reranking](vectors.md#cross-encoder-reranking) for how a field's vectorizer turns this on.
 
 A `.filter`, `.limit` or `.offset` after a ranked step keeps the order and the scores; a traversal or a mutation drops them.
 

@@ -33,12 +33,47 @@ pub struct IndexingStatus {
     /// Whether at least one embedding model has been loaded successfully
     /// since this `Vectorizer` was created. See [`Vectorizer::model_loaded`].
     pub model_loaded: bool,
+    /// The most recent cross-encoder reranker load failure, if any is
+    /// currently in effect. Always `None` while `cross_encoder` is `Off`.
+    /// See [`Vectorizer::reranker_error`].
+    pub reranker_error: Option<String>,
+    /// Whether the cross-encoder reranker has loaded successfully at least
+    /// once. See [`Vectorizer::reranker_loaded`].
+    pub reranker_loaded: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct IndexStat {
     pub name: String,
     pub vectors: usize,
+}
+
+/// One ranked hit from [`Vectorizer::search_text`]/[`Vectorizer::search_vector`].
+///
+/// `distance` is the index metric's distance between the query and this
+/// object — the full-precision exact distance when `exact_rescore` ran (or
+/// the brute-force exact path was used), otherwise the ANN's TurboQuant
+/// estimate. LOWER is closer, in both cases.
+///
+/// `rerank_score` is `Some` only when the cross-encoder ran for this hit (see
+/// [`CrossEncoder`]) — a text-relevance score on a DIFFERENT, unrelated scale
+/// from `distance`, where HIGHER is more relevant. `search_vector` never sets
+/// it (there is no query text to rank against).
+///
+/// A result `Vec` is ordered by `rerank_score` descending where present
+/// (i.e. cross-encoder-ranked hits sort first, among themselves by score),
+/// then by `distance` ascending for the rest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimilarHit {
+    pub object_id: u64,
+    pub distance: f32,
+    pub rerank_score: Option<f32>,
+}
+
+impl SimilarHit {
+    fn by_distance(object_id: u64, distance: f32) -> Self {
+        Self { object_id, distance, rerank_score: None }
+    }
 }
 
 /// State of a vector field on an object.
@@ -141,7 +176,39 @@ pub struct VectorizerConfig {
     /// Retries double this delay each consecutive failure, capped here.
     /// Default 60s.
     pub model_retry_max: Duration,
+    /// Whether `.similar` text search also runs a cross-encoder rerank pass
+    /// over the ANN candidates' source text. Default `Off`. This is separate
+    /// from — and used ALONGSIDE — the per-query full-precision
+    /// `exact_rescore` (`.similar(..., rerank: N)` in the query language):
+    /// `exact_rescore` re-scores candidates against the exact `f32` vectors
+    /// (cheap, always available); the cross-encoder additionally re-scores
+    /// them against the query TEXT with a second model (a ~280MB download,
+    /// one forward pass per candidate — expensive enough that it must be an
+    /// explicit opt-in, never an implicit default).
+    pub cross_encoder: CrossEncoder,
 }
+
+/// Whether and how `.similar` text search cross-encoder-reranks its ANN
+/// candidates. See [`VectorizerConfig::cross_encoder`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CrossEncoder {
+    /// No cross-encoder. `.similar` text search returns ANN order (optionally
+    /// full-precision-rescored by `exact_rescore`) only. No reranker model is
+    /// ever downloaded or loaded.
+    #[default]
+    Off,
+    /// Cross-encoder-rerank every text `.similar` query whose field has a
+    /// readable source text. `model` names the reranker model; today exactly
+    /// one is supported (see [`DEFAULT_RERANKER_MODEL`]) and any other value
+    /// fails the (lazy, fail-soft) load with `UnsupportedModel` — the field
+    /// exists so a future rhypedb-embed release can add more without an API
+    /// change here.
+    On { model: String },
+}
+
+/// The only reranker model this build knows how to load. `CrossEncoder::On`'s
+/// `model` must equal this (today); see [`CrossEncoder::On`].
+pub const DEFAULT_RERANKER_MODEL: &str = "bge-reranker-base";
 
 impl Default for VectorizerConfig {
     fn default() -> Self {
@@ -150,6 +217,7 @@ impl Default for VectorizerConfig {
             embed: rhypedb_embed::EmbedOptions::default(),
             model_retry_initial: Duration::from_secs(2),
             model_retry_max: Duration::from_secs(60),
+            cross_encoder: CrossEncoder::default(),
         }
     }
 }
@@ -164,6 +232,7 @@ impl PartialEq for VectorizerConfig {
         self.batch_size == other.batch_size
             && self.model_retry_initial == other.model_retry_initial
             && self.model_retry_max == other.model_retry_max
+            && self.cross_encoder == other.cross_encoder
             && self.embed.cache_dir == other.embed.cache_dir
             && self.embed.max_length == other.embed.max_length
             && self.embed.intra_threads == other.embed.intra_threads
@@ -196,6 +265,33 @@ fn default_embedder_loader() -> Box<EmbedderLoader> {
     })
 }
 
+/// How a fresh cross-encoder [`Reranker`] is constructed for
+/// `CrossEncoder::On`'s `model` name. Mirrors [`EmbedderLoader`]: production
+/// resolves to `default_reranker_loader()` (real `FastReranker::new()`, after
+/// checking `model` against [`DEFAULT_RERANKER_MODEL`]); tests substitute a
+/// `FailingLoader`-style closure. See `Vectorizer::get_or_load_reranker`.
+type LoadedReranker = Result<Box<dyn Reranker>, rhypedb_embed::EmbedError>;
+type RerankerLoader = dyn Fn(&str) -> LoadedReranker + Send + Sync;
+
+#[cfg(feature = "fastembed")]
+fn default_reranker_loader() -> Box<RerankerLoader> {
+    Box::new(|model_name: &str| {
+        if model_name != DEFAULT_RERANKER_MODEL {
+            return Err(rhypedb_embed::EmbedError::UnsupportedModel(model_name.into()));
+        }
+        FastReranker::new().map(|r| Box::new(r) as Box<dyn Reranker>)
+    })
+}
+
+#[cfg(not(feature = "fastembed"))]
+fn default_reranker_loader() -> Box<RerankerLoader> {
+    Box::new(|_model_name: &str| {
+        Err(rhypedb_embed::EmbedError::Unavailable(
+            "no reranker available (built without the `fastembed` feature)".into(),
+        ))
+    })
+}
+
 /// Manages vector indexes and the async vectorization pipeline.
 pub struct Vectorizer {
     storage: Arc<LsmTree>,
@@ -224,6 +320,17 @@ pub struct Vectorizer {
     /// `config.model_retry_max`) on each consecutive failure and resets to
     /// `config.model_retry_initial` on success. See [`Self::backoff_delay`].
     next_retry_delay: parking_lot::Mutex<Duration>,
+    /// Factory for the lazily-created cross-encoder reranker. Only ever
+    /// consulted when `config.cross_encoder` is `On`; see
+    /// [`Self::get_or_load_reranker`].
+    reranker_loader: parking_lot::Mutex<Box<RerankerLoader>>,
+    /// The most recent reranker-load failure message, or `None` once a load
+    /// has succeeded (or none has ever failed, or `cross_encoder` is `Off`).
+    /// See [`Self::reranker_error`].
+    reranker_error: parking_lot::Mutex<Option<String>>,
+    /// Whether the cross-encoder reranker has ever loaded successfully. See
+    /// [`Self::reranker_loaded`].
+    reranker_loaded: AtomicBool,
 }
 
 /// Effective index config for a Vector field with no (or a partial) `@index`
@@ -401,6 +508,9 @@ impl Vectorizer {
             model_error: parking_lot::Mutex::new(None),
             model_loaded: AtomicBool::new(false),
             next_retry_delay: parking_lot::Mutex::new(next_retry_delay),
+            reranker_loader: parking_lot::Mutex::new(default_reranker_loader()),
+            reranker_error: parking_lot::Mutex::new(None),
+            reranker_loaded: AtomicBool::new(false),
             config,
         };
 
@@ -862,6 +972,8 @@ impl Vectorizer {
             index_stats,
             model_error: self.model_error(),
             model_loaded: self.model_loaded(),
+            reranker_error: self.reranker_error(),
+            reranker_loaded: self.reranker_loaded(),
         }
     }
 
@@ -935,6 +1047,52 @@ impl Vectorizer {
             }
         }
         Ok(embedders.get_mut(model_name).unwrap())
+    }
+
+    /// The most recent cross-encoder reranker load failure, if one is
+    /// currently in effect. `None` if `cross_encoder` is `Off`, no load has
+    /// ever failed, or a later load succeeded. See [`Self::model_error`] for
+    /// the analogous embedder signal.
+    pub fn reranker_error(&self) -> Option<String> {
+        self.reranker_error.lock().clone()
+    }
+
+    /// Whether the cross-encoder reranker has loaded successfully at least
+    /// once. Always `false` while `cross_encoder` is `Off`.
+    pub fn reranker_loaded(&self) -> bool {
+        self.reranker_loaded.load(Ordering::SeqCst)
+    }
+
+    /// Get the cross-encoder reranker, lazily constructing it via
+    /// `reranker_loader` if absent (in production, `FastReranker::new()`
+    /// after validating the configured model name; tests substitute a
+    /// `FailingLoader`-style closure — see `default_reranker_loader` and the
+    /// `tests` module). Mirrors [`Self::get_or_load_embedder`]'s fail-soft
+    /// contract exactly: on success, records `reranker_loaded`/clears
+    /// `reranker_error`; on failure nothing is cached, so the NEXT call (the
+    /// next `.similar` text query) retries, and `reranker_error` is recorded.
+    /// Callers must check `config.cross_encoder` themselves — this method
+    /// always attempts a load and never panics.
+    fn get_or_load_reranker(&self, model: &str) -> Result<(), rhypedb_embed::EmbedError> {
+        let mut reranker = self.reranker.lock();
+        if reranker.is_some() {
+            return Ok(());
+        }
+        let loader = self.reranker_loader.lock();
+        match (loader)(model) {
+            Ok(r) => {
+                *reranker = Some(r);
+                drop(loader);
+                *self.reranker_error.lock() = None;
+                self.reranker_loaded.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(e) => {
+                drop(loader);
+                *self.reranker_error.lock() = Some(e.to_string());
+                Err(e)
+            }
+        }
     }
 
     /// Process pending jobs using the shared embedder (for single-threaded use / tests).
@@ -1086,6 +1244,14 @@ impl Vectorizer {
     }
 
     /// Search a vector index with a text query (encodes text first).
+    ///
+    /// `exact_rescore` re-scores the ANN candidates against the exact `f32`
+    /// vectors before returning (see [`Self::rerank_candidates`]) — cheap,
+    /// always available. This is UNRELATED to the cross-encoder ([`CrossEncoder`]),
+    /// which text search additionally runs, over the query TEXT, whenever
+    /// `config.cross_encoder` is `On` and this field has readable source
+    /// text — regardless of `exact_rescore`. See [`SimilarHit`] for how the
+    /// two combine in the result.
     #[allow(clippy::too_many_arguments)]
     pub fn search_text(
         &self,
@@ -1094,9 +1260,9 @@ impl Vectorizer {
         query_text: &str,
         k: usize,
         ef: usize,
-        rerank: bool,
+        exact_rescore: bool,
         restrict: Option<&HashSet<u64>>,
-    ) -> EngineResult<Vec<(u64, f32)>> {
+    ) -> EngineResult<Vec<SimilarHit>> {
         let index_key = format!("{type_name}.{vector_field}");
         let index = self
             .indexes
@@ -1134,18 +1300,22 @@ impl Vectorizer {
             return Ok(Vec::new());
         }
 
-        // Whether cross-encoder reranking is active. RHYPEDB_DISABLE_RERANK
-        // turns it off entirely (no reranker model is loaded) — raw HNSW
-        // results, much faster and a far smaller memory/image footprint.
-        let rerank_disabled = std::env::var_os("RHYPEDB_DISABLE_RERANK").is_some();
+        // Whether the cross-encoder runs at all: an explicit opt-in
+        // (`config.cross_encoder = On { model }`), never an implicit default —
+        // `Off` (the default) never loads the reranker model, so a plain
+        // deployment pays no cross-encoder cost at all.
+        let cross_encoder_model = match &self.config.cross_encoder {
+            CrossEncoder::On { model } => Some(model.clone()),
+            CrossEncoder::Off => None,
+        };
 
-        // How many HNSW candidates to retrieve. With reranking off we only need
-        // the top k. With it on we over-retrieve a *bounded* pool to feed the
-        // cross-encoder — it runs one forward pass per candidate, so this is the
-        // dominant query cost. Capped (overridable via RHYPEDB_RERANK_CANDIDATES)
-        // rather than the old uncapped `k * 10`, which reranked ~120 verses for
-        // a 12-result query.
-        let retrieval_k = if rerank_disabled {
+        // How many HNSW candidates to retrieve. With the cross-encoder off we
+        // only need the top k. With it on we over-retrieve a *bounded* pool to
+        // feed the cross-encoder — it runs one forward pass per candidate, so
+        // this is the dominant query cost. Capped (overridable via
+        // RHYPEDB_RERANK_CANDIDATES) rather than an uncapped `k * 10`, which
+        // reranked ~120 candidates for a 12-result query.
+        let retrieval_k = if cross_encoder_model.is_none() {
             k
         } else {
             std::env::var("RHYPEDB_RERANK_CANDIDATES")
@@ -1179,113 +1349,131 @@ impl Vectorizer {
             index.search(&query_vec[0], retrieval_k, ef.max(retrieval_k))
         };
 
-        // Full-precision rerank: replace the TurboQuant estimates with exact
-        // distances against the f32 vectors in the LSM. When a cross-encoder
-        // reranker also runs below it re-sorts by semantic score (so this is a
-        // no-op for that path); when it does not, the exactly-reranked order is
-        // what we return. Skipped on the brute path (already exact).
-        if rerank && !use_brute {
+        // Full-precision rescore: replace the TurboQuant estimates with exact
+        // distances against the f32 vectors in the LSM. When the cross-encoder
+        // also runs below it re-sorts by relevance score (so this only changes
+        // each hit's `distance`, not the final order); when it does not, this
+        // exact order IS what we return. Skipped on the brute path (already
+        // exact).
+        if exact_rescore && !use_brute {
             candidates = self.rerank_candidates(&index_key, &index, &query_vec[0], candidates);
         }
 
-        // Find the source field for this vector field.
-        let source_field = self
-            .schema
-            .get_type(type_name)
-            .and_then(|td| td.get_field(vector_field))
-            .and_then(|fd| fd.vectorize())
-            .map(|v| v.source_field.clone());
+        // Cross-encoder rerank: only when explicitly enabled AND we can read
+        // the field's source text.
+        if let Some(model) = cross_encoder_model {
+            let source_field = self
+                .schema
+                .get_type(type_name)
+                .and_then(|td| td.get_field(vector_field))
+                .and_then(|fd| fd.vectorize())
+                .map(|v| v.source_field.clone());
 
-        // Rerank if enabled and we can read the source text.
-        if let Some(source_field) = source_field.filter(|_| !rerank_disabled) {
-            let type_id = self.type_ids.get(type_name).copied();
+            if let Some(source_field) = source_field {
+                let type_id = self.type_ids.get(type_name).copied();
 
-            // Fetch original text for each candidate, all under ONE snapshot.
-            let mut candidate_texts: Vec<(u64, String)> = Vec::new();
-            if let Some(type_id) = type_id {
-                let snapshot = self.storage.read_snapshot();
-                for (obj_id, _dist) in &candidates {
-                    let obj_key = KeyBuilder::object(type_id, *obj_id);
-                    if let Ok(Some(data)) = self.storage.get_at(snapshot, &obj_key) {
-                        let fields = deserialize_fields(&data);
-                        if let Some(Value::String(text)) = fields.get(&source_field) {
-                            candidate_texts.push((*obj_id, text.clone()));
-                        }
-                    }
-                }
-            }
-
-            if !candidate_texts.is_empty() {
-                // Lazily initialize the reranker.
-                let mut reranker = self.reranker.lock();
-                if reranker.is_none() {
-                    #[cfg(feature = "fastembed")]
-                    match FastReranker::new() {
-                        Ok(r) => *reranker = Some(Box::new(r)),
-                        Err(_) => {
-                            // Reranker unavailable — return HNSW results as-is.
-                            return Ok(candidates.into_iter().take(k).collect());
-                        }
-                    }
-                    // Still none — either the load above failed, or this build has
-                    // no `fastembed` feature (no built-in reranker). Return the
-                    // raw HNSW results rather than reranking.
-                    if reranker.is_none() {
-                        return Ok(candidates.into_iter().take(k).collect());
-                    }
-                }
-
-                if let Some(ref mut ranker) = *reranker {
-                    let doc_refs: Vec<&str> =
-                        candidate_texts.iter().map(|(_, t)| t.as_str()).collect();
-
-                    if let Ok(reranked) = ranker.rerank(query_text, &doc_refs, k) {
-                        let mut out: Vec<(u64, f32)> = reranked
-                            .into_iter()
-                            .map(|r| (candidate_texts[r.index].0, r.score))
-                            .collect();
-                        // The cross-encoder can only rank candidates whose source
-                        // text was readable; a candidate with missing/non-string
-                        // text is invisible to it. Don't silently drop those —
-                        // append any not already chosen (in candidate order, i.e.
-                        // exact-distance order on the brute path) up to k, so a
-                        // reranked result never under-fills relative to the
-                        // no-reranker fallback. No-op when every candidate has
-                        // text (the normal @vectorize case), so global searches
-                        // are unaffected.
-                        if out.len() < k {
-                            let chosen: HashSet<u64> = out.iter().map(|(id, _)| *id).collect();
-                            for (id, dist) in &candidates {
-                                if out.len() >= k {
-                                    break;
-                                }
-                                if !chosen.contains(id) {
-                                    out.push((*id, *dist));
-                                }
+                // Fetch original text for each candidate, all under ONE snapshot.
+                let mut candidate_texts: Vec<(u64, String)> = Vec::new();
+                if let Some(type_id) = type_id {
+                    let snapshot = self.storage.read_snapshot();
+                    for (obj_id, _dist) in &candidates {
+                        let obj_key = KeyBuilder::object(type_id, *obj_id);
+                        if let Ok(Some(data)) = self.storage.get_at(snapshot, &obj_key) {
+                            let fields = deserialize_fields(&data);
+                            if let Some(Value::String(text)) = fields.get(&source_field) {
+                                candidate_texts.push((*obj_id, text.clone()));
                             }
                         }
-                        return Ok(out);
                     }
                 }
+
+                // Lazily load the reranker (fail-soft: on load failure, fall
+                // through to the plain distance-ordered result below rather
+                // than erroring the query — matches the embedder's philosophy
+                // of "rerank is best-effort", but here the query itself is
+                // never blocked on it).
+                if !candidate_texts.is_empty() && self.get_or_load_reranker(&model).is_ok() {
+                    let mut reranker = self.reranker.lock();
+                    if let Some(ref mut ranker) = *reranker {
+                        let doc_refs: Vec<&str> =
+                            candidate_texts.iter().map(|(_, t)| t.as_str()).collect();
+
+                        if let Ok(reranked) = ranker.rerank(query_text, &doc_refs, k) {
+                            // Distance lookup by object id, for both the
+                            // ranked hits and the appended tail below.
+                            let distance_by_id: HashMap<u64, f32> =
+                                candidates.iter().copied().collect();
+
+                            let mut out: Vec<SimilarHit> = reranked
+                                .into_iter()
+                                .map(|r| {
+                                    let object_id = candidate_texts[r.index].0;
+                                    SimilarHit {
+                                        object_id,
+                                        distance: distance_by_id
+                                            .get(&object_id)
+                                            .copied()
+                                            .unwrap_or(f32::INFINITY),
+                                        rerank_score: Some(r.score),
+                                    }
+                                })
+                                .collect();
+                            // The cross-encoder can only rank candidates whose source
+                            // text was readable; a candidate with missing/non-string
+                            // text is invisible to it. Don't silently drop those —
+                            // append any not already chosen (in candidate order, i.e.
+                            // exact-distance order on the brute path) up to k, so a
+                            // reranked result never under-fills relative to the
+                            // no-reranker fallback. No-op when every candidate has
+                            // text (the normal @vectorize case), so global searches
+                            // are unaffected. Appended hits carry NO rerank score —
+                            // the cross-encoder never saw them.
+                            if out.len() < k {
+                                let chosen: HashSet<u64> =
+                                    out.iter().map(|h| h.object_id).collect();
+                                for (id, dist) in &candidates {
+                                    if out.len() >= k {
+                                        break;
+                                    }
+                                    if !chosen.contains(id) {
+                                        out.push(SimilarHit::by_distance(*id, *dist));
+                                    }
+                                }
+                            }
+                            return Ok(out);
+                        }
+                    }
+                }
+                // Reranker unavailable (load failed, or no fastembed feature),
+                // or it had no candidate text, or the `ranker.rerank(...)` call
+                // itself failed — fall through to the plain distance-ordered
+                // result below.
             }
         }
 
-        // Fallback: return HNSW results without reranking.
-        Ok(candidates.into_iter().take(k).collect())
+        // Fallback: distance-ordered results, no cross-encoder.
+        Ok(candidates
+            .into_iter()
+            .take(k)
+            .map(|(id, dist)| SimilarHit::by_distance(id, dist))
+            .collect())
     }
 
     /// Search a vector index with a raw vector.
     ///
-    /// When `rerank` is set, the `k` ANN candidates are re-scored against the
-    /// full-precision f32 vectors in the LSM and returned sorted by exact
-    /// distance (see [`Vectorizer::rerank_candidates`]). The caller is expected
-    /// to have sized `k` to the desired rerank pool and to trim to the final
-    /// top-k itself.
+    /// When `exact_rescore` is set, the `k` ANN candidates are re-scored
+    /// against the full-precision f32 vectors in the LSM and returned sorted
+    /// by exact distance (see [`Self::rerank_candidates`]). The caller is
+    /// expected to have sized `k` to the desired rescore pool and to trim to
+    /// the final top-k itself. There is no cross-encoder path here — a
+    /// raw-vector query has no query TEXT to rank source text against (see
+    /// [`Self::search_text`], [`CrossEncoder`]) — every hit's `rerank_score`
+    /// is `None`.
     ///
     /// A non-empty `restrict` of at most [`EXACT_FILTER_MAX`] ids takes the exact
-    /// brute-force path over that set (see [`Vectorizer::brute_force_restricted`]),
-    /// ignoring `ef`/`rerank` (the result is already exact); `restrict = None`
-    /// leaves the global HNSW path unchanged.
+    /// brute-force path over that set (see [`Self::brute_force_restricted`]),
+    /// ignoring `ef`/`exact_rescore` (the result is already exact); `restrict =
+    /// None` leaves the global HNSW path unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn search_vector(
         &self,
@@ -1294,9 +1482,9 @@ impl Vectorizer {
         query_vec: &[f32],
         k: usize,
         ef: usize,
-        rerank: bool,
+        exact_rescore: bool,
         restrict: Option<&HashSet<u64>>,
-    ) -> EngineResult<Vec<(u64, f32)>> {
+    ) -> EngineResult<Vec<SimilarHit>> {
         let index_key = format!("{type_name}.{vector_field}");
         let index = self
             .indexes
@@ -1311,22 +1499,30 @@ impl Vectorizer {
         // Exact small-set path: a selective filter restricts the search to a
         // bounded set — brute-force exact distances over just those vectors.
         // Exact recall, never under-fills, and (for a small set) cheaper than
-        // the graph. `ef`/`rerank` are moot here (the result is already exact).
+        // the graph. `ef`/`exact_rescore` are moot here (already exact).
         if let Some(set) = restrict
             && set.len() <= EXACT_FILTER_MAX
         {
             if std::env::var_os("RHYPEDB_DEBUG_RERANK").is_some() {
                 eprintln!("[brute] key={index_key} restrict={} (exact small-set path)", set.len());
             }
-            return Ok(self.brute_force_restricted(&index_key, &index, query_vec, set));
+            return Ok(self
+                .brute_force_restricted(&index_key, &index, query_vec, set)
+                .into_iter()
+                .map(|(id, dist)| SimilarHit::by_distance(id, dist))
+                .collect());
         }
 
         let results = index.search(query_vec, k, ef);
-        if rerank {
-            Ok(self.rerank_candidates(&index_key, &index, query_vec, results))
+        let results = if exact_rescore {
+            self.rerank_candidates(&index_key, &index, query_vec, results)
         } else {
-            Ok(results)
-        }
+            results
+        };
+        Ok(results
+            .into_iter()
+            .map(|(id, dist)| SimilarHit::by_distance(id, dist))
+            .collect())
     }
 
     /// Re-score ANN candidates against the full-precision f32 vectors stored in
@@ -2065,7 +2261,7 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         // The ML-related posts (1 and 3) should rank above the cooking post (2).
-        let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<u64> = results.iter().map(|h| h.object_id).collect();
         assert!(
             ids.contains(&1) || ids.contains(&3),
             "expected ML-related posts in top 2, got {ids:?}"
@@ -2169,7 +2365,7 @@ mod tests {
             );
 
             // The ML document should rank above the cooking document.
-            assert_eq!(results[0].0, 1, "ML document should be the top result");
+            assert_eq!(results[0].object_id, 1, "ML document should be the top result");
         }
     }
 
@@ -2271,7 +2467,7 @@ mod tests {
                 .search_text("Post", "embedding", "artificial intelligence", 2, 50, false, None)
                 .unwrap();
             assert_eq!(results.len(), 2);
-            let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+            let ids: Vec<u64> = results.iter().map(|h| h.object_id).collect();
             assert!(
                 ids.contains(&1) || ids.contains(&3),
                 "ML posts should rank high after snapshot restore, got {ids:?}"
@@ -2408,7 +2604,7 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].0, 1,
+            results[0].object_id, 1,
             "nearest to [0.9,0.1,0,0] must be id 1, got {results:?}"
         );
         assert_eq!(
@@ -2443,7 +2639,7 @@ mod tests {
             .search_vector("Doc", "embedding", &[0.1, 0.9, 0.0, 0.0], 1, 16, false, None)
             .unwrap();
         assert_eq!(
-            results[0].0, 2,
+            results[0].object_id, 2,
             "after restart, nearest to [0.1,0.9,0,0] must be id 2, got {results:?}"
         );
     }
@@ -2583,13 +2779,13 @@ mod tests {
         assert_eq!(reranked.len(), n as usize, "rerank must keep the full pool");
         for (r, e) in reranked.iter().zip(exact.iter()) {
             assert!(
-                (r.1 - e.1).abs() < 1e-6,
+                (r.distance - e.1).abs() < 1e-6,
                 "reranked distance {} != exact {}",
-                r.1,
+                r.distance,
                 e.1
             );
         }
-        assert_eq!(reranked[0].0, exact[0].0, "top-1 id must match the exact NN");
+        assert_eq!(reranked[0].object_id, exact[0].0, "top-1 id must match the exact NN");
     }
 
     // Reproduces the benchmark conditions in-process: a higher-dim index, a
@@ -2645,8 +2841,8 @@ mod tests {
             let rr = v
                 .search_vector("Doc", "embedding", &query, pool, pool, true, None)
                 .unwrap();
-            ann_hits += ann.iter().take(k).filter(|(id, _)| gt_set.contains(id)).count();
-            rr_hits += rr.iter().take(k).filter(|(id, _)| gt_set.contains(id)).count();
+            ann_hits += ann.iter().take(k).filter(|h| gt_set.contains(&h.object_id)).count();
+            rr_hits += rr.iter().take(k).filter(|h| gt_set.contains(&h.object_id)).count();
             total += k;
         }
         let ann_recall = ann_hits as f32 / total as f32;
@@ -2674,7 +2870,7 @@ mod tests {
             .search_vector("Doc", "embedding", &synth_vec(2.0), 100, 200, true, None)
             .unwrap();
         assert_eq!(reranked.len(), 5);
-        assert_eq!(reranked[0].0, 2, "exact nearest to query(seed=2) is id 2");
+        assert_eq!(reranked[0].object_id, 2, "exact nearest to query(seed=2) is id 2");
     }
 
     // --- @index SDL directive → per-index config (Knob A) ---
@@ -2806,7 +3002,7 @@ mod tests {
             let hits = v
                 .search_vector("Doc", "embedding", &synth_vec(5.0), 3, 64, false, None)
                 .unwrap();
-            assert!(hits.iter().any(|(id, _)| *id == 5), "got {hits:?}");
+            assert!(hits.iter().any(|h| h.object_id == 5), "got {hits:?}");
         }
     }
 
@@ -2835,7 +3031,7 @@ mod tests {
             .search_vector("Doc", "embedding", &query, 2, 64, false, Some(&restrict))
             .unwrap();
 
-        let got_ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
+        let got_ids: Vec<u64> = got.iter().map(|h| h.object_id).collect();
         let exp_ids: Vec<u64> = expected.iter().map(|(id, _)| *id).collect();
         assert_eq!(
             got_ids, exp_ids,
@@ -2862,7 +3058,7 @@ mod tests {
         let global = v
             .search_vector("Doc", "embedding", &query, 8, 64, false, None)
             .unwrap();
-        let global_ids: HashSet<u64> = global.iter().map(|(id, _)| *id).collect();
+        let global_ids: HashSet<u64> = global.iter().map(|h| h.object_id).collect();
         assert!(
             restrict.is_disjoint(&global_ids),
             "precondition: restrict set must lie outside the global top-8, got {global_ids:?}"
@@ -2873,7 +3069,7 @@ mod tests {
         let got = v
             .search_vector("Doc", "embedding", &query, 2, 64, false, Some(&restrict))
             .unwrap();
-        let got_ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
+        let got_ids: HashSet<u64> = got.iter().map(|h| h.object_id).collect();
         assert_eq!(
             got_ids, restrict,
             "filtered search must return the set's members, not under-fill to the global top-k"
@@ -2900,9 +3096,9 @@ mod tests {
         // and sorts last — parity with rerank's never-under-fill rule. id 2 is
         // the exact self-match to the query.
         assert_eq!(got.len(), 3);
-        assert_eq!(got[0].0, 2, "self-match is nearest");
-        assert_eq!(got.last().unwrap().0, 99, "missing-vector member sorts last");
-        assert!(got.last().unwrap().1.is_infinite());
+        assert_eq!(got[0].object_id, 2, "self-match is nearest");
+        assert_eq!(got.last().unwrap().object_id, 99, "missing-vector member sorts last");
+        assert!(got.last().unwrap().distance.is_infinite());
     }
 
     #[test]
@@ -2925,7 +3121,7 @@ mod tests {
             let got = v
                 .search_vector("Doc", "embedding", &shared, 2, 64, false, Some(&restrict))
                 .unwrap();
-            let ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
+            let ids: Vec<u64> = got.iter().map(|h| h.object_id).collect();
             assert_eq!(ids, vec![10, 20], "tie-break by id must be deterministic");
         }
     }
@@ -3037,11 +3233,29 @@ mod tests {
         *v.reranker.lock() = Some(Box::new(MockReranker));
     }
 
+    /// Config used by tests that exercise the cross-encoder path: `On` plus a
+    /// `MockEmbedder`/`MockReranker` pre-injected via `inject_mocks` (which
+    /// bypasses the loaders entirely), so the `model` name here is never
+    /// actually looked up against `DEFAULT_RERANKER_MODEL`.
+    fn cross_encoder_on_config() -> VectorizerConfig {
+        VectorizerConfig {
+            cross_encoder: CrossEncoder::On { model: "mock".into() },
+            ..VectorizerConfig::default()
+        }
+    }
+
     #[test]
     fn filtered_text_search_keeps_textless_candidate_via_append() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
-        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema,
+            type_ids,
+            field_ids,
+            cross_encoder_on_config(),
+        )
+        .unwrap();
 
         // ids 1,2,3 all get vectors; only 1 and 2 get source text. id 3 has a
         // vector but NO body → invisible to the cross-encoder.
@@ -3062,7 +3276,7 @@ mod tests {
             .search_text("Doc", "embedding", "q", 3, 64, false, Some(&restrict))
             .unwrap();
 
-        let ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
+        let ids: HashSet<u64> = got.iter().map(|h| h.object_id).collect();
         // Without the append-fill, the cross-encoder would drop id 3 (no text)
         // and return only {1,2}. The result must still contain the textless
         // member, so a reranked result never under-fills.
@@ -3076,7 +3290,14 @@ mod tests {
     fn filtered_text_search_runs_cross_encoder_over_brute_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
-        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema,
+            type_ids,
+            field_ids,
+            cross_encoder_on_config(),
+        )
+        .unwrap();
 
         let rows = vec![
             (1u64, vec![1.0f32, 0.0, 0.0, 0.0]),
@@ -3095,8 +3316,93 @@ mod tests {
         let got = v
             .search_text("Doc", "embedding", "q", 5, 64, false, Some(&restrict))
             .unwrap();
-        let ids: HashSet<u64> = got.iter().map(|(id, _)| *id).collect();
+        let ids: HashSet<u64> = got.iter().map(|h| h.object_id).collect();
         assert_eq!(ids, restrict, "filtered text search returns the filter's members");
+    }
+
+    /// Regression test for the bug this config was added to fix: with the
+    /// default `CrossEncoder::Off`, `search_text` must never attempt to load
+    /// or run the cross-encoder — previously it ran unconditionally (gated
+    /// only by an env var), so `search_text(..., exact_rescore: false, ...)`
+    /// still downloaded and ran the ~280MB reranker model.
+    #[test]
+    fn cross_encoder_off_by_default_never_loads_reranker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        assert_eq!(v.config().cross_encoder, CrossEncoder::Off, "Off must be the default");
+
+        let rows = vec![(1u64, vec![1.0f32, 0.0, 0.0, 0.0]), (2, vec![0.0, 1.0, 0.0, 0.0])];
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+        for (id, _) in &rows {
+            store_object(&storage, 1, *id, &format!("doc {id}"));
+        }
+        // Only the embedder is injected, not the reranker — if search_text
+        // tried the cross-encoder path it would fall through to the REAL
+        // (network) loader, which this test would rather fail loudly on
+        // than silently succeed via a mock.
+        v.embedders
+            .lock()
+            .insert("mock".into(), Box::new(MockEmbedder { vec: vec![1.0, 0.0, 0.0, 0.0] }));
+
+        let got = v
+            .search_text("Doc", "embedding", "q", 2, 64, false, None)
+            .unwrap();
+        assert!(
+            got.iter().all(|h| h.rerank_score.is_none()),
+            "CrossEncoder::Off must never attach a rerank score: {got:?}"
+        );
+        assert!(
+            !v.reranker_loaded(),
+            "the reranker must never be loaded while cross_encoder is Off"
+        );
+    }
+
+    /// A reranked `search_text` result is a DIFFERENT ordering than plain
+    /// vector distance (`MockReranker` ranks by candidate order, i.e. the
+    /// reverse of the synthetic vectors' distance-from-query order below),
+    /// and every hit must carry a `rerank_score`, sorted strictly descending.
+    #[test]
+    fn cross_encoder_reranked_results_are_ordered_by_rerank_score_descending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::with_config(
+            Arc::clone(&storage),
+            schema,
+            type_ids,
+            field_ids,
+            cross_encoder_on_config(),
+        )
+        .unwrap();
+
+        let rows = vec![
+            (1u64, vec![1.0f32, 0.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0, 0.0]),
+            (4, vec![0.0, 0.0, 0.0, 1.0]),
+        ];
+        v.ingest_vectors("Doc", "embedding", &rows).unwrap();
+        for (id, _) in &rows {
+            store_object(&storage, 1, *id, &format!("doc {id}"));
+        }
+        inject_mocks(&v, vec![1.0, 0.0, 0.0, 0.0]);
+
+        let got = v
+            .search_text("Doc", "embedding", "q", 4, 64, false, None)
+            .unwrap();
+
+        assert_eq!(got.len(), 4, "every candidate has source text, so all 4 are ranked");
+        assert!(
+            got.iter().all(|h| h.rerank_score.is_some()),
+            "the cross-encoder ran, so every hit must carry a rerank score: {got:?}"
+        );
+        let scores: Vec<f32> = got.iter().map(|h| h.rerank_score.unwrap()).collect();
+        let mut sorted_desc = scores.clone();
+        sorted_desc.sort_by(|a, b| b.total_cmp(a));
+        assert_eq!(
+            scores, sorted_desc,
+            "a cross-encoder-reranked result must be ordered by rerank_score descending: {got:?}"
+        );
     }
 
     // --- Vectorizer hardening (issue #18): config knobs + fail-soft model load ---

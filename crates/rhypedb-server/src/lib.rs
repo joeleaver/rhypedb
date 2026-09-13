@@ -576,6 +576,11 @@ async fn handle_status(
             // soon as a load succeeds). See `Vectorizer::model_loaded`/`model_error`.
             "model_loaded": status.model_loaded,
             "model_error": status.model_error,
+            // The cross-encoder reranker's own (separate) fail-soft load
+            // state — only ever non-default when `[vectorizer] cross_encoder
+            // = true`. See `Vectorizer::reranker_loaded`/`reranker_error`.
+            "reranker_loaded": status.reranker_loaded,
+            "reranker_error": status.reranker_error,
         });
     } else {
         // No `@vectorize` fields → no vector index → zero indexed vectors.

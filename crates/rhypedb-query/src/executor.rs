@@ -751,12 +751,14 @@ fn resolve_similar_defaults(
 
 /// The HNSW search parameters resolved for one `.similar` step: the candidate
 /// pool to retrieve (`search_k`), the HNSW search width (`ef`), and whether to
-/// run a full-precision rerank.
+/// run a full-precision rescore (`Vectorizer::search_text`/`search_vector`'s
+/// `exact_rescore` — the query language's `rerank:` argument means exactly
+/// this, and is unrelated to the vectorizer-config-level cross-encoder).
 #[derive(Debug, PartialEq, Eq)]
 struct ResolvedSearch {
     search_k: usize,
     ef: usize,
-    rerank: bool,
+    exact_rescore: bool,
 }
 
 /// Resolve the effective HNSW search parameters from a `.similar` step plus the
@@ -817,7 +819,7 @@ fn resolve_search(
     ResolvedSearch {
         search_k,
         ef,
-        rerank: rerank.is_some(),
+        exact_rescore: rerank.is_some(),
     }
 }
 
@@ -865,7 +867,7 @@ fn run_similar(
     let ResolvedSearch {
         search_k,
         ef,
-        rerank,
+        exact_rescore,
     } = resolve_search(
         ef,
         rerank,
@@ -882,7 +884,7 @@ fn run_similar(
             text,
             search_k,
             ef,
-            rerank,
+            exact_rescore,
             restrict,
         )?,
         SimilarQuery::Vector(vec) => vectorizer.search_vector(
@@ -891,19 +893,28 @@ fn run_similar(
             vec,
             search_k,
             ef,
-            rerank,
+            exact_rescore,
             restrict,
         )?,
     };
 
-    // Each row carries the index's distance under the field's metric (lower =
-    // closer) as its score, so a client can fuse `.similar` and `.matches`
-    // rankings (reciprocal-rank fusion needs only the order).
+    // Each row's score is the cross-encoder's relevance score when one ran for
+    // that hit (HIGHER is more relevant — see `SimilarHit`), otherwise the
+    // index's distance under the field's metric (LOWER is closer). A caller
+    // fusing `.similar` with `.matches` (reciprocal-rank fusion needs only the
+    // order, not the scale) is unaffected either way; a caller reading `score`
+    // directly must check whether the field's vectorizer has a cross-encoder
+    // enabled to know which quantity it is. See "Ranked results" in the docs.
     let rows: Vec<(Object, f32)> = results
         .iter()
-        .filter(|(id, _dist)| restrict.is_none_or(|set| set.contains(id)))
+        .filter(|hit| restrict.is_none_or(|set| set.contains(&hit.object_id)))
         .take(k)
-        .filter_map(|(id, dist)| ctx.db.get(type_name, *id).ok().map(|o| (o, *dist)))
+        .filter_map(|hit| {
+            ctx.db
+                .get(type_name, hit.object_id)
+                .ok()
+                .map(|o| (o, hit.rerank_score.unwrap_or(hit.distance)))
+        })
         .collect();
 
     Ok(QueryOutput::Scored(rows))
@@ -2001,32 +2012,32 @@ mod tests {
         // heuristic ef (k.max(50) = 50), pool = k, no rerank.
         assert_eq!(
             resolve_search(None, None, None, None, 1, false),
-            ResolvedSearch { search_k: 1, ef: 50, rerank: false }
+            ResolvedSearch { search_k: 1, ef: 50, exact_rescore: false }
         );
         // A server `RHYPEDB_EF` default REACHES the resolved ef — 200, not the
         // heuristic 50. This is exactly what would NOT happen if run_similar
         // failed to thread the default through.
         assert_eq!(
             resolve_search(None, None, Some(200), None, 1, false),
-            ResolvedSearch { search_k: 1, ef: 200, rerank: false }
+            ResolvedSearch { search_k: 1, ef: 200, exact_rescore: false }
         );
         // A server `RHYPEDB_RERANK` default turns rerank ON and grows the pool to
         // at least the rerank size (ef stays at the heuristic, floored to search_k).
         assert_eq!(
             resolve_search(None, None, None, Some(10), 1, false),
-            ResolvedSearch { search_k: 10, ef: 50, rerank: true }
+            ResolvedSearch { search_k: 10, ef: 50, exact_rescore: true }
         );
         // An explicit per-query value wins over BOTH defaults; `rerank: 0` is an
         // explicit "off" that the default must not resurrect.
         assert_eq!(
             resolve_search(Some(7), Some(0), Some(200), Some(10), 5, false),
-            ResolvedSearch { search_k: 5, ef: 7, rerank: false }
+            ResolvedSearch { search_k: 5, ef: 7, exact_rescore: false }
         );
         // Restricted (post-filter) path: over-fetch base_k = 4*k, heuristic ef =
         // max(2*search_k, 64); the default ef still flows in and floors to search_k.
         assert_eq!(
             resolve_search(None, None, Some(200), None, 2, true),
-            ResolvedSearch { search_k: 8, ef: 200, rerank: false }
+            ResolvedSearch { search_k: 8, ef: 200, exact_rescore: false }
         );
         // Safety cap: a default far above MAX_VECTOR_SEARCH_POOL is clamped (so a
         // server-wide default can't exhaust a small VM any more than a per-query
@@ -2036,7 +2047,7 @@ mod tests {
             ResolvedSearch {
                 search_k: MAX_VECTOR_SEARCH_POOL,
                 ef: MAX_VECTOR_SEARCH_POOL,
-                rerank: true
+                exact_rescore: true
             }
         );
     }

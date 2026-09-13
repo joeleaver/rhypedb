@@ -280,7 +280,7 @@ fn assert_indexed_and_searchable(vz: &Vectorizer, storage: &LsmTree, oid: u64) {
         .search_vector("Doc", "embedding", &gt(oid), 1, 64, false, None)
         .unwrap();
     assert_eq!(
-        hits.first().map(|(id, _)| *id),
+        hits.first().map(|h| h.object_id),
         Some(oid),
         "object {oid} must be its own nearest neighbor (HNSW searchable)",
     );

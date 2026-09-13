@@ -66,7 +66,7 @@ The keys map one-to-one to the flags/env vars (flat, `snake_case`):
 | `worker_quiesce_budget_secs` | int ≥ 1 | `10` | *(file only)* |
 | `block_compression` | `"none"` \| `"lz4"` | `"none"` | `--block-compression` / `RHYPEDB_BLOCK_COMPRESSION` |
 
-**Background embedding pipeline.** A `[vectorizer]` TABLE (not a flat key) tunes the embed worker used by `@vectorize` fields: `batch_size`, `max_length`, `intra_threads`, `quantized`, `cache_dir` — all optional, config-file only, no flag/env in this version. See [Embedding pipeline settings](vectors.md#embedding-pipeline-settings) for defaults and what each knob costs.
+**Background embedding pipeline.** A `[vectorizer]` TABLE (not a flat key) tunes the embed worker used by `@vectorize` fields: `batch_size`, `max_length`, `intra_threads`, `quantized`, `cache_dir`, plus `cross_encoder`/`cross_encoder_model` to turn on (OFF by default) cross-encoder reranking of `.similar` text search — all optional, config-file only, no flag/env in this version. See [Embedding pipeline settings](vectors.md#embedding-pipeline-settings) for defaults and what each knob costs.
 
 **SST block compression.** `block_compression` controls how newly written SST
 files (memtable flushes and compactions) store their data region. `"none"` (the
@@ -211,7 +211,7 @@ curl -s -X POST http://127.0.0.1:4200/admin/compact \
 ## Monitoring
 
 - **`GET /health`** — liveness. Returns `200 OK` with a short status string.
-- **`GET /status`** — operational snapshot: active subscriptions, pending embeddings, per-index vector counts, the embedding model's load state (`model_loaded`, `model_error` — see [Embedding pipeline settings](vectors.md#embedding-pipeline-settings)), and — when the schema has `@fulltext` fields — a `fulltext` block: `building` (fields whose index is still being backfilled), `failed` (background index tasks that hit an error — the next restart retries them), and per-field `indexes` entries with `state` (`building` / `built`, or `dropping` for a field whose directive was removed and whose rows are still being swept), `generation`, `documents` (indexed documents), and backfill progress `indexed` / `total`.
+- **`GET /status`** — operational snapshot: active subscriptions, pending embeddings, per-index vector counts, the embedding model's load state (`model_loaded`, `model_error`) and, when [cross-encoder reranking](vectors.md#cross-encoder-reranking) is turned on, the reranker's own load state (`reranker_loaded`, `reranker_error`) — see [Embedding pipeline settings](vectors.md#embedding-pipeline-settings) — and — when the schema has `@fulltext` fields — a `fulltext` block: `building` (fields whose index is still being backfilled), `failed` (background index tasks that hit an error — the next restart retries them), and per-field `indexes` entries with `state` (`building` / `built`, or `dropping` for a field whose directive was removed and whose rows are still being swept), `generation`, `documents` (indexed documents), and backfill progress `indexed` / `total`.
 - **`GET /schema`** — live schema introspection (JSON + canonical SDL) for tooling and typed-client codegen. See the [API reference](api-reference.md#get-schema).
 
 ```bash
@@ -225,7 +225,9 @@ curl -s http://127.0.0.1:4200/status
     "pending": 0,
     "indexes": [ { "name": "Post.embedding", "vectors": 12000 } ],
     "model_loaded": true,
-    "model_error": null
+    "model_error": null,
+    "reranker_loaded": false,
+    "reranker_error": null
   }
 }
 ```

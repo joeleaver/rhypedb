@@ -70,8 +70,36 @@ The background embed worker (and the query-time embedder used by a text `.simila
 | `intra_threads` | half the CPU cores | ONNX Runtime intra-op threads used by each lazily-loaded model. |
 | `quantized` | `true` | Prefer the int8-quantized model variant when fastembed has one (`all-MiniLM-L6-v2`, `bge-small-en-v1.5`); smaller and faster, a small quality cost. Base/large BGE models have no quantized variant and always use fp32 regardless of this setting. |
 | `cache_dir` | fastembed's own default | Where downloaded model files are cached on disk. |
+| `cross_encoder` | `false` | Turn on cross-encoder reranking of `.similar` text search (see [Cross-encoder reranking](#cross-encoder-reranking) below). A second model, off by default. |
+| `cross_encoder_model` | `"bge-reranker-base"` | The cross-encoder model name; only used when `cross_encoder = true`. Today exactly one model is supported — see below. |
 
 If the model fails to load — a network hiccup mid-download, a cold cache on first boot, or simply the time it takes to download and initialize a ~100MB+ ONNX model — the background worker does **not** fail or drop the affected jobs. It puts them back on the queue, records the failure under `vectorizer.model_error` on `GET /status`, and retries with an exponential backoff (starting at 2s, doubling up to a 60s cap) until a load succeeds, at which point `model_error` clears and the backoff resets. A `.similar` text query made while the model is unavailable gets a clear `ModelUnavailable` error rather than blocking or panicking.
+
+### Cross-encoder reranking
+
+`.similar` text search can optionally run a SECOND pass over the ANN
+candidates: a cross-encoder model scores each candidate's source text
+directly against your query text, which typically ranks results more
+accurately than vector distance alone — at the cost of one extra model
+(~280MB) and one forward pass per candidate. It is **off by default**
+(`cross_encoder = false`); turn it on with:
+
+```toml
+[vectorizer]
+cross_encoder = true
+# cross_encoder_model = "bge-reranker-base"   # optional; this is the default (and only supported) value
+```
+
+This is a **separate knob from the per-query `rerank:` argument** (see
+[Searching — `.similar`](#searching--similar) below) — `rerank: N` always
+means "re-score `N` candidates against the exact `f32` vectors," a cheap
+step that is always available. The cross-encoder runs *in addition to* that,
+whenever it is turned on here AND the field has a readable `@vectorize`
+source text; a raw-vector `.similar` query never uses it (there is no query
+text to score against). Like the embedder, a cross-encoder load failure is
+fail-soft: `.similar` falls back to returning the ANN/rescored order rather
+than erroring, and the failure is visible under `vectorizer.reranker_error`
+on `GET /status` (`vectorizer.reranker_loaded` mirrors `model_loaded`).
 
 ## Indexing for search — `@index(hnsw, ...)`
 
@@ -125,7 +153,7 @@ Post.similar(.embedding, "distributed consensus", k: 10, ef: 200, rerank: 50)
 Post.filter(.published == true).similar(.embedding, "rust async", k: 10)
 ```
 
-Every `.similar` result is **ranked**: the objects come back nearest-first and each carries a `score` — the index's distance under the field's metric (lower is closer). Clients read it as `Row.score`; see [Ranked results](queries.md#ranked-results) and, for keyword search over the same objects, [`.matches`](queries.md#full-text-search--matchesfield-query-k-n).
+Every `.similar` result is **ranked** and each carries a `score`, read as `Row.score`. Ordinarily `score` is the index's distance under the field's metric (**lower** is closer) and results come back nearest-first. If the field's vectorizer has [cross-encoder reranking](#cross-encoder-reranking) turned on, `score` is instead the cross-encoder's relevance score (**higher** is more relevant) and results come back most-relevant-first — the two scales are not comparable, so know which one your deployment uses. See [Ranked results](queries.md#ranked-results) and, for keyword search over the same objects, [`.matches`](queries.md#full-text-search--matchesfield-query-k-n).
 
 ## Tuning recall vs. latency
 
