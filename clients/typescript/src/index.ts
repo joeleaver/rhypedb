@@ -22,4 +22,4 @@ export { RhypedbError } from "./errors.ts";
 export type { ErrorCode } from "./errors.ts";
 export { AsyncSubscription, SubscriptionFilter } from "./subscription.ts";
 export type { ChangeNotification, Notification } from "./subscription.ts";
-export type { ChangeKind, DecodedObject, DecodedValue, Frame } from "./wire.ts";
+export type { ChangeKind, DecodedObject, DecodedValue, Frame, ScoredObject } from "./wire.ts";

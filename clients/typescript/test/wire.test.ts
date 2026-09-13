@@ -18,6 +18,8 @@ import {
   encodeSubscribeFilter,
   encodeUnsubscribePayload,
   decodeObjectsPayload,
+  decodeScoredPayload,
+  encodeScoredPayload,
   decodeSinglePayload,
   decodePreparedPayload,
   decodeErrorPayload,
@@ -205,4 +207,25 @@ test("decoding truncated payloads throws WireError, never a silent wrong value",
   // count says 1 object but no object bytes follow
   assert.throws(() => decodeObjectsPayload(Buffer.from([0, 0, 0, 1])), WireError);
   assert.throws(() => decodeErrorPayload(Buffer.from([0, 0, 0, 5, 0x61])), WireError); // body short
+});
+
+test("scored payload round-trips rows in order with exact scores", () => {
+  const a = encodeObject("Post", 1n, [["title", { tag: "string", value: "a" }]]);
+  const b = encodeObject("Post", 2n, [["title", { tag: "string", value: "b" }]]);
+  const rows = decodeScoredPayload(
+    encodeScoredPayload([
+      { object: a, score: 2.5 },
+      { object: b, score: -0.25 },
+    ]),
+  );
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.object.id, 1n);
+  assert.equal(rows[0]!.score, 2.5);
+  assert.equal(rows[1]!.object.id, 2n);
+  assert.equal(rows[1]!.score, -0.25);
+  assert.deepEqual(decodeScoredPayload(encodeScoredPayload([])), []);
+  // Truncated score / truncated object fail loudly.
+  const full = encodeScoredPayload([{ object: a, score: 1 }]);
+  assert.throws(() => decodeScoredPayload(full.subarray(0, 6)), WireError);
+  assert.throws(() => decodeScoredPayload(full.subarray(0, full.length - 1)), WireError);
 });

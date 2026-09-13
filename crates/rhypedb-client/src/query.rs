@@ -66,6 +66,18 @@ impl<T> Query<T> {
         self
     }
 
+    /// Append `.matches(.<field>, "<text>", k: <k>)` — ranked full-text search
+    /// over a `@fulltext` field. `text` is escaped as a query-language string
+    /// literal; the rows come back with [`Row::score`] set (BM25).
+    #[must_use]
+    pub fn matches(mut self, field: &str, text: &str, k: u64) -> Self {
+        self.text.push_str(&format!(
+            ".matches(.{field}, {}, k: {k})",
+            ql_string_literal(text)
+        ));
+        self
+    }
+
     /// Borrow the query string (what the client sends).
     pub fn as_str(&self) -> &str {
         &self.text
@@ -77,17 +89,39 @@ impl<T> Query<T> {
     }
 }
 
+/// Escape `s` as a query-language string literal (the two escapes the
+/// server's parser understands: `\"` and `\\`).
+fn ql_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 impl<T> std::fmt::Display for Query<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.text)
     }
 }
 
-/// A query-result row: the object `id` plus its typed scalar fields.
+/// A query-result row: the object `id` plus its typed scalar fields, and —
+/// for a ranked result — its score.
 #[derive(Debug, Clone)]
 pub struct Row<T> {
     pub id: u64,
     pub data: T,
+    /// `Some` only for rows of a ranked result, which arrive in rank order:
+    /// `.matches` → the BM25 score (higher is better); `.similar` → the
+    /// index distance under the field's metric (lower is closer). `None`
+    /// for every other query shape.
+    pub score: Option<f32>,
 }
 
 impl<T: DeserializeOwned> Row<T> {
@@ -104,7 +138,18 @@ impl<T: DeserializeOwned> Row<T> {
         }
         let data = serde_json::from_value(serde_json::Value::Object(map))
             .map_err(|e| Error::Deserialize(e.to_string()))?;
-        Ok(Row { id: obj.id, data })
+        Ok(Row {
+            id: obj.id,
+            data,
+            score: None,
+        })
+    }
+
+    /// Materialize a typed row of a ranked result (see [`Row::score`]).
+    pub fn from_scored(obj: &Object, score: f32) -> Result<Self, Error> {
+        let mut row = Self::from_object(obj)?;
+        row.score = Some(score);
+        Ok(row)
     }
 }
 
@@ -135,6 +180,26 @@ mod tests {
             "User.filter(.age > 18).limit(5)"
         );
         assert_eq!(Query::<User>::raw("anything").as_str(), "anything");
+        assert_eq!(
+            Query::<User>::all("Post")
+                .filter(".published == true")
+                .matches("body", "invoice \"4471\" a\\b", 20)
+                .build(),
+            r#"Post.filter(.published == true).matches(.body, "invoice \"4471\" a\\b", k: 20)"#
+        );
+    }
+
+    #[test]
+    fn row_from_scored_carries_the_score() {
+        let obj = Object {
+            type_name: "User".into(),
+            id: 9,
+            fields: FieldMap::new(),
+            raw_fields: None,
+        };
+        let row = Row::<User>::from_scored(&obj, 2.5).unwrap();
+        assert_eq!(row.score, Some(2.5));
+        assert_eq!(Row::<User>::from_object(&obj).unwrap().score, None);
     }
 
     #[test]

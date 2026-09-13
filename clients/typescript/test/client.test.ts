@@ -18,6 +18,7 @@ import {
   encodeFrame,
   encodeObject,
   encodeObjectsPayload,
+  encodeScoredPayload,
   encodeErrorPayload,
   type EncValue,
   type Frame,
@@ -48,6 +49,14 @@ function respondQuery(sock: Socket, reqId: number, q: string): void {
     send(Resp.Single, userObj(2n, "Bob", 25));
   } else if (q.includes("delete")) {
     send(Resp.Done, Buffer.alloc(0));
+  } else if (q.includes(".matches(")) {
+    send(
+      Resp.Scored,
+      encodeScoredPayload([
+        { object: userObj(2n, "Bob", 25), score: 1.75 },
+        { object: userObj(1n, "Alice", 30), score: 0.5 },
+      ]),
+    );
   } else {
     send(Resp.Error, encodeErrorPayload("no such type: Bad"));
   }
@@ -213,4 +222,28 @@ test("connect to a closed port rejects with a connect error", async () => {
     AsyncClient.connect({ host: "127.0.0.1", port }, { connectTimeoutMs: 1000 }),
     (e: unknown) => e instanceof RhypedbError && e.code === "connect",
   );
+});
+
+test("a ranked (Scored) reply materializes rows in rank order with score", async () => {
+  const { port, server } = await startMock(standardHandler);
+  const client = await AsyncClient.connect({ host: "127.0.0.1", port });
+
+  const q = Query.all<User>("User").matches("name", 'bo "b"\\x', 2);
+  assert.equal(q.text, 'User.matches(.name, "bo \\"b\\"\\\\x", k: 2)');
+  const rows = await client.fetch(q);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.id, 2n);
+  assert.equal(rows[0]!.score, 1.75);
+  assert.equal(rows[0]!.data.name, "Bob");
+  assert.equal(rows[1]!.id, 1n);
+  assert.equal(rows[1]!.score, 0.5);
+  // The untyped result exposes the kind.
+  const raw = await client.query(q.text);
+  assert.equal(raw.kind, "scored");
+  // Ordinary rows carry no score.
+  const plain = await client.fetch(Query.all<User>("User"));
+  assert.equal(plain[0]!.score, undefined);
+
+  client.close();
+  server.close();
 });

@@ -102,6 +102,8 @@ Post.similar(.embedding, "distributed consensus", k: 10, ef: 200, rerank: 50)
 Post.filter(.published == true).similar(.embedding, "rust async", k: 10)
 ```
 
+Every `.similar` result is **ranked**: the objects come back nearest-first and each carries a `score` — the index's distance under the field's metric (lower is closer). Clients read it as `Row.score`; see [Ranked results](queries.md#ranked-results) and, for keyword search over the same objects, [`.matches`](queries.md#full-text-search--matchesfield-query-k-n).
+
 ## Tuning recall vs. latency
 
 Three knobs trade accuracy for speed:

@@ -34,6 +34,8 @@ export const Resp = {
   Subscribed: 0x86,
   Event: 0x87,
   SubLagged: 0x88,
+  /** A ranked list: `[count:u32]` then `[score:f32][object]` per row, in rank order. */
+  Scored: 0x89,
 } as const;
 
 /** Value serialization tags (the `ValueTag` enum on the Rust side). */
@@ -315,6 +317,25 @@ export function decodeObjectsPayload(payload: Buffer): DecodedObject[] {
   return out;
 }
 
+/** One row of a ranked (`RESP_SCORED`) result. */
+export interface ScoredObject {
+  object: DecodedObject;
+  /** `.matches` → BM25 (higher is better); `.similar` → index distance (lower is closer). */
+  score: number;
+}
+
+/** Decode a `RESP_SCORED` payload: `[count:u32]` then `[score:f32 BE][object]` per row. */
+export function decodeScoredPayload(payload: Buffer): ScoredObject[] {
+  const r = new Reader(payload);
+  const count = r.u32("scored count");
+  const out: ScoredObject[] = [];
+  for (let i = 0; i < count; i++) {
+    const score = r.f32("row score");
+    out.push({ object: decodeObjectAt(r), score });
+  }
+  return out;
+}
+
 /** Decode a `RESP_SINGLE` payload: exactly one object. */
 export function decodeSinglePayload(payload: Buffer): DecodedObject {
   return decodeObjectAt(new Reader(payload));
@@ -583,6 +604,19 @@ export function encodeObjectsPayload(objects: ReadonlyArray<Buffer>): Buffer {
   const head = Buffer.allocUnsafe(4);
   head.writeUInt32BE(objects.length, 0);
   return Buffer.concat([head, ...objects]);
+}
+
+/** Encode a `RESP_SCORED` payload: `[count:u32]` then `[score:f32][object]` per row. */
+export function encodeScoredPayload(rows: ReadonlyArray<{ object: Buffer; score: number }>): Buffer {
+  const head = Buffer.allocUnsafe(4);
+  head.writeUInt32BE(rows.length, 0);
+  const parts: Buffer[] = [head];
+  for (const { object, score } of rows) {
+    const s = Buffer.allocUnsafe(4);
+    s.writeFloatBE(score, 0);
+    parts.push(s, object);
+  }
+  return Buffer.concat(parts);
 }
 
 /** Encode a `RESP_ERROR` payload: `[len:u32][utf8]`. */

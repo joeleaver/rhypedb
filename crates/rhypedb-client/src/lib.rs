@@ -119,8 +119,11 @@ pub struct ClientConfig {
 /// The decoded result of a query, before typing.
 #[derive(Debug, Clone)]
 pub enum QueryResult {
-    /// A list result (`RESP_OBJECTS`) — filters, scans, `.similar`, etc.
+    /// A list result (`RESP_OBJECTS`) — filters, scans, gets, etc.
     Objects(Vec<Object>),
+    /// A RANKED list (`RESP_SCORED`) — `.matches` / `.similar` — each row with
+    /// its score, in rank order. See [`Row::score`] for the score's meaning.
+    Scored(Vec<(Object, f32)>),
     /// A single object (`RESP_SINGLE`) — `get`, `create`, `update`.
     Single(Object),
     /// A void result (`RESP_DONE`) — `delete`, `link`, `unlink`.
@@ -128,10 +131,13 @@ pub enum QueryResult {
 }
 
 impl QueryResult {
-    /// Flatten to a list: `Single` → one element, `Done` → empty.
+    /// Flatten to a list: `Single` → one element, `Done` → empty, `Scored` →
+    /// the objects in rank order (scores dropped; use [`Client::fetch`] /
+    /// [`Row::score`] to keep them).
     pub fn into_objects(self) -> Vec<Object> {
         match self {
             QueryResult::Objects(v) => v,
+            QueryResult::Scored(v) => v.into_iter().map(|(o, _)| o).collect(),
             QueryResult::Single(o) => vec![o],
             QueryResult::Done => Vec::new(),
         }
@@ -140,14 +146,22 @@ impl QueryResult {
     fn shape(&self) -> &'static str {
         match self {
             QueryResult::Objects(_) => "a list",
+            QueryResult::Scored(_) => "a ranked list",
             QueryResult::Single(_) => "a single object",
             QueryResult::Done => "no result",
         }
     }
 
-    /// Materialize every object into `T` (`fetch`-shaped results).
+    /// Materialize every object into `T` (`fetch`-shaped results). Ranked
+    /// results keep their score on each row.
     fn into_typed_rows<T: DeserializeOwned>(self) -> Result<Vec<Row<T>>> {
-        self.into_objects().iter().map(Row::from_object).collect()
+        match self {
+            QueryResult::Scored(rows) => rows
+                .iter()
+                .map(|(o, score)| Row::from_scored(o, *score))
+                .collect(),
+            other => other.into_objects().iter().map(Row::from_object).collect(),
+        }
     }
 
     /// Materialize a result that must be exactly one object into `T`
@@ -156,6 +170,10 @@ impl QueryResult {
         match self {
             QueryResult::Single(o) => Row::from_object(&o),
             QueryResult::Objects(mut v) if v.len() == 1 => Row::from_object(&v.remove(0)),
+            QueryResult::Scored(mut v) if v.len() == 1 => {
+                let (o, score) = v.remove(0);
+                Row::from_scored(&o, score)
+            }
             other => Err(Error::UnexpectedShape(other.shape())),
         }
     }
@@ -442,6 +460,9 @@ fn decode_query_frame(frame: &protocol::Frame) -> Result<QueryResult> {
         protocol::RESP_OBJECTS => Ok(QueryResult::Objects(
             protocol::decode_objects_payload(&frame.payload).map_err(Error::Io)?,
         )),
+        protocol::RESP_SCORED => Ok(QueryResult::Scored(
+            protocol::decode_scored_payload(&frame.payload).map_err(Error::Io)?,
+        )),
         protocol::RESP_SINGLE => {
             let (obj, _) = protocol::decode_object(&frame.payload, 0).map_err(Error::Io)?;
             Ok(QueryResult::Single(obj))
@@ -491,6 +512,16 @@ mod tests {
         let payload = protocol::encode_objects_payload(&[obj(1), obj(2)]);
         match decode_query_frame(&frame(protocol::RESP_OBJECTS, payload)).unwrap() {
             QueryResult::Objects(v) => assert_eq!(v.len(), 2),
+            other => panic!("{other:?}"),
+        }
+        // RESP_SCORED → Scored, scores bit-exact and in order
+        let payload = protocol::encode_scored_payload(&[(obj(3), 1.5), (obj(4), 0.25)]);
+        match decode_query_frame(&frame(protocol::RESP_SCORED, payload)).unwrap() {
+            QueryResult::Scored(v) => {
+                assert_eq!(v.len(), 2);
+                assert_eq!((v[0].0.id, v[0].1), (3, 1.5));
+                assert_eq!((v[1].0.id, v[1].1), (4, 0.25));
+            }
             other => panic!("{other:?}"),
         }
         // RESP_SINGLE → Single

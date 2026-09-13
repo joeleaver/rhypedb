@@ -177,6 +177,9 @@ struct ObjectJson {
     type_name: String,
     id: u64,
     fields: std::collections::HashMap<String, serde_json::Value>,
+    /// Ranked results (`.matches` / `.similar`) carry a per-row score.
+    #[serde(default)]
+    score: Option<f64>,
 }
 
 fn send_query(host: &str, query: &str) -> Result<QueryResponse, String> {
@@ -220,7 +223,10 @@ fn print_response(resp: &QueryResponse) {
 }
 
 fn print_object(obj: &ObjectJson) {
-    println!("{}:{}", obj.type_name, obj.id);
+    match obj.score {
+        Some(score) => println!("{}:{}  (score: {score})", obj.type_name, obj.id),
+        None => println!("{}:{}", obj.type_name, obj.id),
+    }
     let mut keys: Vec<_> = obj.fields.keys().collect();
     keys.sort();
     for key in keys {

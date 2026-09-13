@@ -14,6 +14,7 @@ use crate::error::{QueryError, QueryResult};
 ///           | IDENT
 /// step      = "filter(" predicate ")"
 ///           | "similar(" field "," vector "," "k:" INT ("," ("ef"|"rerank") ":" INT)* ")"
+///           | "matches(" field "," STRING "," "k:" INT ")"
 ///           | "update(" object ")"
 ///           | "delete()"
 ///           | "link(" IDENT ".get(" INT ")" ["," object] ")"
@@ -558,7 +559,9 @@ impl<'a> Parser<'a> {
 
             match &step {
                 Step::Limit { .. } => saw_limit = true,
-                Step::Traverse { .. } | Step::Similar { .. } => saw_limit = false,
+                Step::Traverse { .. } | Step::Similar { .. } | Step::Matches { .. } => {
+                    saw_limit = false
+                }
                 Step::Offset { .. } if saw_limit => {
                     return Err(self.error(
                         "`.offset(...)` must come before `.limit(...)`: `.limit(N).offset(M)` \
@@ -721,6 +724,41 @@ impl<'a> Parser<'a> {
                     k,
                     ef,
                     rerank,
+                })
+            }
+            "matches" => {
+                self.expect_char('(')?;
+                self.skip_ws();
+                self.expect_char('.')?;
+                let field_name = self.parse_ident()?;
+                self.skip_ws();
+                self.expect_char(',')?;
+                self.skip_ws();
+                if self.peek() != Some('"') {
+                    return Err(self.error("matches() query must be a string literal"));
+                }
+                let query = self.parse_string_literal()?;
+                self.skip_ws();
+                self.expect_char(',')?;
+                self.skip_ws();
+                self.expect_str("k:")?;
+                let k = self.parse_count()?;
+                self.skip_ws();
+                if self.peek() == Some(',') {
+                    self.advance();
+                    self.skip_ws();
+                    if self.peek() != Some(')') {
+                        let name = self.parse_ident()?;
+                        return Err(self.error(format!(
+                            "unknown matches() parameter '{name}' (only `k:` is accepted)"
+                        )));
+                    }
+                }
+                self.expect_char(')')?;
+                Ok(Step::Matches {
+                    field_name,
+                    query,
+                    k,
                 })
             }
             "update" => {
@@ -1050,6 +1088,54 @@ mod tests {
         assert!(parse_query("Post.similar(.embedding, [1.0, 0.0], k: 10, ef: 0)").is_err());
         // Negative count is rejected by parse_count.
         assert!(parse_query("Post.similar(.embedding, [1.0, 0.0], k: 10, rerank: -1)").is_err());
+    }
+
+    #[test]
+    fn parse_matches_step() {
+        let q = parse_query(r#"Post.matches(.body, "invoice 4471", k: 20)"#).unwrap();
+        assert_eq!(q.source, Source::All { type_name: "Post".into() });
+        assert_eq!(
+            q.steps,
+            vec![Step::Matches {
+                field_name: "body".into(),
+                query: "invoice 4471".into(),
+                k: 20,
+            }]
+        );
+        // After a filter, with escapes and whitespace; a trailing comma is tolerated.
+        let q = parse_query(
+            r#"Post.filter(.published == true).matches( .body , "+\"a b\" c\n" , k: 3 , )"#,
+        )
+        .unwrap();
+        // `Post.filter(..)` is the SOURCE; `.matches` is the only step.
+        assert!(matches!(q.source, Source::Filter { .. }));
+        assert_eq!(q.steps.len(), 1);
+        assert_eq!(
+            q.steps[0],
+            Step::Matches {
+                field_name: "body".into(),
+                query: "+\"a b\" c\n".into(),
+                k: 3,
+            }
+        );
+        // Resets the limit/offset ordering rule like `.similar`.
+        assert!(parse_query(r#"Post.limit(5).matches(.body, "x", k: 2).offset(1)"#).is_ok());
+    }
+
+    #[test]
+    fn parse_matches_rejects_bad_shapes() {
+        for q in [
+            r#"Post.matches(.body, invoice, k: 20)"#,
+            r#"Post.matches(.body, ["a"], k: 20)"#,
+            r#"Post.matches(.body, "x")"#,
+            r#"Post.matches(.body, "x", 20)"#,
+            r#"Post.matches(.body, "x", k: -1)"#,
+            r#"Post.matches(.body, "x", k: 2, ef: 5)"#,
+            r#"Post.matches(body, "x", k: 2)"#,
+            r#"Post.matches("x", k: 2)"#,
+        ] {
+            assert!(parse_query(q).is_err(), "{q}");
+        }
     }
 
     #[test]

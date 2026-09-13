@@ -257,6 +257,11 @@ struct ObjectJson {
     type_name: String,
     id: u64,
     fields: HashMap<String, serde_json::Value>,
+    /// Present only on a RANKED result (`.matches` → BM25, higher is better;
+    /// `.similar` → the index distance under the field's metric, lower is
+    /// closer). Rows are in rank order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    score: Option<f32>,
 }
 
 impl From<Object> for ObjectJson {
@@ -273,7 +278,16 @@ impl From<Object> for ObjectJson {
             type_name: obj.type_name,
             id: obj.id,
             fields,
+            score: None,
         }
+    }
+}
+
+impl ObjectJson {
+    fn scored(obj: Object, score: f32) -> Self {
+        let mut json = Self::from(obj);
+        json.score = Some(score);
+        json
     }
 }
 
@@ -333,6 +347,19 @@ async fn handle_query(
             StatusCode::OK,
             Json(QueryResponse {
                 objects: Some(objs.into_iter().map(ObjectJson::from).collect()),
+                object: None,
+                ok: None,
+                error: None,
+            }),
+        ),
+        Ok(QueryOutput::Scored(rows)) => (
+            StatusCode::OK,
+            Json(QueryResponse {
+                objects: Some(
+                    rows.into_iter()
+                        .map(|(obj, score)| ObjectJson::scored(obj, score))
+                        .collect(),
+                ),
                 object: None,
                 ok: None,
                 error: None,
@@ -1999,6 +2026,12 @@ where
             })
             .await
         }
+        Ok(QueryOutput::Scored(rows)) => {
+            protocol::write_frame_buffered(writer, response_buf, req_id, protocol::RESP_SCORED, |buf| {
+                protocol::encode_scored_payload_into(&rows, buf)
+            })
+            .await
+        }
         Ok(QueryOutput::Single(obj)) => {
             if let Some(vectorizer) = &state.vectorizer {
                 enqueue_vectorize(vectorizer, &state.db(), &obj);
@@ -2037,16 +2070,24 @@ mod tcp_tests {
     fn test_state_with_governor(
         query_governor: Option<rhypedb_query::GovernorLimits>,
     ) -> Arc<AppState> {
-        let dir = tempfile::tempdir().unwrap();
-        let schema = parse_schema(
+        test_state_full(
             r#"
             type User {
                 name: String
                 age: u32
             }
             "#,
+            query_governor,
         )
-        .unwrap();
+    }
+
+    /// An `AppState` over an arbitrary schema (`sdl`), governor optional.
+    fn test_state_full(
+        sdl: &str,
+        query_governor: Option<rhypedb_query::GovernorLimits>,
+    ) -> Arc<AppState> {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(sdl).unwrap();
         let db = Database::open(schema, dir.path()).unwrap();
         let data_dir = dir.path().to_path_buf();
         // Leak the tempdir — it will live for the test process lifetime.
@@ -2213,6 +2254,72 @@ mod tcp_tests {
                 .expect("create");
         }
         assert!(execute_query(&open, "User", &rhypedb_authz::Principal::anonymous()).is_ok());
+    }
+
+    /// A ranked query (`.matches`) reaches the HTTP path as `"score"` on each
+    /// object (absent on plain queries) and the TCP path as a `RESP_SCORED`
+    /// frame, rows in rank order on both.
+    #[tokio::test]
+    async fn ranked_query_renders_score_on_json_and_scored_frame_on_tcp() {
+        let state = test_state_full("type Post { title: String @fulltext }", None);
+        let anon = rhypedb_authz::Principal::anonymous();
+        execute_query(&state, r#"Post.create({ title: "invoice invoice run" })"#, &anon).unwrap();
+        execute_query(&state, r#"Post.create({ title: "one invoice" })"#, &anon).unwrap();
+        execute_query(&state, r#"Post.create({ title: "unrelated" })"#, &anon).unwrap();
+
+        // HTTP/JSON.
+        let (status, Json(resp)) = handle_query(
+            State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            Json(QueryRequest {
+                query: r#"Post.matches(.title, "invoice", k: 5)"#.into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{:?}", resp.error);
+        let objs = resp.objects.as_ref().unwrap();
+        assert_eq!(objs.len(), 2);
+        assert_eq!(objs[0].id, 1);
+        assert_eq!(objs[1].id, 2);
+        let (s0, s1) = (objs[0].score.unwrap(), objs[1].score.unwrap());
+        assert!(s0 > s1 && s1 > 0.0, "{s0} {s1}");
+        let text = serde_json::to_string(&resp).unwrap();
+        assert!(text.contains("\"score\":"), "{text}");
+        // A plain query has no score member at all.
+        let (_, Json(plain)) = handle_query(
+            State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            Json(QueryRequest { query: "Post".into() }),
+        )
+        .await;
+        assert!(plain.objects.as_ref().unwrap().iter().all(|o| o.score.is_none()));
+        assert!(!serde_json::to_string(&plain).unwrap().contains("score"));
+
+        // Binary TCP.
+        let (mut client, server) = duplex(4096);
+        let st = Arc::clone(&state);
+        let handler = tokio::spawn(async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let (read, write) = tokio::io::split(server);
+            let mut reader = tokio::io::BufReader::new(read);
+            let mut writer = tokio::io::BufWriter::new(write);
+            handle_connection_stream(&mut reader, &mut writer, st, shutdown_rx).await;
+        });
+        let payload = protocol::encode_query_payload(r#"Post.matches(.title, "invoice", k: 5)"#);
+        protocol::write_frame(&mut client, 7, protocol::REQ_QUERY, &payload).await.unwrap();
+        let resp = protocol::read_frame(&mut client).await.unwrap();
+        assert_eq!(resp.req_id, 7);
+        assert_eq!(resp.kind, protocol::RESP_SCORED);
+        let rows = protocol::decode_scored_payload(&resp.payload).unwrap();
+        assert_eq!(rows.iter().map(|(o, _)| o.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(rows[0].1, s0);
+        assert_eq!(rows[1].1, s1);
+        assert_eq!(
+            rows[0].0.fields.get("title"),
+            Some(&Value::String("invoice invoice run".into()))
+        );
+        drop(client);
+        let _ = handler.await;
     }
 
     #[tokio::test]

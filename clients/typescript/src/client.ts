@@ -28,6 +28,8 @@ import {
   decodeErrorPayload,
   type DecodedObject,
   type Frame,
+  decodeScoredPayload,
+  type ScoredObject,
 } from "./wire.ts";
 
 /** Connection options. */
@@ -39,6 +41,8 @@ export interface ClientOptions {
 /** The decoded result of a query, before typing. */
 export type QueryResult =
   | { kind: "objects"; objects: DecodedObject[] }
+  /** A ranked list (`.matches` / `.similar`): rows in rank order, each with its score. */
+  | { kind: "scored"; rows: ScoredObject[] }
   | { kind: "single"; object: DecodedObject }
   | { kind: "done" };
 
@@ -319,6 +323,8 @@ function decodeQueryFrame(frame: Frame): QueryResult {
   switch (frame.kind) {
     case Resp.Objects:
       return { kind: "objects", objects: decode(() => decodeObjectsPayload(frame.payload)) };
+    case Resp.Scored:
+      return { kind: "scored", rows: decode(() => decodeScoredPayload(frame.payload)) };
     case Resp.Single:
       return { kind: "single", object: decode(() => decodeSinglePayload(frame.payload)) };
     case Resp.Done:
@@ -339,15 +345,19 @@ function decode<T>(f: () => T): T {
   }
 }
 
-function objectToRow<T>(obj: DecodedObject): Row<T> {
-  return { id: obj.id, data: obj.fields as unknown as T };
+function objectToRow<T>(obj: DecodedObject, score?: number): Row<T> {
+  const row: Row<T> = { id: obj.id, data: obj.fields as unknown as T };
+  if (score !== undefined) row.score = score;
+  return row;
 }
 
-/** `objects` → rows; `single` → one row; `done` → empty (the `fetch` shape). */
+/** `objects` → rows; `scored` → rows with `score`; `single` → one row; `done` → empty. */
 function flattenRows<T>(result: QueryResult): Row<T>[] {
   switch (result.kind) {
     case "objects":
       return result.objects.map((o) => objectToRow<T>(o));
+    case "scored":
+      return result.rows.map((r) => objectToRow<T>(r.object, r.score));
     case "single":
       return [objectToRow<T>(result.object)];
     case "done":
@@ -360,6 +370,9 @@ function singleRow<T>(result: QueryResult): Row<T> {
   if (result.kind === "single") return objectToRow<T>(result.object);
   if (result.kind === "objects" && result.objects.length === 1) {
     return objectToRow<T>(result.objects[0]!);
+  }
+  if (result.kind === "scored" && result.rows.length === 1) {
+    return objectToRow<T>(result.rows[0]!.object, result.rows[0]!.score);
   }
   throw new RhypedbError("unexpected_shape", `expected a single object, got ${result.kind}`);
 }

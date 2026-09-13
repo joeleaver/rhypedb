@@ -38,6 +38,13 @@ pub enum QueryOutput {
     /// Void result (delete, link, unlink).
     Done,
 
+    /// A RANKED list with a per-row score (`.matches` BM25, `.similar`
+    /// distance), in rank order. Reaches the wire as `RESP_SCORED` /
+    /// `"score"` on each JSON object. Downstream `filter`/`limit`/`offset`
+    /// keep the scores; a traversal or mutation collapses it to ids like
+    /// `Objects`.
+    Scored(Vec<(Object, f32)>),
+
     /// A dedup'd set of (type_name, ids) carried between traversal hops. Never
     /// reaches the wire — terminal-materialized in `execute()`.
     IdSet { type_name: String, ids: Vec<u64> },
@@ -116,6 +123,11 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
             run_similar(ctx, type_name, field_name, sq, *k, None, *ef, *rerank)?,
             1,
         ),
+        // Same for a bare `Type.matches(...)`: a global full-text search reads
+        // only the query terms' postings, never the whole type.
+        (Source::All { type_name }, Some(Step::Matches { field_name, query: text, k })) => {
+            (run_matches(ctx, type_name, field_name, text, *k, None)?, 1)
+        }
         _ => (execute_source(ctx, &query.source, &query.steps)?, 0),
     };
 
@@ -169,8 +181,10 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
 
     // A pipeline that produced `Objects` directly (filter, scan, similar, get)
     // rather than a streaming IdSet still owes the result-row ceiling.
-    if let QueryOutput::Objects(ref objs) = result {
-        ctx.governor.check_result_rows(objs.len())?;
+    match &result {
+        QueryOutput::Objects(objs) => ctx.governor.check_result_rows(objs.len())?,
+        QueryOutput::Scored(rows) => ctx.governor.check_result_rows(rows.len())?,
+        _ => {}
     }
 
     Ok(result)
@@ -514,6 +528,17 @@ fn execute_step(
             // hold the SOURCE object's fields (the previous hop), not the
             // current type's fields. The Filter predicate is against the
             // current type, so a fresh LSM probe is required.
+            // A ranked input stays ranked: filter the rows, keep the scores.
+            if let QueryOutput::Scored(rows) = current {
+                let filtered = rows
+                    .into_iter()
+                    .filter_map(|(mut obj, score)| {
+                        obj.ensure_fields_deserialized();
+                        evaluate_predicate(predicate, &obj.fields).then_some((obj, score))
+                    })
+                    .collect();
+                return Ok(QueryOutput::Scored(filtered));
+            }
             let mut objects = match current {
                 QueryOutput::IdSet { type_name, ids } => {
                     materialize_ids(db, &type_name, &ids)
@@ -650,6 +675,14 @@ fn execute_step(
             )
         }
 
+        Step::Matches { field_name, query, k } => {
+            // Like `.similar`: the type and the candidate set come from the
+            // live pipeline (`A.filter(...).matches(...)`, `A.bs.matches(...)`).
+            let (type_name, incoming_ids) = ids_from_output(current, source)?;
+            let allowed: HashSet<u64> = incoming_ids.into_iter().collect();
+            run_matches(ctx, &type_name, field_name, query, *k, Some(&allowed))
+        }
+
         Step::Limit { count } => {
             // Clamp the requested limit to the governor's `max_limit` so a
             // `.limit(1_000_000_000)` can't be used to demand an absurd buffer.
@@ -662,6 +695,10 @@ fn execute_step(
                 QueryOutput::IdSetWithFields { type_name, mut items } => {
                     items.truncate(count);
                     Ok(QueryOutput::IdSetWithFields { type_name, items })
+                }
+                QueryOutput::Scored(mut rows) => {
+                    rows.truncate(count);
+                    Ok(QueryOutput::Scored(rows))
                 }
                 other => {
                     let mut objects = extract_objects(other)?;
@@ -679,6 +716,10 @@ fn execute_step(
             QueryOutput::IdSetWithFields { type_name, items } => {
                 let items: Vec<_> = items.into_iter().skip(*count).collect();
                 Ok(QueryOutput::IdSetWithFields { type_name, items })
+            }
+            QueryOutput::Scored(rows) => {
+                let rows: Vec<_> = rows.into_iter().skip(*count).collect();
+                Ok(QueryOutput::Scored(rows))
             }
             other => {
                 let objects = extract_objects(other)?;
@@ -804,7 +845,7 @@ fn run_similar(
     // vectorizer, so a pipeline that emptied after a traversal doesn't trigger a
     // wrong-type index lookup (and doesn't even require a vectorizer).
     if matches!(restrict, Some(set) if set.is_empty()) {
-        return Ok(QueryOutput::Objects(Vec::new()));
+        return Ok(QueryOutput::Scored(Vec::new()));
     }
 
     // Governor: clamp `k` to `max_limit`. The retrieval pool is already bounded by
@@ -855,14 +896,54 @@ fn run_similar(
         )?,
     };
 
-    let objects: Vec<Object> = results
+    // Each row carries the index's distance under the field's metric (lower =
+    // closer) as its score, so a client can fuse `.similar` and `.matches`
+    // rankings (reciprocal-rank fusion needs only the order).
+    let rows: Vec<(Object, f32)> = results
         .iter()
         .filter(|(id, _dist)| restrict.is_none_or(|set| set.contains(id)))
         .take(k)
-        .filter_map(|(id, _dist)| ctx.db.get(type_name, *id).ok())
+        .filter_map(|(id, dist)| ctx.db.get(type_name, *id).ok().map(|o| (o, *dist)))
         .collect();
 
-    Ok(QueryOutput::Objects(objects))
+    Ok(QueryOutput::Scored(rows))
+}
+
+/// Run a full-text search over `type_name.field_name` (a `@fulltext` field).
+///
+/// `restrict = None` is a bare `Type.matches(...)`; `Some(set)` limits the
+/// candidates to the pipeline's ids — applied by the engine BEFORE its top-k
+/// cut, so `k` rows come from within the set (no over-fetch needed, unlike
+/// `.similar`). The rows carry their BM25 score. Every posting row the
+/// engine examined is charged against the governor's row budget.
+fn run_matches(
+    ctx: &ExecContext<'_>,
+    type_name: &str,
+    field_name: &str,
+    query_text: &str,
+    k: usize,
+    restrict: Option<&HashSet<u64>>,
+) -> QueryResult<QueryOutput> {
+    if matches!(restrict, Some(set) if set.is_empty()) {
+        return Ok(QueryOutput::Scored(Vec::new()));
+    }
+    let k = ctx.governor.clamp_limit(k);
+    ctx.governor.check_deadline()?;
+    let result = ctx
+        .db
+        .fulltext_search(type_name, field_name, query_text, k, restrict)?;
+    ctx.governor.charge(result.postings_scanned)?;
+    let rows: Vec<(Object, f32)> = result
+        .hits
+        .iter()
+        .filter_map(|hit| {
+            ctx.db
+                .get(type_name, hit.object_id)
+                .ok()
+                .map(|o| (o, hit.score))
+        })
+        .collect();
+    Ok(QueryOutput::Scored(rows))
 }
 
 /// Read the type_name from any QueryOutput shape, without consuming it.
@@ -876,6 +957,10 @@ fn output_type_name(output: &QueryOutput, source: &Source) -> Option<String> {
         QueryOutput::Objects(objs) => objs
             .first()
             .map(|o| o.type_name.clone())
+            .or_else(|| source_type_name(source)),
+        QueryOutput::Scored(rows) => rows
+            .first()
+            .map(|(o, _)| o.type_name.clone())
             .or_else(|| source_type_name(source)),
         QueryOutput::Done => source_type_name(source),
     }
@@ -904,6 +989,15 @@ fn ids_from_output(
             }
             let type_name = objs[0].type_name.clone();
             let ids: Vec<u64> = objs.into_iter().map(|o| o.id).collect();
+            Ok((type_name, ids))
+        }
+        QueryOutput::Scored(rows) => {
+            if rows.is_empty() {
+                let t = source_type_name(source).unwrap_or_default();
+                return Ok((t, Vec::new()));
+            }
+            let type_name = rows[0].0.type_name.clone();
+            let ids: Vec<u64> = rows.into_iter().map(|(o, _)| o.id).collect();
             Ok((type_name, ids))
         }
         QueryOutput::Done => {
@@ -937,6 +1031,7 @@ fn materialize_ids(db: &Database, type_name: &str, ids: &[u64]) -> Vec<Object> {
 fn extract_objects(output: QueryOutput) -> QueryResult<Vec<Object>> {
     match output {
         QueryOutput::Objects(objs) => Ok(objs),
+        QueryOutput::Scored(rows) => Ok(rows.into_iter().map(|(o, _)| o).collect()),
         QueryOutput::Single(obj) => Ok(vec![obj]),
         QueryOutput::Done => Ok(Vec::new()),
         QueryOutput::IdSet { .. } | QueryOutput::IdSetWithFields { .. } => {
@@ -1979,11 +2074,14 @@ mod tests {
         // Query equals the second basis vector -> Doc #1 is the unique nearest.
         let q = parse_query("Doc.similar(.v, [0.0, 1.0, 0.0, 0.0], k: 1)").unwrap();
         let top_id = |ctx: &ExecContext<'_>| match execute(ctx, &q).unwrap() {
-            QueryOutput::Objects(objs) => {
-                assert_eq!(objs.len(), 1);
-                objs[0].id
+            QueryOutput::Scored(rows) => {
+                assert_eq!(rows.len(), 1);
+                // The score is the index's (quantized) distance estimate for the
+                // nearest neighbour — finite, and small for an exact match.
+                assert!(rows[0].1.is_finite() && rows[0].1 < 0.5, "{}", rows[0].1);
+                rows[0].0.id
             }
-            other => panic!("expected Objects, got {other:?}"),
+            other => panic!("expected Scored, got {other:?}"),
         };
 
         // No defaults: engine heuristics; explicit defaults via the context.
@@ -2100,8 +2198,8 @@ mod tests {
 
         let q = parse_query(r#"Product.filter(.rating > 9999).similar(.name, "x", k: 5)"#).unwrap();
         match execute(&ctx, &q).unwrap() {
-            QueryOutput::Objects(o) => assert!(o.is_empty()),
-            other => panic!("expected empty Objects, got {other:?}"),
+            QueryOutput::Scored(o) => assert!(o.is_empty()),
+            other => panic!("expected empty Scored, got {other:?}"),
         }
     }
 
@@ -2261,6 +2359,178 @@ mod tests {
             QueryOutput::Objects(objs) => assert_eq!(objs.len(), 1),
             _ => panic!("expected Objects"),
         }
+    }
+
+    fn scored_ids(out: QueryOutput) -> Vec<(u64, f32)> {
+        match out {
+            QueryOutput::Scored(rows) => rows.into_iter().map(|(o, s)| (o.id, s)).collect(),
+            other => panic!("expected Scored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn matches_step_ranks_over_fulltext_fields_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Author { name: String  posts: [Post] @inverse(Post.author) }
+            type Post {
+                title: String @fulltext
+                body: String @fulltext(positions: false)
+                published: Bool
+                author: Author
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let ctx = ExecContext::new(&db, None);
+        let run = |q: &str| execute(&ctx, &parse_query(q).unwrap());
+        let single_id = |out: QueryOutput| match out {
+            QueryOutput::Single(o) => o.id,
+            other => panic!("expected Single, got {other:?}"),
+        };
+
+        let alice = single_id(run(r#"Author.create({ name: "alice" })"#).unwrap());
+        let bob = single_id(run(r#"Author.create({ name: "bob" })"#).unwrap());
+        let p1 = single_id(
+            run(&format!(
+                r#"Post.create({{ title: "Invoice 4471 draft", body: "pay the invoice", published: true, author: {alice} }})"#
+            ))
+            .unwrap(),
+        );
+        let p2 = single_id(
+            run(&format!(
+                r#"Post.create({{ title: "invoice invoice run", body: "milk", published: false, author: {alice} }})"#
+            ))
+            .unwrap(),
+        );
+        let p3 = single_id(
+            run(&format!(
+                r#"Post.create({{ title: "groceries", body: "the invoice", published: true, author: {bob} }})"#
+            ))
+            .unwrap(),
+        );
+
+        // Bare global search: ranked, scored, k honored.
+        let rows = scored_ids(run(r#"Post.matches(.title, "invoice", k: 10)"#).unwrap());
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![p2, p1]);
+        assert!(rows[0].1 > rows[1].1 && rows[1].1 > 0.0);
+        assert_eq!(scored_ids(run(r#"Post.matches(.title, "invoice", k: 1)"#).unwrap()).len(), 1);
+
+        // After a filter: the candidate set is restricted BEFORE the top-k cut.
+        let rows = scored_ids(
+            run(r#"Post.filter(.published == true).matches(.title, "invoice", k: 1)"#).unwrap(),
+        );
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![p1]);
+
+        // After a traversal: only bob's posts are candidates (p3), even though
+        // alice's p1 would outrank it globally.
+        let rows = scored_ids(
+            run(&format!(r#"Author.get({bob}).posts.matches(.body, "invoice", k: 5)"#)).unwrap(),
+        );
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![p3]);
+        let rows = scored_ids(
+            run(&format!(r#"Author.get({alice}).posts.matches(.body, "invoice", k: 5)"#)).unwrap(),
+        );
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![p1]);
+
+        // Required term + phrase (title stores positions), OR semantics.
+        assert_eq!(
+            scored_ids(run(r#"Post.matches(.title, "+invoice +draft", k: 5)"#).unwrap())
+                .iter()
+                .map(|r| r.0)
+                .collect::<Vec<_>>(),
+            vec![p1]
+        );
+        assert_eq!(
+            scored_ids(run(r#"Post.matches(.title, "\"invoice run\"", k: 5)"#).unwrap())
+                .iter()
+                .map(|r| r.0)
+                .collect::<Vec<_>>(),
+            vec![p2]
+        );
+        let mut any: Vec<u64> = scored_ids(run(r#"Post.matches(.title, "groceries draft", k: 5)"#).unwrap())
+            .iter()
+            .map(|r| r.0)
+            .collect();
+        any.sort_unstable();
+        assert_eq!(any, vec![p1, p3]);
+
+        // Downstream steps keep rank + score: filter / limit / offset.
+        let rows = scored_ids(
+            run(r#"Post.matches(.title, "invoice", k: 10).filter(.published == true)"#).unwrap(),
+        );
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![p1]);
+        let all = scored_ids(run(r#"Post.matches(.title, "invoice", k: 10)"#).unwrap());
+        let limited = scored_ids(run(r#"Post.matches(.title, "invoice", k: 10).limit(1)"#).unwrap());
+        assert_eq!(limited, vec![all[0]]);
+        let offset = scored_ids(run(r#"Post.matches(.title, "invoice", k: 10).offset(1)"#).unwrap());
+        assert_eq!(offset, vec![all[1]]);
+        // A traversal after the ranked step collapses to plain objects.
+        match run(r#"Post.matches(.title, "invoice", k: 10).author"#).unwrap() {
+            QueryOutput::Objects(objs) => assert_eq!(objs.len(), 1, "one distinct author"),
+            other => panic!("expected Objects, got {other:?}"),
+        }
+
+        // Errors are loud: not @fulltext, phrase on positions:false, empty
+        // query, unknown field.
+        for q in [
+            r#"Post.matches(.published, "x", k: 5)"#,
+            r#"Post.matches(.body, "\"the invoice\"", k: 5)"#,
+            r#"Post.matches(.title, "...", k: 5)"#,
+            r#"Post.matches(.nosuch, "x", k: 5)"#,
+            r#"Author.matches(.name, "alice", k: 5)"#,
+        ] {
+            assert!(run(q).is_err(), "{q}");
+        }
+        // An emptied pipeline short-circuits without touching the index.
+        assert!(scored_ids(run(r#"Post.filter(.published == 42).matches(.title, "invoice", k: 5)"#).unwrap()).is_empty());
+
+        // Updating / deleting is reflected immediately.
+        run(&format!(r#"Post.get({p2}).update({{ title: "nothing here" }})"#)).unwrap();
+        assert_eq!(
+            scored_ids(run(r#"Post.matches(.title, "invoice", k: 10)"#).unwrap()).len(),
+            1
+        );
+        run(&format!(r#"Post.get({p1}).delete()"#)).unwrap();
+        assert!(scored_ids(run(r#"Post.matches(.title, "invoice", k: 10)"#).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn matches_step_is_governed_by_k_clamp_and_posting_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(r#"type Post { title: String @fulltext }"#).unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        for i in 0..6 {
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String(format!("term number {i}")));
+            db.create("Post", f).unwrap();
+        }
+        // max_limit clamps k.
+        let limits = crate::governor::GovernorLimits {
+            max_limit: 2,
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        let ctx = gov_ctx(&db, limits);
+        let q = parse_query(r#"Post.matches(.title, "term", k: 100)"#).unwrap();
+        assert_eq!(scored_ids(execute(&ctx, &q).unwrap()).len(), 2);
+        // Every posting examined (6 for `term`) is charged against the row budget.
+        let limits = crate::governor::GovernorLimits {
+            max_rows_scanned: 5,
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        let ctx = gov_ctx(&db, limits);
+        assert!(matches!(
+            execute(&ctx, &q),
+            Err(QueryError::ResourceLimitExceeded(_))
+        ));
+        let limits = crate::governor::GovernorLimits {
+            max_rows_scanned: 6,
+            ..crate::governor::GovernorLimits::UNLIMITED
+        };
+        let ctx = gov_ctx(&db, limits);
+        assert_eq!(scored_ids(execute(&ctx, &q).unwrap()).len(), 6);
     }
 
     #[test]

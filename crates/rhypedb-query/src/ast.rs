@@ -67,6 +67,16 @@ pub enum Step {
         rerank: Option<usize>,
     },
 
+    /// `.matches(.field, "query text", k: N)` — ranked full-text search over
+    /// a `@fulltext` String field. Sits where `.similar` sits: bare on a type
+    /// (global search) or after a filter/traversal (restricted to the
+    /// pipeline's ids). Produces a scored result.
+    Matches {
+        field_name: String,
+        query: String,
+        k: usize,
+    },
+
     /// `.update({...})` — update matched objects.
     Update {
         fields: HashMap<String, Literal>,

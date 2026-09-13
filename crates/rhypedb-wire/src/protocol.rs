@@ -139,6 +139,13 @@ pub const RESP_EVENT: u8 = 0x87;
 /// Server-PUSHED lag notice: `req_id` = the subscription handle; empty payload.
 /// At least one event for that subscription was dropped — reconcile by re-query.
 pub const RESP_SUBLAGGED: u8 = 0x88;
+/// A RANKED list result (`.matches` / `.similar`): `[count: u32 BE]` then, per
+/// row, `[score: f32 BE]` followed by one encoded object. Rows are in rank
+/// order. The score's meaning is the step's: BM25 (higher = better) for
+/// `.matches`, the index distance under the field's metric (lower = closer)
+/// for `.similar`. Back-compat: an old client has no arm for `0x89` and
+/// surfaces an unexpected-response error rather than mis-decoding.
+pub const RESP_SCORED: u8 = 0x89;
 
 /// Format tag stamped into every [`WireEvent`] so a consumer can detect the
 /// envelope version (mirrors the logical-export `FORMAT_TAG` convention).
@@ -558,6 +565,44 @@ pub fn decode_objects_payload(data: &[u8]) -> io::Result<Vec<Object>> {
         pos = new_pos;
     }
     Ok(objects)
+}
+
+/// Encode a `RESP_SCORED` payload into `out`: `[count]` then `[score f32 BE][object]` per row.
+pub fn encode_scored_payload_into(rows: &[(Object, f32)], out: &mut Vec<u8>) {
+    out.reserve(4 + rows.len() * 68);
+    out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+    for (obj, score) in rows {
+        out.extend_from_slice(&score.to_be_bytes());
+        encode_object(obj, out);
+    }
+}
+
+/// Convenience wrapper over [`encode_scored_payload_into`].
+pub fn encode_scored_payload(rows: &[(Object, f32)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_scored_payload_into(rows, &mut buf);
+    buf
+}
+
+/// Decode a `RESP_SCORED` payload into `(object, score)` rows in rank order.
+pub fn decode_scored_payload(data: &[u8]) -> io::Result<Vec<(Object, f32)>> {
+    if data.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "scored count missing"));
+    }
+    let count = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
+    let mut pos = 4;
+    let mut rows = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        if pos + 4 > data.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "scored row score truncated"));
+        }
+        let score = f32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let (obj, new_pos) = decode_object(data, pos)?;
+        rows.push((obj, score));
+        pos = new_pos;
+    }
+    Ok(rows)
 }
 
 /// Encode a Single response payload.
@@ -1011,6 +1056,39 @@ pub fn decode_event_payload(data: &[u8]) -> io::Result<WireEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scored_payload_round_trips_and_rejects_truncation() {
+        let mk = |id: u64| {
+            let mut fields = FieldMap::new();
+            fields.insert("name".into(), Value::String(format!("n{id}")));
+            Object {
+                type_name: "T".into(),
+                id,
+                fields,
+                raw_fields: None,
+            }
+        };
+        let rows = vec![(mk(1), 2.5f32), (mk(2), -0.25f32), (mk(3), 0.0f32)];
+        let payload = encode_scored_payload(&rows);
+        let back = decode_scored_payload(&payload).unwrap();
+        assert_eq!(back.len(), 3);
+        for ((o, sc), (bo, bsc)) in rows.iter().zip(&back) {
+            assert_eq!(o.id, bo.id);
+            assert_eq!(o.fields, bo.fields);
+            assert_eq!(sc.to_bits(), bsc.to_bits(), "score is bit-exact");
+        }
+        // Empty list.
+        assert!(decode_scored_payload(&encode_scored_payload(&[])).unwrap().is_empty());
+        // Truncations: missing count, missing score, truncated object.
+        assert!(decode_scored_payload(&payload[..2]).is_err());
+        assert!(decode_scored_payload(&payload[..6]).is_err());
+        assert!(decode_scored_payload(&payload[..payload.len() - 1]).is_err());
+        // A count larger than the rows present fails rather than panics.
+        let mut bad = payload.clone();
+        bad[0..4].copy_from_slice(&9u32.to_be_bytes());
+        assert!(decode_scored_payload(&bad).is_err());
+    }
     use crate::object::{FieldMap, Value};
 
     fn sample_object() -> Object {

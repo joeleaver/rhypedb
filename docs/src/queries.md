@@ -103,6 +103,50 @@ Post.similar(.embedding, "databases", k: 10, ef: 200, rerank: 50)
 Post.filter(.published == true).similar(.embedding, "rust", k: 5)
 ```
 
+`.similar` returns a **ranked** result: each object carries a `score` — the index's distance under the field's metric (lower is closer) — and the rows come back in rank order. See [Ranked results](#ranked-results).
+
+### Full-text search — `.matches(.field, "query", k: N)`
+
+Ranked keyword search over a `String` field declared `@fulltext` (see [Schema → `@fulltext`](schema.md#fulltext--fulltextanalyzer-simple-positions-false)). Sits where `.similar` sits: bare on a type, or after a filter or traversal that narrows the candidates.
+
+```
+Post.matches(.body, "invoice 4471", k: 20)
+Post.filter(.published == true).matches(.body, "distributed consensus", k: 10)
+User.get(1).posts.matches(.title, "+draft budget", k: 5)
+```
+
+| Argument | Meaning |
+| --- | --- |
+| `.field` | the `@fulltext` String field to search |
+| `"query"` | the search text (syntax below) |
+| `k:` | number of results to return (most relevant first) |
+
+**Query syntax.** The text is analyzed with the field's analyzer (lowercased, diacritics folded, split into words), then:
+
+| Form | Meaning |
+| --- | --- |
+| `invoice 4471` | terms are **OR-ed**: a document matches if it contains any of them, and every term it contains adds to its score |
+| `+invoice` | a `+` prefix makes the term **required** |
+| `"distributed consensus"` | quoted words are a **phrase**: they must appear consecutively (the field must store positions — the default) |
+| `+"exact phrase" extra` | modifiers combine: the phrase is required, `extra` is optional |
+
+Results are ranked by **BM25** (k1 = 1.2, b = 0.75): rarer terms count more, repeated terms count more with diminishing returns, and shorter documents win ties. Each returned object carries its `score` (higher is better) — see [Ranked results](#ranked-results).
+
+A query with no searchable terms (only punctuation), an unterminated quote, or a phrase against a field declared `@fulltext(positions: false)` is an error. So is `.matches` on a field without `@fulltext`; for an unindexed substring test use [`.contains`](#filter--filterpredicate) instead.
+
+`.matches` after a filter or traversal restricts the ranking to those candidates *before* taking the top `k`, so you always get up to `k` results from within the narrowed set.
+
+### Ranked results
+
+`.similar` and `.matches` produce a **ranked** result: the same objects as any other query, in rank order, each carrying a `score`. Over `POST /query` the score is an extra `"score"` member on every object; over the binary protocol the result is a `Scored` frame ([API Reference](api-reference.md#server-response-types)); the Rust and TypeScript clients expose it as `Row.score`. The score's meaning depends on the step:
+
+| Step | `score` |
+| --- | --- |
+| `.matches` | BM25 relevance — higher is better |
+| `.similar` | the index distance under the field's metric (cosine distance, squared L2, or negated dot product) — lower is closer |
+
+A `.filter`, `.limit` or `.offset` after a ranked step keeps the order and the scores; a traversal or a mutation drops them.
+
 ### Mutations — `.update`, `.delete`
 
 ```

@@ -54,6 +54,15 @@ export class Query<T> {
     return new Query<T>(`${this.text}.limit(${n})`);
   }
 
+  /**
+   * Append `.matches(.<field>, "<text>", k: <k>)` — ranked full-text search
+   * over a `@fulltext` field. `text` is escaped as a query-language string
+   * literal; the rows come back with [`Row.score`](Row) set (BM25).
+   */
+  matches(field: string, text: string, k: bigint | number): Query<T> {
+    return new Query<T>(`${this.text}.matches(.${field}, ${qlStringLiteral(text)}, k: ${k})`);
+  }
+
   toString(): string {
     return this.text;
   }
@@ -68,4 +77,15 @@ export class Query<T> {
 export interface Row<T> {
   id: bigint;
   data: T;
+  /**
+   * Set only for rows of a ranked result, which arrive in rank order:
+   * `.matches` → the BM25 score (higher is better); `.similar` → the index
+   * distance under the field's metric (lower is closer).
+   */
+  score?: number;
+}
+
+/** Escape `s` as a query-language string literal (`\"` and `\\`). */
+function qlStringLiteral(s: string): string {
+  return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }

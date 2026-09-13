@@ -47,6 +47,22 @@ pub(crate) fn apply_read_filter(ctx: &ExecContext<'_>, result: QueryOutput) -> Q
             filter_read(ctx, &mut objs);
             QueryOutput::Objects(objs)
         }
+        // A ranked result is filtered row-wise too; scores ride along by id
+        // (ids are unique within one result) and the rank order is kept.
+        QueryOutput::Scored(rows) => {
+            let scores: std::collections::HashMap<u64, f32> =
+                rows.iter().map(|(o, s)| (o.id, *s)).collect();
+            let mut objs: Vec<Object> = rows.into_iter().map(|(o, _)| o).collect();
+            filter_read(ctx, &mut objs);
+            QueryOutput::Scored(
+                objs.into_iter()
+                    .map(|o| {
+                        let s = scores[&o.id];
+                        (o, s)
+                    })
+                    .collect(),
+            )
+        }
         QueryOutput::Single(mut obj) => {
             obj.ensure_fields_deserialized();
             let type_name = obj.type_name.clone();

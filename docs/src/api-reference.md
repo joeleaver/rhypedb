@@ -32,6 +32,12 @@ Each `<object>` is `{ "type": …, "id": …, "fields": { … } }`:
 { "object": { "type": "User", "id": 1, "fields": { "name": "Alice", "age": 30 } } }
 ```
 
+A **ranked** query (`.matches`, `.similar`) returns `objects` in rank order, each with an extra `"score"` member — BM25 relevance for `.matches` (higher is better), the index distance for `.similar` (lower is closer). See [Ranked results](queries.md#ranked-results).
+
+```json
+{ "objects": [ { "type": "Post", "id": 7, "fields": { "title": "Invoice 4471" }, "score": 2.31 } ] }
+```
+
 `id` is a JSON number (an unsigned 64-bit id). Treat it as opaque — ids above 2⁵³ can lose precision in clients that parse JSON numbers as doubles. See [Object identity](schema.md#object-identity).
 
 **Errors:** `400`/`500` with `{ "error": "message" }`.
@@ -273,6 +279,7 @@ For high-throughput clients, the server speaks a length-prefixed binary protocol
 | `0x86` | Subscribed | *(empty; ack of a Subscribe, correlated by `req_id`)* |
 | `0x87` | Event | UTF-8 JSON `WireEvent` (**server-pushed**) |
 | `0x88` | SubLagged | *(empty; **server-pushed** lag notice)* |
+| `0x89` | Scored | `[ count: u32 BE ]` then, per row, `[ score: f32 BE ]` + one encoded object — a **ranked** result (`.matches` / `.similar`) in rank order |
 
 `VectorBatch` (`0x03`) bulk-ingests caller-supplied `f32` vectors for one type's `Vector` field — the path used by `rhypedb-import` and the recommended way to load precomputed vectors at scale.
 
