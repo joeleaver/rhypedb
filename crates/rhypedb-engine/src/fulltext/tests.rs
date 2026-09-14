@@ -898,15 +898,17 @@ fn english_analyzer_matches_inflections_on_both_sides() {
     assert_eq!(ids(&db, "title", "\"security camera\"", 10), vec![a]);
     assert_eq!(ids(&db, "title", "+\"security cameras\" +replace", 10), vec![a]);
     assert!(ids(&db, "title", "\"camera security\"", 10).is_empty());
-    // The index holds ONE term per stem: a has 5 distinct stems (the, secur,
-    // camera, were, replac), b 2 (camera, batteri), c 3 (a, camera, obscura), d 2.
-    assert_eq!(raw_rows(&db, "title"), (5 + 2 + 3 + 2, 4));
-    // Stats count surface tokens, not stems.
-    assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 4, total_tokens: 5 + 2 + 3 + 2 });
-    // Scoring is over the stem: the two "camera" mentions... c has tf 1 and
-    // length 3, b has tf 1 and length 2 → b ranks above c on length norm.
+    // The index holds ONE term per stem, and no stop words: a has 3 distinct
+    // stems (secur, camera, replac — `the`, `were` dropped), b 2 (camera,
+    // batteri), c 2 (camera, obscura — `a` dropped), d 2.
+    assert_eq!(raw_rows(&db, "title"), (3 + 2 + 2 + 2, 4));
+    // Stats count indexed tokens (stop words excluded), not stems.
+    assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 4, total_tokens: 3 + 2 + 2 + 2 });
+    // Scoring is over the stem: b and c both have tf 1 at length 2 (c's `a`
+    // is a stop word) — a tie, broken by id, so b first.
     let hits = db.fulltext_search("Note", "title", "cameras", 10, None, None).unwrap().hits;
     assert_eq!(hits[0].object_id, b);
+    assert!((hits[0].score - hits[1].score).abs() < 1e-6, "{hits:?}");
     // `body` keeps the simple analyzer: no stemming there.
     let e = note(&db, "x", "cameras", "e");
     assert_eq!(ids(&db, "body", "cameras", 10), vec![e]);
@@ -916,6 +918,102 @@ fn english_analyzer_matches_inflections_on_both_sides() {
     assert!(ids(&db, "title", "running", 10).is_empty());
     assert_eq!(ids(&db, "title", "walk", 10), vec![d]);
     assert_eq!(db.fulltext_field("Note", "title").unwrap().analyzer, crate::fulltext::Analyzer::English);
+}
+
+#[test]
+fn english_stop_words_never_reach_the_index_and_queries_drop_them() {
+    let dir = TempDir::new().unwrap();
+    let db = open_sdl(&dir, ENGLISH);
+    let a = note(&db, "surveillance video of my house", "x", "a");
+    let b = note(&db, "the house of the rising sun", "x", "b");
+    let c = note(&db, "state of the art", "x", "c");
+    let d = note(&db, "state art", "x", "d");
+
+    // Acceptance: `of my house` scores exactly as `house` — same ids, same
+    // scores — because `of`/`my` are not in the query.
+    let stop = db.fulltext_search("Note", "title", "of my house", 5, None, None).unwrap().hits;
+    let plain = db.fulltext_search("Note", "title", "house", 5, None, None).unwrap().hits;
+    assert_eq!(stop, plain);
+    let mut got: Vec<u64> = stop.iter().map(|h| h.object_id).collect();
+    got.sort_unstable();
+    assert_eq!(got, vec![a, b]);
+    // Stop words are absent from the postings: a = surveil, video, hous;
+    // b = hous, rise, sun; c = state, art; d = state, art → 10 rows; and
+    // the per-document lengths exclude them (3 + 3 + 2 + 2).
+    assert_eq!(raw_rows(&db, "title"), (10, 4));
+    assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 4, total_tokens: 10 });
+    // A query of nothing but stop words is an EMPTY result, not an error.
+    let r = db.fulltext_search("Note", "title", "of my the", 5, None, None).unwrap();
+    assert!(r.hits.is_empty());
+    assert_eq!(r.postings_scanned, 0);
+    // A required stop word constrains nothing: `+of house` is `house`.
+    assert_eq!(
+        db.fulltext_search("Note", "title", "+of house", 5, None, None).unwrap().hits,
+        plain
+    );
+    // Phrases keep the gap: "state of the art" is state +0 / art +3.
+    assert_eq!(ids(&db, "title", "\"state of the art\"", 10), vec![c]);
+    assert_eq!(ids(&db, "title", "\"state art\"", 10), vec![d]);
+    // A phrase left with one word after the stop word goes is that term.
+    let mut both = ids(&db, "title", "\"the house\"", 10);
+    both.sort_unstable();
+    assert_eq!(both, vec![a, b]);
+    // Prefix text keeps its stop word: `the*` finds nothing here (no word
+    // STARTS with "the" in the index — `the` itself was never indexed).
+    assert!(ids(&db, "title", "the*", 10).is_empty());
+    // `body` is `simple`: stop words are ordinary terms there.
+    let e = note(&db, "x", "of my house", "e");
+    assert_eq!(ids(&db, "body", "of", 10), vec![e]);
+}
+
+/// An `english` index built before stop-word removal (issue #20) records the
+/// analyzer as plain `"english"`; the definition is now `"english/2"`, so
+/// opening it must rebuild into a new generation — otherwise queries (which
+/// drop stop words) would silently disagree with the index (which kept them).
+#[test]
+fn english_index_from_before_stop_words_is_rebuilt_on_open() {
+    let dir = TempDir::new().unwrap();
+    let field_id;
+    {
+        let db = open_sdl(&dir, ENGLISH);
+        for i in 0..50 {
+            note(&db, &format!("the house {i}"), "b", &format!("t{i}"));
+        }
+        assert!(db.wait_for_fulltext_builds(BUILD_TIMEOUT));
+        field_id = db.field_ids()["Note.title"];
+        let type_id = db.type_ids()["Note"];
+        // Rewrite the marker as a #17-era build would have left it.
+        let m = crate::fulltext::build::BuildMarker {
+            state: crate::fulltext::BuildState::Built,
+            generation: 0,
+            cursor: 0,
+            positions: true,
+            stale_generations: false,
+            analyzer: "english".into(),
+        };
+        let mut txn = db.storage().begin_txn();
+        db.storage()
+            .put(&mut txn, &KeyBuilder::catalog_fulltext_marker(type_id, field_id), m.encode())
+            .unwrap();
+        db.storage().commit(&mut txn).unwrap();
+    }
+    let db = open_sdl(&dir, ENGLISH);
+    assert!(db.wait_for_fulltext_builds(BUILD_TIMEOUT));
+    let ff = db.fulltext_field("Note", "title").unwrap();
+    assert_eq!((ff.generation, ff.analyzer), (1, crate::fulltext::Analyzer::English));
+    let m = markers(&db).into_iter().find(|(k, _)| k.1 == field_id).unwrap().1;
+    assert_eq!(
+        (m.generation, m.analyzer.as_str(), m.stale_generations, m.state),
+        (1, "english/2", false, crate::fulltext::BuildState::Built)
+    );
+    // One generation's rows only, stop words gone: hous + i per doc.
+    assert_eq!(raw_rows(&db, "title"), (100, 50));
+    assert_eq!(ids(&db, "title", "house", 100).len(), 50);
+    // And an unchanged definition does NOT rebuild on the next open.
+    drop(db);
+    let db = open_sdl(&dir, ENGLISH);
+    assert!(db.wait_for_fulltext_builds(BUILD_TIMEOUT));
+    assert_eq!(db.fulltext_field("Note", "title").unwrap().generation, 1);
 }
 
 #[test]
@@ -943,7 +1041,10 @@ fn switching_the_analyzer_bumps_the_generation_and_rebuilds() {
     assert_eq!(raw_rows(&db, "title"), (300 * 3, 300));
     assert_eq!(stats(&db, "title"), CorpusStats { doc_count: 300, total_tokens: 900 });
     let m = markers(&db).into_iter().find(|(k, _)| k.1 == db.field_ids()["Note.title"]).unwrap().1;
-    assert_eq!((m.generation, m.analyzer.as_str(), m.stale_generations), (1, "english", false));
+    assert_eq!(
+        (m.generation, m.analyzer.as_str(), m.stale_generations),
+        (1, crate::fulltext::Analyzer::English.definition(), false)
+    );
     assert_eq!(m.state, crate::fulltext::BuildState::Built);
     // A write after the switch lands in the new generation only.
     let n = note(&db, "flying drones", "b", "new");

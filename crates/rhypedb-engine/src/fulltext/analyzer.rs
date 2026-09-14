@@ -6,10 +6,12 @@
 //! MUST get consecutive positions even when one of them is dropped from the
 //! index (an over-long token still consumes its position).
 //!
-//! The analyzer name is part of a field's index identity: the SDL stores it
+//! The analyzer is part of a field's index identity: the SDL stores its name
 //! (`@fulltext(analyzer: "simple")`), the catalog digest hashes it, and the
-//! index build marker records it so a change rebuilds the index rather than
-//! mixing token streams produced by two different analyzers.
+//! index build marker records its [`Analyzer::definition`] — the name plus a
+//! version of its behaviour — so a change of analyzer OR of what an analyzer
+//! does (a new stop-word list, say) rebuilds the index rather than mixing
+//! token streams produced by two different tokenizations.
 
 use rust_stemmers::{Algorithm, Stemmer};
 use unicode_normalization::UnicodeNormalization;
@@ -69,10 +71,61 @@ pub enum Analyzer {
     ///
     /// The stem is what the index holds, so the same function runs on query
     /// terms — including every word of a phrase and the text of a prefix
-    /// term. Still no stop words. Only English inflection is modelled: a
-    /// French or German word gets the English rules applied, which is
-    /// harmless but not stemming.
+    /// term. Only English inflection is modelled: a French or German word
+    /// gets the English rules applied, which is harmless but not stemming.
+    ///
+    /// 7. **Stop words** ([`ENGLISH_STOP_WORDS`], the Snowball list) are
+    ///    dropped — on indexed text and on query text alike, so `of my
+    ///    house` searches for `house` and `of`/`my` never enter the
+    ///    postings. Checked after the fold and apostrophe normalization and
+    ///    BEFORE stemming (the list holds surface forms: `don't`, `it's`,
+    ///    `having`). A dropped stop word still consumes its position, exactly
+    ///    like an over-long token, so a phrase keeps its shape: `"state of
+    ///    the art"` is `state` at +0 and `art` at +3, and matches a document
+    ///    with the same gap. The text of a prefix term (`the*`) is exempt —
+    ///    a prefix asks for words STARTING with those letters, not the word.
     English,
+}
+
+/// The Snowball English stop-word list (the one Lucene's `EnglishAnalyzer`,
+/// Postgres's `english` configuration and SQLite FTS5's porter setups all
+/// derive from): pronouns, auxiliaries, determiners, prepositions,
+/// conjunctions and their common contractions — 174 surface forms. Sorted,
+/// so membership is a binary search.
+pub const ENGLISH_STOP_WORDS: &[&str] = &[
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are",
+    "aren't", "as", "at", "be", "because", "been", "before", "being", "below", "between", "both",
+    "but", "by", "can't", "cannot", "could", "couldn't", "did", "didn't", "do", "does", "doesn't",
+    "doing", "don't", "down", "during", "each", "few", "for", "from", "further", "had", "hadn't",
+    "has", "hasn't", "have", "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here",
+    "here's", "hers", "herself", "him", "himself", "his", "how", "how's", "i", "i'd", "i'll",
+    "i'm", "i've", "if", "in", "into", "is", "isn't", "it", "it's", "its", "itself", "let's",
+    "me", "more", "most", "mustn't", "my", "myself", "no", "nor", "not", "of", "off", "on",
+    "once", "only", "or", "other", "ought", "our", "ours", "ourselves", "out", "over", "own",
+    "same", "shan't", "she", "she'd", "she'll", "she's", "should", "shouldn't", "so", "some",
+    "such", "than", "that", "that's", "the", "their", "theirs", "them", "themselves", "then",
+    "there", "there's", "these", "they", "they'd", "they'll", "they're", "they've", "this",
+    "those", "through", "to", "too", "under", "until", "up", "very", "was", "wasn't", "we",
+    "we'd", "we'll", "we're", "we've", "were", "weren't", "what", "what's", "when", "when's",
+    "where", "where's", "which", "while", "who", "who's", "whom", "why", "why's", "with",
+    "won't", "would", "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours",
+    "yourself", "yourselves",
+];
+
+/// Whether `word` (already folded and apostrophe-normalized) is an English
+/// stop word.
+pub fn is_english_stop_word(word: &str) -> bool {
+    ENGLISH_STOP_WORDS.binary_search(&word).is_ok()
+}
+
+/// The token stream of one analysis plus what was dropped on the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Analyzed {
+    pub tokens: Vec<Token>,
+    /// Words dropped because they are stop words (positions consumed). Lets
+    /// a query distinguish "nothing but stop words" (an empty result) from
+    /// "nothing searchable at all" (an error).
+    pub stop_words_dropped: u32,
 }
 
 impl Analyzer {
@@ -95,29 +148,61 @@ impl Analyzer {
         }
     }
 
+    /// The identity the index build marker records: the SDL name, plus a
+    /// suffix whenever the analyzer's BEHAVIOUR has changed since it first
+    /// shipped, so an index built by the previous behaviour no longer
+    /// matches and is rebuilt into a new generation (see
+    /// `BuildMarker::matches_config`). Bump the suffix — never edit an
+    /// existing analyzer's behaviour without one; the index would silently
+    /// stop matching the query side.
+    ///
+    /// * `simple`: unchanged since it shipped.
+    /// * `english/2`: `english` gained stop-word removal (issue #20). A
+    ///   marker that says plain `english` is a #17-era index.
+    pub fn definition(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::English => "english/2",
+        }
+    }
+
     /// Tokenize `text`. Deterministic: the same input always yields the same
     /// token stream, on every platform (the crates are table-driven, not
-    /// locale-driven).
+    /// locale-driven). Stop words (english) are dropped.
     pub fn analyze(self, text: &str) -> Vec<Token> {
+        self.analyze_opts(text, false).tokens
+    }
+
+    /// [`Self::analyze`] with control over stop words and a count of what
+    /// was dropped. `keep_stop_words` is for the text of a prefix term: a
+    /// prefix asks for words that START with those letters, so `the*` must
+    /// expand to `theory`, `theatre`, … rather than vanish.
+    pub fn analyze_opts(self, text: &str, keep_stop_words: bool) -> Analyzed {
         match self {
-            Self::Simple => analyze_words(text, fold_simple),
-            Self::English => analyze_words(text, fold_english),
+            Self::Simple => analyze_words(text, |w| Some(fold_simple(w))),
+            Self::English => analyze_words(text, |w| fold_english(w, keep_stop_words)),
         }
     }
 }
 
-/// Split `text` into UAX#29 words, fold each one into its term with `fold`,
-/// and stamp positions. Shared by every analyzer so the position and
-/// length-cap rules can never drift between them.
-fn analyze_words(text: &str, fold: fn(&str) -> String) -> Vec<Token> {
+/// Split `text` into UAX#29 words, fold each one into its term with `fold`
+/// (`None` = a stop word), and stamp positions. Shared by every analyzer so
+/// the position and length-cap rules can never drift between them.
+fn analyze_words(text: &str, fold: impl Fn(&str) -> Option<String>) -> Analyzed {
     let mut out = Vec::new();
+    let mut stop_words_dropped = 0u32;
     let mut position: u32 = 0;
     for word in text.unicode_words() {
         let term = fold(word);
         // Position is consumed whether or not the term is kept, so phrase
-        // adjacency in the source text is preserved around a dropped token.
+        // adjacency in the source text is preserved around a dropped token —
+        // an over-long word, a word that folds to nothing, or a stop word.
         let pos = position;
         position = position.saturating_add(1);
+        let Some(term) = term else {
+            stop_words_dropped += 1;
+            continue;
+        };
         if term.is_empty() || term.len() > MAX_TERM_BYTES {
             continue;
         }
@@ -126,7 +211,10 @@ fn analyze_words(text: &str, fold: fn(&str) -> String) -> Vec<Token> {
             position: pos,
         });
     }
-    out
+    Analyzed {
+        tokens: out,
+        stop_words_dropped,
+    }
 }
 
 /// Lowercase, NFKD-decompose, strip diacritic marks and ignorable format
@@ -139,10 +227,11 @@ fn fold_simple(word: &str) -> String {
         .collect()
 }
 
-/// [`fold_simple`], then apostrophe normalization and the Snowball English
-/// stemmer. The length cap is applied by the caller on the RESULT, so a
-/// stem is measured, not the surface form.
-fn fold_english(word: &str) -> String {
+/// [`fold_simple`], then apostrophe normalization, the stop-word check
+/// (`None` = dropped as a stop word, unless `keep_stop_words`) and the
+/// Snowball English stemmer. The length cap is applied by the caller on
+/// the RESULT, so a stem is measured, not the surface form.
+fn fold_english(word: &str, keep_stop_words: bool) -> Option<String> {
     let folded: String = fold_simple(word)
         .chars()
         .map(|c| match c {
@@ -151,14 +240,17 @@ fn fold_english(word: &str) -> String {
         })
         .collect();
     if folded.is_empty() {
-        return folded;
+        return Some(folded);
+    }
+    if !keep_stop_words && is_english_stop_word(&folded) {
+        return None;
     }
     // `Stemmer` is a plain function-pointer wrapper; creating one is free
     // and keeps the analyzer `Copy` with no shared state.
-    match Stemmer::create(Algorithm::English).stem(&folded) {
+    Some(match Stemmer::create(Algorithm::English).stem(&folded) {
         std::borrow::Cow::Borrowed(_) => folded,
         std::borrow::Cow::Owned(stemmed) => stemmed,
-    }
+    })
 }
 
 /// The four Combining Diacritical Marks blocks (UTR#30 "diacritic folding"
@@ -390,8 +482,11 @@ mod tests {
         // Everything the simple analyzer drops, english drops too.
         assert_eq!(english("... !!! 🎉"), Vec::<String>::new());
         assert_eq!(english("co\u{AD}operate"), vec!["cooper"]);
-        // Same tokenization: hyphens split, apostrophes stay word-internal.
-        assert_eq!(english("e-mail don't"), vec!["e", "mail", "don't"]);
+        // Same tokenization: hyphens split, apostrophes stay word-internal
+        // (`don't` is one word — and a stop word; `won't`-style contractions
+        // are on the list as surface forms).
+        assert_eq!(english("e-mail don't"), vec!["e", "mail"]);
+        assert_eq!(english("e-mail dont"), vec!["e", "mail", "dont"]);
     }
 
     #[test]
@@ -412,7 +507,10 @@ mod tests {
     #[test]
     fn english_leaves_numbers_short_words_and_other_scripts_alone() {
         assert_eq!(english("3.14 4471 v2"), vec!["3.14", "4471", "v2"]);
-        assert_eq!(english("a is us the"), vec!["a", "is", "us", "the"]);
+        // Short words pass the stemmer unchanged — but `a`, `is`, `the` are
+        // stop words and go; `us` is not on the list.
+        assert_eq!(english("a is us the"), vec!["us"]);
+        assert_eq!(english("us"), vec!["us"]);
         assert_eq!(english("東京都 कल Ελληνικά"), vec!["東", "京", "都", "कल", "ελληνικα"]);
         assert_eq!(english("Straße"), vec!["straße"]);
         // Non-English Latin words get the English rules — harmless, but
@@ -434,12 +532,70 @@ mod tests {
         // Over the cap even after stemming: dropped, position consumed.
         let huge = "y".repeat(MAX_TERM_BYTES + 10);
         assert_eq!(
-            positions_of(Analyzer::English, &format!("a {huge} c")),
-            vec![("a".into(), 0), ("c".into(), 2)]
+            positions_of(Analyzer::English, &format!("zeta {huge} c")),
+            vec![("zeta".into(), 0), ("c".into(), 2)]
         );
     }
 
     fn positions_of(a: Analyzer, text: &str) -> Vec<(String, u32)> {
         a.analyze(text).into_iter().map(|t| (t.term, t.position)).collect()
+    }
+
+    // ---- english stop words (issue #20) ----
+
+    #[test]
+    fn stop_word_list_is_sorted_lowercase_and_unique() {
+        for w in ENGLISH_STOP_WORDS {
+            assert_eq!(*w, w.to_lowercase(), "{w}");
+            assert!(!w.is_empty());
+        }
+        for pair in ENGLISH_STOP_WORDS.windows(2) {
+            assert!(pair[0] < pair[1], "not sorted/unique at {pair:?}");
+        }
+        assert_eq!(ENGLISH_STOP_WORDS.len(), 174);
+        assert!(is_english_stop_word("the") && is_english_stop_word("don't"));
+        assert!(!is_english_stop_word("house") && !is_english_stop_word("us"));
+    }
+
+    #[test]
+    fn english_drops_stop_words_before_stemming_and_keeps_their_positions() {
+        // The issue's acceptance case: `of my house` searches for `house`.
+        assert_eq!(english("of my house"), vec!["hous"]);
+        assert_eq!(english("surveillance video of my house"), vec!["surveil", "video", "hous"]);
+        // Checked on the folded, apostrophe-normalized surface form, before
+        // stemming: `having` is on the list (its stem `have` is too, but that
+        // is not what is checked), and the typographic apostrophe folds.
+        assert_eq!(english("Having HAVING don\u{2019}t It's"), Vec::<String>::new());
+        // Position is consumed: the phrase keeps its shape.
+        assert_eq!(
+            positions_of(Analyzer::English, "state of the art"),
+            vec![("state".into(), 0), ("art".into(), 3)]
+        );
+        // Only stop words: nothing left, and the count says why.
+        let a = Analyzer::English.analyze_opts("of the", false);
+        assert_eq!((a.tokens.len(), a.stop_words_dropped), (0, 2));
+        let a = Analyzer::English.analyze_opts("!!!", false);
+        assert_eq!((a.tokens.len(), a.stop_words_dropped), (0, 0));
+        // Kept on request (prefix text): the surface stop word is stemmed
+        // like any word.
+        let a = Analyzer::English.analyze_opts("the", true);
+        assert_eq!((terms_of(&a.tokens), a.stop_words_dropped), (vec!["the".to_string()], 0));
+        // `simple` never drops them.
+        assert_eq!(terms("of my house"), vec!["of", "my", "house"]);
+        assert_eq!(Analyzer::Simple.analyze_opts("of the", false).stop_words_dropped, 0);
+    }
+
+    #[test]
+    fn definitions_version_behaviour_changes() {
+        assert_eq!(Analyzer::Simple.definition(), "simple");
+        assert_eq!(Analyzer::English.definition(), "english/2");
+        // The definition starts with the SDL name, so a marker is readable.
+        for a in [Analyzer::Simple, Analyzer::English] {
+            assert!(a.definition().starts_with(a.name()));
+        }
+    }
+
+    fn terms_of(tokens: &[Token]) -> Vec<String> {
+        tokens.iter().map(|t| t.term.clone()).collect()
     }
 }

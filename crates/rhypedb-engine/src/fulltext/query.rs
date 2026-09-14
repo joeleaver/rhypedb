@@ -12,7 +12,10 @@
 //! * `+` marks a clause **required**: a document must match every required
 //!   clause. Required clauses still contribute to the score.
 //! * `"quoted words"` is a **phrase clause**: the analyzed tokens must occur
-//!   consecutively in the document (needs stored positions). A phrase that
+//!   in the document at the same relative positions they have in the query
+//!   (needs stored positions) — consecutively for plain words, and with the
+//!   same gaps where the analyzer dropped a word (a stop word under
+//!   `english`: `"state of the art"` is `state` +0, `art` +3). A phrase that
 //!   analyzes to a single token is just a term clause.
 //! * Bare text ending in `*` is a **prefix clause** (`camera*`): it matches
 //!   every indexed term that starts with the analyzed text before the `*`
@@ -31,7 +34,11 @@
 //!   unstemmed, so this is the better single strategy); `simple` gives
 //!   exact character-by-character type-ahead.
 //! * Clauses that analyze to nothing (punctuation, emoji) are dropped; a
-//!   query left with no clauses is an error rather than a silent empty set.
+//!   query left with no clauses is an error rather than a silent empty set —
+//!   UNLESS what was dropped were stop words (`of my`, under `english`): the
+//!   user typed real words, so that is an empty RESULT, not a syntax error.
+//!   A required stop word (`+of`) is dropped like any other and constrains
+//!   nothing.
 
 use super::analyzer::Analyzer;
 
@@ -51,11 +58,43 @@ pub struct Clause {
     pub terms: Vec<String>,
     /// `terms[0]` is a prefix key (`"camera*"`), not an exact term.
     pub prefix: bool,
+    /// For a phrase: each term's position relative to the first
+    /// (`offsets[0] == 0`, strictly increasing) — consecutive words are
+    /// `0, 1, 2, …`; a gap marks a word the analyzer dropped between them.
+    /// Empty for term and prefix clauses.
+    pub offsets: Vec<u32>,
 }
 
 impl Clause {
     pub fn is_phrase(&self) -> bool {
         self.terms.len() > 1
+    }
+
+    /// A term clause.
+    pub fn term(term: String, required: bool) -> Self {
+        Self {
+            required,
+            terms: vec![term],
+            prefix: false,
+            offsets: Vec::new(),
+        }
+    }
+
+    /// A phrase clause with consecutive offsets `0, 1, …`.
+    pub fn phrase(terms: Vec<String>, required: bool) -> Self {
+        let offsets = (0..terms.len() as u32).collect();
+        Self {
+            required,
+            terms,
+            prefix: false,
+            offsets,
+        }
+    }
+
+    /// The relative position of the `i`-th phrase term (`i` itself when the
+    /// clause was built without explicit offsets).
+    pub fn offset(&self, i: usize) -> u32 {
+        self.offsets.get(i).copied().unwrap_or(i as u32)
     }
 
     /// The analyzed prefix text of a prefix clause (`"camera"` for the key
@@ -76,6 +115,11 @@ pub struct ParsedQuery {
 }
 
 impl ParsedQuery {
+    /// No clauses at all: every word was a stop word. Matches nothing.
+    pub fn is_empty(&self) -> bool {
+        self.clauses.is_empty()
+    }
+
     pub fn has_required(&self) -> bool {
         self.clauses.iter().any(|c| c.required)
     }
@@ -155,6 +199,7 @@ impl std::fmt::Display for QuerySyntaxError {
 /// Parse + analyze a `.matches` query string.
 pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySyntaxError> {
     let mut clauses = Vec::new();
+    let mut stop_words_dropped = 0u32;
     let mut chars = raw.char_indices().peekable();
     while let Some(&(i, c)) = chars.peek() {
         if c.is_whitespace() {
@@ -195,13 +240,20 @@ pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySy
                     phrase: text.to_string(),
                 });
             }
-            let tokens = analyzer.analyze(text);
-            let terms: Vec<String> = tokens.into_iter().map(|t| t.term).collect();
-            if !terms.is_empty() {
+            let analyzed = analyzer.analyze_opts(text, false);
+            stop_words_dropped += analyzed.stop_words_dropped;
+            let tokens = analyzed.tokens;
+            if let Some(first) = tokens.first() {
+                // Offsets are relative to the first KEPT token: a leading
+                // dropped word shifts nothing, an inner one leaves a gap.
+                let base = first.position;
+                let offsets: Vec<u32> = tokens.iter().map(|t| t.position - base).collect();
+                let terms: Vec<String> = tokens.into_iter().map(|t| t.term).collect();
                 clauses.push(Clause {
                     required,
                     terms,
                     prefix: false,
+                    offsets: if offsets.len() > 1 { offsets } else { Vec::new() },
                 });
             }
         } else {
@@ -219,7 +271,11 @@ pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySy
             // analyzer and simply splits words (`cam*era` → `cam`, `era`).
             let stem = word.trim_end_matches('*');
             let is_prefix = stem.len() != word.len();
-            let mut tokens = analyzer.analyze(stem);
+            // The prefix text keeps stop words (`the*` asks for words that
+            // START with "the"); only the plain words before it drop them.
+            let analyzed = analyzer.analyze_opts(stem, is_prefix);
+            stop_words_dropped += analyzed.stop_words_dropped;
+            let mut tokens = analyzed.tokens;
             let prefix_token = if is_prefix {
                 let last = tokens.pop();
                 match last {
@@ -237,22 +293,19 @@ pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySy
             // A bare word is one OR-ed term per analyzed token (no implicit
             // phrase — `e-mail` finds documents with either word).
             for t in tokens {
-                clauses.push(Clause {
-                    required,
-                    terms: vec![t.term],
-                    prefix: false,
-                });
+                clauses.push(Clause::term(t.term, required));
             }
             if let Some(prefix) = prefix_token {
                 clauses.push(Clause {
                     required,
                     terms: vec![format!("{prefix}*")],
                     prefix: true,
+                    offsets: Vec::new(),
                 });
             }
         }
     }
-    if clauses.is_empty() {
+    if clauses.is_empty() && stop_words_dropped == 0 {
         return Err(QuerySyntaxError::NoSearchableTerms);
     }
     Ok(ParsedQuery { clauses })
@@ -266,24 +319,17 @@ mod tests {
         parse_query(raw, Analyzer::Simple).unwrap()
     }
     fn term(t: &str, required: bool) -> Clause {
-        Clause {
-            required,
-            terms: vec![t.into()],
-            prefix: false,
-        }
+        Clause::term(t.into(), required)
     }
     fn phrase(ts: &[&str], required: bool) -> Clause {
-        Clause {
-            required,
-            terms: ts.iter().map(|s| s.to_string()).collect(),
-            prefix: false,
-        }
+        Clause::phrase(ts.iter().map(|s| s.to_string()).collect(), required)
     }
     fn prefix(p: &str, required: bool) -> Clause {
         Clause {
             required,
             terms: vec![format!("{p}*")],
             prefix: true,
+            offsets: Vec::new(),
         }
     }
 
@@ -422,6 +468,43 @@ mod tests {
         assert!(matches!(parse_query("é*", Analyzer::Simple), Err(QuerySyntaxError::PrefixTooShort { .. })));
         assert_eq!(parse("ça*").clauses, vec![prefix("ca", false)]);
         assert!(matches!(parse_query("東京*", Analyzer::Simple), Err(QuerySyntaxError::PrefixTooShort { .. })));
+    }
+
+    #[test]
+    fn english_stop_words_are_dropped_from_queries_not_errors() {
+        let en = |raw: &str| parse_query(raw, Analyzer::English);
+        // Acceptance: `of my house` is the query `house`.
+        assert_eq!(en("of my house").unwrap(), en("house").unwrap());
+        assert_eq!(en("of my house").unwrap().clauses, vec![term("hous", false)]);
+        // A required stop word constrains nothing.
+        assert_eq!(en("+of house").unwrap().clauses, vec![term("hous", false)]);
+        // Only stop words: an EMPTY query (matches nothing), not an error…
+        let q = en("of my").unwrap();
+        assert!(q.is_empty() && q.clauses.is_empty());
+        assert!(en("+the \"of the\"").unwrap().is_empty());
+        // …but nothing searchable at all is still an error, under english too.
+        for raw in ["", "!!!", "\"...\"", "🎉"] {
+            assert_eq!(en(raw), Err(QuerySyntaxError::NoSearchableTerms), "{raw:?}");
+        }
+        // A phrase keeps the gap where a stop word was.
+        let q = en("\"state of the art\"").unwrap();
+        assert_eq!(q.clauses.len(), 1);
+        assert_eq!(q.clauses[0].terms, vec!["state", "art"]);
+        assert_eq!(q.clauses[0].offsets, vec![0, 3]);
+        assert!(q.needs_positions());
+        // A leading stop word shifts nothing; a phrase left with one word is
+        // a term.
+        let q = en("\"the state art\"").unwrap();
+        assert_eq!((q.clauses[0].terms.clone(), q.clauses[0].offsets.clone()), (vec!["state".to_string(), "art".to_string()], vec![0, 1]));
+        assert_eq!(en("\"of the art\"").unwrap().clauses, vec![term("art", false)]);
+        // Prefix text keeps stop words: `the*` asks for words starting with "the".
+        assert_eq!(en("the*").unwrap().clauses, vec![prefix("the", false)]);
+        assert_eq!(en("of the*").unwrap().clauses, vec![prefix("the", false)]);
+        // `simple` is untouched.
+        assert_eq!(
+            parse("of my house").clauses,
+            vec![term("of", false), term("my", false), term("house", false)]
+        );
     }
 
     #[test]

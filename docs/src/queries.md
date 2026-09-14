@@ -121,13 +121,13 @@ User.get(1).posts.matches(.title, "+draft budget", k: 5)
 | `"query"` | the search text (syntax below) |
 | `k:` | number of results to return (most relevant first) |
 
-**Query syntax.** The text is analyzed with the field's analyzer (lowercased, diacritics folded, split into words; stemmed too under `analyzer: "english"`), then:
+**Query syntax.** The text is analyzed with the field's analyzer (lowercased, diacritics folded, split into words; under `analyzer: "english"` also [stop words](schema.md#fulltext--fulltextanalyzer-simple-positions-false) dropped and the rest stemmed), then:
 
 | Form | Meaning |
 | --- | --- |
 | `invoice 4471` | terms are **OR-ed**: a document matches if it contains any of them, and every term it contains adds to its score |
 | `+invoice` | a `+` prefix makes the term **required** |
-| `"distributed consensus"` | quoted words are a **phrase**: they must appear consecutively (the field must store positions — the default) |
+| `"distributed consensus"` | quoted words are a **phrase**: they must appear consecutively (the field must store positions — the default). Under `english`, a stop word inside the phrase leaves a gap the document must have too: `"state of the art"` searches for `state` followed three words later by `art`, so it matches *state of the art* but not *state art* |
 | `camera*` | a trailing `*` makes a **prefix term**: it matches every indexed term that starts with `camera` (`camera`, `cameras`, `camerawork`, …) and scores as one term — the type-ahead case |
 | `+"exact phrase" cam* extra` | modifiers combine: the phrase is required, the prefix and `extra` are optional |
 
@@ -137,7 +137,7 @@ A prefix term is analyzed like any other term before it is expanded — lowercas
 
 The prefix needs at least two characters after analysis (`*` and `c*` are errors — the error names the analyzed word, so `東京*`, one ideograph per word under Unicode segmentation, reports the one-character prefix `京`), it cannot appear inside a phrase, and an expansion of more than **64 distinct indexed terms** is refused with an error asking for a longer prefix — so a one- or two-letter prefix over a large vocabulary fails fast instead of scanning half the index. The cap counts the field's whole vocabulary under the prefix, not only the terms of the candidates a preceding filter narrowed to. A `*` anywhere but the end of a word is ordinary punctuation and splits the word.
 
-A query with no searchable terms (only punctuation), an unterminated quote, or a phrase against a field declared `@fulltext(positions: false)` is an error. So is `.matches` on a field without `@fulltext`; for an unindexed substring test use [`.contains`](#filter--filterpredicate) instead — `.contains` is literal and never stems, whatever the field's analyzer. While the index of a freshly-declared (or reconfigured) field is still being built for existing objects, `.matches` on it is an error that reports the progress — see [`@fulltext`](schema.md#fulltext--fulltextanalyzer-simple-positions-false).
+Under `english`, stop words are dropped from the query exactly as from the index: `of my house` searches for `house`, `+of` requires nothing, and a query made only of stop words (`of the`) returns an **empty result** rather than an error. A prefix term keeps its letters (`the*` still expands to `theory`, `theatre`, …). A query with no searchable terms (only punctuation), an unterminated quote, or a phrase against a field declared `@fulltext(positions: false)` is an error. So is `.matches` on a field without `@fulltext`; for an unindexed substring test use [`.contains`](#filter--filterpredicate) instead — `.contains` is literal and never stems, whatever the field's analyzer. While the index of a freshly-declared (or reconfigured) field is still being built for existing objects, `.matches` on it is an error that reports the progress — see [`@fulltext`](schema.md#fulltext--fulltextanalyzer-simple-positions-false).
 
 `.matches` after a filter or traversal restricts the ranking to those candidates *before* taking the top `k`, so you always get up to `k` results from within the narrowed set.
 

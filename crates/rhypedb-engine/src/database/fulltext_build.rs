@@ -245,7 +245,7 @@ pub(super) fn plan_fulltext_open(
 
             let prior = existing.remove(&(type_id, field_id));
             let (marker, changed) = match prior {
-                Some(m) if m.matches_config(&ft.analyzer, ft.positions) && m.state != BuildState::Dropping => {
+                Some(m) if m.matches_config(analyzer.definition(), ft.positions) && m.state != BuildState::Dropping => {
                     (m, false)
                 }
                 Some(m) => (
@@ -257,7 +257,7 @@ pub(super) fn plan_fulltext_open(
                         cursor: 0,
                         positions: ft.positions,
                         stale_generations: true,
-                        analyzer: ft.analyzer.clone(),
+                        analyzer: analyzer.definition().to_string(),
                     },
                     true,
                 ),
@@ -268,7 +268,7 @@ pub(super) fn plan_fulltext_open(
                         cursor: 0,
                         positions: ft.positions,
                         stale_generations: false,
-                        analyzer: ft.analyzer.clone(),
+                        analyzer: analyzer.definition().to_string(),
                     },
                     true,
                 ),
@@ -513,7 +513,7 @@ fn run_build(
                 cursor: next_cursor,
                 positions: field.positions,
                 stale_generations: stale,
-                analyzer: field.analyzer.name().to_string(),
+                analyzer: field.analyzer.definition().to_string(),
             };
             puts.push((marker_key.clone(), marker.encode()));
             db.storage.put_batch(&mut txn, &puts)?;

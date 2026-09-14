@@ -122,7 +122,8 @@ impl BuildMarker {
     }
 
     /// Whether this marker describes the same index identity as the schema's
-    /// directive (same analyzer and positions setting).
+    /// directive (same analyzer DEFINITION — `Analyzer::definition`, which
+    /// changes when an analyzer's behaviour does — and positions setting).
     pub fn matches_config(&self, analyzer: &str, positions: bool) -> bool {
         self.analyzer == analyzer && self.positions == positions
     }

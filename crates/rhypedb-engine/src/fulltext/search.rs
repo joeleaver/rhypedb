@@ -143,9 +143,12 @@ pub fn score_query(
 }
 
 /// Phrase clause: a document matches when every term is present and some
-/// occurrence of term₀ at position `p` is followed by term₁ at `p+1`, term₂
-/// at `p+2`, … Repeated terms inside a phrase ("to be or not to be") are
-/// handled naturally by the per-term position lists.
+/// occurrence of term₀ at position `p` is followed by termᵢ at
+/// `p + offsetᵢ` (see `Clause::offsets` — consecutive words are `1, 2, …`; a
+/// larger step is a word the analyzer dropped, e.g. a stop word, which the
+/// document must also have a word in place of). Repeated terms inside a
+/// phrase ("to be or not to be") are handled naturally by the per-term
+/// position lists.
 fn score_phrase(
     clause: &Clause,
     postings: &HashMap<&str, PostingList>,
@@ -179,12 +182,12 @@ fn score_phrase(
                 None => continue 'docs,
             }
         }
-        // Adjacency: walk term₀'s positions; each later term must have
-        // position p + offset. Position lists are ascending, so a binary
-        // search keeps this O(tf₀ · Σ log tfᵢ).
+        // Shape: walk term₀'s positions; each later term must sit at
+        // p + its offset. Position lists are ascending, so a binary search
+        // keeps this O(tf₀ · Σ log tfᵢ).
         let matched = per_term[0].positions.iter().any(|&p| {
-            per_term.iter().enumerate().skip(1).all(|(offset, post)| {
-                p.checked_add(offset as u32)
+            per_term.iter().enumerate().skip(1).all(|(i, post)| {
+                p.checked_add(clause.offset(i))
                     .is_some_and(|want| post.positions.binary_search(&want).is_ok())
             })
         });
@@ -325,6 +328,33 @@ mod tests {
         assert_eq!(ids(&run(DOCS, "+\"distributed consensus\" overdue", 10, None)), vec![4]);
         // A phrase term absent from the corpus matches nothing (no panic).
         assert!(run(DOCS, "\"distributed nowhere\"", 10, None).is_empty());
+    }
+
+    #[test]
+    fn phrase_offsets_require_the_same_gap_in_the_document() {
+        // doc 1: state@0 of@1 the@2 art@3 · doc 2: state@0 art@1 (simple
+        // analyzer keeps every word, so the positions are literal).
+        let docs: &[(u64, &str)] = &[(1, "state of the art"), (2, "state art")];
+        let (owned, stats) = corpus(docs);
+        let postings: HashMap<&str, PostingList> =
+            owned.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let phrase = |offsets: Vec<u32>| ParsedQuery {
+            clauses: vec![Clause {
+                required: false,
+                terms: vec!["state".into(), "art".into()],
+                prefix: false,
+                offsets,
+            }],
+        };
+        // What the english analyzer produces for "state of the art".
+        assert_eq!(ids(&score_query(&phrase(vec![0, 3]), &postings, stats, None, 10)), vec![1]);
+        // Adjacent: only the adjacent document.
+        assert_eq!(ids(&score_query(&phrase(vec![0, 1]), &postings, stats, None, 10)), vec![2]);
+        // No offsets = consecutive (the pre-#20 contract).
+        assert_eq!(ids(&score_query(&phrase(vec![]), &postings, stats, None, 10)), vec![2]);
+        // An empty query (every word was a stop word) matches nothing.
+        let empty = ParsedQuery { clauses: vec![] };
+        assert!(score_query(&empty, &postings, stats, None, 10).is_empty());
     }
 
     #[test]
