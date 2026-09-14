@@ -259,9 +259,13 @@ struct ObjectJson {
     fields: HashMap<String, serde_json::Value>,
     /// Present only on a RANKED result (`.matches` → BM25, higher is better;
     /// `.similar` → the index distance under the field's metric, lower is
-    /// closer). Rows are in rank order.
+    /// closer — always, even when reranked). Rows are in rank order.
     #[serde(skip_serializing_if = "Option::is_none")]
     score: Option<f32>,
+    /// Present only on a `.similar` row the cross-encoder scored (higher is
+    /// more relevant). See `RowScore`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rerank_score: Option<f32>,
 }
 
 impl From<Object> for ObjectJson {
@@ -279,14 +283,16 @@ impl From<Object> for ObjectJson {
             id: obj.id,
             fields,
             score: None,
+            rerank_score: None,
         }
     }
 }
 
 impl ObjectJson {
-    fn scored(obj: Object, score: f32) -> Self {
+    fn scored(obj: Object, score: rhypedb_query::executor::RowScore) -> Self {
         let mut json = Self::from(obj);
-        json.score = Some(score);
+        json.score = Some(score.score);
+        json.rerank_score = score.rerank_score;
         json
     }
 }
@@ -2095,10 +2101,24 @@ where
             .await
         }
         Ok(QueryOutput::Scored(rows)) => {
-            protocol::write_frame_buffered(writer, response_buf, req_id, protocol::RESP_SCORED, |buf| {
-                protocol::encode_scored_payload_into(&rows, buf)
-            })
-            .await
+            // `RESP_SCORED` unless some row carries a cross-encoder score —
+            // then `RESP_RERANKED`, which adds the second f32 per row.
+            if rows.iter().any(|(_, s)| s.rerank_score.is_some()) {
+                let rows: Vec<(Object, f32, Option<f32>)> = rows
+                    .into_iter()
+                    .map(|(o, s)| (o, s.score, s.rerank_score))
+                    .collect();
+                protocol::write_frame_buffered(writer, response_buf, req_id, protocol::RESP_RERANKED, |buf| {
+                    protocol::encode_reranked_payload_into(&rows, buf)
+                })
+                .await
+            } else {
+                let rows: Vec<(Object, f32)> = rows.into_iter().map(|(o, s)| (o, s.score)).collect();
+                protocol::write_frame_buffered(writer, response_buf, req_id, protocol::RESP_SCORED, |buf| {
+                    protocol::encode_scored_payload_into(&rows, buf)
+                })
+                .await
+            }
         }
         Ok(QueryOutput::Single(obj)) => {
             if let Some(vectorizer) = &state.vectorizer {

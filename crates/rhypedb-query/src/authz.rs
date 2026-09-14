@@ -50,7 +50,7 @@ pub(crate) fn apply_read_filter(ctx: &ExecContext<'_>, result: QueryOutput) -> Q
         // A ranked result is filtered row-wise too; scores ride along by id
         // (ids are unique within one result) and the rank order is kept.
         QueryOutput::Scored(rows) => {
-            let scores: std::collections::HashMap<u64, f32> =
+            let scores: std::collections::HashMap<u64, crate::executor::RowScore> =
                 rows.iter().map(|(o, s)| (o.id, *s)).collect();
             let mut objs: Vec<Object> = rows.into_iter().map(|(o, _)| o).collect();
             filter_read(ctx, &mut objs);

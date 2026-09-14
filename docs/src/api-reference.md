@@ -32,10 +32,11 @@ Each `<object>` is `{ "type": …, "id": …, "fields": { … } }`:
 { "object": { "type": "User", "id": 1, "fields": { "name": "Alice", "age": 30 } } }
 ```
 
-A **ranked** query (`.matches`, `.similar`) returns `objects` in rank order, each with an extra `"score"` member — BM25 relevance for `.matches` (higher is better), the index distance for `.similar` (lower is closer). See [Ranked results](queries.md#ranked-results).
+A **ranked** query (`.matches`, `.similar`) returns `objects` in rank order, each with an extra `"score"` member — BM25 relevance for `.matches` (higher is better), the index distance for `.similar` (lower is closer, always). A `.similar` row the server's [cross-encoder](vectors.md#cross-encoder-reranking) scored also carries `"rerank_score"` (higher is better); rows are then ordered by it. See [Ranked results](queries.md#ranked-results).
 
 ```json
 { "objects": [ { "type": "Post", "id": 7, "fields": { "title": "Invoice 4471" }, "score": 2.31 } ] }
+{ "objects": [ { "type": "Post", "id": 7, "fields": { "body": "…" }, "score": 0.18, "rerank_score": 4.72 } ] }
 ```
 
 `id` is a JSON number (an unsigned 64-bit id). Treat it as opaque — ids above 2⁵³ can lose precision in clients that parse JSON numbers as doubles. See [Object identity](schema.md#object-identity).
@@ -280,6 +281,7 @@ For high-throughput clients, the server speaks a length-prefixed binary protocol
 | `0x87` | Event | UTF-8 JSON `WireEvent` (**server-pushed**) |
 | `0x88` | SubLagged | *(empty; **server-pushed** lag notice)* |
 | `0x89` | Scored | `[ count: u32 BE ]` then, per row, `[ score: f32 BE ]` + one encoded object — a **ranked** result (`.matches` / `.similar`) in rank order |
+| `0x8A` | Reranked | `[ count: u32 BE ]` then, per row, `[ score: f32 BE ][ rerank_score: f32 BE ]` + one encoded object — a ranked `.similar` result in which at least one row was scored by the cross-encoder; `rerank_score` is **NaN** on a row it did not score. Sent instead of `Scored` only in that case, so clients that predate it keep working wherever the cross-encoder is off |
 
 `VectorBatch` (`0x03`) bulk-ingests caller-supplied `f32` vectors for one type's `Vector` field — the path used by `rhypedb-import` and the recommended way to load precomputed vectors at scale.
 

@@ -28,6 +28,7 @@ import {
   decodeErrorPayload,
   type DecodedObject,
   type Frame,
+  decodeRerankedPayload,
   decodeScoredPayload,
   type ScoredObject,
 } from "./wire.ts";
@@ -325,6 +326,8 @@ function decodeQueryFrame(frame: Frame): QueryResult {
       return { kind: "objects", objects: decode(() => decodeObjectsPayload(frame.payload)) };
     case Resp.Scored:
       return { kind: "scored", rows: decode(() => decodeScoredPayload(frame.payload)) };
+    case Resp.Reranked:
+      return { kind: "scored", rows: decode(() => decodeRerankedPayload(frame.payload)) };
     case Resp.Single:
       return { kind: "single", object: decode(() => decodeSinglePayload(frame.payload)) };
     case Resp.Done:
@@ -345,9 +348,10 @@ function decode<T>(f: () => T): T {
   }
 }
 
-function objectToRow<T>(obj: DecodedObject, score?: number): Row<T> {
+function objectToRow<T>(obj: DecodedObject, score?: number, rerankScore?: number): Row<T> {
   const row: Row<T> = { id: obj.id, data: obj.fields as unknown as T };
   if (score !== undefined) row.score = score;
+  if (rerankScore !== undefined) row.rerankScore = rerankScore;
   return row;
 }
 
@@ -357,7 +361,7 @@ function flattenRows<T>(result: QueryResult): Row<T>[] {
     case "objects":
       return result.objects.map((o) => objectToRow<T>(o));
     case "scored":
-      return result.rows.map((r) => objectToRow<T>(r.object, r.score));
+      return result.rows.map((r) => objectToRow<T>(r.object, r.score, r.rerankScore));
     case "single":
       return [objectToRow<T>(result.object)];
     case "done":
@@ -372,7 +376,7 @@ function singleRow<T>(result: QueryResult): Row<T> {
     return objectToRow<T>(result.objects[0]!);
   }
   if (result.kind === "scored" && result.rows.length === 1) {
-    return objectToRow<T>(result.rows[0]!.object, result.rows[0]!.score);
+    return objectToRow<T>(result.rows[0]!.object, result.rows[0]!.score, result.rows[0]!.rerankScore);
   }
   throw new RhypedbError("unexpected_shape", `expected a single object, got ${result.kind}`);
 }

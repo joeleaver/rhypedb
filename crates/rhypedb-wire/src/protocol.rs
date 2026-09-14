@@ -146,6 +146,13 @@ pub const RESP_SUBLAGGED: u8 = 0x88;
 /// for `.similar`. Back-compat: an old client has no arm for `0x89` and
 /// surfaces an unexpected-response error rather than mis-decoding.
 pub const RESP_SCORED: u8 = 0x89;
+/// A ranked result where at least one row also carries a cross-encoder
+/// relevance score: `[count]` then `[score f32 BE][rerank_score f32 BE][object]`
+/// per row, `rerank_score` = NaN for a row the cross-encoder did not score.
+/// Emitted instead of `RESP_SCORED` only when some row has a rerank score,
+/// so a client that predates it keeps decoding every result of a deployment
+/// without the cross-encoder.
+pub const RESP_RERANKED: u8 = 0x8A;
 
 /// Format tag stamped into every [`WireEvent`] so a consumer can detect the
 /// envelope version (mirrors the logical-export `FORMAT_TAG` convention).
@@ -577,6 +584,48 @@ pub fn encode_scored_payload_into(rows: &[(Object, f32)], out: &mut Vec<u8>) {
     }
 }
 
+/// Encode a `RESP_RERANKED` payload into `out`: `[count]` then
+/// `[score f32 BE][rerank_score f32 BE (NaN = none)][object]` per row.
+pub fn encode_reranked_payload_into(rows: &[(Object, f32, Option<f32>)], out: &mut Vec<u8>) {
+    out.reserve(4 + rows.len() * 72);
+    out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
+    for (obj, score, rerank) in rows {
+        out.extend_from_slice(&score.to_be_bytes());
+        out.extend_from_slice(&rerank.unwrap_or(f32::NAN).to_be_bytes());
+        encode_object(obj, out);
+    }
+}
+
+/// Convenience wrapper over [`encode_reranked_payload_into`].
+pub fn encode_reranked_payload(rows: &[(Object, f32, Option<f32>)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_reranked_payload_into(rows, &mut buf);
+    buf
+}
+
+/// Decode a `RESP_RERANKED` payload into `(object, score, rerank_score)` rows
+/// in rank order (`rerank_score` is `None` where the wire holds NaN).
+pub fn decode_reranked_payload(data: &[u8]) -> io::Result<Vec<(Object, f32, Option<f32>)>> {
+    if data.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "reranked count missing"));
+    }
+    let count = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
+    let mut pos = 4;
+    let mut rows = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        if pos + 8 > data.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "reranked row scores truncated"));
+        }
+        let score = f32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
+        let rerank = f32::from_be_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+        pos += 8;
+        let (obj, new_pos) = decode_object(data, pos)?;
+        rows.push((obj, score, (!rerank.is_nan()).then_some(rerank)));
+        pos = new_pos;
+    }
+    Ok(rows)
+}
+
 /// Convenience wrapper over [`encode_scored_payload_into`].
 pub fn encode_scored_payload(rows: &[(Object, f32)]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -603,6 +652,40 @@ pub fn decode_scored_payload(data: &[u8]) -> io::Result<Vec<(Object, f32)>> {
         pos = new_pos;
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod reranked_payload_tests {
+    use super::*;
+    use crate::object::FieldMap;
+
+    fn obj(id: u64) -> Object {
+        Object {
+            type_name: "Post".into(),
+            id,
+            fields: FieldMap::new(),
+            raw_fields: None,
+        }
+    }
+
+    #[test]
+    fn reranked_payload_round_trips_with_nan_meaning_none() {
+        let rows = vec![(obj(1), 0.12f32, Some(4.5f32)), (obj(2), 0.08, None)];
+        let bytes = encode_reranked_payload(&rows);
+        let back = decode_reranked_payload(&bytes).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[0].0.id, back[0].1, back[0].2), (1, 0.12, Some(4.5)));
+        assert_eq!((back[1].0.id, back[1].1, back[1].2), (2, 0.08, None));
+        // The wire holds NaN for the absent rerank score: row 0's second f32
+        // is 4.5, row 1's is NaN.
+        assert_eq!(f32::from_be_bytes(bytes[8..12].try_into().unwrap()), 4.5);
+        let row1 = 4 + (bytes.len() - 4) / 2; // two rows of equal length (same-shape objects)
+        let row1_rerank = f32::from_be_bytes(bytes[row1 + 4..row1 + 8].try_into().unwrap());
+        assert!(row1_rerank.is_nan(), "{row1_rerank}");
+        // Truncation inside the second f32 is an error, not a silent None.
+        assert!(decode_reranked_payload(&bytes[..4 + 6]).is_err());
+        assert!(decode_reranked_payload(&encode_reranked_payload(&[])).unwrap().is_empty());
+    }
 }
 
 /// Encode a Single response payload.

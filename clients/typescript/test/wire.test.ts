@@ -25,6 +25,8 @@ import {
   decodeErrorPayload,
   rfc3339FromMillis,
   type EncValue,
+  decodeRerankedPayload,
+  encodeRerankedPayload,
 } from "../src/wire.ts";
 
 // ---- value round-trips (encode a single-field object, decode it back) -------
@@ -207,6 +209,29 @@ test("decoding truncated payloads throws WireError, never a silent wrong value",
   // count says 1 object but no object bytes follow
   assert.throws(() => decodeObjectsPayload(Buffer.from([0, 0, 0, 1])), WireError);
   assert.throws(() => decodeErrorPayload(Buffer.from([0, 0, 0, 5, 0x61])), WireError); // body short
+});
+
+test("reranked payload round-trips score + optional rerank score (NaN = none)", () => {
+  const a = encodeObject("Post", 1n, [["title", { tag: "string", value: "a" }]]);
+  const b = encodeObject("Post", 2n, [["title", { tag: "string", value: "b" }]]);
+  const rows = decodeRerankedPayload(
+    encodeRerankedPayload([
+      { object: a, score: 0.12, rerankScore: 4.5 },
+      { object: b, score: 0.08 }, // textless tail row: distance only
+    ]),
+  );
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.object.id, 1n);
+  assert.ok(Math.abs(rows[0]!.score - 0.12) < 1e-6);
+  assert.equal(rows[0]!.rerankScore, 4.5);
+  assert.equal(rows[1]!.object.id, 2n);
+  assert.ok(Math.abs(rows[1]!.score - 0.08) < 1e-6);
+  assert.equal(rows[1]!.rerankScore, undefined);
+  assert.equal("rerankScore" in rows[1]!, false);
+  assert.deepEqual(decodeRerankedPayload(encodeRerankedPayload([])), []);
+  // Truncated second f32 fails loudly.
+  const full = encodeRerankedPayload([{ object: a, score: 1, rerankScore: 2 }]);
+  assert.throws(() => decodeRerankedPayload(full.subarray(0, 4 + 6)));
 });
 
 test("scored payload round-trips rows in order with exact scores", () => {

@@ -36,6 +36,11 @@ export const Resp = {
   SubLagged: 0x88,
   /** A ranked list: `[count:u32]` then `[score:f32][object]` per row, in rank order. */
   Scored: 0x89,
+  /**
+   * A ranked list where some row also carries a cross-encoder relevance score:
+   * `[count:u32]` then `[score:f32][rerank_score:f32, NaN = none][object]` per row.
+   */
+  Reranked: 0x8a,
 } as const;
 
 /** Value serialization tags (the `ValueTag` enum on the Rust side). */
@@ -317,11 +322,20 @@ export function decodeObjectsPayload(payload: Buffer): DecodedObject[] {
   return out;
 }
 
-/** One row of a ranked (`RESP_SCORED`) result. */
+/** One row of a ranked (`RESP_SCORED` / `RESP_RERANKED`) result. */
 export interface ScoredObject {
   object: DecodedObject;
-  /** `.matches` → BM25 (higher is better); `.similar` → index distance (lower is closer). */
+  /**
+   * `.matches` → BM25 (higher is better); `.similar` → index distance (lower is
+   * closer) — always the distance, even when the row was reranked.
+   */
   score: number;
+  /**
+   * The cross-encoder's relevance (higher is better), only on a `.similar` row
+   * it actually scored (`[vectorizer] cross_encoder` on). Rows arrive in rank
+   * order either way.
+   */
+  rerankScore?: number;
 }
 
 /** Decode a `RESP_SCORED` payload: `[count:u32]` then `[score:f32 BE][object]` per row. */
@@ -332,6 +346,25 @@ export function decodeScoredPayload(payload: Buffer): ScoredObject[] {
   for (let i = 0; i < count; i++) {
     const score = r.f32("row score");
     out.push({ object: decodeObjectAt(r), score });
+  }
+  return out;
+}
+
+/**
+ * Decode a `RESP_RERANKED` payload: `[count:u32]` then
+ * `[score:f32 BE][rerank_score:f32 BE][object]` per row; a NaN rerank score
+ * means the cross-encoder did not score that row.
+ */
+export function decodeRerankedPayload(payload: Buffer): ScoredObject[] {
+  const r = new Reader(payload);
+  const count = r.u32("reranked count");
+  const out: ScoredObject[] = [];
+  for (let i = 0; i < count; i++) {
+    const score = r.f32("row score");
+    const rerank = r.f32("row rerank score");
+    const row: ScoredObject = { object: decodeObjectAt(r), score };
+    if (!Number.isNaN(rerank)) row.rerankScore = rerank;
+    out.push(row);
   }
   return out;
 }
@@ -614,6 +647,22 @@ export function encodeScoredPayload(rows: ReadonlyArray<{ object: Buffer; score:
   for (const { object, score } of rows) {
     const s = Buffer.allocUnsafe(4);
     s.writeFloatBE(score, 0);
+    parts.push(s, object);
+  }
+  return Buffer.concat(parts);
+}
+
+/** Encode a `RESP_RERANKED` payload: `[count:u32]` then `[score:f32][rerank:f32 (NaN = none)][object]` per row. */
+export function encodeRerankedPayload(
+  rows: ReadonlyArray<{ object: Buffer; score: number; rerankScore?: number }>,
+): Buffer {
+  const head = Buffer.allocUnsafe(4);
+  head.writeUInt32BE(rows.length, 0);
+  const parts: Buffer[] = [head];
+  for (const { object, score, rerankScore } of rows) {
+    const s = Buffer.allocUnsafe(8);
+    s.writeFloatBE(score, 0);
+    s.writeFloatBE(rerankScore ?? Number.NaN, 4);
     parts.push(s, object);
   }
   return Buffer.concat(parts);

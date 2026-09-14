@@ -103,7 +103,7 @@ Post.similar(.embedding, "databases", k: 10, ef: 200, rerank: 50)
 Post.filter(.published == true).similar(.embedding, "rust", k: 5)
 ```
 
-`.similar` returns a **ranked** result: each object carries a `score` and the rows come back in rank order. Ordinarily `score` is the index's distance under the field's metric (lower is closer); when the [cross-encoder](vectors.md#cross-encoder-reranking) actually scored a row it is instead the cross-encoder's relevance score (higher is better). See [Ranked results](#ranked-results) for exactly when that is.
+`.similar` returns a **ranked** result: each object carries a `score` — the index's distance under the field's metric (lower is closer) — and the rows come back in rank order. When the [cross-encoder](vectors.md#cross-encoder-reranking) scored a row it also carries a `rerank_score` (higher is better). See [Ranked results](#ranked-results).
 
 ### Full-text search — `.matches(.field, "query", k: N)`
 
@@ -143,15 +143,14 @@ A query with no searchable terms (only punctuation), an unterminated quote, or a
 
 ### Ranked results
 
-`.similar` and `.matches` produce a **ranked** result: the same objects as any other query, in rank order, each carrying a `score`. Over `POST /query` the score is an extra `"score"` member on every object; over the binary protocol the result is a `Scored` frame ([API Reference](api-reference.md#server-response-types)); the Rust and TypeScript clients expose it as `Row.score`. The score's meaning depends on the step:
+`.similar` and `.matches` produce a **ranked** result: the same objects as any other query, in rank order, each carrying a `score`. Over `POST /query` the score is an extra `"score"` member on every object; over the binary protocol the result is a `Scored` frame (or a `Reranked` frame when a cross-encoder score is present — [API Reference](api-reference.md#server-response-types)); the Rust and TypeScript clients expose it as `Row.score` (and `Row.rerank_score` / `Row.rerankScore`). The score's meaning depends on the step:
 
 | Step | `score` |
 | --- | --- |
 | `.matches` | BM25 relevance — higher is better |
-| `.similar` (default) | the index distance under the field's metric (cosine distance, squared L2, or negated dot product) — lower is closer |
-| `.similar`, row scored by the cross-encoder | the cross-encoder's relevance score — higher is better |
+| `.similar` | the index distance under the field's metric (cosine distance, squared L2, or negated dot product) — lower is closer. Always the distance, so it can be thresholded on whatever the deployment's reranking configuration |
 
-The cross-encoder scores a row only when all of these hold: `[vectorizer] cross_encoder` names a model, the query was a **text** query (a raw-vector `.similar` has no text to score against), the reranker model is currently loaded (a load failure is fail-soft — see `reranker_error` on `GET /status`), and the row's object has readable source text. A row that misses any of these carries a distance, and one result set can mix the two: with the cross-encoder on, rows the model scored come first (relevance, descending), then any candidates whose source text was unreadable (distance, ascending). So treat `score` as opaque for ordering purposes — the rows are already in rank order — and, if you read it directly, know which of the two your deployment produces. A `.similar` step's `score` is only comparable across queries against the SAME field with the SAME vectorizer configuration.
+A `.similar` row additionally carries `rerank_score` — the cross-encoder's relevance, higher is better — when all of these hold: `[vectorizer] cross_encoder` names a model, the query was a **text** query (a raw-vector `.similar` has no text to score against), the reranker model is currently loaded (a load failure is fail-soft — see `reranker_error` on `GET /status`), and the row's object has readable source text. Rows come back in rank order either way: the rows the cross-encoder scored first (by `rerank_score`, descending), then any candidates it could not score (by `score`, ascending). A `.similar` step's `score` is only comparable across queries against the SAME field (the metric is a property of the field).
 
 A `.filter`, `.limit` or `.offset` after a ranked step keeps the order and the scores; a traversal or a mutation drops them.
 

@@ -47,7 +47,7 @@ mod query;
 mod subscription;
 #[cfg(feature = "async")]
 pub use async_client::{AsyncClient, AsyncSubscription};
-pub use query::{Query, Row};
+pub use query::{Query, Row, Score};
 pub use subscription::{ChangeNotification, Notification, Subscription, SubscriptionStopper};
 // Re-export the filter model so callers can build subscriptions without naming
 // `rhypedb-subscribe` (which is tokio-free, so the client stays runtime-free).
@@ -121,9 +121,10 @@ pub struct ClientConfig {
 pub enum QueryResult {
     /// A list result (`RESP_OBJECTS`) — filters, scans, gets, etc.
     Objects(Vec<Object>),
-    /// A RANKED list (`RESP_SCORED`) — `.matches` / `.similar` — each row with
-    /// its score, in rank order. See [`Row::score`] for the score's meaning.
-    Scored(Vec<(Object, f32)>),
+    /// A RANKED list (`RESP_SCORED` / `RESP_RERANKED`) — `.matches` /
+    /// `.similar` — each row with its [`Score`], in rank order. See
+    /// [`Row::score`] / [`Row::rerank_score`] for the meaning.
+    Scored(Vec<(Object, Score)>),
     /// A single object (`RESP_SINGLE`) — `get`, `create`, `update`.
     Single(Object),
     /// A void result (`RESP_DONE`) — `delete`, `link`, `unlink`.
@@ -461,7 +462,18 @@ fn decode_query_frame(frame: &protocol::Frame) -> Result<QueryResult> {
             protocol::decode_objects_payload(&frame.payload).map_err(Error::Io)?,
         )),
         protocol::RESP_SCORED => Ok(QueryResult::Scored(
-            protocol::decode_scored_payload(&frame.payload).map_err(Error::Io)?,
+            protocol::decode_scored_payload(&frame.payload)
+                .map_err(Error::Io)?
+                .into_iter()
+                .map(|(o, score)| (o, Score { score, rerank_score: None }))
+                .collect(),
+        )),
+        protocol::RESP_RERANKED => Ok(QueryResult::Scored(
+            protocol::decode_reranked_payload(&frame.payload)
+                .map_err(Error::Io)?
+                .into_iter()
+                .map(|(o, score, rerank_score)| (o, Score { score, rerank_score }))
+                .collect(),
         )),
         protocol::RESP_SINGLE => {
             let (obj, _) = protocol::decode_object(&frame.payload, 0).map_err(Error::Io)?;
@@ -519,8 +531,21 @@ mod tests {
         match decode_query_frame(&frame(protocol::RESP_SCORED, payload)).unwrap() {
             QueryResult::Scored(v) => {
                 assert_eq!(v.len(), 2);
-                assert_eq!((v[0].0.id, v[0].1), (3, 1.5));
-                assert_eq!((v[1].0.id, v[1].1), (4, 0.25));
+                assert_eq!((v[0].0.id, v[0].1.score, v[0].1.rerank_score), (3, 1.5, None));
+                assert_eq!((v[1].0.id, v[1].1.score, v[1].1.rerank_score), (4, 0.25, None));
+            }
+            other => panic!("{other:?}"),
+        }
+        // RESP_RERANKED → Scored with rerank scores where the wire has them
+        let payload = protocol::encode_reranked_payload(&[
+            (obj(3), 0.2, Some(9.0)),
+            (obj(4), 0.1, None),
+        ]);
+        match decode_query_frame(&frame(protocol::RESP_RERANKED, payload)).unwrap() {
+            QueryResult::Scored(v) => {
+                assert_eq!(v.len(), 2);
+                assert_eq!((v[0].0.id, v[0].1.score, v[0].1.rerank_score), (3, 0.2, Some(9.0)));
+                assert_eq!((v[1].0.id, v[1].1.score, v[1].1.rerank_score), (4, 0.1, None));
             }
             other => panic!("{other:?}"),
         }

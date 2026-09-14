@@ -27,6 +27,27 @@ use crate::governor::Governor;
 /// `.field` traversal can then satisfy itself by reading the target id out
 /// of those FieldMaps — saving a per-source forward-edge prefix scan, which
 /// is the hot path that dominates multi-hop traversal at scale.
+/// The score(s) of one row of a ranked result. `score` is always on the
+/// step's own, stable scale — BM25 for `.matches` (higher is better), the
+/// index distance under the field's metric for `.similar` (lower is closer)
+/// — regardless of any reranking. `rerank_score` is the cross-encoder's
+/// relevance (higher is better), present only on rows the cross-encoder
+/// actually scored (a text `.similar` with `[vectorizer] cross_encoder` on,
+/// the reranker loaded, and the object's source text readable). Rows are in
+/// rank order either way: by `rerank_score` where the cross-encoder ran,
+/// else by `score`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowScore {
+    pub score: f32,
+    pub rerank_score: Option<f32>,
+}
+
+impl RowScore {
+    pub fn plain(score: f32) -> Self {
+        Self { score, rerank_score: None }
+    }
+}
+
 #[derive(Debug)]
 pub enum QueryOutput {
     /// A list of objects (from get, filter, scan_type, materialized traversal).
@@ -38,12 +59,13 @@ pub enum QueryOutput {
     /// Void result (delete, link, unlink).
     Done,
 
-    /// A RANKED list with a per-row score (`.matches` BM25, `.similar`
-    /// distance), in rank order. Reaches the wire as `RESP_SCORED` /
-    /// `"score"` on each JSON object. Downstream `filter`/`limit`/`offset`
-    /// keep the scores; a traversal or mutation collapses it to ids like
-    /// `Objects`.
-    Scored(Vec<(Object, f32)>),
+    /// A RANKED list with a per-row [`RowScore`] (`.matches` BM25, `.similar`
+    /// distance, plus the cross-encoder's relevance when it ran), in rank
+    /// order. Reaches the wire as `RESP_SCORED` / `RESP_RERANKED` and as
+    /// `"score"` (+ `"rerank_score"`) on each JSON object. Downstream
+    /// `filter`/`limit`/`offset` keep the scores; a traversal or mutation
+    /// collapses it to ids like `Objects`.
+    Scored(Vec<(Object, RowScore)>),
 
     /// A dedup'd set of (type_name, ids) carried between traversal hops. Never
     /// reaches the wire — terminal-materialized in `execute()`.
@@ -898,22 +920,25 @@ fn run_similar(
         )?,
     };
 
-    // Each row's score is the cross-encoder's relevance score when one ran for
-    // that hit (HIGHER is more relevant — see `SimilarHit`), otherwise the
-    // index's distance under the field's metric (LOWER is closer). A caller
-    // fusing `.similar` with `.matches` (reciprocal-rank fusion needs only the
-    // order, not the scale) is unaffected either way; a caller reading `score`
-    // directly must check whether the field's vectorizer has a cross-encoder
-    // enabled to know which quantity it is. See "Ranked results" in the docs.
-    let rows: Vec<(Object, f32)> = results
+    // `score` is ALWAYS the index distance (lower is closer) — a stable scale
+    // a client can threshold on — and the cross-encoder's relevance, when it
+    // ran for that hit (see `SimilarHit`), rides along separately as
+    // `rerank_score`. Rank order is the vectorizer's (rerank order where the
+    // cross-encoder ran). See "Ranked results" in the docs.
+    let rows: Vec<(Object, RowScore)> = results
         .iter()
         .filter(|hit| restrict.is_none_or(|set| set.contains(&hit.object_id)))
         .take(k)
         .filter_map(|hit| {
-            ctx.db
-                .get(type_name, hit.object_id)
-                .ok()
-                .map(|o| (o, hit.rerank_score.unwrap_or(hit.distance)))
+            ctx.db.get(type_name, hit.object_id).ok().map(|o| {
+                (
+                    o,
+                    RowScore {
+                        score: hit.distance,
+                        rerank_score: hit.rerank_score,
+                    },
+                )
+            })
         })
         .collect();
 
@@ -959,14 +984,14 @@ fn run_matches(
             other => QueryError::Engine(other),
         })?;
     ctx.governor.charge(result.postings_scanned)?;
-    let rows: Vec<(Object, f32)> = result
+    let rows: Vec<(Object, RowScore)> = result
         .hits
         .iter()
         .filter_map(|hit| {
             ctx.db
                 .get(type_name, hit.object_id)
                 .ok()
-                .map(|o| (o, hit.score))
+                .map(|o| (o, RowScore::plain(hit.score)))
         })
         .collect();
     Ok(QueryOutput::Scored(rows))
@@ -2104,7 +2129,8 @@ mod tests {
                 assert_eq!(rows.len(), 1);
                 // The score is the index's (quantized) distance estimate for the
                 // nearest neighbour — finite, and small for an exact match.
-                assert!(rows[0].1.is_finite() && rows[0].1 < 0.5, "{}", rows[0].1);
+                assert!(rows[0].1.score.is_finite() && rows[0].1.score < 0.5, "{}", rows[0].1.score);
+                assert_eq!(rows[0].1.rerank_score, None, "no cross-encoder configured");
                 rows[0].0.id
             }
             other => panic!("expected Scored, got {other:?}"),
@@ -2389,7 +2415,7 @@ mod tests {
 
     fn scored_ids(out: QueryOutput) -> Vec<(u64, f32)> {
         match out {
-            QueryOutput::Scored(rows) => rows.into_iter().map(|(o, s)| (o.id, s)).collect(),
+            QueryOutput::Scored(rows) => rows.into_iter().map(|(o, s)| (o.id, s.score)).collect(),
             other => panic!("expected Scored, got {other:?}"),
         }
     }

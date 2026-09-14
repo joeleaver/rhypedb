@@ -111,17 +111,34 @@ impl<T> std::fmt::Display for Query<T> {
     }
 }
 
+/// The score(s) of one row of a ranked result (`.matches` / `.similar`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Score {
+    /// `.matches` → the BM25 score (higher is better); `.similar` → the
+    /// index distance under the field's metric (lower is closer) — always
+    /// the distance, even when the server reranked the row.
+    pub score: f32,
+    /// The server's cross-encoder relevance (higher is better). `Some` only
+    /// on a `.similar` row the cross-encoder actually scored
+    /// (`[vectorizer] cross_encoder` on); such rows are ordered by it.
+    pub rerank_score: Option<f32>,
+}
+
 /// A query-result row: the object `id` plus its typed scalar fields, and —
-/// for a ranked result — its score.
+/// for a ranked result — its score(s).
 #[derive(Debug, Clone)]
 pub struct Row<T> {
     pub id: u64,
     pub data: T,
     /// `Some` only for rows of a ranked result, which arrive in rank order:
     /// `.matches` → the BM25 score (higher is better); `.similar` → the
-    /// index distance under the field's metric (lower is closer). `None`
-    /// for every other query shape.
+    /// index distance under the field's metric (lower is closer), always —
+    /// see [`Row::rerank_score`] for the cross-encoder's score. `None` for
+    /// every other query shape.
     pub score: Option<f32>,
+    /// The server's cross-encoder relevance (higher is better); `Some` only
+    /// on a `.similar` row it actually scored. See [`Score::rerank_score`].
+    pub rerank_score: Option<f32>,
 }
 
 impl<T: DeserializeOwned> Row<T> {
@@ -142,13 +159,15 @@ impl<T: DeserializeOwned> Row<T> {
             id: obj.id,
             data,
             score: None,
+            rerank_score: None,
         })
     }
 
     /// Materialize a typed row of a ranked result (see [`Row::score`]).
-    pub fn from_scored(obj: &Object, score: f32) -> Result<Self, Error> {
+    pub fn from_scored(obj: &Object, score: Score) -> Result<Self, Error> {
         let mut row = Self::from_object(obj)?;
-        row.score = Some(score);
+        row.score = Some(score.score);
+        row.rerank_score = score.rerank_score;
         Ok(row)
     }
 }
@@ -197,8 +216,12 @@ mod tests {
             fields: FieldMap::new(),
             raw_fields: None,
         };
-        let row = Row::<User>::from_scored(&obj, 2.5).unwrap();
+        let row = Row::<User>::from_scored(&obj, Score { score: 2.5, rerank_score: None }).unwrap();
         assert_eq!(row.score, Some(2.5));
+        assert_eq!(row.rerank_score, None);
+        let reranked =
+            Row::<User>::from_scored(&obj, Score { score: 0.1, rerank_score: Some(7.25) }).unwrap();
+        assert_eq!((reranked.score, reranked.rerank_score), (Some(0.1), Some(7.25)));
         assert_eq!(Row::<User>::from_object(&obj).unwrap().score, None);
     }
 

@@ -80,9 +80,16 @@ export interface Row<T> {
   /**
    * Set only for rows of a ranked result, which arrive in rank order:
    * `.matches` → the BM25 score (higher is better); `.similar` → the index
-   * distance under the field's metric (lower is closer).
+   * distance under the field's metric (lower is closer) — always the
+   * distance, even when the server reranked the row.
    */
   score?: number;
+  /**
+   * The cross-encoder's relevance score (higher is better). Set only on a
+   * `.similar` row the server's cross-encoder actually scored
+   * (`[vectorizer] cross_encoder` on); such rows are ordered by it.
+   */
+  rerankScore?: number;
 }
 
 /** Escape `s` as a query-language string literal (`\"` and `\\`). */
