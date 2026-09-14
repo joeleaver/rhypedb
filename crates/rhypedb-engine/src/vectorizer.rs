@@ -1259,6 +1259,48 @@ impl Vectorizer {
 
     /// Atomically claim a batch of jobs from the queue.
     /// Deletes queue entries upfront so parallel workers don't double-claim.
+    /// Delete the `Pending` vector-state rows of claimed jobs whose source
+    /// text could not be read (see `process_batch`), so an object deleted
+    /// between enqueue and claim does not linger as a `Pending` orphan until
+    /// the next open. Best-effort and conflict-tolerant: a `WriteConflict`
+    /// on a state key means a foreground write just re-asserted `Pending`
+    /// with a NEW job for that object — that job will index it, so the row
+    /// must be left alone. Tried as one txn, then per job on conflict; any
+    /// other storage error is logged (the open-time reconcile still covers
+    /// the row).
+    fn clear_orphaned_states(&self, jobs: &[&VectorizeJob]) {
+        let state_key = |job: &VectorizeJob| -> Option<Bytes> {
+            let type_id = *self.type_ids.get(&job.type_name)?;
+            let field_id = *self
+                .field_ids
+                .get(&format!("{}.{}", job.type_name, job.vector_field))?;
+            Some(KeyBuilder::vector_state(type_id, job.object_id, field_id))
+        };
+        let keys: Vec<Bytes> = jobs.iter().filter_map(|j| state_key(j)).collect();
+        let delete_all = |keys: &[Bytes]| -> Result<(), rhypedb_storage::Error> {
+            let mut txn = self.storage.begin_txn();
+            for key in keys {
+                self.storage.delete(&mut txn, key)?;
+            }
+            self.storage.commit(&mut txn).map(|_| ())
+        };
+        match delete_all(&keys) {
+            Ok(()) => {}
+            Err(rhypedb_storage::Error::WriteConflict) => {
+                for key in &keys {
+                    match delete_all(std::slice::from_ref(key)) {
+                        Ok(()) | Err(rhypedb_storage::Error::WriteConflict) => {}
+                        Err(e) => eprintln!("vectorizer: clearing an orphaned Pending state: {e}"),
+                    }
+                }
+            }
+            Err(e) => eprintln!(
+                "vectorizer: clearing {} orphaned Pending state(s): {e}",
+                keys.len()
+            ),
+        }
+    }
+
     /// The smallest job id that might still be uncommitted: the lowest
     /// in-flight `enqueue_many` range start, else `next_job_id`. Every id
     /// below the returned value is already durably committed (or was
@@ -1399,6 +1441,19 @@ impl Vectorizer {
                     }
                 })
                 .collect();
+
+            // Jobs dropped above are orphans NOW (object deleted, or source
+            // cleared / no longer a string — every write path commits the
+            // object before enqueuing its job, so "absent at claim time" can
+            // only mean "gone since"). Clear their `Pending` state here rather
+            // than leaving them invisible until the next open's reconcile.
+            let textless: Vec<&VectorizeJob> = batch_jobs
+                .iter()
+                .filter(|job| !with_text.iter().any(|(j, _)| std::ptr::eq(*j, *job)))
+                .collect();
+            if !textless.is_empty() {
+                self.clear_orphaned_states(&textless);
+            }
 
             if with_text.is_empty() {
                 continue;
@@ -3243,11 +3298,16 @@ mod tests {
                 .find(|s| s.name == "Doc.embedding")
                 .unwrap();
             assert_eq!(stat.vectors, 20, "all vectors must survive the rebuild");
-            // The rebuilt index is functional: the self-match query ranks first.
+            // The rebuilt index is functional. A 2-bit graph over 20 vectors is
+            // not deterministic under parallel build, so ask for half the index
+            // with an exact rescore and require the self-match to be TOP-1 of
+            // the rescored pool — recall@10 of 20 is saturated at 2-bit, and
+            // the rescore makes the rank exact. (`k: 3` without rescore failed
+            // once under full-workspace load.)
             let hits = v
-                .search_vector("Doc", "embedding", &synth_vec(5.0), 3, 64, false, None)
+                .search_vector("Doc", "embedding", &synth_vec(5.0), 10, 64, true, None)
                 .unwrap();
-            assert!(hits.iter().any(|h| h.object_id == 5), "got {hits:?}");
+            assert_eq!(hits.first().map(|h| h.object_id), Some(5), "got {hits:?}");
         }
     }
 
@@ -3985,6 +4045,100 @@ mod tests {
 
         let got: Vec<u64> = v.claim_batch().unwrap().iter().map(|(_, o)| *o).collect();
         assert_eq!(got, vec![3, 4, 5], "late commit is claimed, in id order, nothing lost");
+    }
+
+    /// A claimed job whose object was deleted in the meantime must not stay
+    /// `Pending` (invisible, no queue row) until the next open: the batch
+    /// clears its state, and the surviving jobs in the same batch are
+    /// embedded with THEIR OWN text (no misalignment).
+    #[test]
+    fn deleted_object_mid_batch_clears_pending_state_and_keeps_neighbours_aligned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let v = Vectorizer::new(Arc::clone(&storage), schema, type_ids, field_ids).unwrap();
+        let job = |id: u64| VectorizeJob {
+            type_name: "Doc".into(),
+            object_id: id,
+            source_field: "body".into(),
+            vector_field: "embedding".into(),
+            model: "mock".into(),
+        };
+        for id in 1..=3u64 {
+            store_object(&storage, 1, id, &format!("doc {id}"));
+            v.enqueue(job(id)).unwrap();
+        }
+        // Object 2 disappears after enqueue, before the claim.
+        let mut txn = storage.begin_txn();
+        storage.delete(&mut txn, &KeyBuilder::object(1, 2)).unwrap();
+        storage.commit(&mut txn).unwrap();
+
+        // The embedder returns a vector that encodes which TEXT it saw, so a
+        // shifted pairing would be visible in the stored vectors.
+        struct TextEchoEmbedder;
+        impl Embedder for TextEchoEmbedder {
+            fn embed(&mut self, texts: &[&str]) -> rhypedb_embed::EmbedResult<Vec<Vec<f32>>> {
+                Ok(texts
+                    .iter()
+                    .map(|t| {
+                        let n: f32 = t.trim_start_matches("doc ").parse().unwrap();
+                        vec![n, 0.0, 0.0, 0.0]
+                    })
+                    .collect())
+            }
+            fn dimensions(&self) -> usize {
+                4
+            }
+            fn model_name(&self) -> &str {
+                "mock"
+            }
+        }
+        v.embedders.lock().insert("mock".into(), Box::new(TextEchoEmbedder));
+
+        assert_eq!(v.process_pending().unwrap(), 2);
+        assert_eq!(v.get_state("Doc", 1, "embedding").unwrap(), VectorState::Indexed);
+        assert_eq!(v.get_state("Doc", 3, "embedding").unwrap(), VectorState::Indexed);
+        // `get_state` reads a MISSING row as Pending, so check the row itself.
+        let field_id = v.field_ids["Doc.embedding"];
+        let row = storage
+            .get_at(storage.read_snapshot(), &KeyBuilder::vector_state(1, 2, field_id))
+            .unwrap();
+        assert!(row.is_none(), "the deleted object's Pending state must be cleared in-batch");
+        // Neighbour alignment: object 3 holds the vector for "doc 3", not "doc 2".
+        let hits = v
+            .search_vector("Doc", "embedding", &[3.0, 0.0, 0.0, 0.0], 1, 16, true, None)
+            .unwrap();
+        assert_eq!(hits[0].object_id, 3);
+        assert!(hits[0].distance.abs() < 1e-6, "exact self-match expected: {hits:?}");
+        assert_eq!(v.status().pending, 0);
+    }
+
+    /// With several workers, only the FIRST to hit a failure pays a real load
+    /// attempt (and escalates the backoff once); the others are refused by
+    /// the gate without escalating — so N workers do not multiply the delay.
+    #[test]
+    fn gated_attempts_do_not_escalate_the_shared_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, schema, type_ids, field_ids) = vectorize_setup(dir.path());
+        let config = VectorizerConfig {
+            model_retry_initial: Duration::from_secs(2),
+            model_retry_max: Duration::from_secs(60),
+            ..VectorizerConfig::default()
+        };
+        let v = Vectorizer::with_config(Arc::clone(&storage), schema, type_ids, field_ids, config)
+            .unwrap();
+        *v.embedder_loader.lock() = always_failing_loader();
+
+        let mut scratch = HashMap::new();
+        assert!(v.get_or_load_embedder(&mut scratch, "mock").is_err()); // real attempt
+        assert_eq!(*v.next_retry_delay.lock(), Duration::from_secs(4), "escalated once");
+        for _ in 0..4 {
+            assert!(v.get_or_load_embedder(&mut scratch, "mock").is_err()); // gated
+        }
+        assert_eq!(
+            *v.next_retry_delay.lock(),
+            Duration::from_secs(4),
+            "gated attempts (other workers / queries) must not escalate the shared backoff"
+        );
     }
 
     #[test]
