@@ -82,8 +82,8 @@ pub enum Analyzer {
     ///    `having`). A dropped stop word still consumes its position, exactly
     ///    like an over-long token, so a phrase keeps its shape: `"state of
     ///    the art"` is `state` at +0 and `art` at +3, and matches a document
-    ///    with the same gap. The text of a prefix term (`the*`) is exempt —
-    ///    a prefix asks for words STARTING with those letters, not the word.
+    ///    with the same gap. A prefix term whose text is a stop word
+    ///    (`the*`) is dropped too — see the query parser.
     English,
 }
 
@@ -174,9 +174,9 @@ impl Analyzer {
     }
 
     /// [`Self::analyze`] with control over stop words and a count of what
-    /// was dropped. `keep_stop_words` is for the text of a prefix term: a
-    /// prefix asks for words that START with those letters, so `the*` must
-    /// expand to `theory`, `theatre`, … rather than vanish.
+    /// was dropped. `keep_stop_words` lets the query parser see which word a
+    /// stop-word drop removed (it analyzes a prefix term both ways to tell a
+    /// stop-word prefix from an ordinary one).
     pub fn analyze_opts(self, text: &str, keep_stop_words: bool) -> Analyzed {
         match self {
             Self::Simple => analyze_words(text, |w| Some(fold_simple(w))),
@@ -576,8 +576,8 @@ mod tests {
         assert_eq!((a.tokens.len(), a.stop_words_dropped), (0, 2));
         let a = Analyzer::English.analyze_opts("!!!", false);
         assert_eq!((a.tokens.len(), a.stop_words_dropped), (0, 0));
-        // Kept on request (prefix text): the surface stop word is stemmed
-        // like any word.
+        // Kept on request (the parser's stop-word-prefix check): the surface
+        // stop word is stemmed like any word.
         let a = Analyzer::English.analyze_opts("the", true);
         assert_eq!((terms_of(&a.tokens), a.stop_words_dropped), (vec!["the".to_string()], 0));
         // `simple` never drops them.

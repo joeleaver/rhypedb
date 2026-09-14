@@ -26,7 +26,11 @@
 //!   characters after analysis; `*` alone, a one-character prefix, and a
 //!   `*` inside a phrase are errors. Bare text that analyzes to several
 //!   tokens (`e-mail*`) yields plain terms for all but the last, which is
-//!   the prefix. Under a stemming analyzer the prefix is stemmed too and
+//!   the prefix. A prefix whose text is a stop word (`the*`, `of*`) is no
+//!   term at all under `english` — dropped exactly like the plain word `the`
+//!   would be (an expansion of `theory`, `theatre`, `theocratic` … is noise,
+//!   and vanishing on the space that completes the word was the wrong
+//!   cliff). Under a stemming analyzer the prefix is stemmed too and
 //!   matched against stored STEMS, so a partial word whose stem is shorter
 //!   than what was typed (`securit*` vs the stem `secur`) finds nothing —
 //!   an inherent stem+prefix trade-off (a dictionary sweep put stemming the
@@ -271,19 +275,32 @@ pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySy
             // analyzer and simply splits words (`cam*era` → `cam`, `era`).
             let stem = word.trim_end_matches('*');
             let is_prefix = stem.len() != word.len();
-            // The prefix text keeps stop words (`the*` asks for words that
-            // START with "the"); only the plain words before it drop them.
-            let analyzed = analyzer.analyze_opts(stem, is_prefix);
+            // Stop words are dropped from the plain words AND from the prefix
+            // text: a prefix that IS a stop word (`the*`) is no term, like
+            // `the` itself. Analyzing twice tells the two cases apart — the
+            // last word is present with stop words kept and absent without
+            // them exactly when it is a stop word (only `english` differs).
+            let analyzed = analyzer.analyze_opts(stem, false);
             stop_words_dropped += analyzed.stop_words_dropped;
             let mut tokens = analyzed.tokens;
             let prefix_token = if is_prefix {
-                let last = tokens.pop();
-                match last {
-                    Some(t) if t.term.chars().count() >= MIN_PREFIX_CHARS => Some(t.term),
+                let kept = analyzer.analyze_opts(stem, true).tokens;
+                match kept.last() {
+                    Some(t) if !tokens.iter().any(|d| d.position == t.position) => {
+                        // The prefix word was a stop word: dropped (already
+                        // counted above), constrains nothing.
+                        None
+                    }
+                    Some(t) if t.term.chars().count() >= MIN_PREFIX_CHARS => {
+                        // The prefix word is the last token of `tokens` too;
+                        // it becomes the prefix clause, not a plain term.
+                        tokens.pop();
+                        Some(t.term.clone())
+                    }
                     other => {
                         return Err(QuerySyntaxError::PrefixTooShort {
                             raw: stem.to_string(),
-                            prefix: other.map(|t| t.term).unwrap_or_default(),
+                            prefix: other.map(|t| t.term.clone()).unwrap_or_default(),
                         });
                     }
                 }
@@ -497,9 +514,26 @@ mod tests {
         let q = en("\"the state art\"").unwrap();
         assert_eq!((q.clauses[0].terms.clone(), q.clauses[0].offsets.clone()), (vec!["state".to_string(), "art".to_string()], vec![0, 1]));
         assert_eq!(en("\"of the art\"").unwrap().clauses, vec![term("art", false)]);
-        // Prefix text keeps stop words: `the*` asks for words starting with "the".
-        assert_eq!(en("the*").unwrap().clauses, vec![prefix("the", false)]);
-        assert_eq!(en("of the*").unwrap().clauses, vec![prefix("the", false)]);
+        // A prefix that IS a stop word is no term (like the plain word): an
+        // expansion of theory/theatre/theocratic would be noise, and the
+        // term would vanish anyway on the space that completes the word.
+        assert!(en("the*").unwrap().is_empty());
+        assert!(en("of the*").unwrap().is_empty());
+        assert_eq!(en("+of* house").unwrap().clauses, vec![term("hous", false)]);
+        // …but a real prefix that merely STARTS like one is fine, stemmed as
+        // usual, and stop words before it are dropped.
+        assert_eq!(en("theo*").unwrap().clauses, vec![prefix("theo", false)]);
+        assert_eq!(en("of the theo*").unwrap().clauses, vec![prefix("theo", false)]);
+        assert_eq!(en("house the*").unwrap().clauses, vec![term("hous", false)]);
+        // `a*`: a one-letter prefix is too short — but `a` is a stop word,
+        // which is checked first, so under english it is simply dropped.
+        assert!(en("a*").unwrap().is_empty());
+        assert_eq!(
+            parse_query("a*", Analyzer::Simple),
+            Err(QuerySyntaxError::PrefixTooShort { raw: "a".into(), prefix: "a".into() })
+        );
+        // `simple` keeps every prefix literal.
+        assert_eq!(parse("the*").clauses, vec![prefix("the", false)]);
         // `simple` is untouched.
         assert_eq!(
             parse("of my house").clauses,

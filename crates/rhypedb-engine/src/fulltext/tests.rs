@@ -958,9 +958,10 @@ fn english_stop_words_never_reach_the_index_and_queries_drop_them() {
     let mut both = ids(&db, "title", "\"the house\"", 10);
     both.sort_unstable();
     assert_eq!(both, vec![a, b]);
-    // Prefix text keeps its stop word: `the*` finds nothing here (no word
-    // STARTS with "the" in the index — `the` itself was never indexed).
+    // A stop-word prefix is no term: `the*` is an empty query, and adding it
+    // to a real query changes nothing.
     assert!(ids(&db, "title", "the*", 10).is_empty());
+    assert_eq!(ids(&db, "title", "house the*", 10), ids(&db, "title", "house", 10));
     // `body` is `simple`: stop words are ordinary terms there.
     let e = note(&db, "x", "of my house", "e");
     assert_eq!(ids(&db, "body", "of", 10), vec![e]);
