@@ -71,6 +71,9 @@ The background embed worker (and the query-time embedder used by a text `.simila
 | `quantized` | `true` | Prefer the int8-quantized model variant when fastembed has one (`all-MiniLM-L6-v2`, `bge-small-en-v1.5`); smaller and faster, a small quality cost. Base/large BGE models have no quantized variant and always use fp32 regardless of this setting. |
 | `cache_dir` | fastembed's own default | Where downloaded model files are cached on disk. |
 | `cross_encoder` | `"off"` | `"off"` disables cross-encoder reranking of `.similar` text search; any other string names the reranker model to turn it on with (see [Cross-encoder reranking](#cross-encoder-reranking) below). A second model, off by default. |
+| `rerank_candidates` | `min(k * 3, 48)` | ANN candidates the cross-encoder scores per text query — one forward pass each, so this is the dominant query cost when reranking is on. Never below `k`. |
+| `reranker_dir` | download | Load the reranker from a local directory (`model.onnx` plus the four tokenizer files) instead of downloading it — for bundled deployments that must not touch the network. |
+| `reranker_fp32` | `false` | Use the full-precision `bge-reranker-base` (~1.1 GB) instead of the int8-quantized build (~280 MB, equivalent quality). |
 
 If the model fails to load — a network hiccup mid-download, a cold cache on first boot, or simply the time it takes to download and initialize a ~100MB+ ONNX model — the background worker does **not** fail or drop the affected jobs. It puts them back on the queue, records the failure under `vectorizer.model_error` on `GET /status`, and retries with an exponential backoff (starting at 2s, doubling up to a 60s cap) until a load succeeds, at which point `model_error` clears and the backoff resets. A `.similar` text query made while the model is unavailable gets a clear `ModelUnavailable` error rather than panicking: the first query after a failure attempts the load itself (and waits for that attempt, which for a download can be the network timeout); queries during the backoff window are refused immediately without retrying, so a known-bad model doesn't cost every query a download attempt. Embedded callers driving `process_pending` see the same failure as an `Err(ModelUnavailable)` when a batch could not be embedded at all (its jobs are re-queued), so a "loop until 0" driver can back off rather than spin.
 
@@ -102,15 +105,14 @@ fail-soft: `.similar` falls back to returning the ANN/rescored order rather
 than erroring, and the failure is visible under `vectorizer.reranker_error`
 on `GET /status` (`vectorizer.reranker_loaded` mirrors `model_loaded`).
 
-Reranker environment knobs (all optional; the config key above is the only
-switch that turns the cross-encoder on):
-
-| Variable | Effect |
-| --- | --- |
-| `RHYPEDB_RERANKER_DIR` | Load the reranker from a local directory (`model.onnx` plus the four tokenizer files) instead of downloading it. |
-| `RHYPEDB_RERANKER_FP32` | Use the full-precision `bge-reranker-base` instead of the default int8-quantized build (larger, slower, marginally more accurate). |
-| `RHYPEDB_RERANK_CANDIDATES` | How many ANN candidates the cross-encoder scores per query (default `min(k * 3, 48)`); this is the dominant query cost when reranking is on. |
-| `RHYPEDB_DEBUG_RERANK` | Log the search path taken (brute-force / ANN / rerank pool) to stderr. |
+The reranker is tuned by the `[vectorizer]` keys `rerank_candidates`,
+`reranker_dir` and `reranker_fp32` (table above; a downloaded reranker
+shares `cache_dir` with the embedding models). Three environment variables
+predate those keys and are still honoured as fallbacks when the key is
+absent — `RHYPEDB_RERANK_CANDIDATES`, `RHYPEDB_RERANKER_DIR`,
+`RHYPEDB_RERANKER_FP32` — prefer the config keys. `RHYPEDB_DEBUG_RERANK`
+(any value) logs the search path taken (brute-force / ANN / rerank pool) to
+stderr.
 
 ## Indexing for search — `@index(hnsw, ...)`
 

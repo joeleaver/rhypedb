@@ -1026,7 +1026,8 @@ pub async fn run() {
                 "WARNING: RHYPEDB_RERANKER_DIR is set but the cross-encoder is OFF \
                  (it is opt-in since #18): `.similar` text search will NOT be reranked. \
                  Set `[vectorizer] cross_encoder = \"{DEFAULT_RERANKER_MODEL}\"` in \
-                 rhypedb.toml (--config / RHYPEDB_CONFIG) to turn it back on."
+                 rhypedb.toml (--config / RHYPEDB_CONFIG) to turn it back on \
+                 (`reranker_dir` there replaces the env var)."
             );
         }
     }

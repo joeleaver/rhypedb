@@ -60,6 +60,43 @@ impl Default for EmbedOptions {
     }
 }
 
+/// How the fastembed cross-encoder reranker is built. Like [`EmbedOptions`]
+/// this has no fastembed dependency and is always available.
+///
+/// Each field's `None`/`false` means "consult the legacy environment
+/// variable, else the default" — the env vars predate this struct and are
+/// kept as fallbacks so an existing deployment keeps working:
+/// `RHYPEDB_RERANKER_DIR` (a local model directory) and
+/// `RHYPEDB_RERANKER_FP32` (the full-precision model).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RerankOptions {
+    /// Load the reranker from this directory (`model.onnx` plus the four
+    /// tokenizer files) instead of downloading it. `None` = the
+    /// `RHYPEDB_RERANKER_DIR` env var if set, else download.
+    pub model_dir: Option<PathBuf>,
+    /// Use the full-precision `bge-reranker-base` (~1.1 GB) instead of the
+    /// int8-quantized build (~280 MB, equivalent quality). `false` = the
+    /// `RHYPEDB_RERANKER_FP32` env var if set, else quantized.
+    pub fp32: bool,
+    /// Where a downloaded reranker is cached. `None` = fastembed's default
+    /// cache dir (shared with the embedding models).
+    pub cache_dir: Option<PathBuf>,
+}
+
+impl RerankOptions {
+    /// The effective model directory: the option, else the env var.
+    pub fn effective_model_dir(&self) -> Option<PathBuf> {
+        self.model_dir
+            .clone()
+            .or_else(|| std::env::var_os("RHYPEDB_RERANKER_DIR").map(PathBuf::from))
+    }
+
+    /// The effective precision choice: the option, else the env var.
+    pub fn effective_fp32(&self) -> bool {
+        self.fp32 || std::env::var_os("RHYPEDB_RERANKER_FP32").is_some()
+    }
+}
+
 /// Trait for text-to-vector encoding.
 pub trait Embedder: Send + Sync {
     fn embed(&mut self, texts: &[&str]) -> EmbedResult<Vec<Vec<f32>>>;
@@ -223,26 +260,40 @@ pub struct FastReranker {
 
 #[cfg(feature = "fastembed")]
 impl FastReranker {
+    /// [`Self::with_options`] with [`RerankOptions::default`] — i.e. the
+    /// legacy env vars, else the int8-quantized download.
     pub fn new() -> EmbedResult<Self> {
-        // Reranker selection:
-        //   - RHYPEDB_RERANKER_DIR=<dir>: load a user-supplied reranker
-        //     (model.onnx + the four tokenizer files) from a local directory.
-        //     Used by bundled deployments that ship their own model and must not
-        //     touch the network.
-        //   - RHYPEDB_RERANKER_FP32 set: the full-precision bge-reranker-base
-        //     (~1.1GB) — an escape hatch.
-        //   - otherwise (DEFAULT): the int8-quantized bge-reranker-base (~280MB,
-        //     equivalent quality, ~4x smaller and lower memory), downloaded and
-        //     cached on first use.
-        let model = if let Some(dir) = std::env::var_os("RHYPEDB_RERANKER_DIR") {
-            Self::load_from_dir(std::path::Path::new(&dir))?
-        } else if std::env::var_os("RHYPEDB_RERANKER_FP32").is_some() {
+        Self::with_options(&RerankOptions::default())
+    }
+
+    pub fn with_options(options: &RerankOptions) -> EmbedResult<Self> {
+        // Reranker selection (each option falls back to its legacy env var,
+        // see `RerankOptions`):
+        //   - a model directory: load a user-supplied reranker (model.onnx +
+        //     the four tokenizer files) from local disk. Used by bundled
+        //     deployments that ship their own model and must not touch the
+        //     network.
+        //   - fp32: the full-precision bge-reranker-base (~1.1GB) — an
+        //     escape hatch.
+        //   - otherwise (DEFAULT): the int8-quantized bge-reranker-base
+        //     (~280MB, equivalent quality, ~4x smaller and lower memory),
+        //     downloaded and cached on first use.
+        // Serialized under `MODEL_LOAD` like the embedder: a reranker load
+        // racing an embedder load on the same hf-hub cache hit the same
+        // per-blob lock failure.
+        let _guard = MODEL_LOAD.lock().unwrap_or_else(|e| e.into_inner());
+        let model = if let Some(dir) = options.effective_model_dir() {
+            Self::load_from_dir(&dir)?
+        } else if options.effective_fp32() {
             let mut init_options = fastembed::RerankInitOptions::default();
             init_options.show_download_progress = false;
+            if let Some(cache_dir) = &options.cache_dir {
+                init_options.cache_dir = cache_dir.clone();
+            }
             fastembed::TextRerank::try_new(init_options)
-                .map_err(|e| EmbedError::Model(e.to_string()))?
+                .map_err(|e| EmbedError::Unavailable(e.to_string()))?
         } else {
-            Self::load_quantized_default()?
+            Self::load_quantized_default(options.cache_dir.as_deref())?
         };
 
         Ok(Self { model })
@@ -269,10 +320,15 @@ impl FastReranker {
     /// Default reranker: the int8-quantized bge-reranker-base, fetched from the
     /// HuggingFace hub (Xenova/bge-reranker-base) and cached alongside the
     /// embedding models. ~280MB vs the 1.1GB fp32 build, equivalent quality.
-    fn load_quantized_default() -> EmbedResult<fastembed::TextRerank> {
+    fn load_quantized_default(
+        cache_dir: Option<&std::path::Path>,
+    ) -> EmbedResult<fastembed::TextRerank> {
         use hf_hub::api::sync::ApiBuilder;
+        let cache_dir = cache_dir
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from(fastembed::get_cache_dir()));
         let api = ApiBuilder::new()
-            .with_cache_dir(std::path::PathBuf::from(fastembed::get_cache_dir()))
+            .with_cache_dir(cache_dir)
             .with_progress(false)
             .build()
             .map_err(|e| EmbedError::Model(format!("hf-hub init: {e}")))?;
@@ -450,6 +506,17 @@ mod options_tests {
         assert_eq!(opts.max_length, 256);
         assert!(opts.intra_threads >= 1);
         assert!(opts.quantized);
+    }
+
+    #[test]
+    fn rerank_options_fall_back_to_env_then_default() {
+        // No option, no env → download the quantized default.
+        let o = RerankOptions::default();
+        // (env may be set on a developer machine; only assert the option path)
+        let with_dir = RerankOptions { model_dir: Some(PathBuf::from("/m")), ..o.clone() };
+        assert_eq!(with_dir.effective_model_dir(), Some(PathBuf::from("/m")));
+        let with_fp32 = RerankOptions { fp32: true, ..o };
+        assert!(with_fp32.effective_fp32());
     }
 
     #[test]

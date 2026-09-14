@@ -89,6 +89,16 @@ pub struct VectorizerFileConfig {
     /// Prefer the int8-quantized model variant, forwarded to
     /// `EmbedOptions::quantized`.
     pub quantized: Option<bool>,
+    /// ANN candidates the cross-encoder scores per text query; forwarded to
+    /// `VectorizerConfig::rerank_candidates` (default `min(k * 3, 48)`).
+    pub rerank_candidates: Option<i64>,
+    /// Load the reranker from a local directory instead of downloading it;
+    /// forwarded to `RerankOptions::model_dir` (legacy env
+    /// `RHYPEDB_RERANKER_DIR`).
+    pub reranker_dir: Option<PathBuf>,
+    /// Use the full-precision reranker instead of the int8 build; forwarded
+    /// to `RerankOptions::fp32` (legacy env `RHYPEDB_RERANKER_FP32`).
+    pub reranker_fp32: Option<bool>,
     /// Cross-encoder reranking of `.similar` text search (a second, ~280MB
     /// model, one forward pass per candidate — expensive enough that it
     /// defaults to off). `"off"` (any case), empty, or absent = `CrossEncoder::Off`; any other
@@ -332,9 +342,27 @@ fn resolve_vectorizer_config(
     }
     if let Some(dir) = &vz.cache_dir {
         cfg.embed.cache_dir = Some(dir.clone());
+        // One cache for both models, unless the reranker is loaded from disk.
+        cfg.reranker.cache_dir = Some(dir.clone());
     }
     if let Some(q) = vz.quantized {
         cfg.embed.quantized = q;
+    }
+    if let Some(n) = vz.rerank_candidates {
+        if n >= 1 {
+            cfg.rerank_candidates = Some(n as usize);
+        } else {
+            eprintln!(
+                "WARNING: vectorizer.rerank_candidates must be >= 1 (got {n}); using the \
+                 default (min(k * 3, 48))."
+            );
+        }
+    }
+    if let Some(dir) = &vz.reranker_dir {
+        cfg.reranker.model_dir = Some(dir.clone());
+    }
+    if let Some(fp32) = vz.reranker_fp32 {
+        cfg.reranker.fp32 = fp32;
     }
     // `"off"` (or absent, handled by the `let Some(vz)` above returning early)
     // means Off; any other string is the reranker model name. The name is NOT
@@ -918,6 +946,9 @@ mod tests {
             intra_threads = 4
             cache_dir = "/var/cache/rhypedb-models"
             quantized = false
+            rerank_candidates = 24
+            reranker_dir = "/opt/reranker"
+            reranker_fp32 = true
         "#,
         );
         let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
@@ -926,6 +957,16 @@ mod tests {
         assert_eq!(c.vectorizer.embed.intra_threads, 4);
         assert_eq!(c.vectorizer.embed.cache_dir, Some(PathBuf::from("/var/cache/rhypedb-models")));
         assert!(!c.vectorizer.embed.quantized);
+        assert_eq!(c.vectorizer.rerank_candidates, Some(24));
+        assert_eq!(c.vectorizer.reranker.model_dir, Some(PathBuf::from("/opt/reranker")));
+        assert!(c.vectorizer.reranker.fp32);
+        // The shared cache dir also serves a downloaded reranker.
+        assert_eq!(c.vectorizer.reranker.cache_dir, Some(PathBuf::from("/var/cache/rhypedb-models")));
+
+        // Out-of-range rerank_candidates warns and keeps the default.
+        let f = file("[vectorizer]\nrerank_candidates = 0");
+        let c = resolve(&CliLayer::default(), &EnvLayer::default(), Some(&f));
+        assert_eq!(c.vectorizer.rerank_candidates, None);
 
         // Out-of-range batch_size warns and falls back to the default rather
         // than a fatal error (consistent with ef/rerank/cache_max_entries).

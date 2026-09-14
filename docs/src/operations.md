@@ -66,7 +66,7 @@ The keys map one-to-one to the flags/env vars (flat, `snake_case`):
 | `worker_quiesce_budget_secs` | int ≥ 1 | `10` | *(file only)* |
 | `block_compression` | `"none"` \| `"lz4"` | `"none"` | `--block-compression` / `RHYPEDB_BLOCK_COMPRESSION` |
 
-**Background embedding pipeline.** A `[vectorizer]` TABLE (not a flat key) tunes the embed worker used by `@vectorize` fields: `batch_size`, `max_length`, `intra_threads`, `quantized`, `cache_dir`, plus `cross_encoder` (`"off"`, the default, or a reranker model name) to turn on cross-encoder reranking of `.similar` text search — all optional, config-file only, no flag/env in this version. See [Embedding pipeline settings](vectors.md#embedding-pipeline-settings) for defaults and what each knob costs.
+**Background embedding pipeline.** A `[vectorizer]` TABLE (not a flat key) tunes the embed worker used by `@vectorize` fields: `batch_size`, `max_length`, `intra_threads`, `quantized`, `cache_dir`, plus `cross_encoder` (`"off"`, the default, or a reranker model name) to turn on cross-encoder reranking of `.similar` text search and its knobs `rerank_candidates`, `reranker_dir`, `reranker_fp32` — all optional, config-file only, no flag/env in this version. See [Embedding pipeline settings](vectors.md#embedding-pipeline-settings) for defaults and what each knob costs.
 
 **SST block compression.** `block_compression` controls how newly written SST
 files (memtable flushes and compactions) store their data region. `"none"` (the

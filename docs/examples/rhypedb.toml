@@ -76,3 +76,6 @@
 # "off" (the default) or the reranker model name; "bge-reranker-base" is the
 # only supported value today.
 # cross_encoder = "off"
+# rerank_candidates = 48     # ANN candidates the cross-encoder scores per query (default min(k*3, 48))
+# reranker_dir = "/opt/reranker"   # load the reranker from disk (model.onnx + tokenizer files) instead of downloading
+# reranker_fp32 = false      # full-precision reranker (~1.1 GB) instead of the int8 build (~280 MB)

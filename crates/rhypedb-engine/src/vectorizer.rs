@@ -176,6 +176,16 @@ pub struct VectorizerConfig {
     /// Retries double this delay each consecutive failure, capped here.
     /// Default 60s.
     pub model_retry_max: Duration,
+    /// How many ANN candidates the cross-encoder scores per text query
+    /// (one forward pass each — the dominant query cost when it is on).
+    /// `None` = `min(k * 3, 48)`, or the legacy `RHYPEDB_RERANK_CANDIDATES`
+    /// env var if set; always at least `k`. Ignored while `cross_encoder`
+    /// is `Off`.
+    pub rerank_candidates: Option<usize>,
+    /// How the cross-encoder model is located/built when `cross_encoder` is
+    /// `On` (local directory, fp32 vs int8, cache dir). Each field falls back
+    /// to its legacy env var; see [`rhypedb_embed::RerankOptions`].
+    pub reranker: rhypedb_embed::RerankOptions,
     /// Whether `.similar` text search also runs a cross-encoder rerank pass
     /// over the ANN candidates' source text. Default `Off`. This is separate
     /// from — and used ALONGSIDE — the per-query full-precision
@@ -217,6 +227,8 @@ impl Default for VectorizerConfig {
             embed: rhypedb_embed::EmbedOptions::default(),
             model_retry_initial: Duration::from_secs(2),
             model_retry_max: Duration::from_secs(60),
+            rerank_candidates: None,
+            reranker: rhypedb_embed::RerankOptions::default(),
             cross_encoder: CrossEncoder::default(),
         }
     }
@@ -233,6 +245,8 @@ impl PartialEq for VectorizerConfig {
             && self.model_retry_initial == other.model_retry_initial
             && self.model_retry_max == other.model_retry_max
             && self.cross_encoder == other.cross_encoder
+            && self.rerank_candidates == other.rerank_candidates
+            && self.reranker == other.reranker
             && self.embed.cache_dir == other.embed.cache_dir
             && self.embed.max_length == other.embed.max_length
             && self.embed.intra_threads == other.embed.intra_threads
@@ -271,21 +285,22 @@ fn default_embedder_loader() -> Box<EmbedderLoader> {
 /// checking `model` against [`DEFAULT_RERANKER_MODEL`]); tests substitute a
 /// `FailingLoader`-style closure. See `Vectorizer::get_or_load_reranker`.
 type LoadedReranker = Result<Box<dyn Reranker>, rhypedb_embed::EmbedError>;
-type RerankerLoader = dyn Fn(&str) -> LoadedReranker + Send + Sync;
+type RerankerLoader =
+    dyn Fn(&str, &rhypedb_embed::RerankOptions) -> LoadedReranker + Send + Sync;
 
 #[cfg(feature = "fastembed")]
 fn default_reranker_loader() -> Box<RerankerLoader> {
-    Box::new(|model_name: &str| {
+    Box::new(|model_name: &str, options: &rhypedb_embed::RerankOptions| {
         if model_name != DEFAULT_RERANKER_MODEL {
             return Err(rhypedb_embed::EmbedError::UnsupportedModel(model_name.into()));
         }
-        FastReranker::new().map(|r| Box::new(r) as Box<dyn Reranker>)
+        FastReranker::with_options(options).map(|r| Box::new(r) as Box<dyn Reranker>)
     })
 }
 
 #[cfg(not(feature = "fastembed"))]
 fn default_reranker_loader() -> Box<RerankerLoader> {
-    Box::new(|_model_name: &str| {
+    Box::new(|_model_name: &str, _options: &rhypedb_embed::RerankOptions| {
         Err(rhypedb_embed::EmbedError::Unavailable(
             "no reranker available (built without the `fastembed` feature)".into(),
         ))
@@ -1219,7 +1234,7 @@ impl Vectorizer {
             return Ok(());
         }
         let loader = self.reranker_loader.lock();
-        match (loader)(model) {
+        match (loader)(model, &self.config.reranker) {
             Ok(r) => {
                 *reranker = Some(r);
                 drop(loader);
@@ -1605,15 +1620,19 @@ impl Vectorizer {
         // How many HNSW candidates to retrieve. With the cross-encoder off we
         // only need the top k. With it on we over-retrieve a *bounded* pool to
         // feed the cross-encoder — it runs one forward pass per candidate, so
-        // this is the dominant query cost. Capped (overridable via
-        // RHYPEDB_RERANK_CANDIDATES) rather than an uncapped `k * 10`, which
-        // reranked ~120 candidates for a 12-result query.
+        // this is the dominant query cost. Capped (`config.rerank_candidates`,
+        // legacy env `RHYPEDB_RERANK_CANDIDATES`) rather than an uncapped
+        // `k * 10`, which reranked ~120 candidates for a 12-result query.
         let retrieval_k = if cross_encoder_model.is_none() {
             k
         } else {
-            std::env::var("RHYPEDB_RERANK_CANDIDATES")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
+            self.config
+                .rerank_candidates
+                .or_else(|| {
+                    std::env::var("RHYPEDB_RERANK_CANDIDATES")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                })
                 .unwrap_or((k * 3).min(48))
                 .max(k)
         };
@@ -4077,11 +4096,16 @@ mod tests {
         struct TextEchoEmbedder;
         impl Embedder for TextEchoEmbedder {
             fn embed(&mut self, texts: &[&str]) -> rhypedb_embed::EmbedResult<Vec<Vec<f32>>> {
+                // One-hot on the document number: distinct DIRECTIONS, so the
+                // cosine index can tell them apart (scaled copies of one axis
+                // would all be cosine-distance 0 from each other).
                 Ok(texts
                     .iter()
                     .map(|t| {
-                        let n: f32 = t.trim_start_matches("doc ").parse().unwrap();
-                        vec![n, 0.0, 0.0, 0.0]
+                        let n: usize = t.trim_start_matches("doc ").parse().unwrap();
+                        let mut v = vec![0.0; 4];
+                        v[n - 1] = 1.0;
+                        v
                     })
                     .collect())
             }
@@ -4103,12 +4127,17 @@ mod tests {
             .get_at(storage.read_snapshot(), &KeyBuilder::vector_state(1, 2, field_id))
             .unwrap();
         assert!(row.is_none(), "the deleted object's Pending state must be cleared in-batch");
-        // Neighbour alignment: object 3 holds the vector for "doc 3", not "doc 2".
-        let hits = v
-            .search_vector("Doc", "embedding", &[3.0, 0.0, 0.0, 0.0], 1, 16, true, None)
-            .unwrap();
-        assert_eq!(hits[0].object_id, 3);
-        assert!(hits[0].distance.abs() < 1e-6, "exact self-match expected: {hits:?}");
+        // Neighbour alignment: object 3 holds the vector for "doc 3" (axis 2),
+        // not "doc 2" (axis 1), and object 1 holds axis 0.
+        for (axis, expect_id) in [(2usize, 3u64), (0, 1)] {
+            let mut q = vec![0.0f32; 4];
+            q[axis] = 1.0;
+            let hits = v
+                .search_vector("Doc", "embedding", &q, 1, 16, true, None)
+                .unwrap();
+            assert_eq!(hits[0].object_id, expect_id, "axis {axis}: {hits:?}");
+            assert!(hits[0].distance.abs() < 1e-6, "exact self-match expected: {hits:?}");
+        }
         assert_eq!(v.status().pending, 0);
     }
 
