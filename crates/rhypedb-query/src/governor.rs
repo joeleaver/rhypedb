@@ -143,6 +143,31 @@ impl Governor {
         Some(cap.saturating_sub(self.rows_examined.get()))
     }
 
+    /// The wall-clock deadline, or `None` when unlimited / disabled — for an engine
+    /// call that must stop mid-work (a long posting scan) rather than between steps.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// The error [`charge`](Self::charge) returns past the row budget. For mapping an
+    /// engine-side budget refusal: it names the configured cap, never the REMAINING
+    /// budget, which would disclose how many rows earlier steps examined — rows the
+    /// caller may not be allowed to read.
+    pub fn rows_exceeded_error(&self) -> QueryError {
+        QueryError::ResourceLimitExceeded(format!(
+            "query examined more than {} rows; narrow it with an indexed filter or a smaller .limit()",
+            self.limits.max_rows_scanned
+        ))
+    }
+
+    /// The error [`check_deadline`](Self::check_deadline) returns once the deadline passed.
+    pub fn deadline_error(&self) -> QueryError {
+        QueryError::ResourceLimitExceeded(format!(
+            "query exceeded its {} ms time budget",
+            self.limits.max_duration.as_millis()
+        ))
+    }
+
     /// Charge `n` rows against the examined-rows budget and re-check the deadline.
     /// Call this as rows are consumed by scans / traversals / mutations. Prefer
     /// charging in bulk (one call per batch) so the deadline's `Instant::now()`
@@ -154,10 +179,7 @@ impl Governor {
         let total = self.rows_examined.get().saturating_add(n);
         self.rows_examined.set(total);
         if self.limits.max_rows_scanned != 0 && total > self.limits.max_rows_scanned as u64 {
-            return Err(QueryError::ResourceLimitExceeded(format!(
-                "query examined more than {} rows; narrow it with an indexed filter or a smaller .limit()",
-                self.limits.max_rows_scanned
-            )));
+            return Err(self.rows_exceeded_error());
         }
         self.check_deadline()
     }
@@ -166,12 +188,7 @@ impl Governor {
     /// between steps and in bulk loops (one `Instant::now()` + compare).
     pub fn check_deadline(&self) -> QueryResult<()> {
         match self.deadline {
-            Some(deadline) if Instant::now() >= deadline => {
-                Err(QueryError::ResourceLimitExceeded(format!(
-                    "query exceeded its {} ms time budget",
-                    self.limits.max_duration.as_millis()
-                )))
-            }
+            Some(deadline) if Instant::now() >= deadline => Err(self.deadline_error()),
             _ => Ok(()),
         }
     }

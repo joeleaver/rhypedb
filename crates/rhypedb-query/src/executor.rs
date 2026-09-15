@@ -138,15 +138,19 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
     // type just to build an all-permissive candidate set, turning an O(k) k-NN
     // lookup into an O(type-size) scan.
     let (mut result, first_step) = match (&query.source, query.steps.first()) {
+        // Not under rules: the global HNSW top-k would be cut before the read rule, so hidden
+        // rows could crowd readable ones out (and the count would leak). Under rules a bare
+        // `.similar` runs over the readable rows of the type, via the generic source + filter.
         (
             Source::All { type_name },
             Some(Step::Similar { field_name, query: sq, k, ef, rerank }),
-        ) => (
+        ) if ctx.rules.is_none() => (
             run_similar(ctx, type_name, field_name, sq, *k, None, *ef, *rerank)?,
             1,
         ),
         // Same for a bare `Type.matches(...)`: a global full-text search reads
-        // only the query terms' postings, never the whole type.
+        // only the query terms' postings, never the whole type. (Under rules it
+        // ranks only the readable candidates — see `run_matches`.)
         (Source::All { type_name }, Some(Step::Matches { field_name, query: text, k })) => {
             (run_matches(ctx, type_name, field_name, text, *k, None)?, 1)
         }
@@ -159,11 +163,22 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
     // a long-running pipeline fails closed between stages (each step's inner loops
     // also charge rows, which re-checks the deadline in bulk).
     let mut depth = 0usize;
-    for step in &query.steps[first_step..] {
+    // A point source (`get(id)`, a create) inspects no data, so a write step straight after it
+    // gates the named object itself — delete/update need not imply read, as in Firestore.
+    let point_source = matches!(
+        query.source,
+        Source::Get { .. } | Source::Create { .. } | Source::CreateBatch { .. }
+    );
+    for (i, step) in query.steps.iter().enumerate().skip(first_step) {
         ctx.governor.check_deadline()?;
         if matches!(step, Step::Traverse { .. }) {
             depth += 1;
             ctx.governor.check_depth(depth)?;
+        }
+        // P4 read authz, per stage: the step sees only rows the principal may read (no-op when
+        // rules are off). See `authz::read_filter_stage`.
+        if ctx.rules.is_some() && !(i == 0 && point_source && step.is_write()) {
+            result = crate::authz::read_filter_stage(ctx, result)?;
         }
         result = execute_step(ctx, result, step, &query.source)?;
     }
@@ -192,7 +207,8 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
         _ => {}
     }
 
-    // P4 read authz: filter the terminal result through the `read` rule (no-op when rules are off).
+    // P4 read authz: filter the terminal result through the `read` rule (no-op when rules are off);
+    // every intermediate stage was filtered on the way in above.
     // Applies to EVERY returned object shape — Objects AND a mutation's returned Single/post-image —
     // because any object surfaced to the caller is a read: a create/update that returns a row the
     // principal may not read must not leak it (a denied Single collapses to void). Denied rows are
@@ -238,7 +254,11 @@ fn execute_source(
             // Anything it can't profitably narrow falls through to the full scan.
             // Clamp the pushed `.limit(N)` to the governor's `max_limit` so the
             // indexed fast path can't be asked to buffer an absurd match count.
-            let pushed_limit = leading_limit(steps).map(|n| ctx.governor.clamp_limit(n));
+            // Not under rules: a pushed limit is cut BEFORE the read rule, so hidden matches would
+            // crowd readable ones out of the page (and leak how many there are).
+            let pushed_limit = leading_limit(steps)
+                .filter(|_| ctx.rules.is_none())
+                .map(|n| ctx.governor.clamp_limit(n));
             if let Some(mut objects) = plan_filter_scan(db, type_name, predicate, pushed_limit)? {
                 // Fast-path objects may carry `raw_fields` — if a downstream
                 // step inspects them via `obj.fields`, eagerly populate now.
@@ -965,7 +985,14 @@ fn run_similar(
 /// candidates to the pipeline's ids — applied by the engine BEFORE its top-k
 /// cut, so `k` rows come from within the set (no over-fetch needed, unlike
 /// `.similar`). The rows carry their BM25 score. Every posting row the
-/// engine examined is charged against the governor's row budget.
+/// engine examined, and every clause's walk over them, is charged against the
+/// governor's row budget; the scan honours the governor's deadline.
+///
+/// Under rules the ranking runs over READABLE candidates only
+/// (`FulltextCandidates::score_visible`): each candidate is checked against
+/// the read rule first, and `df`, the corpus statistics, the prefix cap and
+/// the top-`k` cut see nothing else — so a score, a row count or an error is
+/// never an oracle for text the principal cannot read.
 fn run_matches(
     ctx: &ExecContext<'_>,
     type_name: &str,
@@ -979,36 +1006,65 @@ fn run_matches(
     }
     let k = ctx.governor.clamp_limit(k);
     ctx.governor.check_deadline()?;
-    // The engine refuses (before decoding a single posting) a search that
-    // would examine more rows than the governor's remaining budget.
-    let result = ctx
+    let limits = rhypedb_engine::fulltext::FulltextLimits {
+        // The engine refuses (before decoding a single posting) a search that
+        // would examine more rows than the governor's remaining budget.
+        max_postings: ctx.governor.remaining_scan_budget(),
+        deadline: ctx.governor.deadline(),
+        defer_prefix_cap: ctx.rules.is_some(),
+    };
+    let candidates = ctx
         .db
-        .fulltext_search(
-            type_name,
-            field_name,
-            query_text,
-            k,
-            restrict,
-            ctx.governor.remaining_scan_budget(),
-        )
-        .map_err(|e| match e {
-            rhypedb_engine::EngineError::FulltextScanBudgetExceeded { .. } => {
-                QueryError::ResourceLimitExceeded(e.to_string())
-            }
-            other => QueryError::Engine(other),
-        })?;
-    ctx.governor.charge(result.postings_scanned)?;
-    let rows: Vec<(Object, RowScore)> = result
-        .hits
+        .fulltext_candidates(type_name, field_name, query_text, limits)
+        .map_err(|e| fulltext_error(ctx, e))?;
+    ctx.governor.charge(candidates.postings_scanned)?;
+    ctx.governor.charge(candidates.scoring_work())?;
+
+    let mut readable: HashMap<u64, Object> = HashMap::new();
+    let hits = if ctx.rules.is_some() {
+        let mut ids = candidates.candidate_ids();
+        if let Some(set) = restrict {
+            ids.retain(|id| set.contains(id));
+        }
+        ctx.governor.charge(ids.len() as u64)?;
+        let mut objs = ctx.db.get_many_lazy(type_name, &ids).unwrap_or_default();
+        crate::authz::filter_read(ctx, &mut objs);
+        readable = objs.into_iter().map(|o| (o.id, o)).collect();
+        let visible: HashSet<u64> = readable.keys().copied().collect();
+        candidates.score_visible(&visible, k)
+    } else {
+        candidates.score(restrict, k)
+    }
+    .map_err(|e| fulltext_error(ctx, e))?;
+
+    let rows: Vec<(Object, RowScore)> = hits
         .iter()
         .filter_map(|hit| {
-            ctx.db
-                .get(type_name, hit.object_id)
-                .ok()
+            readable
+                .remove(&hit.object_id)
+                .or_else(|| ctx.db.get(type_name, hit.object_id).ok())
                 .map(|o| (o, RowScore::plain(hit.score)))
         })
         .collect();
     Ok(QueryOutput::Scored(rows))
+}
+
+/// Map a full-text engine error to the query layer. Budget and deadline refusals become the
+/// governor's own errors (naming the configured cap, not the remaining budget). Under rules an
+/// index-still-building error drops its progress counts, which cover documents the principal may
+/// not be able to read.
+fn fulltext_error(ctx: &ExecContext<'_>, e: rhypedb_engine::EngineError) -> QueryError {
+    use rhypedb_engine::EngineError;
+    match e {
+        EngineError::FulltextScanBudgetExceeded { .. } => ctx.governor.rows_exceeded_error(),
+        EngineError::FulltextDeadlineExceeded { .. } => ctx.governor.deadline_error(),
+        EngineError::FulltextIndexBuilding { type_name, field, .. } if ctx.rules.is_some() => {
+            QueryError::InvalidArgument(format!(
+                "full-text index for '{type_name}.{field}' is still building; retry shortly"
+            ))
+        }
+        other => QueryError::Engine(other),
+    }
 }
 
 /// Read the type_name from any QueryOutput shape, without consuming it.
@@ -2630,22 +2686,31 @@ mod tests {
         let ctx = gov_ctx(&db, limits);
         let q = parse_query(r#"Post.matches(.title, "term", k: 100)"#).unwrap();
         assert_eq!(scored_ids(execute(&ctx, &q).unwrap()).len(), 2);
-        // Every posting examined (6 for `term`) is charged against the row budget.
-        let limits = crate::governor::GovernorLimits {
-            max_rows_scanned: 5,
-            ..crate::governor::GovernorLimits::UNLIMITED
+        // Every posting examined (6 for `term`) AND every clause's walk over
+        // them (6 more) is charged against the row budget.
+        let budget = |max_rows_scanned| {
+            gov_ctx(
+                &db,
+                crate::governor::GovernorLimits {
+                    max_rows_scanned,
+                    ..crate::governor::GovernorLimits::UNLIMITED
+                },
+            )
         };
-        let ctx = gov_ctx(&db, limits);
-        assert!(matches!(
-            execute(&ctx, &q),
-            Err(QueryError::ResourceLimitExceeded(_))
-        ));
-        let limits = crate::governor::GovernorLimits {
-            max_rows_scanned: 6,
-            ..crate::governor::GovernorLimits::UNLIMITED
-        };
-        let ctx = gov_ctx(&db, limits);
-        assert_eq!(scored_ids(execute(&ctx, &q).unwrap()).len(), 6);
+        for over in [5, 11] {
+            let err = execute(&budget(over), &q).unwrap_err();
+            // The refusal names the configured cap, never the remaining budget
+            // (which would disclose how many rows earlier steps examined).
+            assert!(
+                matches!(&err, QueryError::ResourceLimitExceeded(m) if m.contains(&format!("more than {over} rows"))),
+                "{err}"
+            );
+        }
+        assert_eq!(scored_ids(execute(&budget(12), &q).unwrap()).len(), 6);
+        // A phrase repeating one word is charged per repeat, not once.
+        let repeated = parse_query(r#"Post.matches(.title, "\"term term term\"", k: 5)"#).unwrap();
+        assert!(matches!(execute(&budget(20), &repeated), Err(QueryError::ResourceLimitExceeded(_))));
+        assert!(execute(&budget(24), &repeated).is_ok());
     }
 
     #[test]
