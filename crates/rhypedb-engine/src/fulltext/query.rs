@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(parse_query(&many.join(" "), Analyzer::Simple), Err(QuerySyntaxError::TooManyTerms));
         assert_eq!(parse(&many[..MAX_QUERY_TERMS].join(" ")).clauses.len(), MAX_QUERY_TERMS);
         // The term budget spans clauses: phrases of repeats add up.
-        let phrases = vec![at_cap.as_str(); MAX_QUERY_TERMS / MAX_PHRASE_TERMS + 1].join(" ");
+        let phrases = [at_cap.as_str(); MAX_QUERY_TERMS / MAX_PHRASE_TERMS + 1].join(" ");
         assert_eq!(parse_query(&phrases, Analyzer::Simple), Err(QuerySyntaxError::TooManyTerms));
         // One hyphen-glued "word" that splits into many tokens counts too.
         let glued = (0..=MAX_QUERY_TERMS).map(|i| format!("w{i}")).collect::<Vec<_>>().join("-");

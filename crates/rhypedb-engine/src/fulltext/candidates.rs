@@ -102,7 +102,7 @@ impl FulltextCandidates {
                 let kept = list.iter().filter(|(id, _)| visible.contains(id)).cloned().collect();
                 (key.as_str(), kept)
             })
-            .chain(merged.into_iter())
+            .chain(merged)
             .collect();
         // One doc_len per document (every posting of a document carries it).
         let mut doc_lens: HashMap<u64, u32> = HashMap::new();
