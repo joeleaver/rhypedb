@@ -8514,6 +8514,27 @@ impl Database {
             .find(|f| f.name == field_name)
     }
 
+    /// Words a write of `fields` to `type_name` will analyze into full-text
+    /// postings: for each `@fulltext` field set to a string, its word count
+    /// capped at [`MAX_ANALYZED_WORDS`](crate::fulltext::MAX_ANALYZED_WORDS).
+    /// One segmentation pass, no allocation — cheap enough for a governor to
+    /// charge BEFORE the write, so a large value is refused rather than
+    /// indexed. `0` for a type without `@fulltext` fields.
+    pub fn fulltext_index_words(&self, type_name: &str, fields: &FieldMap) -> u64 {
+        use unicode_segmentation::UnicodeSegmentation;
+        let Some(ffs) = self.fulltext_fields.get(type_name) else {
+            return 0;
+        };
+        ffs.iter()
+            .filter_map(|ff| match fields.get(&ff.name) {
+                Some(Value::String(text)) => {
+                    Some(text.unicode_words().take(crate::fulltext::MAX_ANALYZED_WORDS).count() as u64)
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
     /// Apply the corpus-stat deltas of a transaction that just COMMITTED.
     /// Never called on the abort path — the index rows didn't land, so the
     /// stats must not move either.

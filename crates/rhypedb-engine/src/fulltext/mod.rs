@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use analyzer::{Analyzer, MAX_TERM_BYTES, Token};
+pub use analyzer::{Analyzer, MAX_ANALYZED_WORDS, MAX_TERM_BYTES, Token};
 pub use posting::Posting;
 pub use query::{Clause, MIN_PREFIX_CHARS, ParsedQuery, QuerySyntaxError};
 pub use build::{BuildProgress, BuildState, FulltextIndexStatus};

@@ -266,6 +266,9 @@ fn execute_source(
 
         Source::Create { type_name, fields } => {
             let field_map = literal_map_to_field_map(db, type_name, fields)?;
+            // Full-text indexing is write work proportional to the words analyzed:
+            // charge it before the write so a huge @fulltext value is refused, not indexed.
+            ctx.governor.charge(db.fulltext_index_words(type_name, &field_map))?;
             // P4 create authz: gate the incoming fields before the write (no-op when rules off).
             crate::authz::gate_create(ctx, type_name, &field_map)?;
             let obj = db.create(type_name, field_map)?;
@@ -280,6 +283,12 @@ fn execute_source(
                 .iter()
                 .map(|r| literal_map_to_field_map(db, type_name, r))
                 .collect::<QueryResult<_>>()?;
+            ctx.governor.charge(
+                field_maps
+                    .iter()
+                    .map(|fm| db.fulltext_index_words(type_name, fm))
+                    .fold(0u64, u64::saturating_add),
+            )?;
             // P4 create authz: every row must pass the `create` rule (no-op when rules off) — the
             // whole batch fails closed if any row is denied.
             for fm in &field_maps {
@@ -589,6 +598,11 @@ fn execute_step(
             // Bound a bulk update against the row budget (and re-check the deadline).
             ctx.governor.charge(ids.len() as u64)?;
             let field_map = literal_map_to_field_map(db, &type_name, fields)?;
+            // The same fields are indexed once per updated row.
+            ctx.governor.charge(
+                db.fulltext_index_words(&type_name, &field_map)
+                    .saturating_mul(ids.len() as u64),
+            )?;
             // P4 write authz: gate each PRE-mutation object against the `update` rule, with the
             // incoming fields visible as `request.*` (no-op when rules off). P0-DBA-6: checking the
             // stored object before the write stops a rule like `resource.author == request.auth.uid`
@@ -2632,6 +2646,41 @@ mod tests {
         };
         let ctx = gov_ctx(&db, limits);
         assert_eq!(scored_ids(execute(&ctx, &q).unwrap()).len(), 6);
+    }
+
+    #[test]
+    fn fulltext_writes_are_charged_per_analyzed_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = rhypedb_schema::parser::parse_schema(
+            "type Post { title: String @fulltext  note: String }",
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let limits = crate::governor::GovernorLimits {
+            max_rows_scanned: 100,
+            ..crate::governor::GovernorLimits::DEFAULT
+        };
+        let run = |q: &str| {
+            let mut ctx = ExecContext::new(&db, None);
+            ctx.governor = Governor::new(limits, std::time::Instant::now());
+            execute(&ctx, &crate::parser::parse_query(q).unwrap())
+        };
+        let words = |n: usize| vec!["w"; n].join(" ");
+        // Under the budget: indexed. Over it: refused before the write.
+        assert!(run(&format!(r#"Post.create({{ title: "{}" }})"#, words(90))).is_ok());
+        let err = run(&format!(r#"Post.create({{ title: "{}" }})"#, words(150))).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
+        // A non-@fulltext field costs nothing extra.
+        assert!(run(&format!(r#"Post.create({{ note: "{}" }})"#, words(150))).is_ok());
+        // A batch sums its rows' words; an update multiplies by rows touched.
+        let batch = format!(r#"Post.create_batch([{{ title: "{0}" }}, {{ title: "{0}" }}])"#, words(60));
+        assert!(matches!(run(&batch), Err(QueryError::ResourceLimitExceeded(_))));
+        assert!(run(r#"Post.filter(.title == "w").update({ title: "a b" })"#).is_ok());
+        let n = match run("Post").unwrap() {
+            QueryOutput::Objects(o) => o.len(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(n, 2, "the refused create and batch wrote nothing");
     }
 
     #[test]

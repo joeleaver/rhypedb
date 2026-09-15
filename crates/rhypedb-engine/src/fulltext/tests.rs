@@ -703,7 +703,7 @@ fn a_build_resumes_from_the_persisted_cursor() {
             cursor: 450,
             positions: true,
             stale_generations: false,
-            analyzer: "simple".into(),
+            analyzer: crate::fulltext::Analyzer::Simple.definition().into(),
         };
         let mut txn = db.storage().begin_txn();
         db.storage()
@@ -968,7 +968,7 @@ fn english_stop_words_never_reach_the_index_and_queries_drop_them() {
 }
 
 /// An `english` index built before stop-word removal (issue #20) records the
-/// analyzer as plain `"english"`; the definition is now `"english/2"`, so
+/// analyzer as plain `"english"`; the definition has moved on since, so
 /// opening it must rebuild into a new generation — otherwise queries (which
 /// drop stop words) would silently disagree with the index (which kept them).
 #[test]
@@ -1005,7 +1005,7 @@ fn english_index_from_before_stop_words_is_rebuilt_on_open() {
     let m = markers(&db).into_iter().find(|(k, _)| k.1 == field_id).unwrap().1;
     assert_eq!(
         (m.generation, m.analyzer.as_str(), m.stale_generations, m.state),
-        (1, "english/2", false, crate::fulltext::BuildState::Built)
+        (1, crate::fulltext::Analyzer::English.definition(), false, crate::fulltext::BuildState::Built)
     );
     // One generation's rows only, stop words gone: hous + i per doc.
     assert_eq!(raw_rows(&db, "title"), (100, 50));
@@ -1028,7 +1028,7 @@ fn switching_the_analyzer_bumps_the_generation_and_rebuilds() {
         assert!(ids(&db, "title", "camera", 10).is_empty(), "simple: no stemming");
         assert_eq!(ids(&db, "title", "cameras", 1000).len(), 300);
         let m = markers(&db).into_iter().find(|(k, _)| k.1 == db.field_ids()["Note.title"]).unwrap().1;
-        assert_eq!((m.generation, m.analyzer.as_str()), (0, "simple"));
+        assert_eq!((m.generation, m.analyzer.as_str()), (0, "simple/2"));
     }
     // Reopen as english: new generation, backfill through the builder, sweep.
     let db = open_sdl(&dir, ENGLISH);
