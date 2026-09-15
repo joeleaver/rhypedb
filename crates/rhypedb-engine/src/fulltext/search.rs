@@ -110,9 +110,23 @@ pub fn score_query(
         }
     };
 
+    // id → posting lookups for phrase words, built ONCE per distinct word and
+    // shared by every phrase (and every repeat inside one) that uses it: a
+    // map per phrase position let `"x x x … x"` allocate repeats × df.
+    let mut phrase_maps: HashMap<&str, HashMap<u64, &Posting>> = HashMap::new();
+    for clause in query.clauses.iter().filter(|c| c.is_phrase()) {
+        for t in &clause.terms {
+            if let Some(list) = postings.get(t.as_str()) {
+                phrase_maps
+                    .entry(t.as_str())
+                    .or_insert_with(|| list.iter().map(|(id, p)| (*id, p)).collect());
+            }
+        }
+    }
+
     for clause in &query.clauses {
         if clause.is_phrase() {
-            score_phrase(clause, postings, &idf, &tfnorm, &allowed, &mut add);
+            score_phrase(clause, &phrase_maps, &idf, &tfnorm, &allowed, &mut add);
         } else {
             let term = clause.terms[0].as_str();
             let list = postings.get(term).unwrap_or(&empty);
@@ -151,27 +165,25 @@ pub fn score_query(
 /// position lists.
 fn score_phrase(
     clause: &Clause,
-    postings: &HashMap<&str, PostingList>,
+    phrase_maps: &HashMap<&str, HashMap<u64, &Posting>>,
     idf: &HashMap<&str, f32>,
     tfnorm: &dyn Fn(&Posting) -> f32,
     allowed: &dyn Fn(u64) -> bool,
     add: &mut dyn FnMut(u64, f32, &Clause),
 ) {
-    // Per-term id → posting lookups; drive from the shortest list.
-    let mut maps: Vec<HashMap<u64, &Posting>> = Vec::with_capacity(clause.terms.len());
+    // Each position's shared id → posting lookup; drive from the shortest.
+    let mut maps: Vec<&HashMap<u64, &Posting>> = Vec::with_capacity(clause.terms.len());
     for t in &clause.terms {
-        let Some(list) = postings.get(t.as_str()) else {
+        let Some(m) = phrase_maps.get(t.as_str()) else {
             return; // a term with no postings → the phrase matches nothing
         };
-        maps.push(list.iter().map(|(id, p)| (*id, p)).collect());
+        maps.push(m);
     }
-    let (driver_idx, _) = maps
+    let driver = *maps
         .iter()
-        .enumerate()
-        .min_by_key(|(_, m)| m.len())
+        .min_by_key(|m| m.len())
         .expect("phrase has ≥ 2 terms");
-    let driver: Vec<u64> = maps[driver_idx].keys().copied().collect();
-    'docs: for id in driver {
+    'docs: for &id in driver.keys() {
         if !allowed(id) {
             continue;
         }

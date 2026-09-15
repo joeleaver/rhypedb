@@ -49,6 +49,19 @@ use super::analyzer::Analyzer;
 /// Shortest prefix (in characters, after analysis) a prefix clause accepts.
 pub const MIN_PREFIX_CHARS: usize = 2;
 
+/// Longest `.matches` query text accepted, in bytes. A search box never needs
+/// more; the cap bounds analysis before any clause is built.
+pub const MAX_QUERY_BYTES: usize = 16 * 1024;
+
+/// Most terms one query may carry across all its clauses (a phrase counts
+/// each of its words, repeats included). Scoring cost grows with clauses ×
+/// postings and each distinct term is its own index scan, so an unbounded
+/// term count let one small frame pin a core or balloon memory.
+pub const MAX_QUERY_TERMS: usize = 256;
+
+/// Most words one phrase clause may carry.
+pub const MAX_PHRASE_TERMS: usize = 32;
+
 /// One parsed clause. `terms.len() == 1` is a term clause (or, with
 /// `prefix`, a prefix clause), `> 1` a phrase.
 ///
@@ -140,15 +153,12 @@ impl ParsedQuery {
     /// Every distinct posting key across all clauses, in first-seen order:
     /// exact terms, plus one `"prefix*"` key per distinct prefix clause.
     pub fn distinct_terms(&self) -> Vec<&str> {
-        let mut out: Vec<&str> = Vec::new();
-        for c in &self.clauses {
-            for t in &c.terms {
-                if !out.contains(&t.as_str()) {
-                    out.push(t.as_str());
-                }
-            }
-        }
-        out
+        let mut seen = std::collections::HashSet::new();
+        self.clauses
+            .iter()
+            .flat_map(|c| c.terms.iter().map(String::as_str))
+            .filter(|t| seen.insert(*t))
+            .collect()
     }
 }
 
@@ -168,6 +178,12 @@ pub enum QuerySyntaxError {
     PrefixTooShort { raw: String, prefix: String },
     /// A `*` inside a quoted phrase; phrases take exact terms only.
     PrefixInPhrase { phrase: String },
+    /// The query text is longer than [`MAX_QUERY_BYTES`].
+    QueryTooLong { bytes: usize },
+    /// The query analyzes to more than [`MAX_QUERY_TERMS`] terms.
+    TooManyTerms,
+    /// A phrase analyzes to more than [`MAX_PHRASE_TERMS`] words.
+    PhraseTooLong,
 }
 
 impl std::fmt::Display for QuerySyntaxError {
@@ -196,13 +212,39 @@ impl std::fmt::Display for QuerySyntaxError {
                 f,
                 "prefix terms (word*) are not supported inside a phrase: \"{phrase}\""
             ),
+            Self::QueryTooLong { bytes } => write!(
+                f,
+                "query text is {bytes} bytes; the limit is {MAX_QUERY_BYTES}"
+            ),
+            Self::TooManyTerms => write!(
+                f,
+                "query has more than {MAX_QUERY_TERMS} terms; search for fewer words"
+            ),
+            Self::PhraseTooLong => write!(
+                f,
+                "a phrase may hold at most {MAX_PHRASE_TERMS} words"
+            ),
         }
     }
 }
 
 /// Parse + analyze a `.matches` query string.
 pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySyntaxError> {
-    let mut clauses = Vec::new();
+    if raw.len() > MAX_QUERY_BYTES {
+        return Err(QuerySyntaxError::QueryTooLong { bytes: raw.len() });
+    }
+    let mut clauses: Vec<Clause> = Vec::new();
+    // Terms across every clause so far, checked as clauses are pushed so an
+    // over-long query stops analyzing instead of building them all first.
+    let mut term_count = 0usize;
+    let mut push = |clauses: &mut Vec<Clause>, clause: Clause| {
+        term_count += clause.terms.len();
+        if term_count > MAX_QUERY_TERMS {
+            return Err(QuerySyntaxError::TooManyTerms);
+        }
+        clauses.push(clause);
+        Ok(())
+    };
     let mut stop_words_dropped = 0u32;
     let mut chars = raw.char_indices().peekable();
     while let Some(&(i, c)) = chars.peek() {
@@ -247,18 +289,24 @@ pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySy
             let analyzed = analyzer.analyze_opts(text, false);
             stop_words_dropped += analyzed.stop_words_dropped;
             let tokens = analyzed.tokens;
+            if tokens.len() > MAX_PHRASE_TERMS {
+                return Err(QuerySyntaxError::PhraseTooLong);
+            }
             if let Some(first) = tokens.first() {
                 // Offsets are relative to the first KEPT token: a leading
                 // dropped word shifts nothing, an inner one leaves a gap.
                 let base = first.position;
                 let offsets: Vec<u32> = tokens.iter().map(|t| t.position - base).collect();
                 let terms: Vec<String> = tokens.into_iter().map(|t| t.term).collect();
-                clauses.push(Clause {
-                    required,
-                    terms,
-                    prefix: false,
-                    offsets: if offsets.len() > 1 { offsets } else { Vec::new() },
-                });
+                push(
+                    &mut clauses,
+                    Clause {
+                        required,
+                        terms,
+                        prefix: false,
+                        offsets: if offsets.len() > 1 { offsets } else { Vec::new() },
+                    },
+                )?;
             }
         } else {
             let mut end = raw.len();
@@ -310,15 +358,18 @@ pub fn parse_query(raw: &str, analyzer: Analyzer) -> Result<ParsedQuery, QuerySy
             // A bare word is one OR-ed term per analyzed token (no implicit
             // phrase — `e-mail` finds documents with either word).
             for t in tokens {
-                clauses.push(Clause::term(t.term, required));
+                push(&mut clauses, Clause::term(t.term, required))?;
             }
             if let Some(prefix) = prefix_token {
-                clauses.push(Clause {
-                    required,
-                    terms: vec![format!("{prefix}*")],
-                    prefix: true,
-                    offsets: Vec::new(),
-                });
+                push(
+                    &mut clauses,
+                    Clause {
+                        required,
+                        terms: vec![format!("{prefix}*")],
+                        prefix: true,
+                        offsets: Vec::new(),
+                    },
+                )?;
             }
         }
     }
@@ -539,6 +590,34 @@ mod tests {
             parse("of my house").clauses,
             vec![term("of", false), term("my", false), term("house", false)]
         );
+    }
+
+    #[test]
+    fn query_size_caps_are_refused_before_scoring() {
+        // Repeating one word inside a phrase used to build a postings map per
+        // position; many distinct terms each cost a scan. Both are capped.
+        let long_phrase = format!("\"{}\"", vec!["x"; MAX_PHRASE_TERMS + 1].join(" "));
+        assert_eq!(parse_query(&long_phrase, Analyzer::Simple), Err(QuerySyntaxError::PhraseTooLong));
+        let at_cap = format!("\"{}\"", vec!["x"; MAX_PHRASE_TERMS].join(" "));
+        assert_eq!(parse(&at_cap).clauses[0].terms.len(), MAX_PHRASE_TERMS);
+
+        let many: Vec<String> = (0..=MAX_QUERY_TERMS).map(|i| format!("t{i}")).collect();
+        assert_eq!(parse_query(&many.join(" "), Analyzer::Simple), Err(QuerySyntaxError::TooManyTerms));
+        assert_eq!(parse(&many[..MAX_QUERY_TERMS].join(" ")).clauses.len(), MAX_QUERY_TERMS);
+        // The term budget spans clauses: phrases of repeats add up.
+        let phrases = vec![at_cap.as_str(); MAX_QUERY_TERMS / MAX_PHRASE_TERMS + 1].join(" ");
+        assert_eq!(parse_query(&phrases, Analyzer::Simple), Err(QuerySyntaxError::TooManyTerms));
+        // One hyphen-glued "word" that splits into many tokens counts too.
+        let glued = (0..=MAX_QUERY_TERMS).map(|i| format!("w{i}")).collect::<Vec<_>>().join("-");
+        assert!(glued.len() <= MAX_QUERY_BYTES);
+        assert_eq!(parse_query(&glued, Analyzer::Simple), Err(QuerySyntaxError::TooManyTerms));
+
+        let huge = "a ".repeat(MAX_QUERY_BYTES / 2 + 1);
+        assert_eq!(
+            parse_query(&huge, Analyzer::Simple),
+            Err(QuerySyntaxError::QueryTooLong { bytes: huge.len() })
+        );
+        assert!(QuerySyntaxError::TooManyTerms.to_string().contains("256"));
     }
 
     #[test]
