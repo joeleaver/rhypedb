@@ -114,6 +114,11 @@ pub(crate) struct AppState {
     pub(crate) db: ArcSwap<Database>,
     vectorizer: Option<Arc<Vectorizer>>,
     query_cache: QueryCache,
+    /// Concurrency limit for query execution, which runs on the blocking pool (see
+    /// [`run_query`]): a query is CPU-bound and bounded only by the governor's deadline, so
+    /// the number running at once is capped near the core count. Waiting for a slot happens
+    /// on the async side, leaving the runtime's workers free for I/O the whole time.
+    query_slots: Arc<tokio::sync::Semaphore>,
     /// Card 5: the `RHYPEDB_ADMIN_TOKEN` env value, read ONCE at startup.
     /// `None` → the `/admin/migrations*` routes return 403 (admin disabled);
     /// `Some` → a request must present a matching `Authorization: Bearer <token>`
@@ -326,27 +331,9 @@ async fn handle_query(
         }
     };
 
-    // Metering: count the query (post-parse) for the `/status` counter.
-    state.queries_total.fetch_add(1, Ordering::Relaxed);
-
-    // Hold the schema-epoch read guard only across execute (the schema-driven
-    // work); a hot-reload (write guard) can't swap the handle mid-query.
-    // Materialized results decode self-describingly afterward, so the guard need
-    // not extend over response building.
-    let result = {
-        let _epoch = state.reload_lock.read().await;
-        let db = state.db();
-        let ctx = ExecContext {
-            db: &db,
-            vectorizer: state.vectorizer.as_deref(),
-            default_ef: state.default_ef,
-            default_rerank: state.default_rerank,
-            governor: state.governor(),
-            principal,
-            rules: state.rules.clone(),
-        };
-        rhypedb_query::executor::execute(&ctx, &query)
-    };
+    // Executed on the blocking pool under the schema-epoch read guard (see `run_query`);
+    // `execute_parsed` counts it for `/status`.
+    let result = run_query(&state, query, principal).await;
 
     match result {
         Ok(QueryOutput::Objects(objs)) => (
@@ -1078,6 +1065,7 @@ pub async fn run() {
         query_cache: QueryCache::new(cfg.cache_max_entries),
         admin_token: cfg.admin_token.clone(),
         reload_lock: tokio::sync::RwLock::new(()),
+        query_slots: Arc::new(tokio::sync::Semaphore::new(query_slot_count())),
         pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
         data_dir: cfg.data_dir.clone(),
         schema_path: schema_path.clone(),
@@ -1708,9 +1696,11 @@ async fn handle_connection_stream<R, W>(
 
                 // Schema-epoch read guard around execute only (see handle_query);
                 // released before the frame write, which touches no handle state.
-                let response = {
-                    let _epoch = state.reload_lock.read().await;
-                    execute_query(&state, &query_text, &principal)
+                let response = match state.query_cache.get_or_parse(&query_text) {
+                    Ok(query) => run_query(&state, query, principal.clone())
+                        .await
+                        .map_err(|e| format!("{e}")),
+                    Err(e) => Err(format!("parse error: {e}")),
                 };
                 if let Err(e) =
                     write_query_result(writer, &mut response_buf, frame.req_id, &state, response).await
@@ -1812,10 +1802,9 @@ async fn handle_connection_stream<R, W>(
                 };
                 // Clone the Arc so we don't hold the map borrow across the await.
                 let response = match prepared.get(&stmt_id).cloned() {
-                    Some(query) => {
-                        let _epoch = state.reload_lock.read().await;
-                        execute_parsed(&state, &query, &principal)
-                    }
+                    Some(query) => run_query(&state, query, principal.clone())
+                        .await
+                        .map_err(|e| format!("{e}")),
                     None => Err(format!(
                         "unknown statement id {stmt_id} — prepare it on this connection first"
                     )),
@@ -2036,6 +2025,41 @@ async fn handle_connection_stream<R, W>(
 
 /// Parse and execute a query, returning either the result or an error message. `principal` is the
 /// connection's verified identity (P4) — anonymous until a `REQ_AUTH` frame set it.
+/// Execute `query` off the async runtime: a query is CPU-bound and can run for the governor's
+/// whole deadline, so running it on a runtime worker starves every other connection on a small
+/// (1-2 vCPU) deployment — including health checks. The schema-epoch read guard is taken on the
+/// blocking thread, and `query_slots` bounds how many run at once.
+pub(crate) async fn run_query(
+    state: &Arc<AppState>,
+    query: Arc<rhypedb_query::ast::Query>,
+    principal: rhypedb_authz::Principal,
+) -> Result<QueryOutput, rhypedb_query::QueryError> {
+    use rhypedb_query::QueryError;
+    let permit = Arc::clone(&state.query_slots)
+        .acquire_owned()
+        .await
+        .map_err(|_| QueryError::Type("server shutting down".into()))?;
+    let st = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _epoch = st.reload_lock.blocking_read();
+        execute_parsed(&st, &query, &principal)
+    })
+    .await
+    .unwrap_or_else(|e| Err(QueryError::Type(format!("query task failed: {e}"))))
+}
+
+/// How many queries may execute at once on the blocking pool: the machine's core count
+/// (at least 2, so a 1-vCPU VM still overlaps a slow query with a quick one), capped so a
+/// large host doesn't turn every core over to query threads.
+fn query_slot_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 64)
+}
+
+#[cfg(test)]
 fn execute_query(
     state: &AppState,
     query_text: &str,
@@ -2045,7 +2069,7 @@ fn execute_query(
         .query_cache
         .get_or_parse(query_text)
         .map_err(|e| format!("parse error: {e}"))?;
-    execute_parsed(state, &query, principal)
+    execute_parsed(state, &query, principal).map_err(|e| format!("{e}"))
 }
 
 /// Execute an already-parsed query (the shared tail of `execute_query` and the
@@ -2054,8 +2078,8 @@ fn execute_parsed(
     state: &AppState,
     query: &rhypedb_query::ast::Query,
     principal: &rhypedb_authz::Principal,
-) -> Result<QueryOutput, String> {
-    // Metering: the binary-protocol choke point (HTTP `/query` counts separately).
+) -> Result<QueryOutput, rhypedb_query::QueryError> {
+    // Metering: the one choke point for every executed query (HTTP + binary).
     state.queries_total.fetch_add(1, Ordering::Relaxed);
     let db = state.db();
     let ctx = ExecContext {
@@ -2067,7 +2091,7 @@ fn execute_parsed(
         principal: principal.clone(),
         rules: state.rules.clone(),
     };
-    rhypedb_query::executor::execute(&ctx, query).map_err(|e| format!("{e}"))
+    rhypedb_query::executor::execute(&ctx, query)
 }
 
 /// Max prepared statements per connection (map-entry count) — generous for the
@@ -2187,6 +2211,7 @@ mod tcp_tests {
             query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
             admin_token: None,
             reload_lock: tokio::sync::RwLock::new(()),
+        query_slots: Arc::new(tokio::sync::Semaphore::new(query_slot_count())),
             pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
             data_dir,
             schema_path,
@@ -2227,6 +2252,7 @@ mod tcp_tests {
             query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
             admin_token: None,
             reload_lock: tokio::sync::RwLock::new(()),
+        query_slots: Arc::new(tokio::sync::Semaphore::new(query_slot_count())),
             pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
             data_dir,
             schema_path,

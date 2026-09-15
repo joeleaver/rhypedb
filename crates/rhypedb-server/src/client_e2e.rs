@@ -79,6 +79,7 @@ fn build_state() -> Arc<AppState> {
         query_cache: QueryCache::new(query_cache::DEFAULT_CACHE_SIZE),
         admin_token: None,
         reload_lock: tokio::sync::RwLock::new(()),
+        query_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         pending_reload_schemas: std::sync::Mutex::new(HashMap::new()),
         data_dir,
         schema_path,
