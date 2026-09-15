@@ -109,7 +109,7 @@ pub fn score_query_with<L: Borrow<PostingList>>(
     let mut visited = 0usize;
     let mut tick = move || -> Result<(), DeadlineExceeded> {
         visited += 1;
-        if visited % DEADLINE_CHECK_EVERY == 0
+        if visited.is_multiple_of(DEADLINE_CHECK_EVERY)
             && deadline.is_some_and(|d| std::time::Instant::now() >= d)
         {
             return Err(DeadlineExceeded);
