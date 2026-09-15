@@ -169,6 +169,12 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
         query.source,
         Source::Get { .. } | Source::Create { .. } | Source::CreateBatch { .. }
     );
+    // Whether `result` may hold rows not yet checked against the read rule: the source's rows,
+    // and whatever a traversal or a mutation brings in. `filter`/`limit`/`offset` only drop
+    // rows, and a ranked step only ranks rows that were already readable, so their output needs
+    // no second pass.
+    // (A bare `Type.matches` fast path already ranked only readable rows.)
+    let mut unfiltered = first_step == 0;
     for (i, step) in query.steps.iter().enumerate().skip(first_step) {
         ctx.governor.check_deadline()?;
         if matches!(step, Step::Traverse { .. }) {
@@ -177,10 +183,17 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
         }
         // P4 read authz, per stage: the step sees only rows the principal may read (no-op when
         // rules are off). See `authz::read_filter_stage`.
-        if ctx.rules.is_some() && !(i == 0 && point_source && step.is_write()) {
+        if ctx.rules.is_some() && unfiltered && !(i == 0 && point_source && step.is_write()) {
             result = crate::authz::read_filter_stage(ctx, result)?;
+            unfiltered = false;
         }
         result = execute_step(ctx, result, step, &query.source)?;
+        if !matches!(
+            step,
+            Step::Filter { .. } | Step::Limit { .. } | Step::Offset { .. } | Step::Matches { .. } | Step::Similar { .. }
+        ) {
+            unfiltered = true;
+        }
     }
 
     // Streaming-traversal: if the pipeline ended on an `IdSet` or
@@ -214,7 +227,14 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
     // principal may not read must not leak it (a denied Single collapses to void). Denied rows are
     // dropped (Firestore semantics), so a point-`get` of an unreadable id returns an empty result.
     if ctx.rules.is_some() {
+        // The terminal check is per-row work like any other stage's.
+        match &result {
+            QueryOutput::Objects(o) => ctx.governor.charge(o.len() as u64)?,
+            QueryOutput::Scored(r) => ctx.governor.charge(r.len() as u64)?,
+            _ => {}
+        }
         result = crate::authz::apply_read_filter(ctx, result);
+        ctx.governor.check_exhausted()?;
     }
 
     // A pipeline that produced `Objects` directly (filter, scan, similar, get)
@@ -288,7 +308,9 @@ fn execute_source(
             let field_map = literal_map_to_field_map(db, type_name, fields)?;
             // Full-text indexing is write work proportional to the words analyzed:
             // charge it before the write so a huge @fulltext value is refused, not indexed.
-            ctx.governor.charge(db.fulltext_index_words(type_name, &field_map))?;
+            if ctx.governor.scan_cap().is_some() {
+                ctx.governor.charge(db.fulltext_index_words(type_name, &field_map))?;
+            }
             // P4 create authz: gate the incoming fields before the write (no-op when rules off).
             crate::authz::gate_create(ctx, type_name, &field_map)?;
             let obj = db.create(type_name, field_map)?;
@@ -303,12 +325,14 @@ fn execute_source(
                 .iter()
                 .map(|r| literal_map_to_field_map(db, type_name, r))
                 .collect::<QueryResult<_>>()?;
-            ctx.governor.charge(
-                field_maps
-                    .iter()
-                    .map(|fm| db.fulltext_index_words(type_name, fm))
-                    .fold(0u64, u64::saturating_add),
-            )?;
+            if ctx.governor.scan_cap().is_some() {
+                ctx.governor.charge(
+                    field_maps
+                        .iter()
+                        .map(|fm| db.fulltext_index_words(type_name, fm))
+                        .fold(0u64, u64::saturating_add),
+                )?;
+            }
             // P4 create authz: every row must pass the `create` rule (no-op when rules off) — the
             // whole batch fails closed if any row is denied.
             for fm in &field_maps {
@@ -618,11 +642,15 @@ fn execute_step(
             // Bound a bulk update against the row budget (and re-check the deadline).
             ctx.governor.charge(ids.len() as u64)?;
             let field_map = literal_map_to_field_map(db, &type_name, fields)?;
-            // The same fields are indexed once per updated row.
-            ctx.governor.charge(
-                db.fulltext_index_words(&type_name, &field_map)
-                    .saturating_mul(ids.len() as u64),
-            )?;
+            // Full-text work: the new value indexed once per row, and the old value's postings
+            // tombstoned (its stored word count) — both charged before any row is written.
+            if ctx.governor.scan_cap().is_some() {
+                ctx.governor.charge(
+                    db.fulltext_index_words(&type_name, &field_map)
+                        .saturating_mul(ids.len() as u64),
+                )?;
+                ctx.governor.charge(db.fulltext_stored_words(&type_name, &ids, Some(&field_map))?)?;
+            }
             // P4 write authz: gate each PRE-mutation object against the `update` rule, with the
             // incoming fields visible as `request.*` (no-op when rules off). P0-DBA-6: checking the
             // stored object before the write stops a rule like `resource.author == request.auth.uid`
@@ -636,6 +664,7 @@ fn execute_step(
             )?;
             let mut updated = Vec::with_capacity(ids.len());
             for id in &ids {
+                ctx.governor.check_deadline()?;
                 updated.push(db.update(&type_name, *id, field_map.clone())?);
             }
             if updated.len() == 1 {
@@ -648,9 +677,14 @@ fn execute_step(
         Step::Delete => {
             let (type_name, ids) = ids_from_output(current, source)?;
             ctx.governor.charge(ids.len() as u64)?;
+            // Deleting tombstones every stored posting of every @fulltext field.
+            if ctx.governor.scan_cap().is_some() {
+                ctx.governor.charge(db.fulltext_stored_words(&type_name, &ids, None)?)?;
+            }
             // P4 write authz: gate each pre-mutation object against the `delete` rule (no-op off).
             crate::authz::gate_write(ctx, rhypedb_authz::Op::Delete, &type_name, &ids, None)?;
             for id in ids {
+                ctx.governor.check_deadline()?;
                 db.delete(&type_name, id)?;
             }
             Ok(QueryOutput::Done)
@@ -1020,29 +1054,27 @@ fn run_matches(
     ctx.governor.charge(candidates.postings_scanned)?;
     ctx.governor.charge(candidates.scoring_work())?;
 
-    let mut readable: HashMap<u64, Object> = HashMap::new();
+    let deadline = ctx.governor.deadline();
     let hits = if ctx.rules.is_some() {
         let mut ids = candidates.candidate_ids();
         if let Some(set) = restrict {
             ids.retain(|id| set.contains(id));
         }
-        ctx.governor.charge(ids.len() as u64)?;
-        let mut objs = ctx.db.get_many_lazy(type_name, &ids).unwrap_or_default();
-        crate::authz::filter_read(ctx, &mut objs);
-        readable = objs.into_iter().map(|o| (o.id, o)).collect();
-        let visible: HashSet<u64> = readable.keys().copied().collect();
-        candidates.score_visible(&visible, k)
+        let visible = crate::authz::readable_ids(ctx, type_name, &ids)?;
+        ctx.governor.check_exhausted()?;
+        candidates.score_visible(&visible, k, deadline)
     } else {
-        candidates.score(restrict, k)
+        candidates.score(restrict, k, deadline)
     }
     .map_err(|e| fulltext_error(ctx, e))?;
 
+    // Only the `k` hits are loaded (a plain `get`: retired fields stripped).
     let rows: Vec<(Object, RowScore)> = hits
         .iter()
         .filter_map(|hit| {
-            readable
-                .remove(&hit.object_id)
-                .or_else(|| ctx.db.get(type_name, hit.object_id).ok())
+            ctx.db
+                .get(type_name, hit.object_id)
+                .ok()
                 .map(|o| (o, RowScore::plain(hit.score)))
         })
         .collect();
@@ -1056,7 +1088,12 @@ fn run_matches(
 fn fulltext_error(ctx: &ExecContext<'_>, e: rhypedb_engine::EngineError) -> QueryError {
     use rhypedb_engine::EngineError;
     match e {
-        EngineError::FulltextScanBudgetExceeded { .. } => ctx.governor.rows_exceeded_error(),
+        EngineError::FulltextScanBudgetExceeded { .. } => match ctx.governor.rows_exceeded_error() {
+            QueryError::ResourceLimitExceeded(m) => QueryError::ResourceLimitExceeded(format!(
+                "{m} (a full-text search: use rarer terms or `+` required terms)"
+            )),
+            other => other,
+        },
         EngineError::FulltextDeadlineExceeded { .. } => ctx.governor.deadline_error(),
         EngineError::FulltextIndexBuilding { type_name, field, .. } if ctx.rules.is_some() => {
             QueryError::InvalidArgument(format!(
@@ -2707,10 +2744,11 @@ mod tests {
             );
         }
         assert_eq!(scored_ids(execute(&budget(12), &q).unwrap()).len(), 6);
-        // A phrase repeating one word is charged per repeat, not once.
+        // A phrase repeating one word is charged per repeat, not once, plus its position walk:
+        // postings 6 + decoded positions 6, walks 3 × 6, position walk Σtf₀ 6 × 2 = 42.
         let repeated = parse_query(r#"Post.matches(.title, "\"term term term\"", k: 5)"#).unwrap();
-        assert!(matches!(execute(&budget(20), &repeated), Err(QueryError::ResourceLimitExceeded(_))));
-        assert!(execute(&budget(24), &repeated).is_ok());
+        assert!(matches!(execute(&budget(41), &repeated), Err(QueryError::ResourceLimitExceeded(_))));
+        assert!(execute(&budget(42), &repeated).is_ok());
     }
 
     #[test]

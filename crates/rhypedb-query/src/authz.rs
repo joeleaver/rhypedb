@@ -101,26 +101,53 @@ pub(crate) fn read_filter_stage(ctx: &ExecContext<'_>, result: QueryOutput) -> Q
     if ctx.rules.is_none() {
         return Ok(result);
     }
-    let readable_ids = |type_name: &str, ids: &[u64]| -> QueryResult<std::collections::HashSet<u64>> {
-        ctx.governor.charge(ids.len() as u64)?;
-        let mut objs = ctx.db.get_many_lazy(type_name, ids).unwrap_or_default();
-        filter_read(ctx, &mut objs);
-        Ok(objs.into_iter().map(|o| o.id).collect())
-    };
-    Ok(match result {
+    let filtered = match result {
         QueryOutput::IdSet { type_name, mut ids } => {
-            let keep = readable_ids(&type_name, &ids)?;
+            let keep = readable_ids(ctx, &type_name, &ids)?;
             ids.retain(|id| keep.contains(id));
             QueryOutput::IdSet { type_name, ids }
         }
         QueryOutput::IdSetWithFields { type_name, mut items } => {
             let ids: Vec<u64> = items.iter().map(|(id, _)| *id).collect();
-            let keep = readable_ids(&type_name, &ids)?;
+            let keep = readable_ids(ctx, &type_name, &ids)?;
             items.retain(|(id, _)| keep.contains(id));
             QueryOutput::IdSetWithFields { type_name, items }
         }
-        other => apply_read_filter(ctx, other),
-    })
+        other => {
+            // Evaluating the rule is per-row work like any other — charge it.
+            let rows = match &other {
+                QueryOutput::Objects(o) => o.len(),
+                QueryOutput::Scored(r) => r.len(),
+                _ => 0,
+            };
+            ctx.governor.charge(rows as u64)?;
+            apply_read_filter(ctx, other)
+        }
+    };
+    ctx.governor.check_exhausted()?;
+    Ok(filtered)
+}
+
+/// Objects evaluated per rule-check batch: the ids that pass are kept, the loaded objects are
+/// dropped before the next batch, so checking a large candidate set never holds it all.
+const READ_CHECK_BATCH: usize = 1024;
+
+/// The ids among `ids` (of `type_name`) the principal may read, charged one row each, checked
+/// in batches of [`READ_CHECK_BATCH`] objects.
+pub(crate) fn readable_ids(
+    ctx: &ExecContext<'_>,
+    type_name: &str,
+    ids: &[u64],
+) -> QueryResult<std::collections::HashSet<u64>> {
+    ctx.governor.charge(ids.len() as u64)?;
+    let mut keep = std::collections::HashSet::with_capacity(ids.len());
+    for batch in ids.chunks(READ_CHECK_BATCH) {
+        let mut objs = ctx.db.get_many_lazy(type_name, batch).unwrap_or_default();
+        filter_read(ctx, &mut objs);
+        keep.extend(objs.iter().map(|o| o.id));
+        ctx.governor.check_deadline()?;
+    }
+    Ok(keep)
 }
 
 /// A [`ResourceAccessor`] backed by the live engine: a stored (pre-mutation) object and/or the
@@ -746,6 +773,82 @@ mod tests {
         // Rules off, the same query sees every row (the path is unchanged).
         let plain = ExecContext::new(&noisy, None);
         assert_eq!(row_ids(run(&plain, r#"Doc.matches(.body, "invoice", k: 10)"#)).len(), 6);
+    }
+
+    /// A governed context for `principal` with `rules`.
+    fn gov_ctx_with<'a>(
+        db: &'a Database,
+        r: &Arc<RulesProgram>,
+        principal: Principal,
+        max_rows_scanned: usize,
+    ) -> ExecContext<'a> {
+        let mut c = ctx_with(db, r, principal);
+        c.governor = crate::governor::Governor::new(
+            crate::governor::GovernorLimits { max_rows_scanned, ..crate::governor::GovernorLimits::UNLIMITED },
+            std::time::Instant::now(),
+        );
+        c
+    }
+
+    #[test]
+    fn deleting_and_shrinking_large_fulltext_documents_is_charged() {
+        let (_d, db) = ft_db();
+        // 200 indexed words per doc, written with the governor off (as a trusted import).
+        let body = (0..200).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let ids: Vec<u64> = (0..3).map(|_| mk_doc(&db, &body, "u1")).collect();
+        let r = rules("match Doc { allow read, delete, update: if request.auth.uid == resource.ownerUid; }", &db);
+        let owner = || user("u1");
+        // Deleting them tombstones 600 postings: refused under a budget that only counts rows…
+        let err = run(&gov_ctx_with(&db, &r, owner(), 100), r#"Doc.filter(.ownerUid == "u1").delete()"#).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
+        // …and the rows are still there (charged BEFORE any write).
+        assert_eq!(row_ids(run(&ctx_with(&db, &r, owner()), "Doc")).len(), 3);
+        // Shrinking a @fulltext field is charged the stored value it tombstones.
+        let err = run(&gov_ctx_with(&db, &r, owner(), 100), &format!(r#"Doc.get({}).update({{ body: "z" }})"#, ids[0])).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
+        // A budget that covers the work succeeds.
+        assert!(run(&gov_ctx_with(&db, &r, owner(), 100_000), r#"Doc.filter(.ownerUid == "u1").delete()"#).is_ok());
+        assert_eq!(row_ids(run(&ctx_with(&db, &r, owner()), "Doc")).len(), 0);
+    }
+
+    #[test]
+    fn per_stage_read_filtering_is_charged_and_not_repeated_needlessly() {
+        let (_d, db) = ft_db();
+        for _ in 0..50 {
+            mk_doc(&db, "text", "u1");
+        }
+        let r = rules(FT_RULES, &db);
+        // Checking the rule on a row is per-row work, and it is charged: the 50-row listing
+        // costs its scan AND its read check, so a 60-row budget can't cover both.
+        let err = run(&gov_ctx_with(&db, &r, user("u1"), 60), "Doc").unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
+        assert_eq!(row_ids(run(&gov_ctx_with(&db, &r, user("u1"), 250), "Doc")).len(), 50);
+        // `limit`/`offset`/`filter` only drop rows, so they never pay for a SECOND check —
+        // 40 of them cost the same as none (before, each stage re-checked every row).
+        let many = format!("Doc{}", ".limit(50)".repeat(40));
+        assert_eq!(row_ids(run(&gov_ctx_with(&db, &r, user("u1"), 250), &many)).len(), 50);
+        // A traversal DOES introduce rows, so its output is checked (and charged) again.
+        let author = mk_user(&db, "u1");
+        let d = mk_doc(&db, "linked", "u1");
+        db.link("Doc", d, "author", author, None).unwrap();
+        let hop = run(&gov_ctx_with(&db, &r, user("u1"), 250), &format!("Doc.get({d}).author"));
+        assert_eq!(row_ids(hop), vec![author]);
+    }
+
+    #[test]
+    fn a_budget_exhausted_inside_the_read_filter_is_reported_not_silently_empty() {
+        // A rule that traverses charges the edges it walks; when that charge fails the rule
+        // evaluator treats the relation as indeterminate (deny). The query must then report the
+        // limit rather than return a quietly shortened result.
+        let (_d, db) = ft_db();
+        let author = mk_user(&db, "u1");
+        for _ in 0..40 {
+            let d = mk_doc(&db, "text", "u1");
+            db.link("Doc", d, "author", author, None).unwrap();
+        }
+        let r = rules("match Doc { allow read: if request.auth.uid == resource.author.uid; } match User { allow read: if true; }", &db);
+        let err = run(&gov_ctx_with(&db, &r, user("u1"), 45), "Doc").unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
     }
 
     #[test]

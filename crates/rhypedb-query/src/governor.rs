@@ -160,6 +160,20 @@ impl Governor {
         ))
     }
 
+    /// Fail if the budget was already overrun or the deadline passed — for work that swallows
+    /// a failed [`charge`](Self::charge) (a rule's relation lookup treats one as "deny"), so a
+    /// query that ran out of budget mid-filter reports the limit instead of silently returning
+    /// fewer rows.
+    pub fn check_exhausted(&self) -> QueryResult<()> {
+        if self.enabled
+            && self.limits.max_rows_scanned != 0
+            && self.rows_examined.get() > self.limits.max_rows_scanned as u64
+        {
+            return Err(self.rows_exceeded_error());
+        }
+        self.check_deadline()
+    }
+
     /// The error [`check_deadline`](Self::check_deadline) returns once the deadline passed.
     pub fn deadline_error(&self) -> QueryError {
         QueryError::ResourceLimitExceeded(format!(
