@@ -1275,3 +1275,22 @@ fn candidate_scan_charges_tombstones_and_honours_the_deadline() {
     let c = db.fulltext_candidates("Note", "title", "needle needle \"needle x\"", FulltextLimits::default()).unwrap();
     assert!(c.scoring_work() >= 2, "{}", c.scoring_work());
 }
+
+#[test]
+fn deferred_prefix_cap_still_has_an_absolute_scan_ceiling() {
+    use crate::fulltext::{FulltextLimits, MAX_PREFIX_EXPANSION_SCAN};
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    for i in 0..=MAX_PREFIX_EXPANSION_SCAN {
+        note(&db, &format!("qq{i:05}"), "x", &format!("k{i}"));
+    }
+    // No posting budget, no deadline (the governor-off shape): the deferred
+    // scan is still refused past the absolute ceiling.
+    let deferred = FulltextLimits { defer_prefix_cap: true, ..Default::default() };
+    assert!(matches!(
+        db.fulltext_candidates("Note", "title", "qq*", deferred),
+        Err(EngineError::FulltextQuery(ref m)) if m.contains("\"qq*\"")
+    ));
+    // A narrower prefix under the ceiling scans (100 terms: past the visible cap of 64).
+    assert!(db.fulltext_candidates("Note", "title", "qq001*", deferred).is_ok());
+}

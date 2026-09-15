@@ -8808,10 +8808,14 @@ impl Database {
                             .ok_or_else(|| corrupt(format!("posting key without a terminated term ({} bytes)", key_bytes.len())))?;
                         if current_term.as_deref() != Some(term) {
                             // Undeferred, the cap is enforced here so a short
-                            // prefix over a huge vocabulary stops scanning.
-                            if !limits.defer_prefix_cap
-                                && per_term.len() >= crate::fulltext::MAX_PREFIX_EXPANSION
-                            {
+                            // prefix over a huge vocabulary stops scanning;
+                            // deferred, an absolute ceiling still bounds the scan.
+                            let cap = if limits.defer_prefix_cap {
+                                crate::fulltext::MAX_PREFIX_EXPANSION_SCAN
+                            } else {
+                                crate::fulltext::MAX_PREFIX_EXPANSION
+                            };
+                            if per_term.len() >= cap {
                                 return Err(EngineError::FulltextQuery(
                                     crate::fulltext::candidates::prefix_cap_message(key),
                                 ));

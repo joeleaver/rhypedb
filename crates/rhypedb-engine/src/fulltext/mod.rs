@@ -188,6 +188,15 @@ pub fn encode_term_prefix(prefix: &str) -> Vec<u8> {
 /// two-letter prefix into a scan of half the index.
 pub const MAX_PREFIX_EXPANSION: usize = 64;
 
+/// Absolute ceiling on distinct indexed terms a prefix scan walks when the
+/// [`MAX_PREFIX_EXPANSION`] cap is DEFERRED to scoring
+/// (`FulltextLimits::defer_prefix_cap`, used under security rules). The
+/// deferred cap counts only visible terms, so without this the scan itself
+/// would be bounded by nothing but the posting budget — and by nothing at all
+/// with the governor off. Refusing past it depends on hidden terms too, but
+/// only at a threshold 16× the visible cap.
+pub const MAX_PREFIX_EXPANSION_SCAN: usize = 1024;
+
 /// Value of an `l:` row: the document's token count as a varint.
 pub fn encode_doc_len(doc_len: u32) -> bytes::Bytes {
     let mut out = Vec::with_capacity(5);
@@ -245,7 +254,8 @@ pub struct FulltextLimits {
     /// Keep each prefix expansion unmerged and apply the
     /// [`MAX_PREFIX_EXPANSION`] cap at scoring instead of during the scan, so
     /// `FulltextCandidates::score_visible` can count only terms that occur in
-    /// visible documents. The scan is then bounded by `max_postings` alone.
+    /// visible documents. The scan is then bounded by `max_postings` and the
+    /// absolute [`MAX_PREFIX_EXPANSION_SCAN`] ceiling.
     pub defer_prefix_cap: bool,
 }
 
