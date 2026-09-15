@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::posting::Posting;
 use super::query::ParsedQuery;
-use super::search::{CorpusStats, FulltextHit, PostingList, score_query};
+use super::search::{CorpusStats, FulltextHit, PostingList, RestrictScope, score_query_with};
 use crate::error::{EngineError, EngineResult};
 
 /// Everything a query's postings scan produced, ready to rank.
@@ -56,14 +56,15 @@ impl FulltextCandidates {
         ids
     }
 
-    /// Rows scoring will walk: every clause visits every posting of each of
-    /// its terms (a phrase once per word, repeats included). A governor
-    /// charges this BEFORE ranking so clauses × postings is budgeted, not
-    /// just the postings fetched once per distinct term.
+    /// Work scoring will do, in rows: every clause walks every posting of each of its
+    /// terms (a phrase once per word, repeats included), and a phrase additionally walks
+    /// its first word's positions in every document, probing each later word — Σ tf₀ ×
+    /// (words − 1). A governor charges this BEFORE ranking, so a query of many phrases
+    /// over high-frequency documents is budgeted, not just the postings fetched once.
     pub fn scoring_work(&self) -> u64 {
+        let list = |key: &str| self.postings.get(key);
         let len = |key: &str| -> u64 {
-            self.postings
-                .get(key)
+            list(key)
                 .map(|l| l.len() as u64)
                 .or_else(|| self.prefix_terms.get(key).map(|ls| ls.iter().map(|l| l.len() as u64).sum()))
                 .unwrap_or(0)
@@ -71,43 +72,50 @@ impl FulltextCandidates {
         self.parsed
             .clauses
             .iter()
-            .flat_map(|c| c.terms.iter())
-            .map(|t| len(t))
+            .map(|c| {
+                let walks = c.terms.iter().map(|t| len(t)).fold(0u64, u64::saturating_add);
+                let positions = if c.is_phrase() {
+                    let tf0: u64 = list(&c.terms[0]).map_or(0, |l| l.iter().map(|(_, p)| p.tf as u64).sum());
+                    tf0.saturating_mul(c.terms.len() as u64 - 1)
+                } else {
+                    0
+                };
+                walks.saturating_add(positions)
+            })
             .fold(0u64, u64::saturating_add)
     }
 
     /// Rank over the whole field: field-wide statistics, `restrict` (when
-    /// given) applied before the top-`k` cut.
-    pub fn score(&self, restrict: Option<&HashSet<u64>>, k: usize) -> EngineResult<Vec<FulltextHit>> {
+    /// given) applied before the top-`k` cut. Fails with
+    /// `FulltextDeadlineExceeded` past `deadline`.
+    pub fn score(
+        &self,
+        restrict: Option<&HashSet<u64>>,
+        k: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> EngineResult<Vec<FulltextHit>> {
         let merged = self.merge_prefixes(None)?;
-        let postings: HashMap<&str, &PostingList> = self
-            .postings
-            .iter()
-            .map(|(key, list)| (key.as_str(), list))
-            .chain(merged.iter().map(|(key, list)| (*key, list)))
-            .collect();
-        Ok(score_query(&self.parsed, &postings, self.stats, restrict, k))
+        let postings = self.lists(&merged);
+        score_query_with(&self.parsed, &postings, self.stats, restrict, RestrictScope::RankOnly, k, deadline)
+            .map_err(|_| self.deadline_error())
     }
 
-    /// Rank over `visible` documents only (see the module doc): invisible
-    /// postings are dropped first, and `df`, the corpus statistics, the
-    /// prefix-expansion cap and the top-`k` cut are all computed from what
-    /// is left.
-    pub fn score_visible(&self, visible: &HashSet<u64>, k: usize) -> EngineResult<Vec<FulltextHit>> {
+    /// Rank over `visible` documents only (see the module doc): the visible set
+    /// is the corpus — `df`, the statistics, the prefix-expansion cap and the
+    /// top-`k` cut are all computed from it. Works on the collected lists in
+    /// place (no copy of the postings).
+    pub fn score_visible(
+        &self,
+        visible: &HashSet<u64>,
+        k: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> EngineResult<Vec<FulltextHit>> {
         let merged = self.merge_prefixes(Some(visible))?;
-        let postings: HashMap<&str, PostingList> = self
-            .postings
-            .iter()
-            .map(|(key, list)| {
-                let kept = list.iter().filter(|(id, _)| visible.contains(id)).cloned().collect();
-                (key.as_str(), kept)
-            })
-            .chain(merged)
-            .collect();
-        // One doc_len per document (every posting of a document carries it).
+        let postings = self.lists(&merged);
+        // One doc_len per visible document (every posting of a document carries it).
         let mut doc_lens: HashMap<u64, u32> = HashMap::new();
         for list in postings.values() {
-            for (id, p) in list {
+            for (id, p) in list.iter().filter(|(id, _)| visible.contains(id)) {
                 doc_lens.entry(*id).or_insert(p.doc_len);
             }
         }
@@ -115,7 +123,24 @@ impl FulltextCandidates {
             doc_count: doc_lens.len() as u64,
             total_tokens: doc_lens.values().map(|&l| l as u64).sum(),
         };
-        Ok(score_query(&self.parsed, &postings, stats, None, k))
+        score_query_with(&self.parsed, &postings, stats, Some(visible), RestrictScope::Corpus, k, deadline)
+            .map_err(|_| self.deadline_error())
+    }
+
+    /// Every posting list by key: the collected exact terms plus `merged` prefix lists.
+    fn lists<'a>(&'a self, merged: &'a HashMap<&'a str, PostingList>) -> HashMap<&'a str, &'a PostingList> {
+        self.postings
+            .iter()
+            .map(|(key, list)| (key.as_str(), list))
+            .chain(merged.iter().map(|(key, list)| (*key, list)))
+            .collect()
+    }
+
+    fn deadline_error(&self) -> EngineError {
+        EngineError::FulltextDeadlineExceeded {
+            type_name: self.type_name.clone(),
+            field: self.field_name.clone(),
+        }
     }
 
     /// Merge each deferred prefix expansion into one list per document
@@ -133,7 +158,7 @@ impl FulltextCandidates {
                         counted = true;
                         terms += 1;
                         if terms > super::MAX_PREFIX_EXPANSION {
-                            return Err(EngineError::FulltextQuery(prefix_cap_message(key)));
+                            return Err(EngineError::FulltextQuery(prefix_cap_message(key, super::MAX_PREFIX_EXPANSION)));
                         }
                     }
                     match merged.entry(*id) {
@@ -163,10 +188,7 @@ impl FulltextCandidates {
     }
 }
 
-/// The "prefix expands too far" message for posting key `key` (`"cam*"`).
-pub(crate) fn prefix_cap_message(key: &str) -> String {
-    format!(
-        "prefix term \"{key}\" matches more than {} indexed terms; use a longer prefix",
-        super::MAX_PREFIX_EXPANSION
-    )
+/// The "prefix expands too far" message for posting key `key` (`"cam*"`) and the `cap` hit.
+pub(crate) fn prefix_cap_message(key: &str, cap: usize) -> String {
+    format!("prefix term \"{key}\" matches more than {cap} indexed terms; use a longer prefix")
 }

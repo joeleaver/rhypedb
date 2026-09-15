@@ -4446,11 +4446,18 @@ impl Database {
             .migrating_field_count
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0;
+        // Same for a type with RETIRED fields (a schema shrink): their values stay in the
+        // stored blob until rewritten, and shipping `raw_fields` verbatim would return data
+        // the schema no longer has.
+        let has_retired = self
+            .retired_field_names_by_type
+            .get(type_name)
+            .is_some_and(|names| !names.is_empty());
 
         let mut out = Vec::with_capacity(sorted.len());
         for (id, value) in sorted.into_iter().zip(values) {
             if let Some(data) = value {
-                if migrating {
+                if migrating || has_retired {
                     let mut fields = deserialize_fields(&data);
                     self.strip_tombstoned_fields(type_name, &mut fields);
                     out.push(Object {
@@ -8535,6 +8542,41 @@ impl Database {
             .sum()
     }
 
+    /// Indexed words currently stored for objects `ids` of `type_name` — the `doc_len` of
+    /// every `@fulltext` field (only those named in `fields`, when given) — which is the
+    /// posting work a delete, or an update of those fields, will do to tombstone the old
+    /// value. One point read per (object, field); a governor charges it BEFORE the write.
+    /// `0` for a type without `@fulltext` fields.
+    pub fn fulltext_stored_words(
+        &self,
+        type_name: &str,
+        ids: &[u64],
+        fields: Option<&FieldMap>,
+    ) -> EngineResult<u64> {
+        let Some(ffs) = self.fulltext_fields.get(type_name) else {
+            return Ok(0);
+        };
+        let ffs: Vec<&FulltextField> = ffs
+            .iter()
+            .filter(|ff| fields.is_none_or(|f| f.contains_key(&ff.name)))
+            .collect();
+        if ffs.is_empty() {
+            return Ok(0);
+        }
+        let type_id = self.resolve_type_id(type_name)?;
+        let snapshot = self.storage.read_snapshot();
+        let mut total = 0u64;
+        for &id in ids {
+            for ff in &ffs {
+                let key = KeyBuilder::fulltext_doc(type_id, ff.field_id, ff.generation, id);
+                if let Some(v) = self.storage.get_at(snapshot, &key)? {
+                    total = total.saturating_add(crate::fulltext::decode_doc_len(&v).unwrap_or(0) as u64);
+                }
+            }
+        }
+        Ok(total)
+    }
+
     /// Apply the corpus-stat deltas of a transaction that just COMMITTED.
     /// Never called on the abort path — the index rows didn't land, so the
     /// stats must not move either.
@@ -8677,7 +8719,7 @@ impl Database {
         };
         let candidates = self.fulltext_candidates(type_name, field_name, query_text, limits)?;
         Ok(FulltextSearchResult {
-            hits: candidates.score(restrict, k)?,
+            hits: candidates.score(restrict, k, None)?,
             postings_scanned: candidates.postings_scanned,
         })
     }
@@ -8803,7 +8845,7 @@ impl Database {
                     &mut postings_scanned,
                     type_name,
                     field_name,
-                    |key_bytes, value| {
+                    |key_bytes, value, _scanned| {
                         let term = KeyBuilder::fulltext_posting_term(&key_bytes)
                             .ok_or_else(|| corrupt(format!("posting key without a terminated term ({} bytes)", key_bytes.len())))?;
                         if current_term.as_deref() != Some(term) {
@@ -8817,7 +8859,7 @@ impl Database {
                             };
                             if per_term.len() >= cap {
                                 return Err(EngineError::FulltextQuery(
-                                    crate::fulltext::candidates::prefix_cap_message(key),
+                                    crate::fulltext::candidates::prefix_cap_message(key, cap),
                                 ));
                             }
                             per_term.push(Vec::new());
@@ -8844,6 +8886,8 @@ impl Database {
                 );
                 let with_positions = phrase_terms.contains(key);
                 let mut list = Vec::new();
+                // Positions decoded for a phrase word are charged as rows too, BEFORE they
+                // are decoded: a high-frequency document carries up to MAX_ANALYZED_WORDS.
                 self.scan_fulltext_postings(
                     snapshot,
                     &prefix,
@@ -8851,10 +8895,22 @@ impl Database {
                     &mut postings_scanned,
                     type_name,
                     field_name,
-                    |key_bytes, value| {
+                    |key_bytes, value, scanned| {
                         let object_id = KeyBuilder::fulltext_object_id(&key_bytes)
                             .ok_or_else(|| corrupt(format!("posting key too short ({} bytes)", key_bytes.len())))?;
                         let posting = if with_positions {
+                            let (_, tf) = crate::fulltext::posting::decode_posting_header(&value)
+                                .map_err(|e| corrupt(format!("posting for term {key:?}, object {object_id}: {e}")))?;
+                            *scanned = scanned.saturating_add(tf as u64);
+                            if let Some(limit) = limits.max_postings
+                                && *scanned > limit
+                            {
+                                return Err(EngineError::FulltextScanBudgetExceeded {
+                                    type_name: type_name.into(),
+                                    field: field_name.into(),
+                                    limit,
+                                });
+                            }
                             crate::fulltext::posting::decode_posting(&value)
                         } else {
                             crate::fulltext::posting::decode_posting_header(&value).map(|(doc_len, tf)| {
@@ -8905,7 +8961,7 @@ impl Database {
         postings_scanned: &mut u64,
         type_name: &str,
         field_name: &str,
-        mut visit: impl FnMut(Bytes, Bytes) -> EngineResult<()>,
+        mut visit: impl FnMut(Bytes, Bytes, &mut u64) -> EngineResult<()>,
     ) -> EngineResult<()> {
         const POSTING_SCAN_CHUNK: usize = 4096;
         let mut start = prefix.clone();
@@ -8937,7 +8993,7 @@ impl Database {
                 });
             }
             for (key, value) in chunk.live {
-                visit(key, value)?;
+                visit(key, value, postings_scanned)?;
             }
             match chunk.high_water {
                 Some(hw) if chunk.more => {
@@ -8968,6 +9024,27 @@ mod tests {
     // -----------------------------------------------------------------
     // Tombstone gating — read paths
     // -----------------------------------------------------------------
+
+    /// A retired (shrunk-away) field's value stays in the stored blob until the object is
+    /// rewritten; the lazy multi-get ships `raw_fields` verbatim to the wire, so it must not
+    /// return the retired value either (it did — review finding).
+    #[test]
+    fn get_many_lazy_never_ships_a_retired_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = parse_schema("type Doc { body: String  secret: String }").unwrap();
+        let db = Database::open(big, dir.path()).unwrap();
+        let mut fields = FieldMap::new();
+        fields.insert("body".into(), Value::String("hello".into()));
+        fields.insert("secret".into(), Value::String("sk_live_x".into()));
+        let id = db.create("Doc", fields).unwrap().id;
+        drop(db);
+        let db = open_with_shrink(parse_schema("type Doc { body: String }").unwrap(), dir.path());
+        let mut objs = db.get_many_lazy("Doc", &[id]).unwrap();
+        assert!(objs[0].raw_fields.is_none(), "the verbatim blob must not reach the wire");
+        objs[0].ensure_fields_deserialized();
+        assert!(objs[0].fields.contains_key("body"));
+        assert!(!objs[0].fields.contains_key("secret"));
+    }
 
     /// A type that was retired via schema shrink must error with
     /// `TypeRetired` (not `TypeNotFound`) when named in `get`. The

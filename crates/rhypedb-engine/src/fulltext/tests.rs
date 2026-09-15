@@ -1196,7 +1196,7 @@ fn score_visible_ignores_invisible_documents_entirely() {
     let visible_hits = |db: &Database, q: &str, visible: &HashSet<u64>, k: usize| {
         db.fulltext_candidates("Note", "title", q, deferred)
             .unwrap()
-            .score_visible(visible, k)
+            .score_visible(visible, k, None)
             .map(|hits| hits.into_iter().map(|h| (h.object_id, h.score)).collect::<Vec<_>>())
     };
 
@@ -1227,7 +1227,7 @@ fn score_visible_ignores_invisible_documents_entirely() {
     assert_eq!(visible_hits(&noisy, "zebra", &visible, 1).unwrap().len(), 1);
     // …while the unrestricted ranking over the same postings does see them.
     let all = noisy.fulltext_candidates("Note", "title", "zebra", deferred).unwrap();
-    assert_ne!(all.score(None, 1).unwrap()[0].object_id, mine_noisy[0]);
+    assert_ne!(all.score(None, 1, None).unwrap()[0].object_id, mine_noisy[0]);
 
     // The prefix cap counts only terms in visible documents: 64 invisible
     // `zq…` terms don't make `zq*` an error for someone who can't see them…
@@ -1293,4 +1293,57 @@ fn deferred_prefix_cap_still_has_an_absolute_scan_ceiling() {
     ));
     // A narrower prefix under the ceiling scans (100 terms: past the visible cap of 64).
     assert!(db.fulltext_candidates("Note", "title", "qq001*", deferred).is_ok());
+}
+
+/// Phrase matching walks positions: the scan charges decoded positions before decoding
+/// them, `scoring_work` charges the walk (Σ tf₀ × (words − 1)), and scoring stops at the
+/// deadline — so many phrases over high-frequency documents can't run unbudgeted.
+#[test]
+fn phrase_position_work_is_charged_and_deadline_bounded() {
+    use crate::fulltext::FulltextLimits;
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let body = "a ".repeat(2000) + &"b ".repeat(2000);
+    for i in 0..3 {
+        note(&db, &body, "x", &format!("t{i}"));
+    }
+    // 3 postings for `b` + 3 for `a`, plus 2000 positions each for the phrase words.
+    let c = db.fulltext_candidates("Note", "title", "\"b a\"", FulltextLimits::default()).unwrap();
+    assert!(c.postings_scanned >= 6 + 6 * 2000, "positions charged: {}", c.postings_scanned);
+    // The scan refuses before decoding past the budget.
+    let tight = FulltextLimits { max_postings: Some(4000), ..Default::default() };
+    assert!(matches!(
+        db.fulltext_candidates("Note", "title", "\"b a\"", tight),
+        Err(EngineError::FulltextScanBudgetExceeded { .. })
+    ));
+    // Each repeated phrase clause is charged its own position walk.
+    let one = db.fulltext_candidates("Note", "title", "\"b a\"", FulltextLimits::default()).unwrap().scoring_work();
+    let four = db
+        .fulltext_candidates("Note", "title", "\"b a\" \"b a\" \"b a\" \"b a\"", FulltextLimits::default())
+        .unwrap()
+        .scoring_work();
+    assert!(one >= 3 * 2000 && four >= 4 * one - 8, "{one} {four}");
+    // A passed deadline stops scoring.
+    let many: Vec<u64> = (0..2000).map(|i| note(&db, "b a", "x", &format!("m{i}"))).collect();
+    assert_eq!(many.len(), 2000);
+    let c = db.fulltext_candidates("Note", "title", "\"b a\"", FulltextLimits::default()).unwrap();
+    let past = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+    assert!(matches!(c.score(None, 10, past), Err(EngineError::FulltextDeadlineExceeded { .. })));
+    assert_eq!(c.score(None, 10, None).unwrap().len(), 10);
+}
+
+#[test]
+fn stored_words_measure_what_a_delete_or_update_will_tombstone() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let a = note(&db, "one two three", "four five", "a");
+    let b = note(&db, "six", "seven eight", "b");
+    assert_eq!(db.fulltext_stored_words("Note", &[a], None).unwrap(), 5);
+    assert_eq!(db.fulltext_stored_words("Note", &[a, b], None).unwrap(), 8);
+    // Only the fields an update touches.
+    let only_title = fields(&[("title", s("x"))]);
+    assert_eq!(db.fulltext_stored_words("Note", &[a, b], Some(&only_title)).unwrap(), 4);
+    let non_ft = fields(&[("n", Value::I64(2))]);
+    assert_eq!(db.fulltext_stored_words("Note", &[a], Some(&non_ft)).unwrap(), 0);
+    assert_eq!(db.fulltext_stored_words("Owner", &[a], None).unwrap(), 0);
 }
