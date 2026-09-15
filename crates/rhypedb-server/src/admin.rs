@@ -1401,6 +1401,7 @@ mod tests {
             query_cache: QueryCache::new(16),
             admin_token: token.map(|s| s.to_string()),
             reload_lock: tokio::sync::RwLock::new(()),
+        query_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             pending_reload_schemas: std::sync::Mutex::new(std::collections::HashMap::new()),
             data_dir,
             schema_path,

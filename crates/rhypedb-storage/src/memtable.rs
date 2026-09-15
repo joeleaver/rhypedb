@@ -158,6 +158,13 @@ impl MemTable {
             }
             let user_key = &key[..key.len() - 8];
 
+            // Internal keys are `user_key ‖ inverted version`, so a SHORTER user key
+            // that is a prefix of `start_user_key` can sort after the seek point: a
+            // resumed scan starting at `hw\0` would otherwise re-read `hw` itself (the
+            // previous chunk's high-water key). Same guard as `SstReader::scan_from_max`.
+            if user_key < start_user_key {
+                continue;
+            }
             if !user_key.starts_with(prefix) {
                 break;
             }

@@ -8,8 +8,10 @@
 //! - **write** (update/delete/link/unlink) — gate the **pre-mutation** object before the engine
 //!   mutates it, so a rule like `request.auth.uid == resource.author` can't be defeated by the same
 //!   write that flips `author` (P0-DBA-6) (§[`gate_write`]).
-//! - **read** — filter the terminal result set, dropping rows the principal may not read (Firestore
-//!   semantics: you get the rows you may read, not an error) (§[`filter_read`]).
+//! - **read** — filter the result of EVERY pipeline stage, dropping rows the principal may not read
+//!   (Firestore semantics: you get the rows you may read, not an error), so no step — a filter, a
+//!   ranked search, a limit, a traversal, a write gate — ever acts on a row the principal cannot
+//!   see (§[`read_filter_stage`], [`filter_read`]).
 //!
 //! A denied *write* is a loud [`QueryError::PermissionDenied`]; a denied *read* row is silently
 //! dropped. Relationship projections a rule needs (`resource.owners.uid`) walk edges via the
@@ -84,6 +86,68 @@ pub(crate) fn apply_read_filter(ctx: &ExecContext<'_>, result: QueryOutput) -> Q
         }
         other => other,
     }
+}
+
+/// Read-filter an INTERMEDIATE pipeline result (rules on; a no-op otherwise), so every step sees
+/// only rows the principal may read — unreadable rows behave exactly as if they did not exist.
+///
+/// Filtering only the terminal result let the steps in between work over unreadable rows, and
+/// their observable effects became oracles: a write gate refusing `….filter(.body.contains(s))
+/// .delete()` only when a hidden row matched, a traversal returning a readable neighbour of a
+/// hidden match, a `.limit`/`k` cut crowded by hidden rows. The streaming id shapes are
+/// materialized to evaluate the rule (charged to the governor) and keep their shape; a `Single`
+/// the principal may not read collapses to `Done` like at the terminal.
+pub(crate) fn read_filter_stage(ctx: &ExecContext<'_>, result: QueryOutput) -> QueryResult<QueryOutput> {
+    if ctx.rules.is_none() {
+        return Ok(result);
+    }
+    let filtered = match result {
+        QueryOutput::IdSet { type_name, mut ids } => {
+            let keep = readable_ids(ctx, &type_name, &ids)?;
+            ids.retain(|id| keep.contains(id));
+            QueryOutput::IdSet { type_name, ids }
+        }
+        QueryOutput::IdSetWithFields { type_name, mut items } => {
+            let ids: Vec<u64> = items.iter().map(|(id, _)| *id).collect();
+            let keep = readable_ids(ctx, &type_name, &ids)?;
+            items.retain(|(id, _)| keep.contains(id));
+            QueryOutput::IdSetWithFields { type_name, items }
+        }
+        other => {
+            // Evaluating the rule is per-row work like any other — charge it.
+            let rows = match &other {
+                QueryOutput::Objects(o) => o.len(),
+                QueryOutput::Scored(r) => r.len(),
+                _ => 0,
+            };
+            ctx.governor.charge(rows as u64)?;
+            apply_read_filter(ctx, other)
+        }
+    };
+    ctx.governor.check_exhausted()?;
+    Ok(filtered)
+}
+
+/// Objects evaluated per rule-check batch: the ids that pass are kept, the loaded objects are
+/// dropped before the next batch, so checking a large candidate set never holds it all.
+const READ_CHECK_BATCH: usize = 1024;
+
+/// The ids among `ids` (of `type_name`) the principal may read, charged one row each, checked
+/// in batches of [`READ_CHECK_BATCH`] objects.
+pub(crate) fn readable_ids(
+    ctx: &ExecContext<'_>,
+    type_name: &str,
+    ids: &[u64],
+) -> QueryResult<std::collections::HashSet<u64>> {
+    ctx.governor.charge(ids.len() as u64)?;
+    let mut keep = std::collections::HashSet::with_capacity(ids.len());
+    for batch in ids.chunks(READ_CHECK_BATCH) {
+        let mut objs = ctx.db.get_many_lazy(type_name, batch).unwrap_or_default();
+        filter_read(ctx, &mut objs);
+        keep.extend(objs.iter().map(|o| o.id));
+        ctx.governor.check_deadline()?;
+    }
+    Ok(keep)
 }
 
 /// A [`ResourceAccessor`] backed by the live engine: a stored (pre-mutation) object and/or the
@@ -573,6 +637,243 @@ mod tests {
             &db,
         );
         assert!(!super::event_read_allowed(&rel, &user("u1"), "Post", Some(&snap)));
+    }
+
+    // ---- Per-stage read filtering + ranked search under rules (FTS review) ----
+
+    const FT_SCHEMA: &str = r#"
+        type User {
+            uid: String
+            name: String
+        }
+        type Doc {
+            body: String @fulltext
+            ownerUid: String @indexed
+            author: User
+        }
+    "#;
+
+    /// Owner-only read + delete on Doc; Users are world-readable.
+    const FT_RULES: &str = "match Doc { allow read, delete: if request.auth.uid == resource.ownerUid; } \
+                            match User { allow read: if true; }";
+
+    fn ft_db() -> (tempfile::TempDir, Arc<Database>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(parse_schema(FT_SCHEMA).unwrap(), dir.path()).unwrap();
+        (dir, db)
+    }
+
+    fn mk_doc(db: &Database, body: &str, owner: &str) -> u64 {
+        let mut f = FieldMap::new();
+        f.insert("body".into(), Value::String(body.into()));
+        f.insert("ownerUid".into(), Value::String(owner.into()));
+        db.create("Doc", f).unwrap().id
+    }
+
+    fn row_ids(out: QueryResult<QueryOutput>) -> Vec<u64> {
+        match out.unwrap() {
+            QueryOutput::Objects(o) => o.into_iter().map(|o| o.id).collect(),
+            QueryOutput::Scored(r) => r.into_iter().map(|(o, _)| o.id).collect(),
+            QueryOutput::Single(o) => vec![o.id],
+            _ => vec![],
+        }
+    }
+
+    fn scores(out: QueryResult<QueryOutput>) -> Vec<(u64, f32)> {
+        match out.unwrap() {
+            QueryOutput::Scored(r) => r.into_iter().map(|(o, s)| (o.id, s.score)).collect(),
+            other => panic!("expected a ranked result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_gate_is_not_an_oracle_for_unreadable_text() {
+        let (_d, db) = ft_db();
+        let secret = mk_doc(&db, "my api key is sk_live_ABC123", "u1");
+        let r = rules(FT_RULES, &db);
+        let attacker = ctx_with(&db, &r, user("u2"));
+        // Before: `….delete()` was PermissionDenied exactly when a hidden row matched the guess.
+        // Now the hidden row never reaches the write gate — right and wrong guesses both succeed
+        // as no-ops, and nothing is deleted.
+        for q in [
+            r#"Doc.matches(.body, "sk_live_abc*", k: 10).delete()"#,
+            r#"Doc.matches(.body, "sk_live_abd*", k: 10).delete()"#,
+            r#"Doc.filter(.body.contains("sk_live_ABC1")).delete()"#,
+            r#"Doc.filter(.body.contains("sk_live_ABD")).delete()"#,
+            r#"Doc.filter(.ownerUid == "u1").limit(5).delete()"#,
+        ] {
+            assert!(run(&attacker, q).is_ok(), "{q}");
+        }
+        let get_filter = format!(r#"Doc.get({secret}).filter(.body >= "my api key is sk_live_A").delete()"#);
+        assert!(run(&attacker, &get_filter).is_ok());
+        assert!(db.get("Doc", secret).is_ok(), "nothing was deleted");
+        // A point delete of a NAMED object is still gated by the delete rule itself (delete need
+        // not imply read — Firestore semantics).
+        assert!(matches!(
+            run(&attacker, &format!("Doc.get({secret}).delete()")),
+            Err(QueryError::PermissionDenied(_))
+        ));
+        // The owner can search-and-delete their own row.
+        let owner = ctx_with(&db, &r, user("u1"));
+        assert!(run(&owner, r#"Doc.matches(.body, "sk_live_abc*", k: 10).delete()"#).is_ok());
+        assert!(db.get("Doc", secret).is_err());
+    }
+
+    #[test]
+    fn traversal_from_a_hidden_match_reveals_nothing() {
+        let (_d, db) = ft_db();
+        let author = mk_user(&db, "ceo");
+        let memo = mk_doc(&db, "merger with acme next week", "u1");
+        db.link("Doc", memo, "author", author, None).unwrap();
+        let r = rules(FT_RULES, &db);
+        let attacker = ctx_with(&db, &r, user("u2"));
+        for q in [
+            r#"Doc.matches(.body, "+merger +acme", k: 10).author"#,
+            r#"Doc.matches(.body, "+merger +globex", k: 10).author"#,
+            r#"Doc.filter(.body.contains("acme")).author"#,
+            r#"Doc.filter(.ownerUid == "u1").author.limit(1)"#,
+        ] {
+            assert_eq!(row_ids(run(&attacker, q)), Vec::<u64>::new(), "{q}");
+        }
+        let owner = ctx_with(&db, &r, user("u1"));
+        assert_eq!(row_ids(run(&owner, r#"Doc.matches(.body, "+merger +acme", k: 10).author"#)), vec![author]);
+    }
+
+    #[test]
+    fn hidden_rows_neither_crowd_nor_skew_what_a_caller_can_read() {
+        let clean_dir = tempfile::tempdir().unwrap();
+        let clean = Database::open(parse_schema(FT_SCHEMA).unwrap(), clean_dir.path()).unwrap();
+        let (_nd, noisy) = ft_db();
+        // The attacker's own row, identical in both databases.
+        let mine = mk_doc(&noisy, "zebra crossing invoice", "u2");
+        assert_eq!(mk_doc(&clean, "zebra crossing invoice", "u2"), mine);
+        // Hidden rows full of the query terms, only in `noisy`.
+        for _ in 0..5 {
+            mk_doc(&noisy, "invoice invoice invoice zebra", "u1");
+        }
+        for i in 0..rhypedb_engine::fulltext::MAX_PREFIX_EXPANSION {
+            mk_doc(&noisy, &format!("zq{i:03}"), "u1");
+        }
+        let r_noisy = rules(FT_RULES, &noisy);
+        let r_clean = rules(FT_RULES, &clean);
+        let (n, c) = (ctx_with(&noisy, &r_noisy, user("u2")), ctx_with(&clean, &r_clean, user("u2")));
+        // `k` is cut after the read rule: the hidden, higher-scoring rows don't crowd `k: 1`.
+        assert_eq!(row_ids(run(&n, r#"Doc.matches(.body, "invoice", k: 1)"#)), vec![mine]);
+        // The score is computed from readable documents only (no df/doc_count oracle).
+        for q in [r#"Doc.matches(.body, "zebra", k: 3)"#, r#"Doc.matches(.body, "invoice zebra crossing", k: 3)"#] {
+            assert_eq!(scores(run(&n, q)), scores(run(&c, q)), "{q}");
+        }
+        // The prefix cap counts terms in readable documents only.
+        assert!(run(&n, r#"Doc.matches(.body, "zq*", k: 3)"#).is_ok());
+        // Limits after a filter, pushed-down or not, page over readable rows only.
+        assert_eq!(row_ids(run(&n, r#"Doc.filter(.body.contains("invoice")).limit(1)"#)), vec![mine]);
+        assert_eq!(row_ids(run(&n, r#"Doc.filter(.ownerUid != "nobody").limit(1)"#)), vec![mine]);
+        assert_eq!(row_ids(run(&n, "Doc.limit(1)")), vec![mine]);
+        assert_eq!(row_ids(run(&n, "Doc.offset(0).limit(1)")), vec![mine]);
+        // Rules off, the same query sees every row (the path is unchanged).
+        let plain = ExecContext::new(&noisy, None);
+        assert_eq!(row_ids(run(&plain, r#"Doc.matches(.body, "invoice", k: 10)"#)).len(), 6);
+    }
+
+    /// A governed context for `principal` with `rules`.
+    fn gov_ctx_with<'a>(
+        db: &'a Database,
+        r: &Arc<RulesProgram>,
+        principal: Principal,
+        max_rows_scanned: usize,
+    ) -> ExecContext<'a> {
+        let mut c = ctx_with(db, r, principal);
+        c.governor = crate::governor::Governor::new(
+            crate::governor::GovernorLimits { max_rows_scanned, ..crate::governor::GovernorLimits::UNLIMITED },
+            std::time::Instant::now(),
+        );
+        c
+    }
+
+    #[test]
+    fn deleting_and_shrinking_large_fulltext_documents_is_charged() {
+        let (_d, db) = ft_db();
+        // 200 indexed words per doc, written with the governor off (as a trusted import).
+        let body = (0..200).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let ids: Vec<u64> = (0..3).map(|_| mk_doc(&db, &body, "u1")).collect();
+        let r = rules("match Doc { allow read, delete, update: if request.auth.uid == resource.ownerUid; }", &db);
+        let owner = || user("u1");
+        // Deleting them tombstones 600 postings: refused under a budget that only counts rows…
+        let err = run(&gov_ctx_with(&db, &r, owner(), 100), r#"Doc.filter(.ownerUid == "u1").delete()"#).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
+        // …and the rows are still there (charged BEFORE any write).
+        assert_eq!(row_ids(run(&ctx_with(&db, &r, owner()), "Doc")).len(), 3);
+        // Shrinking a @fulltext field is charged the stored value it tombstones.
+        let err = run(&gov_ctx_with(&db, &r, owner(), 100), &format!(r#"Doc.get({}).update({{ body: "z" }})"#, ids[0])).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
+        // A budget that covers the work succeeds.
+        assert!(run(&gov_ctx_with(&db, &r, owner(), 100_000), r#"Doc.filter(.ownerUid == "u1").delete()"#).is_ok());
+        assert_eq!(row_ids(run(&ctx_with(&db, &r, owner()), "Doc")).len(), 0);
+    }
+
+    #[test]
+    fn per_stage_read_filtering_is_charged_and_not_repeated_needlessly() {
+        let (_d, db) = ft_db();
+        for _ in 0..50 {
+            mk_doc(&db, "text", "u1");
+        }
+        let r = rules(FT_RULES, &db);
+        // Checking the rule on a row is per-row work, and it is charged: the 50-row listing
+        // costs its scan AND its read check, so a 60-row budget can't cover both.
+        let err = run(&gov_ctx_with(&db, &r, user("u1"), 60), "Doc").unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
+        assert_eq!(row_ids(run(&gov_ctx_with(&db, &r, user("u1"), 250), "Doc")).len(), 50);
+        // `limit`/`offset`/`filter` only drop rows, so they never pay for a SECOND check —
+        // 40 of them cost the same as none (before, each stage re-checked every row).
+        let many = format!("Doc{}", ".limit(50)".repeat(40));
+        assert_eq!(row_ids(run(&gov_ctx_with(&db, &r, user("u1"), 250), &many)).len(), 50);
+        // A traversal DOES introduce rows, so its output is checked (and charged) again.
+        let author = mk_user(&db, "u1");
+        let d = mk_doc(&db, "linked", "u1");
+        db.link("Doc", d, "author", author, None).unwrap();
+        let hop = run(&gov_ctx_with(&db, &r, user("u1"), 250), &format!("Doc.get({d}).author"));
+        assert_eq!(row_ids(hop), vec![author]);
+    }
+
+    #[test]
+    fn a_budget_exhausted_inside_the_read_filter_is_reported_not_silently_empty() {
+        // A rule that traverses charges the edges it walks; when that charge fails the rule
+        // evaluator treats the relation as indeterminate (deny). The query must then report the
+        // limit rather than return a quietly shortened result.
+        let (_d, db) = ft_db();
+        let author = mk_user(&db, "u1");
+        for _ in 0..40 {
+            let d = mk_doc(&db, "text", "u1");
+            db.link("Doc", d, "author", author, None).unwrap();
+        }
+        let r = rules("match Doc { allow read: if request.auth.uid == resource.author.uid; } match User { allow read: if true; }", &db);
+        let err = run(&gov_ctx_with(&db, &r, user("u1"), 45), "Doc").unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
+    }
+
+    #[test]
+    fn building_index_error_hides_progress_counts_under_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let plain = parse_schema(&FT_SCHEMA.replace("@fulltext", "")).unwrap();
+            let db = Database::open(plain, dir.path()).unwrap();
+            for i in 0..20 {
+                mk_doc(&db, &format!("text {i}"), "u1");
+            }
+        }
+        let db = Database::open_with_options(
+            parse_schema(FT_SCHEMA).unwrap(),
+            dir.path(),
+            rhypedb_engine::database::OpenOptions { background_fulltext_build: false, ..Default::default() },
+        )
+        .unwrap();
+        let q = r#"Doc.matches(.body, "text", k: 5)"#;
+        let r = rules(FT_RULES, &db);
+        let err = run(&ctx_with(&db, &r, user("u2")), q).unwrap_err().to_string();
+        assert!(err.contains("still building") && !err.contains("objects indexed"), "{err}");
+        // Rules off (a trusted caller) still gets the progress.
+        let err = run(&ExecContext::new(&db, None), q).unwrap_err().to_string();
+        assert!(err.contains("objects indexed"), "{err}");
     }
 
     #[test]

@@ -138,15 +138,19 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
     // type just to build an all-permissive candidate set, turning an O(k) k-NN
     // lookup into an O(type-size) scan.
     let (mut result, first_step) = match (&query.source, query.steps.first()) {
+        // Not under rules: the global HNSW top-k would be cut before the read rule, so hidden
+        // rows could crowd readable ones out (and the count would leak). Under rules a bare
+        // `.similar` runs over the readable rows of the type, via the generic source + filter.
         (
             Source::All { type_name },
             Some(Step::Similar { field_name, query: sq, k, ef, rerank }),
-        ) => (
+        ) if ctx.rules.is_none() => (
             run_similar(ctx, type_name, field_name, sq, *k, None, *ef, *rerank)?,
             1,
         ),
         // Same for a bare `Type.matches(...)`: a global full-text search reads
-        // only the query terms' postings, never the whole type.
+        // only the query terms' postings, never the whole type. (Under rules it
+        // ranks only the readable candidates — see `run_matches`.)
         (Source::All { type_name }, Some(Step::Matches { field_name, query: text, k })) => {
             (run_matches(ctx, type_name, field_name, text, *k, None)?, 1)
         }
@@ -159,13 +163,37 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
     // a long-running pipeline fails closed between stages (each step's inner loops
     // also charge rows, which re-checks the deadline in bulk).
     let mut depth = 0usize;
-    for step in &query.steps[first_step..] {
+    // A point source (`get(id)`, a create) inspects no data, so a write step straight after it
+    // gates the named object itself — delete/update need not imply read, as in Firestore.
+    let point_source = matches!(
+        query.source,
+        Source::Get { .. } | Source::Create { .. } | Source::CreateBatch { .. }
+    );
+    // Whether `result` may hold rows not yet checked against the read rule: the source's rows,
+    // and whatever a traversal or a mutation brings in. `filter`/`limit`/`offset` only drop
+    // rows, and a ranked step only ranks rows that were already readable, so their output needs
+    // no second pass.
+    // (A bare `Type.matches` fast path already ranked only readable rows.)
+    let mut unfiltered = first_step == 0;
+    for (i, step) in query.steps.iter().enumerate().skip(first_step) {
         ctx.governor.check_deadline()?;
         if matches!(step, Step::Traverse { .. }) {
             depth += 1;
             ctx.governor.check_depth(depth)?;
         }
+        // P4 read authz, per stage: the step sees only rows the principal may read (no-op when
+        // rules are off). See `authz::read_filter_stage`.
+        if ctx.rules.is_some() && unfiltered && !(i == 0 && point_source && step.is_write()) {
+            result = crate::authz::read_filter_stage(ctx, result)?;
+            unfiltered = false;
+        }
         result = execute_step(ctx, result, step, &query.source)?;
+        if !matches!(
+            step,
+            Step::Filter { .. } | Step::Limit { .. } | Step::Offset { .. } | Step::Matches { .. } | Step::Similar { .. }
+        ) {
+            unfiltered = true;
+        }
     }
 
     // Streaming-traversal: if the pipeline ended on an `IdSet` or
@@ -192,13 +220,21 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
         _ => {}
     }
 
-    // P4 read authz: filter the terminal result through the `read` rule (no-op when rules are off).
+    // P4 read authz: filter the terminal result through the `read` rule (no-op when rules are off);
+    // every intermediate stage was filtered on the way in above.
     // Applies to EVERY returned object shape — Objects AND a mutation's returned Single/post-image —
     // because any object surfaced to the caller is a read: a create/update that returns a row the
     // principal may not read must not leak it (a denied Single collapses to void). Denied rows are
     // dropped (Firestore semantics), so a point-`get` of an unreadable id returns an empty result.
     if ctx.rules.is_some() {
+        // The terminal check is per-row work like any other stage's.
+        match &result {
+            QueryOutput::Objects(o) => ctx.governor.charge(o.len() as u64)?,
+            QueryOutput::Scored(r) => ctx.governor.charge(r.len() as u64)?,
+            _ => {}
+        }
         result = crate::authz::apply_read_filter(ctx, result);
+        ctx.governor.check_exhausted()?;
     }
 
     // A pipeline that produced `Objects` directly (filter, scan, similar, get)
@@ -238,7 +274,11 @@ fn execute_source(
             // Anything it can't profitably narrow falls through to the full scan.
             // Clamp the pushed `.limit(N)` to the governor's `max_limit` so the
             // indexed fast path can't be asked to buffer an absurd match count.
-            let pushed_limit = leading_limit(steps).map(|n| ctx.governor.clamp_limit(n));
+            // Not under rules: a pushed limit is cut BEFORE the read rule, so hidden matches would
+            // crowd readable ones out of the page (and leak how many there are).
+            let pushed_limit = leading_limit(steps)
+                .filter(|_| ctx.rules.is_none())
+                .map(|n| ctx.governor.clamp_limit(n));
             if let Some(mut objects) = plan_filter_scan(db, type_name, predicate, pushed_limit)? {
                 // Fast-path objects may carry `raw_fields` — if a downstream
                 // step inspects them via `obj.fields`, eagerly populate now.
@@ -266,6 +306,11 @@ fn execute_source(
 
         Source::Create { type_name, fields } => {
             let field_map = literal_map_to_field_map(db, type_name, fields)?;
+            // Full-text indexing is write work proportional to the words analyzed:
+            // charge it before the write so a huge @fulltext value is refused, not indexed.
+            if ctx.governor.scan_cap().is_some() {
+                ctx.governor.charge(db.fulltext_index_words(type_name, &field_map))?;
+            }
             // P4 create authz: gate the incoming fields before the write (no-op when rules off).
             crate::authz::gate_create(ctx, type_name, &field_map)?;
             let obj = db.create(type_name, field_map)?;
@@ -280,6 +325,14 @@ fn execute_source(
                 .iter()
                 .map(|r| literal_map_to_field_map(db, type_name, r))
                 .collect::<QueryResult<_>>()?;
+            if ctx.governor.scan_cap().is_some() {
+                ctx.governor.charge(
+                    field_maps
+                        .iter()
+                        .map(|fm| db.fulltext_index_words(type_name, fm))
+                        .fold(0u64, u64::saturating_add),
+                )?;
+            }
             // P4 create authz: every row must pass the `create` rule (no-op when rules off) — the
             // whole batch fails closed if any row is denied.
             for fm in &field_maps {
@@ -589,6 +642,15 @@ fn execute_step(
             // Bound a bulk update against the row budget (and re-check the deadline).
             ctx.governor.charge(ids.len() as u64)?;
             let field_map = literal_map_to_field_map(db, &type_name, fields)?;
+            // Full-text work: the new value indexed once per row, and the old value's postings
+            // tombstoned (its stored word count) — both charged before any row is written.
+            if ctx.governor.scan_cap().is_some() {
+                ctx.governor.charge(
+                    db.fulltext_index_words(&type_name, &field_map)
+                        .saturating_mul(ids.len() as u64),
+                )?;
+                ctx.governor.charge(db.fulltext_stored_words(&type_name, &ids, Some(&field_map))?)?;
+            }
             // P4 write authz: gate each PRE-mutation object against the `update` rule, with the
             // incoming fields visible as `request.*` (no-op when rules off). P0-DBA-6: checking the
             // stored object before the write stops a rule like `resource.author == request.auth.uid`
@@ -602,6 +664,7 @@ fn execute_step(
             )?;
             let mut updated = Vec::with_capacity(ids.len());
             for id in &ids {
+                ctx.governor.check_deadline()?;
                 updated.push(db.update(&type_name, *id, field_map.clone())?);
             }
             if updated.len() == 1 {
@@ -614,9 +677,14 @@ fn execute_step(
         Step::Delete => {
             let (type_name, ids) = ids_from_output(current, source)?;
             ctx.governor.charge(ids.len() as u64)?;
+            // Deleting tombstones every stored posting of every @fulltext field.
+            if ctx.governor.scan_cap().is_some() {
+                ctx.governor.charge(db.fulltext_stored_words(&type_name, &ids, None)?)?;
+            }
             // P4 write authz: gate each pre-mutation object against the `delete` rule (no-op off).
             crate::authz::gate_write(ctx, rhypedb_authz::Op::Delete, &type_name, &ids, None)?;
             for id in ids {
+                ctx.governor.check_deadline()?;
                 db.delete(&type_name, id)?;
             }
             Ok(QueryOutput::Done)
@@ -951,7 +1019,14 @@ fn run_similar(
 /// candidates to the pipeline's ids — applied by the engine BEFORE its top-k
 /// cut, so `k` rows come from within the set (no over-fetch needed, unlike
 /// `.similar`). The rows carry their BM25 score. Every posting row the
-/// engine examined is charged against the governor's row budget.
+/// engine examined, and every clause's walk over them, is charged against the
+/// governor's row budget; the scan honours the governor's deadline.
+///
+/// Under rules the ranking runs over READABLE candidates only
+/// (`FulltextCandidates::score_visible`): each candidate is checked against
+/// the read rule first, and `df`, the corpus statistics, the prefix cap and
+/// the top-`k` cut see nothing else — so a score, a row count or an error is
+/// never an oracle for text the principal cannot read.
 fn run_matches(
     ctx: &ExecContext<'_>,
     type_name: &str,
@@ -965,27 +1040,36 @@ fn run_matches(
     }
     let k = ctx.governor.clamp_limit(k);
     ctx.governor.check_deadline()?;
-    // The engine refuses (before decoding a single posting) a search that
-    // would examine more rows than the governor's remaining budget.
-    let result = ctx
+    let limits = rhypedb_engine::fulltext::FulltextLimits {
+        // The engine refuses (before decoding a single posting) a search that
+        // would examine more rows than the governor's remaining budget.
+        max_postings: ctx.governor.remaining_scan_budget(),
+        deadline: ctx.governor.deadline(),
+        defer_prefix_cap: ctx.rules.is_some(),
+    };
+    let candidates = ctx
         .db
-        .fulltext_search(
-            type_name,
-            field_name,
-            query_text,
-            k,
-            restrict,
-            ctx.governor.remaining_scan_budget(),
-        )
-        .map_err(|e| match e {
-            rhypedb_engine::EngineError::FulltextScanBudgetExceeded { .. } => {
-                QueryError::ResourceLimitExceeded(e.to_string())
-            }
-            other => QueryError::Engine(other),
-        })?;
-    ctx.governor.charge(result.postings_scanned)?;
-    let rows: Vec<(Object, RowScore)> = result
-        .hits
+        .fulltext_candidates(type_name, field_name, query_text, limits)
+        .map_err(|e| fulltext_error(ctx, e))?;
+    ctx.governor.charge(candidates.postings_scanned)?;
+    ctx.governor.charge(candidates.scoring_work())?;
+
+    let deadline = ctx.governor.deadline();
+    let hits = if ctx.rules.is_some() {
+        let mut ids = candidates.candidate_ids();
+        if let Some(set) = restrict {
+            ids.retain(|id| set.contains(id));
+        }
+        let visible = crate::authz::readable_ids(ctx, type_name, &ids)?;
+        ctx.governor.check_exhausted()?;
+        candidates.score_visible(&visible, k, deadline)
+    } else {
+        candidates.score(restrict, k, deadline)
+    }
+    .map_err(|e| fulltext_error(ctx, e))?;
+
+    // Only the `k` hits are loaded (a plain `get`: retired fields stripped).
+    let rows: Vec<(Object, RowScore)> = hits
         .iter()
         .filter_map(|hit| {
             ctx.db
@@ -995,6 +1079,29 @@ fn run_matches(
         })
         .collect();
     Ok(QueryOutput::Scored(rows))
+}
+
+/// Map a full-text engine error to the query layer. Budget and deadline refusals become the
+/// governor's own errors (naming the configured cap, not the remaining budget). Under rules an
+/// index-still-building error drops its progress counts, which cover documents the principal may
+/// not be able to read.
+fn fulltext_error(ctx: &ExecContext<'_>, e: rhypedb_engine::EngineError) -> QueryError {
+    use rhypedb_engine::EngineError;
+    match e {
+        EngineError::FulltextScanBudgetExceeded { .. } => match ctx.governor.rows_exceeded_error() {
+            QueryError::ResourceLimitExceeded(m) => QueryError::ResourceLimitExceeded(format!(
+                "{m} (a full-text search: use rarer terms or `+` required terms)"
+            )),
+            other => other,
+        },
+        EngineError::FulltextDeadlineExceeded { .. } => ctx.governor.deadline_error(),
+        EngineError::FulltextIndexBuilding { type_name, field, .. } if ctx.rules.is_some() => {
+            QueryError::InvalidArgument(format!(
+                "full-text index for '{type_name}.{field}' is still building; retry shortly"
+            ))
+        }
+        other => QueryError::Engine(other),
+    }
 }
 
 /// Read the type_name from any QueryOutput shape, without consuming it.
@@ -2616,22 +2723,67 @@ mod tests {
         let ctx = gov_ctx(&db, limits);
         let q = parse_query(r#"Post.matches(.title, "term", k: 100)"#).unwrap();
         assert_eq!(scored_ids(execute(&ctx, &q).unwrap()).len(), 2);
-        // Every posting examined (6 for `term`) is charged against the row budget.
-        let limits = crate::governor::GovernorLimits {
-            max_rows_scanned: 5,
-            ..crate::governor::GovernorLimits::UNLIMITED
+        // Every posting examined (6 for `term`) AND every clause's walk over
+        // them (6 more) is charged against the row budget.
+        let budget = |max_rows_scanned| {
+            gov_ctx(
+                &db,
+                crate::governor::GovernorLimits {
+                    max_rows_scanned,
+                    ..crate::governor::GovernorLimits::UNLIMITED
+                },
+            )
         };
-        let ctx = gov_ctx(&db, limits);
-        assert!(matches!(
-            execute(&ctx, &q),
-            Err(QueryError::ResourceLimitExceeded(_))
-        ));
+        for over in [5, 11] {
+            let err = execute(&budget(over), &q).unwrap_err();
+            // The refusal names the configured cap, never the remaining budget
+            // (which would disclose how many rows earlier steps examined).
+            assert!(
+                matches!(&err, QueryError::ResourceLimitExceeded(m) if m.contains(&format!("more than {over} rows"))),
+                "{err}"
+            );
+        }
+        assert_eq!(scored_ids(execute(&budget(12), &q).unwrap()).len(), 6);
+        // A phrase repeating one word is charged per repeat, not once, plus its position walk:
+        // postings 6 + decoded positions 6, walks 3 × 6, position walk Σtf₀ 6 × 2 = 42.
+        let repeated = parse_query(r#"Post.matches(.title, "\"term term term\"", k: 5)"#).unwrap();
+        assert!(matches!(execute(&budget(41), &repeated), Err(QueryError::ResourceLimitExceeded(_))));
+        assert!(execute(&budget(42), &repeated).is_ok());
+    }
+
+    #[test]
+    fn fulltext_writes_are_charged_per_analyzed_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = rhypedb_schema::parser::parse_schema(
+            "type Post { title: String @fulltext  note: String }",
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
         let limits = crate::governor::GovernorLimits {
-            max_rows_scanned: 6,
-            ..crate::governor::GovernorLimits::UNLIMITED
+            max_rows_scanned: 100,
+            ..crate::governor::GovernorLimits::DEFAULT
         };
-        let ctx = gov_ctx(&db, limits);
-        assert_eq!(scored_ids(execute(&ctx, &q).unwrap()).len(), 6);
+        let run = |q: &str| {
+            let mut ctx = ExecContext::new(&db, None);
+            ctx.governor = Governor::new(limits, std::time::Instant::now());
+            execute(&ctx, &crate::parser::parse_query(q).unwrap())
+        };
+        let words = |n: usize| vec!["w"; n].join(" ");
+        // Under the budget: indexed. Over it: refused before the write.
+        assert!(run(&format!(r#"Post.create({{ title: "{}" }})"#, words(90))).is_ok());
+        let err = run(&format!(r#"Post.create({{ title: "{}" }})"#, words(150))).unwrap_err();
+        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "{err}");
+        // A non-@fulltext field costs nothing extra.
+        assert!(run(&format!(r#"Post.create({{ note: "{}" }})"#, words(150))).is_ok());
+        // A batch sums its rows' words; an update multiplies by rows touched.
+        let batch = format!(r#"Post.create_batch([{{ title: "{0}" }}, {{ title: "{0}" }}])"#, words(60));
+        assert!(matches!(run(&batch), Err(QueryError::ResourceLimitExceeded(_))));
+        assert!(run(r#"Post.filter(.title == "w").update({ title: "a b" })"#).is_ok());
+        let n = match run("Post").unwrap() {
+            QueryOutput::Objects(o) => o.len(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(n, 2, "the refused create and batch wrote nothing");
     }
 
     #[test]

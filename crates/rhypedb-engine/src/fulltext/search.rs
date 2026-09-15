@@ -26,6 +26,7 @@
 //! would let a rare misspelling among the expansions dominate with a huge
 //! idf (Lucene's `SCORING_BOOLEAN_REWRITE` pathology).
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 
 use super::posting::Posting;
@@ -52,6 +53,25 @@ pub struct CorpusStats {
 /// Posting list for one term: `(object_id, posting)`, any order.
 pub type PostingList = Vec<(u64, Posting)>;
 
+/// What a `restrict` set means to [`score_query_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestrictScope {
+    /// Rank only documents in the set; term statistics (`df`) still count
+    /// every posting — a filter narrowing the candidates, not the corpus.
+    RankOnly,
+    /// The set IS the corpus: `df` counts only its documents (and the caller's
+    /// `stats` must describe the same documents). Nothing outside the set can
+    /// move a score.
+    Corpus,
+}
+
+/// Scoring ran past its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineExceeded;
+
+/// Documents scored between deadline checks.
+const DEADLINE_CHECK_EVERY: usize = 1024;
+
 /// Score `query` and return the top `k` hits (score desc, id asc).
 ///
 /// `postings` maps every distinct term of the query to its posting list (a
@@ -59,16 +79,43 @@ pub type PostingList = Vec<(u64, Posting)>;
 /// limits candidates to that id set — applied BEFORE the top-k cut so the
 /// caller gets `k` results from within the set, not `k` minus the
 /// filtered-out ones.
-pub fn score_query(
+pub fn score_query<L: Borrow<PostingList>>(
     query: &ParsedQuery,
-    postings: &HashMap<&str, PostingList>,
+    postings: &HashMap<&str, L>,
     stats: CorpusStats,
     restrict: Option<&HashSet<u64>>,
     k: usize,
 ) -> Vec<FulltextHit> {
+    score_query_with(query, postings, stats, restrict, RestrictScope::RankOnly, k, None)
+        .expect("no deadline")
+}
+
+/// [`score_query`] with a [`RestrictScope`] and a deadline checked every
+/// [`DEADLINE_CHECK_EVERY`] documents (phrase matching walks positions, so
+/// one query's scoring is otherwise unbounded in time).
+pub fn score_query_with<L: Borrow<PostingList>>(
+    query: &ParsedQuery,
+    postings: &HashMap<&str, L>,
+    stats: CorpusStats,
+    restrict: Option<&HashSet<u64>>,
+    scope: RestrictScope,
+    k: usize,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<FulltextHit>, DeadlineExceeded> {
     if k == 0 || stats.doc_count == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+    let allowed = |id: u64| restrict.is_none_or(|set| set.contains(&id));
+    let mut visited = 0usize;
+    let mut tick = move || -> Result<(), DeadlineExceeded> {
+        visited += 1;
+        if visited.is_multiple_of(DEADLINE_CHECK_EVERY)
+            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Err(DeadlineExceeded);
+        }
+        Ok(())
+    };
     let required_count = query.clauses.iter().filter(|c| c.required).count() as u32;
 
     // idf per term. `N` is clamped to at least df: the in-memory doc count
@@ -79,7 +126,13 @@ pub fn score_query(
         .distinct_terms()
         .into_iter()
         .map(|t| {
-            let df = postings.get(t).map_or(0, |p| p.len()) as f64;
+            let df = postings.get(t).map_or(0, |p| {
+                let list = p.borrow();
+                match scope {
+                    RestrictScope::RankOnly => list.len(),
+                    RestrictScope::Corpus => list.iter().filter(|(id, _)| allowed(*id)).count(),
+                }
+            }) as f64;
             let n = (stats.doc_count as f64).max(df);
             (t, (1.0 + (n - df + 0.5) / (df + 0.5)).ln() as f32)
         })
@@ -94,7 +147,6 @@ pub fn score_query(
         let dl = p.doc_len as f32;
         tf * (BM25_K1 + 1.0) / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl))
     };
-    let allowed = |id: u64| restrict.is_none_or(|set| set.contains(&id));
 
     #[derive(Default)]
     struct Acc {
@@ -110,14 +162,29 @@ pub fn score_query(
         }
     };
 
+    // id → posting lookups for phrase words, built ONCE per distinct word and
+    // shared by every phrase (and every repeat inside one) that uses it: a
+    // map per phrase position let `"x x x … x"` allocate repeats × df.
+    let mut phrase_maps: HashMap<&str, HashMap<u64, &Posting>> = HashMap::new();
+    for clause in query.clauses.iter().filter(|c| c.is_phrase()) {
+        for t in &clause.terms {
+            if let Some(list) = postings.get(t.as_str()) {
+                phrase_maps
+                    .entry(t.as_str())
+                    .or_insert_with(|| list.borrow().iter().map(|(id, p)| (*id, p)).collect());
+            }
+        }
+    }
+
     for clause in &query.clauses {
         if clause.is_phrase() {
-            score_phrase(clause, postings, &idf, &tfnorm, &allowed, &mut add);
+            score_phrase(clause, &phrase_maps, &idf, &tfnorm, &allowed, &mut add, &mut tick)?;
         } else {
             let term = clause.terms[0].as_str();
-            let list = postings.get(term).unwrap_or(&empty);
+            let list: &PostingList = postings.get(term).map_or(&empty, |l| l.borrow());
             let w = idf[term];
             for (id, p) in list {
+                tick()?;
                 if allowed(*id) {
                     add(*id, w * tfnorm(p), clause);
                 }
@@ -139,7 +206,7 @@ pub fn score_query(
             .then_with(|| a.object_id.cmp(&b.object_id))
     });
     hits.truncate(k);
-    hits
+    Ok(hits)
 }
 
 /// Phrase clause: a document matches when every term is present and some
@@ -151,27 +218,27 @@ pub fn score_query(
 /// position lists.
 fn score_phrase(
     clause: &Clause,
-    postings: &HashMap<&str, PostingList>,
+    phrase_maps: &HashMap<&str, HashMap<u64, &Posting>>,
     idf: &HashMap<&str, f32>,
     tfnorm: &dyn Fn(&Posting) -> f32,
     allowed: &dyn Fn(u64) -> bool,
     add: &mut dyn FnMut(u64, f32, &Clause),
-) {
-    // Per-term id → posting lookups; drive from the shortest list.
-    let mut maps: Vec<HashMap<u64, &Posting>> = Vec::with_capacity(clause.terms.len());
+    tick: &mut dyn FnMut() -> Result<(), DeadlineExceeded>,
+) -> Result<(), DeadlineExceeded> {
+    // Each position's shared id → posting lookup; drive from the shortest.
+    let mut maps: Vec<&HashMap<u64, &Posting>> = Vec::with_capacity(clause.terms.len());
     for t in &clause.terms {
-        let Some(list) = postings.get(t.as_str()) else {
-            return; // a term with no postings → the phrase matches nothing
+        let Some(m) = phrase_maps.get(t.as_str()) else {
+            return Ok(()); // a term with no postings → the phrase matches nothing
         };
-        maps.push(list.iter().map(|(id, p)| (*id, p)).collect());
+        maps.push(m);
     }
-    let (driver_idx, _) = maps
+    let driver = *maps
         .iter()
-        .enumerate()
-        .min_by_key(|(_, m)| m.len())
+        .min_by_key(|m| m.len())
         .expect("phrase has ≥ 2 terms");
-    let driver: Vec<u64> = maps[driver_idx].keys().copied().collect();
-    'docs: for id in driver {
+    'docs: for &id in driver.keys() {
+        tick()?;
         if !allowed(id) {
             continue;
         }
@@ -212,6 +279,7 @@ fn score_phrase(
             add(id, contribution, clause);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

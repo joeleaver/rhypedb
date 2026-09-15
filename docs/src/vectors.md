@@ -168,6 +168,8 @@ Post.filter(.published == true).similar(.embedding, "rust async", k: 10)
 
 Every `.similar` result is **ranked** and each carries a `score`, read as `Row.score`: the index's distance under the field's metric (**lower** is closer), with results nearest-first. When [cross-encoder reranking](#cross-encoder-reranking) is on and the reranker scored a row, that row additionally carries `rerank_score` (**higher** is more relevant) and the scored rows come back most-relevant-first; `score` stays the distance, so the two never share a column. Rows the cross-encoder could not score (a raw-vector query, the reranker failed to load, or the object has no readable source text) have no `rerank_score`; see [Ranked results](queries.md#ranked-results) for the exact rules. See [Ranked results](queries.md#ranked-results) and, for keyword search over the same objects, [`.matches`](queries.md#full-text-search--matchesfield-query-k-n).
 
+**Under security rules** `.similar` searches only rows the caller may read. A bare `Type.similar(...)` lists the type and checks each row against the `read` rule before searching, so it is subject to the governor's scan budget like any listing — on a large type, narrow first with an indexed filter (`Post.filter(.ownerUid == "u1").similar(...)`). Up to 10 000 readable candidates are searched exactly; beyond that the approximate index is filtered to the readable set, which (as for any large filter) can return fewer than `k` rows.
+
 ## Tuning recall vs. latency
 
 Three knobs trade accuracy for speed:

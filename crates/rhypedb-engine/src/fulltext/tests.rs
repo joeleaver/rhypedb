@@ -703,7 +703,7 @@ fn a_build_resumes_from_the_persisted_cursor() {
             cursor: 450,
             positions: true,
             stale_generations: false,
-            analyzer: "simple".into(),
+            analyzer: crate::fulltext::Analyzer::Simple.definition().into(),
         };
         let mut txn = db.storage().begin_txn();
         db.storage()
@@ -968,7 +968,7 @@ fn english_stop_words_never_reach_the_index_and_queries_drop_them() {
 }
 
 /// An `english` index built before stop-word removal (issue #20) records the
-/// analyzer as plain `"english"`; the definition is now `"english/2"`, so
+/// analyzer as plain `"english"`; the definition has moved on since, so
 /// opening it must rebuild into a new generation — otherwise queries (which
 /// drop stop words) would silently disagree with the index (which kept them).
 #[test]
@@ -1005,7 +1005,7 @@ fn english_index_from_before_stop_words_is_rebuilt_on_open() {
     let m = markers(&db).into_iter().find(|(k, _)| k.1 == field_id).unwrap().1;
     assert_eq!(
         (m.generation, m.analyzer.as_str(), m.stale_generations, m.state),
-        (1, "english/2", false, crate::fulltext::BuildState::Built)
+        (1, crate::fulltext::Analyzer::English.definition(), false, crate::fulltext::BuildState::Built)
     );
     // One generation's rows only, stop words gone: hous + i per doc.
     assert_eq!(raw_rows(&db, "title"), (100, 50));
@@ -1028,7 +1028,7 @@ fn switching_the_analyzer_bumps_the_generation_and_rebuilds() {
         assert!(ids(&db, "title", "camera", 10).is_empty(), "simple: no stemming");
         assert_eq!(ids(&db, "title", "cameras", 1000).len(), 300);
         let m = markers(&db).into_iter().find(|(k, _)| k.1 == db.field_ids()["Note.title"]).unwrap().1;
-        assert_eq!((m.generation, m.analyzer.as_str()), (0, "simple"));
+        assert_eq!((m.generation, m.analyzer.as_str()), (0, "simple/2"));
     }
     // Reopen as english: new generation, backfill through the builder, sweep.
     let db = open_sdl(&dir, ENGLISH);
@@ -1184,4 +1184,166 @@ fn prefix_expansion_cap_and_syntax_errors_are_clear() {
     // A prefix on a positions:false field is fine (no positions needed).
     note(&db, "x", "camera", "pf");
     assert_eq!(ids(&db, "body", "cam*", 10).len(), 1);
+}
+
+/// `score_visible` ranks as if invisible documents did not exist: a visible
+/// document's score, the rows under `k`, and the prefix-expansion cap are
+/// identical whether or not invisible documents contain the query terms.
+#[test]
+fn score_visible_ignores_invisible_documents_entirely() {
+    use crate::fulltext::FulltextLimits;
+    let deferred = FulltextLimits { defer_prefix_cap: true, ..Default::default() };
+    let visible_hits = |db: &Database, q: &str, visible: &HashSet<u64>, k: usize| {
+        db.fulltext_candidates("Note", "title", q, deferred)
+            .unwrap()
+            .score_visible(visible, k, None)
+            .map(|hits| hits.into_iter().map(|h| (h.object_id, h.score)).collect::<Vec<_>>())
+    };
+
+    // Two databases whose VISIBLE documents are identical; one also holds
+    // invisible documents full of the query terms.
+    let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (clean, noisy) = (open(&d1), open(&d2));
+    let mine_clean = [note(&clean, "zebra crossing", "x", "a"), note(&clean, "quiet street", "x", "b")];
+    let mine_noisy = [note(&noisy, "zebra crossing", "x", "a"), note(&noisy, "quiet street", "x", "b")];
+    assert_eq!(mine_clean, mine_noisy, "same ids, so results compare directly");
+    for i in 0..5 {
+        note(&noisy, "zebra zebra zebra", "x", &format!("secret{i}"));
+    }
+    for i in 0..crate::fulltext::MAX_PREFIX_EXPANSION {
+        note(&noisy, &format!("zq{i:03}"), "x", &format!("pfx{i}"));
+    }
+    let visible: HashSet<u64> = mine_clean.into_iter().collect();
+
+    // Scores + k: the invisible zebras neither change the BM25 score nor
+    // crowd the one visible match out of `k: 1`.
+    for (q, k) in [("zebra", 1), ("zebra quiet", 10), ("+zebra crossing", 5), ("\"zebra crossing\"", 3)] {
+        assert_eq!(
+            visible_hits(&noisy, q, &visible, k).unwrap(),
+            visible_hits(&clean, q, &visible, k).unwrap(),
+            "{q:?}"
+        );
+    }
+    assert_eq!(visible_hits(&noisy, "zebra", &visible, 1).unwrap().len(), 1);
+    // …while the unrestricted ranking over the same postings does see them.
+    let all = noisy.fulltext_candidates("Note", "title", "zebra", deferred).unwrap();
+    assert_ne!(all.score(None, 1, None).unwrap()[0].object_id, mine_noisy[0]);
+
+    // The prefix cap counts only terms in visible documents: 64 invisible
+    // `zq…` terms don't make `zq*` an error for someone who can't see them…
+    assert_eq!(visible_hits(&noisy, "zq*", &visible, 10).unwrap(), vec![]);
+    // …but undeferred (and unrestricted) it is still refused.
+    note(&noisy, "zq999", "x", "pfx-last");
+    assert!(matches!(
+        noisy.fulltext_search("Note", "title", "zq*", 10, None, None),
+        Err(EngineError::FulltextQuery(_))
+    ));
+    // Visible terms still count toward the deferred cap.
+    let every: HashSet<u64> = noisy.fulltext_candidates("Note", "title", "zq*", deferred).unwrap().candidate_ids().into_iter().collect();
+    assert!(matches!(visible_hits(&noisy, "zq*", &every, 10), Err(EngineError::FulltextQuery(_))));
+}
+
+#[test]
+fn candidate_scan_charges_tombstones_and_honours_the_deadline() {
+    use crate::fulltext::FulltextLimits;
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let keep = note(&db, "needle", "x", "keep");
+    let doomed: Vec<u64> = (0..50).map(|i| note(&db, "needle", "x", &format!("d{i}"))).collect();
+    for id in doomed {
+        db.delete("Note", id).unwrap();
+    }
+    // Tombstoned postings are examined work: charged, and budgeted.
+    let c = db.fulltext_candidates("Note", "title", "needle", FulltextLimits::default()).unwrap();
+    assert_eq!(c.candidate_ids(), vec![keep]);
+    assert!(c.postings_scanned > 1, "tombstones counted: {}", c.postings_scanned);
+    let tight = FulltextLimits { max_postings: Some(10), ..Default::default() };
+    assert!(matches!(
+        db.fulltext_candidates("Note", "title", "needle", tight),
+        Err(EngineError::FulltextScanBudgetExceeded { .. })
+    ));
+    // A passed deadline fails closed before scanning.
+    let late = FulltextLimits {
+        deadline: Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+        ..Default::default()
+    };
+    assert!(matches!(
+        db.fulltext_candidates("Note", "title", "needle", late),
+        Err(EngineError::FulltextDeadlineExceeded { .. })
+    ));
+    // Scoring work counts every clause's walk of its postings.
+    let c = db.fulltext_candidates("Note", "title", "needle needle \"needle x\"", FulltextLimits::default()).unwrap();
+    assert!(c.scoring_work() >= 2, "{}", c.scoring_work());
+}
+
+#[test]
+fn deferred_prefix_cap_still_has_an_absolute_scan_ceiling() {
+    use crate::fulltext::{FulltextLimits, MAX_PREFIX_EXPANSION_SCAN};
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    for i in 0..=MAX_PREFIX_EXPANSION_SCAN {
+        note(&db, &format!("qq{i:05}"), "x", &format!("k{i}"));
+    }
+    // No posting budget, no deadline (the governor-off shape): the deferred
+    // scan is still refused past the absolute ceiling.
+    let deferred = FulltextLimits { defer_prefix_cap: true, ..Default::default() };
+    assert!(matches!(
+        db.fulltext_candidates("Note", "title", "qq*", deferred),
+        Err(EngineError::FulltextQuery(ref m)) if m.contains("\"qq*\"")
+    ));
+    // A narrower prefix under the ceiling scans (100 terms: past the visible cap of 64).
+    assert!(db.fulltext_candidates("Note", "title", "qq001*", deferred).is_ok());
+}
+
+/// Phrase matching walks positions: the scan charges decoded positions before decoding
+/// them, `scoring_work` charges the walk (Σ tf₀ × (words − 1)), and scoring stops at the
+/// deadline — so many phrases over high-frequency documents can't run unbudgeted.
+#[test]
+fn phrase_position_work_is_charged_and_deadline_bounded() {
+    use crate::fulltext::FulltextLimits;
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let body = "a ".repeat(2000) + &"b ".repeat(2000);
+    for i in 0..3 {
+        note(&db, &body, "x", &format!("t{i}"));
+    }
+    // 3 postings for `b` + 3 for `a`, plus 2000 positions each for the phrase words.
+    let c = db.fulltext_candidates("Note", "title", "\"b a\"", FulltextLimits::default()).unwrap();
+    assert!(c.postings_scanned >= 6 + 6 * 2000, "positions charged: {}", c.postings_scanned);
+    // The scan refuses before decoding past the budget.
+    let tight = FulltextLimits { max_postings: Some(4000), ..Default::default() };
+    assert!(matches!(
+        db.fulltext_candidates("Note", "title", "\"b a\"", tight),
+        Err(EngineError::FulltextScanBudgetExceeded { .. })
+    ));
+    // Each repeated phrase clause is charged its own position walk.
+    let one = db.fulltext_candidates("Note", "title", "\"b a\"", FulltextLimits::default()).unwrap().scoring_work();
+    let four = db
+        .fulltext_candidates("Note", "title", "\"b a\" \"b a\" \"b a\" \"b a\"", FulltextLimits::default())
+        .unwrap()
+        .scoring_work();
+    assert!(one >= 3 * 2000 && four >= 4 * one - 8, "{one} {four}");
+    // A passed deadline stops scoring.
+    let many: Vec<u64> = (0..2000).map(|i| note(&db, "b a", "x", &format!("m{i}"))).collect();
+    assert_eq!(many.len(), 2000);
+    let c = db.fulltext_candidates("Note", "title", "\"b a\"", FulltextLimits::default()).unwrap();
+    let past = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+    assert!(matches!(c.score(None, 10, past), Err(EngineError::FulltextDeadlineExceeded { .. })));
+    assert_eq!(c.score(None, 10, None).unwrap().len(), 10);
+}
+
+#[test]
+fn stored_words_measure_what_a_delete_or_update_will_tombstone() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let a = note(&db, "one two three", "four five", "a");
+    let b = note(&db, "six", "seven eight", "b");
+    assert_eq!(db.fulltext_stored_words("Note", &[a], None).unwrap(), 5);
+    assert_eq!(db.fulltext_stored_words("Note", &[a, b], None).unwrap(), 8);
+    // Only the fields an update touches.
+    let only_title = fields(&[("title", s("x"))]);
+    assert_eq!(db.fulltext_stored_words("Note", &[a, b], Some(&only_title)).unwrap(), 4);
+    let non_ft = fields(&[("n", Value::I64(2))]);
+    assert_eq!(db.fulltext_stored_words("Note", &[a], Some(&non_ft)).unwrap(), 0);
+    assert_eq!(db.fulltext_stored_words("Owner", &[a], None).unwrap(), 0);
 }

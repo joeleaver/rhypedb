@@ -2,6 +2,10 @@
 
 This page covers running and operating a `rhypedb-server` in practice: configuration, the data directory, authentication, hot reload, compaction, and monitoring.
 
+## Upgrading
+
+Opening a database with a release that changes what an analyzer does rebuilds every `@fulltext` index in the background, into a fresh generation. `.matches` on a field reports it as still building until its rebuild finishes (`GET /status` shows the progress); everything else, including writes, is unaffected, and nothing is lost. The 0.1 release that added the per-value word cap (`simple/2`, `english/3`) is such a change, so plan for search on a large corpus to be briefly unavailable after that upgrade.
+
 ## Starting the server
 
 ```bash

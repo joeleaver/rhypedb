@@ -29,6 +29,7 @@
 
 pub mod analyzer;
 pub mod build;
+pub mod candidates;
 pub mod posting;
 pub mod query;
 pub mod search;
@@ -37,10 +38,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use analyzer::{Analyzer, MAX_TERM_BYTES, Token};
+pub use analyzer::{Analyzer, MAX_ANALYZED_WORDS, MAX_TERM_BYTES, Token};
 pub use posting::Posting;
 pub use query::{Clause, MIN_PREFIX_CHARS, ParsedQuery, QuerySyntaxError};
 pub use build::{BuildProgress, BuildState, FulltextIndexStatus};
+pub use candidates::FulltextCandidates;
 pub use search::{CorpusStats, FulltextHit};
 
 #[cfg(test)]
@@ -186,6 +188,15 @@ pub fn encode_term_prefix(prefix: &str) -> Vec<u8> {
 /// two-letter prefix into a scan of half the index.
 pub const MAX_PREFIX_EXPANSION: usize = 64;
 
+/// Absolute ceiling on distinct indexed terms a prefix scan walks when the
+/// [`MAX_PREFIX_EXPANSION`] cap is DEFERRED to scoring
+/// (`FulltextLimits::defer_prefix_cap`, used under security rules). The
+/// deferred cap counts only visible terms, so without this the scan itself
+/// would be bounded by nothing but the posting budget — and by nothing at all
+/// with the governor off. Refusing past it depends on hidden terms too, but
+/// only at a threshold 16× the visible cap.
+pub const MAX_PREFIX_EXPANSION_SCAN: usize = 1024;
+
 /// Value of an `l:` row: the document's token count as a varint.
 pub fn encode_doc_len(doc_len: u32) -> bytes::Bytes {
     let mut out = Vec::with_capacity(5);
@@ -228,6 +239,24 @@ pub fn stage_doc_puts(
         rhypedb_storage::key::KeyBuilder::fulltext_doc(type_id, ff.field_id, ff.generation, object_id),
         encode_doc_len(doc.doc_len),
     ));
+}
+
+/// Work limits for collecting a query's postings
+/// (`Database::fulltext_candidates`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FulltextLimits {
+    /// Posting rows (tombstones included) the scan may examine; past it the
+    /// scan fails closed with `FulltextScanBudgetExceeded` before decoding.
+    pub max_postings: Option<u64>,
+    /// Wall-clock deadline, checked before every scan chunk; past it the scan
+    /// fails closed with `FulltextDeadlineExceeded`.
+    pub deadline: Option<std::time::Instant>,
+    /// Keep each prefix expansion unmerged and apply the
+    /// [`MAX_PREFIX_EXPANSION`] cap at scoring instead of during the scan, so
+    /// `FulltextCandidates::score_visible` can count only terms that occur in
+    /// visible documents. The scan is then bounded by `max_postings` and the
+    /// absolute [`MAX_PREFIX_EXPANSION_SCAN`] ceiling.
+    pub defer_prefix_cap: bool,
 }
 
 /// Result of a full-text search: the ranked hits plus how many posting rows

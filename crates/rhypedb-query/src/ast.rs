@@ -109,6 +109,16 @@ pub enum Step {
     },
 }
 
+impl Step {
+    /// A mutation step (update / delete / link / unlink), gated by the write rules.
+    pub fn is_write(&self) -> bool {
+        matches!(
+            self,
+            Step::Update { .. } | Step::Delete | Step::Link { .. } | Step::Unlink { .. }
+        )
+    }
+}
+
 /// A filter predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Predicate {

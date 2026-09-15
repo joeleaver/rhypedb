@@ -23,6 +23,13 @@ use unicode_segmentation::UnicodeSegmentation;
 /// space. Same cap as Lucene's `StandardAnalyzer` (255).
 pub const MAX_TERM_BYTES: usize = 255;
 
+/// Most words analyzed from one value; the rest of the text is not indexed
+/// (Lucene's `LimitTokenCountAnalyzer`). Indexing cost and the write's memory
+/// grow with the word count, so an unbounded value let one create of a large
+/// field burn seconds and gigabytes. 65 536 words is several hundred KB of
+/// prose — past any title, description or article body worth ranking.
+pub const MAX_ANALYZED_WORDS: usize = 65_536;
+
 /// One indexed term with its position in the token stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
@@ -156,13 +163,16 @@ impl Analyzer {
     /// existing analyzer's behaviour without one; the index would silently
     /// stop matching the query side.
     ///
-    /// * `simple`: unchanged since it shipped.
     /// * `english/2`: `english` gained stop-word removal (issue #20). A
     ///   marker that says plain `english` is a #17-era index.
+    /// * `simple/2`, `english/3`: both stop after [`MAX_ANALYZED_WORDS`]
+    ///   words. An index built before the cap may hold postings past it that
+    ///   an update or delete (which re-analyzes the old value) would no
+    ///   longer find to remove, so it is rebuilt.
     pub fn definition(self) -> &'static str {
         match self {
-            Self::Simple => "simple",
-            Self::English => "english/2",
+            Self::Simple => "simple/2",
+            Self::English => "english/3",
         }
     }
 
@@ -187,12 +197,13 @@ impl Analyzer {
 
 /// Split `text` into UAX#29 words, fold each one into its term with `fold`
 /// (`None` = a stop word), and stamp positions. Shared by every analyzer so
-/// the position and length-cap rules can never drift between them.
+/// the position and length-cap rules can never drift between them. Stops
+/// after [`MAX_ANALYZED_WORDS`] words.
 fn analyze_words(text: &str, fold: impl Fn(&str) -> Option<String>) -> Analyzed {
     let mut out = Vec::new();
     let mut stop_words_dropped = 0u32;
     let mut position: u32 = 0;
-    for word in text.unicode_words() {
+    for word in text.unicode_words().take(MAX_ANALYZED_WORDS) {
         let term = fold(word);
         // Position is consumed whether or not the term is kept, so phrase
         // adjacency in the source text is preserved around a dropped token —
@@ -587,12 +598,24 @@ mod tests {
 
     #[test]
     fn definitions_version_behaviour_changes() {
-        assert_eq!(Analyzer::Simple.definition(), "simple");
-        assert_eq!(Analyzer::English.definition(), "english/2");
+        assert_eq!(Analyzer::Simple.definition(), "simple/2");
+        assert_eq!(Analyzer::English.definition(), "english/3");
         // The definition starts with the SDL name, so a marker is readable.
         for a in [Analyzer::Simple, Analyzer::English] {
             assert!(a.definition().starts_with(a.name()));
         }
+    }
+
+    #[test]
+    fn analysis_stops_after_the_word_cap() {
+        let text = "w ".repeat(MAX_ANALYZED_WORDS + 10) + "tail";
+        let tokens = Analyzer::Simple.analyze(&text);
+        assert_eq!(tokens.len(), MAX_ANALYZED_WORDS);
+        assert_eq!(tokens.last().unwrap().position as usize, MAX_ANALYZED_WORDS - 1);
+        assert!(!tokens.iter().any(|t| t.term == "tail"));
+        // Dropped words count toward the cap like kept ones (positions).
+        let en = "the ".repeat(MAX_ANALYZED_WORDS) + "house";
+        assert!(Analyzer::English.analyze(&en).is_empty());
     }
 
     fn terms_of(tokens: &[Token]) -> Vec<String> {
