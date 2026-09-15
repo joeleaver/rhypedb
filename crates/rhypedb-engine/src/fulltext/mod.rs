@@ -29,6 +29,7 @@
 
 pub mod analyzer;
 pub mod build;
+pub mod candidates;
 pub mod posting;
 pub mod query;
 pub mod search;
@@ -41,6 +42,7 @@ pub use analyzer::{Analyzer, MAX_TERM_BYTES, Token};
 pub use posting::Posting;
 pub use query::{Clause, MIN_PREFIX_CHARS, ParsedQuery, QuerySyntaxError};
 pub use build::{BuildProgress, BuildState, FulltextIndexStatus};
+pub use candidates::FulltextCandidates;
 pub use search::{CorpusStats, FulltextHit};
 
 #[cfg(test)]
@@ -228,6 +230,23 @@ pub fn stage_doc_puts(
         rhypedb_storage::key::KeyBuilder::fulltext_doc(type_id, ff.field_id, ff.generation, object_id),
         encode_doc_len(doc.doc_len),
     ));
+}
+
+/// Work limits for collecting a query's postings
+/// (`Database::fulltext_candidates`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FulltextLimits {
+    /// Posting rows (tombstones included) the scan may examine; past it the
+    /// scan fails closed with `FulltextScanBudgetExceeded` before decoding.
+    pub max_postings: Option<u64>,
+    /// Wall-clock deadline, checked before every scan chunk; past it the scan
+    /// fails closed with `FulltextDeadlineExceeded`.
+    pub deadline: Option<std::time::Instant>,
+    /// Keep each prefix expansion unmerged and apply the
+    /// [`MAX_PREFIX_EXPANSION`] cap at scoring instead of during the scan, so
+    /// `FulltextCandidates::score_visible` can count only terms that occur in
+    /// visible documents. The scan is then bounded by `max_postings` alone.
+    pub defer_prefix_cap: bool,
 }
 
 /// Result of a full-text search: the ranked hits plus how many posting rows

@@ -1185,3 +1185,93 @@ fn prefix_expansion_cap_and_syntax_errors_are_clear() {
     note(&db, "x", "camera", "pf");
     assert_eq!(ids(&db, "body", "cam*", 10).len(), 1);
 }
+
+/// `score_visible` ranks as if invisible documents did not exist: a visible
+/// document's score, the rows under `k`, and the prefix-expansion cap are
+/// identical whether or not invisible documents contain the query terms.
+#[test]
+fn score_visible_ignores_invisible_documents_entirely() {
+    use crate::fulltext::FulltextLimits;
+    let deferred = FulltextLimits { defer_prefix_cap: true, ..Default::default() };
+    let visible_hits = |db: &Database, q: &str, visible: &HashSet<u64>, k: usize| {
+        db.fulltext_candidates("Note", "title", q, deferred)
+            .unwrap()
+            .score_visible(visible, k)
+            .map(|hits| hits.into_iter().map(|h| (h.object_id, h.score)).collect::<Vec<_>>())
+    };
+
+    // Two databases whose VISIBLE documents are identical; one also holds
+    // invisible documents full of the query terms.
+    let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let (clean, noisy) = (open(&d1), open(&d2));
+    let mine_clean = [note(&clean, "zebra crossing", "x", "a"), note(&clean, "quiet street", "x", "b")];
+    let mine_noisy = [note(&noisy, "zebra crossing", "x", "a"), note(&noisy, "quiet street", "x", "b")];
+    assert_eq!(mine_clean, mine_noisy, "same ids, so results compare directly");
+    for i in 0..5 {
+        note(&noisy, "zebra zebra zebra", "x", &format!("secret{i}"));
+    }
+    for i in 0..crate::fulltext::MAX_PREFIX_EXPANSION {
+        note(&noisy, &format!("zq{i:03}"), "x", &format!("pfx{i}"));
+    }
+    let visible: HashSet<u64> = mine_clean.into_iter().collect();
+
+    // Scores + k: the invisible zebras neither change the BM25 score nor
+    // crowd the one visible match out of `k: 1`.
+    for (q, k) in [("zebra", 1), ("zebra quiet", 10), ("+zebra crossing", 5), ("\"zebra crossing\"", 3)] {
+        assert_eq!(
+            visible_hits(&noisy, q, &visible, k).unwrap(),
+            visible_hits(&clean, q, &visible, k).unwrap(),
+            "{q:?}"
+        );
+    }
+    assert_eq!(visible_hits(&noisy, "zebra", &visible, 1).unwrap().len(), 1);
+    // …while the unrestricted ranking over the same postings does see them.
+    let all = noisy.fulltext_candidates("Note", "title", "zebra", deferred).unwrap();
+    assert_ne!(all.score(None, 1).unwrap()[0].object_id, mine_noisy[0]);
+
+    // The prefix cap counts only terms in visible documents: 64 invisible
+    // `zq…` terms don't make `zq*` an error for someone who can't see them…
+    assert_eq!(visible_hits(&noisy, "zq*", &visible, 10).unwrap(), vec![]);
+    // …but undeferred (and unrestricted) it is still refused.
+    note(&noisy, "zq999", "x", "pfx-last");
+    assert!(matches!(
+        noisy.fulltext_search("Note", "title", "zq*", 10, None, None),
+        Err(EngineError::FulltextQuery(_))
+    ));
+    // Visible terms still count toward the deferred cap.
+    let every: HashSet<u64> = noisy.fulltext_candidates("Note", "title", "zq*", deferred).unwrap().candidate_ids().into_iter().collect();
+    assert!(matches!(visible_hits(&noisy, "zq*", &every, 10), Err(EngineError::FulltextQuery(_))));
+}
+
+#[test]
+fn candidate_scan_charges_tombstones_and_honours_the_deadline() {
+    use crate::fulltext::FulltextLimits;
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    let keep = note(&db, "needle", "x", "keep");
+    let doomed: Vec<u64> = (0..50).map(|i| note(&db, "needle", "x", &format!("d{i}"))).collect();
+    for id in doomed {
+        db.delete("Note", id).unwrap();
+    }
+    // Tombstoned postings are examined work: charged, and budgeted.
+    let c = db.fulltext_candidates("Note", "title", "needle", FulltextLimits::default()).unwrap();
+    assert_eq!(c.candidate_ids(), vec![keep]);
+    assert!(c.postings_scanned > 1, "tombstones counted: {}", c.postings_scanned);
+    let tight = FulltextLimits { max_postings: Some(10), ..Default::default() };
+    assert!(matches!(
+        db.fulltext_candidates("Note", "title", "needle", tight),
+        Err(EngineError::FulltextScanBudgetExceeded { .. })
+    ));
+    // A passed deadline fails closed before scanning.
+    let late = FulltextLimits {
+        deadline: Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+        ..Default::default()
+    };
+    assert!(matches!(
+        db.fulltext_candidates("Note", "title", "needle", late),
+        Err(EngineError::FulltextDeadlineExceeded { .. })
+    ));
+    // Scoring work counts every clause's walk of its postings.
+    let c = db.fulltext_candidates("Note", "title", "needle needle \"needle x\"", FulltextLimits::default()).unwrap();
+    assert!(c.scoring_work() >= 2, "{}", c.scoring_work());
+}

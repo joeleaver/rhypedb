@@ -8638,28 +8638,9 @@ impl Database {
     /// `"a phrase"`, `prefix*`, see [`crate::fulltext::query`]); results are
     /// the top `k` by BM25 (score desc, id asc). `restrict`, when given,
     /// limits the candidates to that id set BEFORE the top-k cut. Reads one
-    /// snapshot.
-    ///
-    /// A prefix clause expands to every indexed term starting with the
-    /// prefix (one range scan) and is scored as a single term over the
-    /// merged postings; more than
-    /// [`MAX_PREFIX_EXPANSION`](crate::fulltext::MAX_PREFIX_EXPANSION)
-    /// distinct terms is an [`EngineError::FulltextQuery`] asking for a
-    /// longer prefix. Its rows count against `max_postings` like any other.
-    ///
-    /// `max_postings`, when given, caps the posting rows the search may
-    /// examine across all its terms: the check runs after each term's prefix
-    /// scan and BEFORE any posting is decoded, so a stop-word query over a
-    /// huge corpus fails closed with
-    /// [`EngineError::FulltextScanBudgetExceeded`] instead of materializing
-    /// every posting (the scan itself hands back zero-copy slices; decoding
-    /// is where the per-posting allocation happens).
-    ///
-    /// Errors: [`EngineError::FulltextNotEnabled`] when the field has no
-    /// `@fulltext`; [`EngineError::FulltextQuery`] for a malformed query or a
-    /// phrase against a `positions: false` field; the usual type/field
-    /// resolution errors; [`EngineError::FulltextIndexCorrupt`] if a posting
-    /// row fails to decode.
+    /// snapshot. A convenience over [`Self::fulltext_candidates`] +
+    /// [`FulltextCandidates::score`](crate::fulltext::FulltextCandidates::score);
+    /// see those for the limits and errors.
     pub fn fulltext_search(
         &self,
         type_name: &str,
@@ -8669,6 +8650,50 @@ impl Database {
         restrict: Option<&std::collections::HashSet<u64>>,
         max_postings: Option<u64>,
     ) -> EngineResult<FulltextSearchResult> {
+        let limits = crate::fulltext::FulltextLimits {
+            max_postings,
+            ..Default::default()
+        };
+        let candidates = self.fulltext_candidates(type_name, field_name, query_text, limits)?;
+        Ok(FulltextSearchResult {
+            hits: candidates.score(restrict, k)?,
+            postings_scanned: candidates.postings_scanned,
+        })
+    }
+
+    /// Collect every posting a full-text query needs, at one snapshot, ready
+    /// to rank (the first half of [`Self::fulltext_search`]).
+    ///
+    /// A prefix clause expands to every indexed term starting with the
+    /// prefix (one range scan) and is scored as a single term over the
+    /// merged postings; more than
+    /// [`MAX_PREFIX_EXPANSION`](crate::fulltext::MAX_PREFIX_EXPANSION)
+    /// distinct terms is an [`EngineError::FulltextQuery`] asking for a
+    /// longer prefix — raised during the scan, or at scoring when
+    /// `limits.defer_prefix_cap` is set. Its rows count against
+    /// `max_postings` like any other.
+    ///
+    /// `limits.max_postings`, when given, caps the posting rows the scan may
+    /// examine across all its terms, tombstones included: the check runs
+    /// after each chunk and BEFORE any of that chunk's postings is decoded,
+    /// so a stop-word query over a huge corpus fails closed with
+    /// [`EngineError::FulltextScanBudgetExceeded`] instead of materializing
+    /// every posting. `limits.deadline` is checked before every chunk
+    /// ([`EngineError::FulltextDeadlineExceeded`]).
+    ///
+    /// Errors: [`EngineError::FulltextNotEnabled`] when the field has no
+    /// `@fulltext`; [`EngineError::FulltextIndexBuilding`] while its backfill
+    /// runs; [`EngineError::FulltextQuery`] for a malformed query or a phrase
+    /// against a `positions: false` field; the usual type/field resolution
+    /// errors; [`EngineError::FulltextIndexCorrupt`] if a posting row fails
+    /// to decode.
+    pub fn fulltext_candidates(
+        &self,
+        type_name: &str,
+        field_name: &str,
+        query_text: &str,
+        limits: crate::fulltext::FulltextLimits,
+    ) -> EngineResult<crate::fulltext::FulltextCandidates> {
         self.check_not_migrated()?;
         let type_id = self.resolve_type_id(type_name)?;
         let Some(ff) = self.fulltext_field(type_name, field_name) else {
@@ -8732,29 +8757,28 @@ impl Database {
             field: field_name.into(),
             detail,
         };
-        let mut postings: HashMap<&str, crate::fulltext::search::PostingList> = HashMap::new();
+        let mut postings: HashMap<String, crate::fulltext::search::PostingList> = HashMap::new();
+        let mut prefix_terms: HashMap<String, Vec<crate::fulltext::search::PostingList>> =
+            HashMap::new();
         let mut postings_scanned = 0u64;
         for key in parsed.distinct_terms() {
-            let list = if let Some(&prefix) = prefix_keys.get(key) {
+            if let Some(&prefix) = prefix_keys.get(key) {
                 // Prefix expansion: one range scan over every term starting
                 // with the prefix (the escaping is prefix-preserving, see
-                // `encode_term_prefix`), grouped by term to enforce the
-                // expansion cap and merged per document into ONE posting
-                // list — the clause scores as a single term (see `search`).
-                // Prefixes never take part in a phrase, so header-only decode.
+                // `encode_term_prefix`), grouped by term. Prefixes never take
+                // part in a phrase, so header-only decode.
                 let range = KeyBuilder::fulltext_term_prefix(
                     type_id,
                     ff.field_id,
                     ff.generation,
                     &crate::fulltext::encode_term_prefix(prefix),
                 );
-                let mut merged: HashMap<u64, crate::fulltext::Posting> = HashMap::new();
+                let mut per_term: Vec<crate::fulltext::search::PostingList> = Vec::new();
                 let mut current_term: Option<Bytes> = None;
-                let mut distinct_terms = 0usize;
                 self.scan_fulltext_postings(
                     snapshot,
                     &range,
-                    max_postings,
+                    limits,
                     &mut postings_scanned,
                     type_name,
                     field_name,
@@ -8762,44 +8786,30 @@ impl Database {
                         let term = KeyBuilder::fulltext_posting_term(&key_bytes)
                             .ok_or_else(|| corrupt(format!("posting key without a terminated term ({} bytes)", key_bytes.len())))?;
                         if current_term.as_deref() != Some(term) {
-                            distinct_terms += 1;
-                            if distinct_terms > crate::fulltext::MAX_PREFIX_EXPANSION {
-                                return Err(EngineError::FulltextQuery(format!(
-                                    "prefix term \"{prefix}*\" matches more than {} indexed terms; use a longer prefix",
-                                    crate::fulltext::MAX_PREFIX_EXPANSION
-                                )));
+                            // Undeferred, the cap is enforced here so a short
+                            // prefix over a huge vocabulary stops scanning.
+                            if !limits.defer_prefix_cap
+                                && per_term.len() >= crate::fulltext::MAX_PREFIX_EXPANSION
+                            {
+                                return Err(EngineError::FulltextQuery(
+                                    crate::fulltext::candidates::prefix_cap_message(key),
+                                ));
                             }
+                            per_term.push(Vec::new());
                             current_term = Some(key_bytes.slice_ref(term));
                         }
                         let object_id = KeyBuilder::fulltext_object_id(&key_bytes)
                             .ok_or_else(|| corrupt(format!("posting key too short ({} bytes)", key_bytes.len())))?;
                         let (doc_len, tf) = crate::fulltext::posting::decode_posting_header(&value)
                             .map_err(|e| corrupt(format!("posting for prefix {prefix:?}*, object {object_id}: {e}")))?;
-                        match merged.entry(object_id) {
-                            std::collections::hash_map::Entry::Vacant(v) => {
-                                v.insert(crate::fulltext::Posting {
-                                    doc_len,
-                                    tf,
-                                    positions: Vec::new(),
-                                });
-                            }
-                            std::collections::hash_map::Entry::Occupied(mut o) => {
-                                // Every posting of one document in one
-                                // generation carries the same doc_len (an
-                                // update rewrites them together).
-                                if o.get().doc_len != doc_len {
-                                    return Err(corrupt(format!(
-                                        "object {object_id} has postings with doc_len {} and {doc_len} under prefix {prefix:?}*",
-                                        o.get().doc_len
-                                    )));
-                                }
-                                o.get_mut().tf = o.get().tf.saturating_add(tf);
-                            }
-                        }
+                        per_term
+                            .last_mut()
+                            .expect("a term group was opened above")
+                            .push((object_id, crate::fulltext::Posting { doc_len, tf, positions: Vec::new() }));
                         Ok(())
                     },
                 )?;
-                merged.into_iter().collect()
+                prefix_terms.insert(key.to_string(), per_term);
             } else {
                 let prefix = KeyBuilder::fulltext_term_prefix(
                     type_id,
@@ -8812,7 +8822,7 @@ impl Database {
                 self.scan_fulltext_postings(
                     snapshot,
                     &prefix,
-                    max_postings,
+                    limits,
                     &mut postings_scanned,
                     type_name,
                     field_name,
@@ -8835,19 +8845,16 @@ impl Database {
                         Ok(())
                     },
                 )?;
-                list
-            };
-            postings.insert(key, list);
+                postings.insert(key.to_string(), list);
+            }
         }
-        let hits = crate::fulltext::search::score_query(
-            &parsed,
-            &postings,
-            ff.stats.snapshot(),
-            restrict,
-            k,
-        );
-        Ok(FulltextSearchResult {
-            hits,
+        Ok(crate::fulltext::FulltextCandidates {
+            type_name: type_name.into(),
+            field_name: field_name.into(),
+            parsed,
+            postings,
+            prefix_terms,
+            stats: ff.stats.snapshot(),
             postings_scanned,
         })
     }
@@ -8856,18 +8863,20 @@ impl Database {
     /// tombstone-correct chunks (`scan_chunk_raw`, never the under-returning
     /// `*_limited` scans) and hand each `(key, value)` to `visit`.
     ///
-    /// `postings_scanned` is charged per live row and checked against
-    /// `max_postings` after each chunk BEFORE any of that chunk's rows are
-    /// visited (decoding is where the per-posting allocation happens), so a
-    /// stop-word over a huge corpus is refused after ~one chunk of merge
+    /// `postings_scanned` is charged per RAW row visited — tombstones too, a
+    /// long run of them is real merge work — and checked against
+    /// `limits.max_postings` after each chunk BEFORE any of that chunk's rows
+    /// are visited (decoding is where the per-posting allocation happens), so
+    /// a stop-word over a huge corpus is refused after ~one chunk of merge
     /// work with [`EngineError::FulltextScanBudgetExceeded`]. The chunk size
     /// shrinks to the remaining budget (+1, to detect the overrun).
+    /// `limits.deadline` is checked before every chunk.
     #[allow(clippy::too_many_arguments)]
     fn scan_fulltext_postings(
         &self,
         snapshot: u64,
         prefix: &Bytes,
-        max_postings: Option<u64>,
+        limits: crate::fulltext::FulltextLimits,
         postings_scanned: &mut u64,
         type_name: &str,
         field_name: &str,
@@ -8876,7 +8885,15 @@ impl Database {
         const POSTING_SCAN_CHUNK: usize = 4096;
         let mut start = prefix.clone();
         loop {
-            let want = match max_postings {
+            if let Some(deadline) = limits.deadline
+                && std::time::Instant::now() >= deadline
+            {
+                return Err(EngineError::FulltextDeadlineExceeded {
+                    type_name: type_name.into(),
+                    field: field_name.into(),
+                });
+            }
+            let want = match limits.max_postings {
                 Some(limit) => {
                     let remaining = limit.saturating_sub(*postings_scanned) as usize;
                     remaining.saturating_add(1).min(POSTING_SCAN_CHUNK)
@@ -8884,8 +8901,8 @@ impl Database {
                 None => POSTING_SCAN_CHUNK,
             };
             let chunk = self.storage.scan_chunk_raw(snapshot, prefix, &start, want)?;
-            *postings_scanned += chunk.live.len() as u64;
-            if let Some(limit) = max_postings
+            *postings_scanned += chunk.visited as u64;
+            if let Some(limit) = limits.max_postings
                 && *postings_scanned > limit
             {
                 return Err(EngineError::FulltextScanBudgetExceeded {

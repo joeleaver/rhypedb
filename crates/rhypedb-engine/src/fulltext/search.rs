@@ -26,6 +26,7 @@
 //! would let a rare misspelling among the expansions dominate with a huge
 //! idf (Lucene's `SCORING_BOOLEAN_REWRITE` pathology).
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 
 use super::posting::Posting;
@@ -59,9 +60,9 @@ pub type PostingList = Vec<(u64, Posting)>;
 /// limits candidates to that id set — applied BEFORE the top-k cut so the
 /// caller gets `k` results from within the set, not `k` minus the
 /// filtered-out ones.
-pub fn score_query(
+pub fn score_query<L: Borrow<PostingList>>(
     query: &ParsedQuery,
-    postings: &HashMap<&str, PostingList>,
+    postings: &HashMap<&str, L>,
     stats: CorpusStats,
     restrict: Option<&HashSet<u64>>,
     k: usize,
@@ -79,7 +80,7 @@ pub fn score_query(
         .distinct_terms()
         .into_iter()
         .map(|t| {
-            let df = postings.get(t).map_or(0, |p| p.len()) as f64;
+            let df = postings.get(t).map_or(0, |p| p.borrow().len()) as f64;
             let n = (stats.doc_count as f64).max(df);
             (t, (1.0 + (n - df + 0.5) / (df + 0.5)).ln() as f32)
         })
@@ -119,7 +120,7 @@ pub fn score_query(
             if let Some(list) = postings.get(t.as_str()) {
                 phrase_maps
                     .entry(t.as_str())
-                    .or_insert_with(|| list.iter().map(|(id, p)| (*id, p)).collect());
+                    .or_insert_with(|| list.borrow().iter().map(|(id, p)| (*id, p)).collect());
             }
         }
     }
@@ -129,7 +130,7 @@ pub fn score_query(
             score_phrase(clause, &phrase_maps, &idf, &tfnorm, &allowed, &mut add);
         } else {
             let term = clause.terms[0].as_str();
-            let list = postings.get(term).unwrap_or(&empty);
+            let list: &PostingList = postings.get(term).map_or(&empty, |l| l.borrow());
             let w = idf[term];
             for (id, p) in list {
                 if allowed(*id) {

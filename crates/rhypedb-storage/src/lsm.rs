@@ -171,6 +171,10 @@ pub struct ChunkScan {
     /// at `high_water`. NEVER infer end-of-range from `live.len() <
     /// max_distinct`; only `!more` (or `high_water == None`) is sound.
     pub more: bool,
+    /// RAW keys taken this chunk, live AND tombstoned (`>= live.len()`). A
+    /// caller that budgets work must charge this, not `live.len()`: a long
+    /// tombstone run is real merge work that yields no live rows.
+    pub visited: usize,
 }
 
 impl LsmTree {
@@ -753,6 +757,7 @@ impl LsmTree {
                 live: Vec::new(),
                 high_water: None,
                 more: false,
+                visited: 0,
             });
         }
         let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
@@ -803,7 +808,9 @@ impl LsmTree {
         // holds it, so it sits inside that source's returned window.
         let mut high_water: Option<Bytes> = None;
         let mut live: Vec<(Bytes, Bytes)> = Vec::new();
+        let mut visited = 0usize;
         for (k, v) in merged.into_iter().take(max_distinct) {
+            visited += 1;
             match v {
                 Some(val) => {
                     high_water = Some(k.clone());
@@ -817,6 +824,7 @@ impl LsmTree {
             live,
             high_water,
             more,
+            visited,
         })
     }
 
@@ -1588,6 +1596,13 @@ mod tests {
             tree.delete(&mut txn, &ckey(id)).unwrap();
             tree.commit(&mut txn).unwrap();
         }
+
+        // `visited` counts the tombstones a chunk walks, so a budgeted caller
+        // pays for a run that yields no live rows.
+        let snap = tree.txn_manager().current_version();
+        let run = tree.scan_chunk_raw(snap, b"P:", &ckey(20), 8).unwrap();
+        assert!(run.live.is_empty());
+        assert_eq!(run.visited, 8);
 
         let got = collect_via_chunks(&tree, 8);
         let expected: Vec<u64> = (0..20).chain(70..100).collect();

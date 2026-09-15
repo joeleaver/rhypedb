@@ -113,6 +113,10 @@ pub enum EngineError {
         limit: u64,
     },
 
+    /// A search's postings scan ran past the caller's wall-clock deadline.
+    #[error("full-text search on '{type_name}.{field}' exceeded its time budget")]
+    FulltextDeadlineExceeded { type_name: String, field: String },
+
     /// A posting row could not be decoded — on-disk corruption of the index.
     #[error("full-text index corrupt for '{type_name}.{field}': {detail}")]
     FulltextIndexCorrupt {
