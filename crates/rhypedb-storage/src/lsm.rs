@@ -1573,6 +1573,49 @@ mod tests {
         out
     }
 
+    // A chunked scan resumes at `high_water ‖ \0`. While the keys are still in a
+    // memtable (no flush), the resume must not re-read the high-water key itself:
+    // `hw ‖ version` sorts after the `hw\0` seek point.
+    #[test]
+    fn scan_chunk_raw_resume_in_memtable_never_rereads_the_high_water_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(LsmConfig {
+            memtable_flush_size: 64 * 1024 * 1024, // keep everything in the memtable
+            ..test_config(dir.path())
+        })
+        .unwrap();
+        for id in 0..50u64 {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, &ckey(id), Bytes::from("v")).unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+        for chunk in [1usize, 3, 7] {
+            let got = collect_via_raw_resume(&tree, chunk);
+            assert_eq!(got, (0..50).collect::<Vec<u64>>(), "chunk size {chunk}");
+        }
+    }
+
+    /// Resume exactly as the full-text postings scan does: `start = high_water ‖ \0`.
+    fn collect_via_raw_resume(tree: &LsmTree, chunk_size: usize) -> Vec<u64> {
+        let prefix = b"P:";
+        let mut out = Vec::new();
+        let mut start = Bytes::from(prefix.to_vec());
+        for _ in 0..10_000 {
+            let snap = tree.txn_manager().current_version();
+            let chunk = tree.scan_chunk_raw(snap, prefix, &start, chunk_size).unwrap();
+            out.extend(chunk.live.iter().map(|(k, _)| ckey_id(k)));
+            match chunk.high_water {
+                Some(hw) if chunk.more => {
+                    let mut next = hw.to_vec();
+                    next.push(0);
+                    start = Bytes::from(next);
+                }
+                _ => return out,
+            }
+        }
+        panic!("resumed scan did not terminate");
+    }
+
     // The load-bearing correctness property: a run of tombstones LONGER than
     // the chunk size must not strand the live keys beyond it. A
     // `scan_from_at_limited` caller (which sees only live keys) would land
