@@ -461,7 +461,9 @@ impl SstReader {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         // Hint random access — bloom-then-seek scans don't benefit from the
         // kernel's read-ahead heuristic, and on big SSTs the read-ahead can
-        // waste page cache and disk bandwidth.
+        // waste page cache and disk bandwidth. `madvise` is a Unix call and
+        // memmap2 only defines `Advice` there; Windows gets no hint.
+        #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Random);
         let data: Bytes = Bytes::from_owner(mmap);
 
