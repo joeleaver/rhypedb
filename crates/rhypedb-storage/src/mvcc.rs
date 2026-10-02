@@ -5,12 +5,31 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// K=100 cascading rows once we counted the bytes hashed). Not HashDoS-resistant
 /// — fine for an in-process key set built from this process's own writes.
 type WriteSet = HashSet<bytes::Bytes, ahash::RandomState>;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
 use crate::{Error, Result};
+
+/// Refcounted active-snapshot registry: snapshot version → number of live
+/// transactions holding it. Shared (`Arc`) between the manager and every
+/// [`Transaction`] it hands out, so a transaction can release its own hold on
+/// drop without a back-reference to the manager (see `Transaction::release`).
+type ActiveSnapshots = Arc<RwLock<HashMap<u64, u64>>>;
+
+/// Release one hold on `snapshot`, removing it from the active set only when
+/// the last transaction holding that version finishes.
+fn release_hold(active: &RwLock<HashMap<u64, u64>>, snapshot: u64) {
+    let mut guard = active.write();
+    if let Some(count) = guard.get_mut(&snapshot) {
+        *count -= 1;
+        if *count == 0 {
+            guard.remove(&snapshot);
+        }
+    }
+}
 
 /// Tracks a committed transaction for write-write conflict detection.
 struct CommittedTxn {
@@ -54,8 +73,15 @@ pub struct TransactionManager {
     /// still holds, wrongly raising `min_active_snapshot()` and letting
     /// compaction GC a version — or the conflict-log trim drop an entry — that
     /// the surviving reader still needs. The count is incremented at `begin` and
-    /// decremented at commit/abort; the key is removed at zero.
-    active_snapshots: RwLock<HashMap<u64, u64>>,
+    /// decremented exactly once per transaction — at commit/abort, or on DROP
+    /// of a transaction that was never finished; the key is removed at zero.
+    ///
+    /// The drop-release is load-bearing: engine paths routinely `drop(txn)` a
+    /// read txn (open/rebuild, migrations, `?` error returns). Before it existed
+    /// each such drop leaked a hold forever, pinning `min_active_snapshot()` at
+    /// (typically) the recovery version, so compaction kept every version
+    /// written since process start — unbounded disk growth on hot keys.
+    active_snapshots: ActiveSnapshots,
     max_committed_log_size: usize,
 }
 
@@ -73,7 +99,7 @@ impl TransactionManager {
                 next_version: 1,
                 committed_log: VecDeque::new(),
             }),
-            active_snapshots: RwLock::new(HashMap::new()),
+            active_snapshots: Arc::new(RwLock::new(HashMap::new())),
             max_committed_log_size: 1024,
         }
     }
@@ -87,7 +113,7 @@ impl TransactionManager {
                 next_version: version + 1,
                 committed_log: VecDeque::new(),
             }),
-            active_snapshots: RwLock::new(HashMap::new()),
+            active_snapshots: Arc::new(RwLock::new(HashMap::new())),
             max_committed_log_size: 1024,
         }
     }
@@ -100,20 +126,7 @@ impl TransactionManager {
             snapshot,
             writes: Vec::new(),
             index: HashMap::default(),
-            committed: false,
-        }
-    }
-
-    /// Release one hold on `snapshot`, removing it from the active set only when
-    /// the last transaction holding that version commits or aborts. See
-    /// [`active_snapshots`](Self::active_snapshots).
-    fn release_snapshot(&self, snapshot: u64) {
-        let mut guard = self.active_snapshots.write();
-        if let Some(count) = guard.get_mut(&snapshot) {
-            *count -= 1;
-            if *count == 0 {
-                guard.remove(&snapshot);
-            }
+            hold: Some(Arc::clone(&self.active_snapshots)),
         }
     }
 
@@ -140,8 +153,7 @@ impl TransactionManager {
         F: FnOnce(u64, &[(Bytes, Option<Bytes>)]) -> Result<()>,
     {
         if txn.writes.is_empty() {
-            txn.committed = true;
-            self.release_snapshot(txn.snapshot);
+            txn.release();
             return Ok(txn.snapshot);
         }
 
@@ -206,16 +218,14 @@ impl TransactionManager {
         self.visible_version.store(commit_version, Ordering::Release);
         drop(state);
 
-        txn.committed = true;
-        self.release_snapshot(txn.snapshot);
+        txn.release();
         Ok(commit_version)
     }
 
     /// Abort a transaction: drop its buffered writes (never applied) and release
     /// its snapshot. Nothing to undo — the writes never reached the memtable.
     pub fn abort(&self, txn: &mut Transaction) {
-        txn.committed = true; // prevent the drop warning / double-release
-        self.release_snapshot(txn.snapshot);
+        txn.release();
     }
 
     /// Returns the minimum active snapshot version, or u64::MAX if none active.
@@ -227,6 +237,15 @@ impl TransactionManager {
             .copied()
             .min()
             .unwrap_or(u64::MAX)
+    }
+
+    /// Observability: `(distinct snapshot versions held, total holds)`. A
+    /// steadily non-zero count with a growing `current_version() -
+    /// min_active_snapshot()` lag is the signature of a leaked/long-lived txn
+    /// pinning compaction GC.
+    pub fn active_snapshot_stats(&self) -> (usize, u64) {
+        let guard = self.active_snapshots.read();
+        (guard.len(), guard.values().sum())
     }
 
     /// Current reader-visible version (latest fully-applied + published commit).
@@ -250,12 +269,26 @@ pub struct Transaction {
     writes: Vec<(Bytes, Option<Bytes>)>,
     /// key → index into `writes`, for O(1) last-write-wins coalescing.
     index: HashMap<Bytes, usize, ahash::RandomState>,
-    committed: bool,
+    /// The live hold on `snapshot` in the manager's active set; `Some` until the
+    /// txn is finished (commit/abort) or dropped. `take()`-on-release makes the
+    /// release exactly-once across commit/abort/drop. It owns no write path, so
+    /// dropping an unfinished txn can only release the snapshot — its buffered
+    /// writes are discarded, never applied.
+    hold: Option<ActiveSnapshots>,
 }
 
 impl Transaction {
     pub fn snapshot(&self) -> u64 {
         self.snapshot
+    }
+
+    /// Release this txn's snapshot hold (idempotent — the second call is a
+    /// no-op, so commit/abort followed by drop never double-decrements a
+    /// refcount another txn shares).
+    fn release(&mut self) {
+        if let Some(active) = self.hold.take() {
+            release_hold(&active, self.snapshot);
+        }
     }
 
     /// Buffer a put for `key` (last write per key wins).
@@ -291,13 +324,16 @@ impl Transaction {
 }
 
 impl Drop for Transaction {
+    /// An unfinished txn releases its snapshot hold here — the structural
+    /// guarantee that no code path (early `?` return, explicit `drop(txn)`,
+    /// panic unwind) can pin `min_active_snapshot()` forever. Buffered writes
+    /// are simply discarded (equivalent to abort): Drop has no apply path.
+    ///
+    /// No warning: dropping an unfinished read-write txn is the normal shape of
+    /// every engine `?` error path, and this crate carries no logging dep (the
+    /// old unconditional `eprintln!` here was stderr noise on each such error).
     fn drop(&mut self) {
-        if !self.committed && !self.writes.is_empty() {
-            eprintln!(
-                "WARNING: read-write transaction with snapshot {} dropped without commit/abort",
-                self.snapshot
-            );
-        }
+        self.release();
     }
 }
 
@@ -409,6 +445,84 @@ mod tests {
         let tm = TransactionManager::new();
         let mut txn = tm.begin();
         tm.abort(&mut txn);
+        assert_eq!(tm.min_active_snapshot(), u64::MAX);
+    }
+
+    #[test]
+    fn dropped_read_only_txn_releases_snapshot() {
+        let tm = TransactionManager::new();
+        let txn = tm.begin();
+        assert_eq!(tm.min_active_snapshot(), 0);
+        drop(txn);
+        assert_eq!(tm.min_active_snapshot(), u64::MAX);
+        assert_eq!(tm.active_snapshot_stats(), (0, 0));
+    }
+
+    #[test]
+    fn dropped_read_write_txn_releases_snapshot_and_applies_nothing() {
+        let tm = TransactionManager::new();
+        let mut txn = tm.begin();
+        txn.record_put(Bytes::from("k"), Bytes::from("v"));
+        drop(txn);
+        assert_eq!(tm.min_active_snapshot(), u64::MAX);
+        // Nothing was committed: no version consumed or published.
+        assert_eq!(tm.current_version(), 0);
+        let mut t2 = tm.begin();
+        t2.record_put(Bytes::from("k"), Bytes::from("v2"));
+        assert_eq!(tm.commit(&mut t2, noop_apply).unwrap(), 1);
+    }
+
+    #[test]
+    fn shared_snapshot_refcount_survives_one_drop() {
+        let tm = TransactionManager::new();
+        let a = tm.begin();
+        let b = tm.begin();
+        assert_eq!(a.snapshot(), b.snapshot());
+        assert_eq!(tm.active_snapshot_stats(), (1, 2));
+        drop(a);
+        // b still holds the shared snapshot value.
+        assert_eq!(tm.min_active_snapshot(), b.snapshot());
+        assert_eq!(tm.active_snapshot_stats(), (1, 1));
+        drop(b);
+        assert_eq!(tm.min_active_snapshot(), u64::MAX);
+    }
+
+    #[test]
+    fn commit_or_abort_then_drop_releases_exactly_once() {
+        let tm = TransactionManager::new();
+        // Three txns share snapshot 0; finishing-then-dropping two of them must
+        // not over-decrement the count the third still relies on.
+        let mut ro = tm.begin();
+        let mut rw = tm.begin();
+        let witness = tm.begin();
+        let mut aborted = tm.begin();
+        assert_eq!(tm.active_snapshot_stats(), (1, 4));
+
+        tm.commit(&mut ro, noop_apply).unwrap(); // read-only fast path
+        drop(ro);
+        rw.record_put(Bytes::from("k"), Bytes::from("v"));
+        tm.commit(&mut rw, noop_apply).unwrap(); // writing commit
+        drop(rw);
+        tm.abort(&mut aborted);
+        tm.abort(&mut aborted); // a second abort is a no-op too
+        drop(aborted);
+
+        assert_eq!(tm.active_snapshot_stats(), (1, 1));
+        assert_eq!(tm.min_active_snapshot(), witness.snapshot());
+        drop(witness);
+        assert_eq!(tm.min_active_snapshot(), u64::MAX);
+    }
+
+    #[test]
+    fn conflict_loser_dropped_without_abort_releases() {
+        let tm = TransactionManager::new();
+        let mut t1 = tm.begin();
+        let mut t2 = tm.begin();
+        t1.record_put(Bytes::from("k"), Bytes::from("a"));
+        t2.record_put(Bytes::from("k"), Bytes::from("b"));
+        tm.commit(&mut t1, noop_apply).unwrap();
+        assert!(matches!(tm.commit(&mut t2, noop_apply), Err(Error::WriteConflict)));
+        drop(t2); // the `?`-propagation shape: no explicit abort
         assert_eq!(tm.min_active_snapshot(), u64::MAX);
     }
 
