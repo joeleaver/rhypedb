@@ -3280,6 +3280,88 @@ mod tests {
         assert_eq!(tree.count_prefix_at(snap, b"a:").unwrap(), 3, "pre-delete snapshot unchanged");
     }
 
+    /// Count every (version-suffixed) entry across all on-disk SSTs.
+    fn total_sst_entries(tree: &LsmTree) -> usize {
+        let mut n = 0;
+        for sst in tree.sst_files.read().iter() {
+            sst.try_for_each_entry(|_, _| n += 1).unwrap();
+        }
+        n
+    }
+
+    /// Regression (prod disk-fill): engine open/rebuild paths `drop(txn)`
+    /// without commit/abort. That used to leak the snapshot hold forever, pinning
+    /// `min_active_snapshot()` at the open-time version so compaction kept EVERY
+    /// later version of a hot key (1,812 versions of one object filled 1 GiB).
+    /// A dropped txn must release, and compaction must collapse to latest-only.
+    #[test]
+    fn compaction_gcs_old_versions_after_txns_are_merely_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+
+        // Open-time shape: a read txn and an abandoned read-write txn, both
+        // just dropped.
+        let ro = tree.begin_txn();
+        let _ = tree.get(&ro, b"hot").unwrap();
+        drop(ro);
+        let mut rw = tree.begin_txn();
+        tree.put(&mut rw, b"never", Bytes::from("applied")).unwrap();
+        drop(rw);
+        assert_eq!(tree.txn_manager().min_active_snapshot(), u64::MAX);
+
+        const UPDATES: usize = 20;
+        for i in 0..UPDATES {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, b"hot", Bytes::from(format!("v{i}"))).unwrap();
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+        }
+        assert_eq!(total_sst_entries(&tree), UPDATES, "one version per flush");
+
+        tree.compact().unwrap();
+        assert_eq!(tree.sst_count(), 1);
+        assert_eq!(total_sst_entries(&tree), 1, "only the latest version survives");
+        let snap = tree.read_snapshot();
+        assert_eq!(
+            tree.get_at(snap, b"hot").unwrap().as_deref(),
+            Some(format!("v{}", UPDATES - 1).as_bytes())
+        );
+        // The dropped read-write txn's buffered write was never applied.
+        assert_eq!(tree.get_at(snap, b"never").unwrap(), None);
+    }
+
+    /// Counterpart: a txn that is genuinely LIVE still pins its versions
+    /// (the drop-release must not weaken MVCC for real readers).
+    #[test]
+    fn compaction_keeps_floor_for_a_live_txn() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config(dir.path())).unwrap();
+        let mut seed = tree.begin_txn();
+        tree.put(&mut seed, b"hot", Bytes::from("v0")).unwrap();
+        tree.commit(&mut seed).unwrap();
+        tree.flush().unwrap();
+
+        let reader = tree.begin_txn();
+        for i in 1..5 {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, b"hot", Bytes::from(format!("v{i}"))).unwrap();
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+        }
+        tree.compact().unwrap();
+        assert_eq!(total_sst_entries(&tree), 5, "versions >= the live floor kept");
+        assert_eq!(tree.get(&reader, b"hot").unwrap().as_deref(), Some(&b"v0"[..]));
+
+        drop(reader);
+        // Need >=2 SSTs to compact again.
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, b"other", Bytes::from("x")).unwrap();
+        tree.commit(&mut txn).unwrap();
+        tree.flush().unwrap();
+        tree.compact().unwrap();
+        assert_eq!(total_sst_entries(&tree), 2, "hot latest + other");
+    }
+
     #[test]
     fn read_snapshot_does_not_register_in_active_set() {
         let dir = tempfile::tempdir().unwrap();
