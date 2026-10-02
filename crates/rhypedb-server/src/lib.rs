@@ -516,6 +516,24 @@ async fn handle_status(
         "edges": edges,
     });
 
+    // MVCC snapshot pinning. Compaction keeps every version newer than the
+    // oldest registered snapshot, so a non-zero `active_snapshots` paired with an
+    // ever-growing `oldest_snapshot_lag` (versions behind head) means a txn is
+    // pinning GC and disk use will grow on hot keys. Healthy idle: 0 / 0.
+    {
+        let tm = db.storage().txn_manager();
+        let (distinct, holds) = tm.active_snapshot_stats();
+        let min = tm.min_active_snapshot();
+        let lag = if min == u64::MAX {
+            0
+        } else {
+            tm.current_version().saturating_sub(min)
+        };
+        result["active_snapshots"] = serde_json::json!(distinct);
+        result["active_snapshot_holds"] = serde_json::json!(holds);
+        result["oldest_snapshot_lag"] = serde_json::json!(lag);
+    }
+
     // Resident memory (Linux /proc/self/statm) when available — a live RSS signal
     // for memory metering. Omitted where unreadable (non-Linux / restricted CI).
     if let Some(rss) = process_rss_bytes() {
@@ -2948,6 +2966,11 @@ mod tcp_tests {
             body["queries"].as_u64().unwrap() >= 4,
             "3 creates + 1 read = 4 queries: {body}"
         );
+        // Nothing is in flight: open-time + per-query txns all released, so no
+        // snapshot pins compaction GC (the prod disk-fill regression).
+        assert_eq!(body["active_snapshots"].as_u64(), Some(0), "{body}");
+        assert_eq!(body["active_snapshot_holds"].as_u64(), Some(0), "{body}");
+        assert_eq!(body["oldest_snapshot_lag"].as_u64(), Some(0), "{body}");
         // rss_bytes is present on Linux (dev + CI); if present it must be positive.
         // Tolerate absence so the test isn't tied to a readable /proc.
         if let Some(rss) = body.get("rss_bytes").and_then(|v| v.as_u64()) {

@@ -17454,6 +17454,54 @@ mod tests {
         );
     }
 
+    /// Regression (prod disk-fill): `Database::open` drops txns without
+    /// commit/abort on its open/rebuild paths. That used to leak an MVCC snapshot
+    /// hold pinned at the open-time version, so compaction kept every version of
+    /// a hot object forever. After open + N flushed updates + compact, the old
+    /// versions must be GC'd: a read at an early snapshot finds nothing.
+    #[test]
+    fn open_then_hot_updates_compact_away_old_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema("type Doc { body: String  n: u32 }").unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let tm = db.storage().txn_manager();
+        assert_eq!(tm.min_active_snapshot(), u64::MAX, "open leaked a snapshot hold");
+
+        let mut f = FieldMap::new();
+        f.insert("body".into(), Value::String("x".repeat(512)));
+        f.insert("n".into(), Value::U32(0));
+        let id = db.create("Doc", f).unwrap().id;
+        db.storage().flush().unwrap();
+        let early = db.storage().read_snapshot();
+
+        for n in 1..=20u32 {
+            let mut u = FieldMap::new();
+            u.insert("n".into(), Value::U32(n));
+            db.update("Doc", id, u).unwrap();
+            db.storage().flush().unwrap();
+        }
+        // An update whose target is missing returns Err via `?` mid-txn — the
+        // error-path drop must release too.
+        assert!(db.update("Doc", id + 999, FieldMap::new()).is_err());
+        assert_eq!(tm.active_snapshot_stats(), (0, 0));
+
+        assert_eq!(
+            db.get_many_at(early, "Doc", &[id]).unwrap().len(),
+            1,
+            "pre-compaction the early version is still on disk"
+        );
+        db.storage().compact().unwrap();
+        assert!(
+            db.get_many_at(early, "Doc", &[id]).unwrap().is_empty(),
+            "the early version must be garbage-collected"
+        );
+        let latest = db.get("Doc", id).unwrap();
+        assert_eq!(latest.fields.get("n"), Some(&Value::U32(20)));
+    }
+
     #[test]
     fn indexed_field_correct_after_flush() {
         // SST + memtable path: half the data is on disk, half is in memory.
