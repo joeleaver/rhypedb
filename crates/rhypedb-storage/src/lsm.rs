@@ -177,6 +177,12 @@ pub struct ChunkScan {
     pub visited: usize,
 }
 
+/// Best-effort unlink of the partial `<sst_path>.tmp` an [`SstWriter`] leaves
+/// when its write fails (see `crate::sst::tmp_path_for`).
+fn discard_sst_tmp(sst_path: &Path) {
+    let _ = std::fs::remove_file(crate::sst::tmp_path_for(sst_path));
+}
+
 impl LsmTree {
     /// Open or create an LSM-tree at the given directory.
     ///
@@ -1102,15 +1108,21 @@ impl LsmTree {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let sst_path = self.config.data_dir.join("sst").join(format!("{sst_id:08}.sst"));
 
+        // A failed write (typically ENOSPC) leaves a partial `.sst.tmp`; unlink
+        // it on the error path so retries can't stack them up on a full disk.
+        // (Not a Drop guard: a crash-injected panic must leave the tmp behind
+        // for the open-time sweep, exactly like a real crash.)
+        let discard_tmp = |_: &Error| discard_sst_tmp(&sst_path);
         let mut writer = SstWriter::new_with_options(
             &sst_path,
             self.config.zone_extractor.clone(),
             self.config.block_compression,
-        )?;
+        )
+        .inspect_err(discard_tmp)?;
         for (key, value) in old_memtable.iter() {
-            writer.add(&key, &value)?;
+            writer.add(&key, &value).inspect_err(discard_tmp)?;
         }
-        writer.finish()?;
+        writer.finish().inspect_err(discard_tmp)?;
         // CRASH BOUNDARY: SST durable on disk, but NOT yet registered for reads
         // and the WAL is still full — reopen must discover the orphan SST and
         // reconcile it against the full WAL (idempotent double-presence).
@@ -1293,11 +1305,17 @@ impl LsmTree {
             .join("sst")
             .join(format!("{sst_id:08}.sst"));
 
+        // Compaction writes the WHOLE merged SST before unlinking any input, so
+        // on a full disk it fails mid-write. Unlink the partial `.sst.tmp` on
+        // that error path — otherwise each retry (the background worker
+        // re-triggers) strands another one until a restart's open-time sweep.
+        let discard_tmp = |_: &Error| discard_sst_tmp(&sst_path);
         let mut writer = SstWriter::new_with_options(
             &sst_path,
             self.config.zone_extractor.clone(),
             self.config.block_compression,
-        )?;
+        )
+        .inspect_err(discard_tmp)?;
         let mut prev_user_key: Option<Vec<u8>> = None;
         // Entries arrive newest-version-first within each user key (version is
         // stored bit-complemented, so larger versions sort first). For each key
@@ -1335,7 +1353,7 @@ impl LsmTree {
             if !floor_kept_for_key {
                 // Newest-first: keep until (and including) the floor at
                 // min_snapshot. The latest version is always the first kept.
-                writer.add(key, value)?;
+                writer.add(key, value).inspect_err(discard_tmp)?;
                 if version <= min_snapshot {
                     floor_kept_for_key = true;
                 }
@@ -1343,7 +1361,7 @@ impl LsmTree {
             // Once the floor is kept, strictly older versions are dropped.
         }
 
-        let meta = writer.finish()?;
+        let meta = writer.finish().inspect_err(discard_tmp)?;
         // CRASH BOUNDARY: merged SST published on disk; inputs still present and
         // not yet swapped. Reopen sees the merged SST AND all inputs (redundant
         // but correct — same versions dedupe; the next compaction reclaims them).
@@ -3360,6 +3378,54 @@ mod tests {
         tree.flush().unwrap();
         tree.compact().unwrap();
         assert_eq!(total_sst_entries(&tree), 2, "hot latest + other");
+    }
+
+    /// ENOSPC: a compaction that runs out of disk mid-write must not strand its
+    /// partial `.sst.tmp`. Needs a genuinely tiny filesystem, so it is opt-in:
+    ///   sudo mount -t tmpfs -o size=1m tmpfs /mnt/tiny && sudo chown $USER /mnt/tiny
+    ///   RHYPEDB_TINY_FS=/mnt/tiny cargo test -p rhypedb-storage -- --ignored enospc
+    #[test]
+    #[ignore = "needs RHYPEDB_TINY_FS pointing at a small (~1 MiB) filesystem"]
+    fn enospc_compaction_unlinks_partial_tmp() {
+        let Ok(root) = std::env::var("RHYPEDB_TINY_FS") else { return };
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.memtable_flush_size = 64 * 1024;
+        cfg.block_compression = SstCompression::None;
+        cfg.sync_on_commit = false;
+        let tree = LsmTree::open(cfg).unwrap();
+        let mut rng_state = 0x9e3779b97f4a7c15u64;
+        let mut noise = |n: usize| {
+            (0..n)
+                .map(|_| {
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 7;
+                    rng_state ^= rng_state << 17;
+                    rng_state as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        // Fill until a write fails, keeping >=2 SSTs so compaction has work.
+        let mut i = 0u32;
+        loop {
+            let mut txn = tree.begin_txn();
+            tree.put(&mut txn, format!("k{i:06}").as_bytes(), Bytes::from(noise(4096))).unwrap();
+            if tree.commit(&mut txn).is_err() || tree.flush().is_err() {
+                break;
+            }
+            i += 1;
+            assert!(i < 100_000, "filesystem never filled");
+        }
+        assert!(tree.sst_count() >= 2, "need inputs to compact");
+        let tmps = |d: &Path| {
+            std::fs::read_dir(d.join("sst"))
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".sst.tmp"))
+                .count()
+        };
+        assert_eq!(tmps(dir.path()), 0, "failed flushes must not strand tmps");
+        assert!(tree.compact().is_err(), "compaction should hit ENOSPC");
+        assert_eq!(tmps(dir.path()), 0, "failed compaction must unlink its tmp");
     }
 
     #[test]

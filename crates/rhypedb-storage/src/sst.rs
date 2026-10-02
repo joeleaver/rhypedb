@@ -121,6 +121,16 @@ fn sync_parent_dir(path: &Path) {
     }
 }
 
+/// The `<path>.tmp` sibling an [`SstWriter`] streams into before `finish`
+/// renames it to `path`. Exposed so a caller whose write FAILED (e.g. ENOSPC)
+/// can unlink the partial temp immediately rather than leaving it to eat disk
+/// until the next `LsmTree::open` sweep.
+pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut s = path.to_path_buf().into_os_string();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
 /// Writer for creating SST files from sorted key-value pairs.
 pub struct SstWriter {
     writer: BufWriter<File>,
@@ -186,11 +196,7 @@ impl SstWriter {
         // mid-write leaves a `.sst.tmp` (ignored by the recovery scan), never a
         // headerless/footerless `.sst` that would fail `SstReader::open` and
         // block reopen.
-        let tmp_path = {
-            let mut s = path.clone().into_os_string();
-            s.push(".tmp");
-            PathBuf::from(s)
-        };
+        let tmp_path = tmp_path_for(&path);
         let file = File::create(&tmp_path)?;
         let mut writer = BufWriter::new(file);
 
