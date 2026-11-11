@@ -296,7 +296,31 @@ struct ForwardRelMeta {
 ///
 /// Manages typed objects and relationships backed by the LSM storage engine,
 /// enforcing the schema's type constraints and referential integrity.
+///
+/// This is the handle callers hold (as `Arc<Database>`); it derefs to the
+/// [`DatabaseCore`] holding the state, so every method is called on it
+/// directly. Background workers (cover refresh, full-text builder, migration
+/// drivers) hold only the core, never a handle. So the handle's `Drop` always
+/// runs on a caller's thread when the LAST caller lets go, and it stops and
+/// joins those workers before the core — and with it the storage, its files
+/// and the data-dir lock — is released. Once `drop` returns, the directory can
+/// be opened again. (When a worker could hold the last strong reference, a
+/// caller's drop could return while the worker still held the lock: GH #29.)
 pub struct Database {
+    core: Arc<DatabaseCore>,
+}
+
+impl std::ops::Deref for Database {
+    type Target = DatabaseCore;
+
+    fn deref(&self) -> &DatabaseCore {
+        &self.core
+    }
+}
+
+/// The state behind a [`Database`] handle (reached through it via `Deref`).
+/// Shared with the database's background workers.
+pub struct DatabaseCore {
     schema: Schema,
     storage: Arc<LsmTree>,
     type_ids: HashMap<String, u64>,
@@ -402,12 +426,12 @@ pub struct Database {
     pub(crate) cover_refresh_stats: CoverRefreshStats,
     /// A `Weak` to this very `Database`, stashed right after `Arc::new` so a
     /// `&self` method (`create_field_type_migration`) can hand a detached
-    /// migration driver thread a `Weak<Database>` WITHOUT changing the public
+    /// migration driver thread a `Weak<DatabaseCore>` WITHOUT changing the public
     /// `&self` signature. The driver upgrades it transiently (only for the
     /// cutover stage) so it never extends the database's lifetime — when external
     /// `Arc`s drop, the upgrade returns `None` and the driver leaves the plan
     /// resumable for the next open. Empty until set in `rebuild_with_arc_storage`.
-    self_weak: parking_lot::Mutex<std::sync::Weak<Database>>,
+    self_weak: parking_lot::Mutex<std::sync::Weak<DatabaseCore>>,
     /// Per-plan registry of in-flight migration drivers (shadow-field card 3/5).
     /// Keyed by `plan_id` (unique, monotonic — never reused). The single gate
     /// enforcing "at most one driver per plan" (async create OR inline
@@ -1041,7 +1065,7 @@ impl Database {
     /// Open a database with the given schema and data directory.
     ///
     /// Returns an `Arc<Database>` because the engine owns a background
-    /// cover-refresh worker thread that holds a `Weak<Database>` reference
+    /// cover-refresh worker thread that holds a `Weak<DatabaseCore>` reference
     /// — the Arc wrapper is required for the worker's lifetime to track
     /// the database's. All callers can treat the `Arc` like a `Database`
     /// directly thanks to deref.
@@ -1404,7 +1428,7 @@ impl Database {
         // would otherwise hide a real durability issue.
         storage.flush()?;
 
-        let db = Arc::new(Self {
+        let core = Arc::new(DatabaseCore {
             schema,
             storage,
             type_ids,
@@ -1476,19 +1500,24 @@ impl Database {
             migrated: std::sync::atomic::AtomicBool::new(false),
         });
 
-        // Stash a `Weak` to ourselves so a `&self` verb can hand a detached
-        // migration driver a `Weak<Database>` (card 3/5) without an `Arc<Self>`
-        // signature. Set before any worker spawns / auto-resume runs.
-        *db.self_weak.lock() = Arc::downgrade(&db);
+        // Stash a `Weak` to the core so a `&self` verb can hand a detached
+        // migration driver a `Weak<DatabaseCore>` (card 3/5) without an
+        // `Arc<Self>` signature. Set before any worker spawns / auto-resume runs.
+        *core.self_weak.lock() = Arc::downgrade(&core);
 
-        // Spawn the cover-refresh worker now that `db` lives inside an Arc
-        // we can downgrade. The worker holds a `Weak<Database>` so it
-        // doesn't extend the database's lifetime — once external Arcs are
-        // dropped, our Drop impl closes the channel and joins. Skipped when
-        // the caller opts out via `OpenOptions::background_cover_refresh`.
+        // Wrap the core in the caller's handle BEFORE any worker starts, so
+        // every exit from here on — including an error in auto-resume below —
+        // drops a handle whose `Drop` stops and joins whatever was started.
+        let db = Arc::new(Database { core });
+
+        // Spawn the cover-refresh worker. It holds a `Weak<DatabaseCore>`, never
+        // a handle, so it neither extends the caller's handle's lifetime nor
+        // runs its `Drop`: once the last handle drops, `Drop` closes the channel
+        // and joins it. Skipped when the caller opts out via
+        // `OpenOptions::background_cover_refresh`.
         if options.background_cover_refresh {
             let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
-            let weak = Arc::downgrade(&db);
+            let weak = Arc::downgrade(&db.core);
             let handle = std::thread::Builder::new()
                 .name("rhypedb-cover-refresh".into())
                 .spawn(move || cover_refresh_worker(rx, weak))
@@ -1500,7 +1529,7 @@ impl Database {
         // Full-text backfills / generation sweeps, if the marker reconcile
         // produced any. Same `Weak` discipline as the cover-refresh worker.
         if options.background_fulltext_build {
-            db.spawn_fulltext_builder()?;
+            db.core.spawn_fulltext_builder()?;
         }
 
         // Auto-resume in-flight chunked field-type migrations (shadow-field
@@ -1515,6 +1544,224 @@ impl Database {
 
         Ok(db)
     }
+
+    /// `Arc<Self>`-consuming variant of `rename_type`. Renames the type
+    /// in the catalog (single LSM commit), then rebuilds engine-level
+    /// derived state under `post_schema` and returns a fresh
+    /// `Arc<Database>` sharing storage + subscribers + counters with
+    /// the consumed handle. The returned report is the same one
+    /// `rename_type` would return.
+    pub fn rename_type_consuming(
+        self: &Arc<Self>,
+        old: &str,
+        new: &str,
+        post_schema: Schema,
+    ) -> EngineResult<(crate::catalog::MigrationReport, Arc<Self>)> {
+        // Take `migration_lock.write()` once and HOLD IT through the
+        // verb + rebuild + poison atomic sequence. Without the held
+        // lock, the window between the verb's commit (catalog migrated
+        // on disk) and the poison flag being set could let a concurrent
+        // writer's `create()` (waiting on `migration_lock.read()`)
+        // acquire the lock and commit OLD-shape data into the post-
+        // migration catalog era. With the lock held, the concurrent
+        // writer remains blocked until the new handle exists and the
+        // poison fires.
+        //
+        // `self: &Arc<Self>` — caller's Arc isn't consumed by the call.
+        // On Err, the caller still owns their original Arc; on Ok they
+        // get both the (now poisoned) original AND the new handle.
+        // This sidesteps the "destroy the only Arc on benign validation
+        // error" hazard the adversarial review flagged for the prior
+        // `self: Arc<Self>` signature.
+        self.check_not_migrated()?;
+        // Stop the builder before the write lock (see `reload_handle`).
+        self.stop_fulltext_builder();
+        let _guard = self.migration_lock.write();
+        let report = self.rename_type_inner(old, new)?;
+        let new_db = self.clone_into_new_handle(post_schema)?;
+        Ok((report, new_db))
+    }
+
+    /// `Arc<Self>`-consuming variant of `rename_field`. See
+    /// `rename_type_consuming` for the shared semantics.
+    pub fn rename_field_consuming(
+        self: &Arc<Self>,
+        type_name: &str,
+        old: &str,
+        new: &str,
+        post_schema: Schema,
+    ) -> EngineResult<(crate::catalog::MigrationReport, Arc<Self>)> {
+        self.check_not_migrated()?;
+        // Stop the builder before the write lock (see `reload_handle`).
+        self.stop_fulltext_builder();
+        let _guard = self.migration_lock.write();
+        let report = self.rename_field_inner(type_name, old, new)?;
+        let new_db = self.clone_into_new_handle(post_schema)?;
+        Ok((report, new_db))
+    }
+
+    /// Build a fresh `Arc<Database>` sharing `Arc<LsmTree>`,
+    /// `Arc<SubscriptionHub>`, `next_object_id`, the `version_counters`
+    /// map, and the `zone_field_id_lookup` `Arc<ArcSwap>` with `self`;
+    /// then mark `self` as migrated so any retained `Arc` to the old
+    /// handle surfaces `DatabaseMigratedAway` on next use.
+    ///
+    /// Private — every public entry point that constructs a successor
+    /// handle goes through one of the `_consuming` verbs above.
+    fn clone_into_new_handle(
+        self: &Arc<Self>,
+        post_schema: Schema,
+    ) -> EngineResult<Arc<Self>> {
+        // Carry the SHARED Arc instances — not snapshots. This makes
+        // `next_object_id`/`version_counters`/`migration_lock`/etc. one
+        // and the same across OLD and NEW handles, closing the carry-
+        // race window where the OLD handle could fetch_add a new id
+        // (or bump a version_counter) after the snapshot but before
+        // the poison and end up colliding with the NEW handle's first
+        // operation.
+        let carry = CarryState {
+            subscriptions: Arc::clone(&self.subscriptions),
+            migration_events: Arc::clone(&self.migration_events),
+            next_object_id: Arc::clone(&self.next_object_id),
+            version_counters: Arc::clone(&self.version_counters),
+            version_counter_count: Arc::clone(&self.version_counter_count),
+            migration_lock: Arc::clone(&self.migration_lock),
+            maintenance_lock: Arc::clone(&self.maintenance_lock),
+            converters: Arc::clone(&self.converters),
+        };
+        // Poison the OLD handle BEFORE rebuilding. If `rebuild_with_arc_storage`
+        // succeeds, the OLD handle is already marked migrated so any
+        // racing call to a public read/write method through `resolve_type_id`
+        // surfaces `DatabaseMigratedAway` instead of stale-cache results.
+        // If rebuild FAILS, the catalog change has already committed on
+        // disk — the old handle is functionally dead (its in-memory
+        // schema disagrees with the on-disk catalog), so poisoning it
+        // is the safer failure mode than leaving it un-poisoned and
+        // letting the caller observe inconsistent reads. The contract
+        // becomes: on Err, drop the OLD handle and reopen.
+        self.migrated
+            .store(true, std::sync::atomic::Ordering::Release);
+        Self::rebuild_with_arc_storage(
+            Arc::clone(&self.storage),
+            post_schema,
+            self.opts.clone(),
+            Arc::clone(&self.zone_field_id_lookup),
+            Some(carry),
+        )
+    }
+
+    /// Hot schema-reload primitive (server `/admin/reload` + auto-reload on
+    /// migration completion). Rebuilds a fresh `Arc<Database>` under
+    /// `post_schema`, sharing the SAME `Arc<LsmTree>` / subscribers / counters /
+    /// converters as `self` (no second LSM/WAL open, no rescan) — i.e. exactly
+    /// the `clone_into_new_handle` carry — but WITHOUT making a catalog change.
+    ///
+    /// Two deliberate differences from `clone_into_new_handle`:
+    ///
+    /// * **Non-poisoning.** `self.migrated` is left `false`, so the OLD handle
+    ///   stays fully live. If the rebuild FAILS (e.g. the supplied SDL disagrees
+    ///   with the on-disk catalog → `FieldKindChanged`), the caller still has a
+    ///   working handle and the server keeps serving — a bad reload can't brick
+    ///   it. The server quiesces in-flight requests around the swap (a
+    ///   write-locked schema epoch), so nothing observes the old handle's stale
+    ///   caches mid-request; the only other old-handle holders (the draining
+    ///   cover-refresh worker, the vectorizer's schema snapshot) are benign for a
+    ///   scalar field-type reload.
+    ///
+    /// * **Refuses while a migration is in flight.** The rebuilt handle does NOT
+    ///   carry `migrating_fields` (CarryState omits it — the `_consuming`
+    ///   invariant is "no unsettled plan"), so reloading mid-migration would
+    ///   silently disarm the double-write hook → source-only writes that cutover
+    ///   later loses/refuses. Holding `migration_lock.write()` across the check +
+    ///   rebuild makes the guard race-free vs a concurrent migration arm/disarm.
+    ///
+    /// * **Old handles keep writing (full-text caveat).** Non-poisoning means a
+    ///   caller that keeps the OLD `Arc` can still write through it, with the
+    ///   OLD schema's `@fulltext` tables. If the reload changed a field's
+    ///   analyzer/positions (a new index generation), such a stale write
+    ///   indexes at the old generation and stays invisible to the new one until
+    ///   the object is written again through the new handle. The server never
+    ///   does this (it drains and swaps under `reload_lock`); embedded callers
+    ///   must drop the old handle after a reload.
+    pub fn reload_handle(self: &Arc<Self>, post_schema: Schema) -> EngineResult<Arc<Self>> {
+        self.check_not_migrated()?;
+        // Stop this handle's full-text builder BEFORE taking the write lock:
+        // the builder takes `migration_lock.read()` per chunk, so joining it
+        // while holding the write side would deadlock. The rebuilt handle
+        // re-derives and resumes its tasks from the persisted markers.
+        self.stop_fulltext_builder();
+        let _guard = self.migration_lock.write();
+        let armed = self
+            .migrating_field_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if armed > 0 {
+            return Err(EngineError::ReloadBlockedByActiveMigration { armed });
+        }
+        let carry = CarryState {
+            subscriptions: Arc::clone(&self.subscriptions),
+            migration_events: Arc::clone(&self.migration_events),
+            next_object_id: Arc::clone(&self.next_object_id),
+            version_counters: Arc::clone(&self.version_counters),
+            version_counter_count: Arc::clone(&self.version_counter_count),
+            migration_lock: Arc::clone(&self.migration_lock),
+            maintenance_lock: Arc::clone(&self.maintenance_lock),
+            converters: Arc::clone(&self.converters),
+        };
+        // NON-poisoning: self.migrated stays false (see doc comment).
+        Self::rebuild_with_arc_storage(
+            Arc::clone(&self.storage),
+            post_schema,
+            self.opts.clone(),
+            Arc::clone(&self.zone_field_id_lookup),
+            Some(carry),
+        )
+    }
+    /// `Arc<Self>`-consuming variant of `change_field_type`. See
+    /// `rename_type_consuming` for the shared semantics.
+    pub fn change_field_type_consuming<F>(
+        self: &Arc<Self>,
+        type_name: &str,
+        field_name: &str,
+        target_field_type: rhypedb_schema::FieldType,
+        converter: F,
+        post_schema: Schema,
+    ) -> EngineResult<(crate::catalog::MigrationReport, Arc<Self>)>
+    where
+        F: Fn(u64, &crate::object::Value) -> EngineResult<crate::object::Value>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.check_not_migrated()?;
+        // Stop the builder before the write lock (see `reload_handle`).
+        self.stop_fulltext_builder();
+        let _guard = self.migration_lock.write();
+        let report =
+            self.change_field_type_inner(type_name, field_name, target_field_type, converter)?;
+        let new_db = self.clone_into_new_handle(post_schema)?;
+        Ok((report, new_db))
+    }
+
+    /// `Arc<Self>`-consuming variant of `run_migrations`. See
+    /// `rename_type_consuming` for the shared semantics.
+    pub fn run_migrations_consuming(
+        self: &Arc<Self>,
+        migrations: Vec<crate::catalog::Migration>,
+        post_schema: Schema,
+    ) -> EngineResult<(crate::catalog::MigrationLogReport, Arc<Self>)> {
+        self.check_not_migrated()?;
+        // Stop the builder before the write lock (see `reload_handle`).
+        self.stop_fulltext_builder();
+        let _guard = self.migration_lock.write();
+        let report = self.run_migrations_inner(migrations)?;
+        let new_db = self.clone_into_new_handle(post_schema)?;
+        Ok((report, new_db))
+    }
+}
+
+impl DatabaseCore {
+
+
 
     /// Return freed heap memory to the operating system now (glibc
     /// `malloc_trim`; a no-op on other allocators). The engine already does
@@ -1937,219 +2184,11 @@ impl Database {
     //   `cascade_meta_by_id`, `type_name_by_id`, `retired_*`.
     // -----------------------------------------------------------------
 
-    /// `Arc<Self>`-consuming variant of `rename_type`. Renames the type
-    /// in the catalog (single LSM commit), then rebuilds engine-level
-    /// derived state under `post_schema` and returns a fresh
-    /// `Arc<Database>` sharing storage + subscribers + counters with
-    /// the consumed handle. The returned report is the same one
-    /// `rename_type` would return.
-    pub fn rename_type_consuming(
-        self: &Arc<Self>,
-        old: &str,
-        new: &str,
-        post_schema: Schema,
-    ) -> EngineResult<(crate::catalog::MigrationReport, Arc<Self>)> {
-        // Take `migration_lock.write()` once and HOLD IT through the
-        // verb + rebuild + poison atomic sequence. Without the held
-        // lock, the window between the verb's commit (catalog migrated
-        // on disk) and the poison flag being set could let a concurrent
-        // writer's `create()` (waiting on `migration_lock.read()`)
-        // acquire the lock and commit OLD-shape data into the post-
-        // migration catalog era. With the lock held, the concurrent
-        // writer remains blocked until the new handle exists and the
-        // poison fires.
-        //
-        // `self: &Arc<Self>` — caller's Arc isn't consumed by the call.
-        // On Err, the caller still owns their original Arc; on Ok they
-        // get both the (now poisoned) original AND the new handle.
-        // This sidesteps the "destroy the only Arc on benign validation
-        // error" hazard the adversarial review flagged for the prior
-        // `self: Arc<Self>` signature.
-        self.check_not_migrated()?;
-        // Stop the builder before the write lock (see `reload_handle`).
-        self.stop_fulltext_builder();
-        let _guard = self.migration_lock.write();
-        let report = self.rename_type_inner(old, new)?;
-        let new_db = self.clone_into_new_handle(post_schema)?;
-        Ok((report, new_db))
-    }
 
-    /// `Arc<Self>`-consuming variant of `rename_field`. See
-    /// `rename_type_consuming` for the shared semantics.
-    pub fn rename_field_consuming(
-        self: &Arc<Self>,
-        type_name: &str,
-        old: &str,
-        new: &str,
-        post_schema: Schema,
-    ) -> EngineResult<(crate::catalog::MigrationReport, Arc<Self>)> {
-        self.check_not_migrated()?;
-        // Stop the builder before the write lock (see `reload_handle`).
-        self.stop_fulltext_builder();
-        let _guard = self.migration_lock.write();
-        let report = self.rename_field_inner(type_name, old, new)?;
-        let new_db = self.clone_into_new_handle(post_schema)?;
-        Ok((report, new_db))
-    }
 
-    /// `Arc<Self>`-consuming variant of `change_field_type`. See
-    /// `rename_type_consuming` for the shared semantics.
-    pub fn change_field_type_consuming<F>(
-        self: &Arc<Self>,
-        type_name: &str,
-        field_name: &str,
-        target_field_type: rhypedb_schema::FieldType,
-        converter: F,
-        post_schema: Schema,
-    ) -> EngineResult<(crate::catalog::MigrationReport, Arc<Self>)>
-    where
-        F: Fn(u64, &crate::object::Value) -> EngineResult<crate::object::Value>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.check_not_migrated()?;
-        // Stop the builder before the write lock (see `reload_handle`).
-        self.stop_fulltext_builder();
-        let _guard = self.migration_lock.write();
-        let report =
-            self.change_field_type_inner(type_name, field_name, target_field_type, converter)?;
-        let new_db = self.clone_into_new_handle(post_schema)?;
-        Ok((report, new_db))
-    }
 
-    /// `Arc<Self>`-consuming variant of `run_migrations`. See
-    /// `rename_type_consuming` for the shared semantics.
-    pub fn run_migrations_consuming(
-        self: &Arc<Self>,
-        migrations: Vec<crate::catalog::Migration>,
-        post_schema: Schema,
-    ) -> EngineResult<(crate::catalog::MigrationLogReport, Arc<Self>)> {
-        self.check_not_migrated()?;
-        // Stop the builder before the write lock (see `reload_handle`).
-        self.stop_fulltext_builder();
-        let _guard = self.migration_lock.write();
-        let report = self.run_migrations_inner(migrations)?;
-        let new_db = self.clone_into_new_handle(post_schema)?;
-        Ok((report, new_db))
-    }
 
-    /// Build a fresh `Arc<Database>` sharing `Arc<LsmTree>`,
-    /// `Arc<SubscriptionHub>`, `next_object_id`, the `version_counters`
-    /// map, and the `zone_field_id_lookup` `Arc<ArcSwap>` with `self`;
-    /// then mark `self` as migrated so any retained `Arc` to the old
-    /// handle surfaces `DatabaseMigratedAway` on next use.
-    ///
-    /// Private — every public entry point that constructs a successor
-    /// handle goes through one of the `_consuming` verbs above.
-    fn clone_into_new_handle(
-        self: &Arc<Self>,
-        post_schema: Schema,
-    ) -> EngineResult<Arc<Self>> {
-        // Carry the SHARED Arc instances — not snapshots. This makes
-        // `next_object_id`/`version_counters`/`migration_lock`/etc. one
-        // and the same across OLD and NEW handles, closing the carry-
-        // race window where the OLD handle could fetch_add a new id
-        // (or bump a version_counter) after the snapshot but before
-        // the poison and end up colliding with the NEW handle's first
-        // operation.
-        let carry = CarryState {
-            subscriptions: Arc::clone(&self.subscriptions),
-            migration_events: Arc::clone(&self.migration_events),
-            next_object_id: Arc::clone(&self.next_object_id),
-            version_counters: Arc::clone(&self.version_counters),
-            version_counter_count: Arc::clone(&self.version_counter_count),
-            migration_lock: Arc::clone(&self.migration_lock),
-            maintenance_lock: Arc::clone(&self.maintenance_lock),
-            converters: Arc::clone(&self.converters),
-        };
-        // Poison the OLD handle BEFORE rebuilding. If `rebuild_with_arc_storage`
-        // succeeds, the OLD handle is already marked migrated so any
-        // racing call to a public read/write method through `resolve_type_id`
-        // surfaces `DatabaseMigratedAway` instead of stale-cache results.
-        // If rebuild FAILS, the catalog change has already committed on
-        // disk — the old handle is functionally dead (its in-memory
-        // schema disagrees with the on-disk catalog), so poisoning it
-        // is the safer failure mode than leaving it un-poisoned and
-        // letting the caller observe inconsistent reads. The contract
-        // becomes: on Err, drop the OLD handle and reopen.
-        self.migrated
-            .store(true, std::sync::atomic::Ordering::Release);
-        Self::rebuild_with_arc_storage(
-            Arc::clone(&self.storage),
-            post_schema,
-            self.opts.clone(),
-            Arc::clone(&self.zone_field_id_lookup),
-            Some(carry),
-        )
-    }
 
-    /// Hot schema-reload primitive (server `/admin/reload` + auto-reload on
-    /// migration completion). Rebuilds a fresh `Arc<Database>` under
-    /// `post_schema`, sharing the SAME `Arc<LsmTree>` / subscribers / counters /
-    /// converters as `self` (no second LSM/WAL open, no rescan) — i.e. exactly
-    /// the `clone_into_new_handle` carry — but WITHOUT making a catalog change.
-    ///
-    /// Two deliberate differences from `clone_into_new_handle`:
-    ///
-    /// * **Non-poisoning.** `self.migrated` is left `false`, so the OLD handle
-    ///   stays fully live. If the rebuild FAILS (e.g. the supplied SDL disagrees
-    ///   with the on-disk catalog → `FieldKindChanged`), the caller still has a
-    ///   working handle and the server keeps serving — a bad reload can't brick
-    ///   it. The server quiesces in-flight requests around the swap (a
-    ///   write-locked schema epoch), so nothing observes the old handle's stale
-    ///   caches mid-request; the only other old-handle holders (the draining
-    ///   cover-refresh worker, the vectorizer's schema snapshot) are benign for a
-    ///   scalar field-type reload.
-    ///
-    /// * **Refuses while a migration is in flight.** The rebuilt handle does NOT
-    ///   carry `migrating_fields` (CarryState omits it — the `_consuming`
-    ///   invariant is "no unsettled plan"), so reloading mid-migration would
-    ///   silently disarm the double-write hook → source-only writes that cutover
-    ///   later loses/refuses. Holding `migration_lock.write()` across the check +
-    ///   rebuild makes the guard race-free vs a concurrent migration arm/disarm.
-    ///
-    /// * **Old handles keep writing (full-text caveat).** Non-poisoning means a
-    ///   caller that keeps the OLD `Arc` can still write through it, with the
-    ///   OLD schema's `@fulltext` tables. If the reload changed a field's
-    ///   analyzer/positions (a new index generation), such a stale write
-    ///   indexes at the old generation and stays invisible to the new one until
-    ///   the object is written again through the new handle. The server never
-    ///   does this (it drains and swaps under `reload_lock`); embedded callers
-    ///   must drop the old handle after a reload.
-    pub fn reload_handle(self: &Arc<Self>, post_schema: Schema) -> EngineResult<Arc<Self>> {
-        self.check_not_migrated()?;
-        // Stop this handle's full-text builder BEFORE taking the write lock:
-        // the builder takes `migration_lock.read()` per chunk, so joining it
-        // while holding the write side would deadlock. The rebuilt handle
-        // re-derives and resumes its tasks from the persisted markers.
-        self.stop_fulltext_builder();
-        let _guard = self.migration_lock.write();
-        let armed = self
-            .migrating_field_count
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if armed > 0 {
-            return Err(EngineError::ReloadBlockedByActiveMigration { armed });
-        }
-        let carry = CarryState {
-            subscriptions: Arc::clone(&self.subscriptions),
-            migration_events: Arc::clone(&self.migration_events),
-            next_object_id: Arc::clone(&self.next_object_id),
-            version_counters: Arc::clone(&self.version_counters),
-            version_counter_count: Arc::clone(&self.version_counter_count),
-            migration_lock: Arc::clone(&self.migration_lock),
-            maintenance_lock: Arc::clone(&self.maintenance_lock),
-            converters: Arc::clone(&self.converters),
-        };
-        // NON-poisoning: self.migrated stays false (see doc comment).
-        Self::rebuild_with_arc_storage(
-            Arc::clone(&self.storage),
-            post_schema,
-            self.opts.clone(),
-            Arc::clone(&self.zone_field_id_lookup),
-            Some(carry),
-        )
-    }
 
     /// Guardrail for read/write entry points. Returns
     /// `DatabaseMigratedAway` if this handle has been consumed by one
@@ -7592,29 +7631,24 @@ impl Database {
 }
 
 impl Drop for Database {
-    /// Tear down the cover-refresh worker. Dropping the sender closes the
-    /// channel — the worker's blocked `recv()` returns `Err`, the loop
-    /// breaks, the thread exits. We then join so this `Drop` doesn't
-    /// return while the worker is still touching the LSM.
-    ///
-    /// Self-join guard: the worker temporarily holds an `Arc<Database>`
-    /// during each iteration (via `Weak::upgrade`). If the external
-    /// holder drops their `Arc` while the worker is processing, the
-    /// worker's local Arc can become the last one — its end-of-scope
-    /// drop fires `Database::drop` on the worker thread itself, where
-    /// `handle.join()` would deadlock against the current thread. In
-    /// that case the worker is already finishing its iteration and will
-    /// exit naturally on the next `rx.recv()` (which now returns `Err`
-    /// because we just dropped the sender), so we just skip the join.
+    /// Stop and join every background worker, so that when this — the last
+    /// caller handle — finishes dropping, the core (storage, files, data-dir
+    /// lock) goes with it. Workers hold only the core (`Weak<DatabaseCore>`,
+    /// upgraded per unit of work), never a handle, so this always runs on a
+    /// caller's thread: a worker can't be the one dropping the last handle,
+    /// and none of these joins can be a self-join (GH #29). Cover refresh:
+    /// dropping the sender ends its `recv()` loop.
     fn drop(&mut self) {
+        let here = std::thread::current().id();
         // Full-text builder first: it holds only a `Weak` between chunks, so
         // it exits at the next boundary once signalled (self-join guarded).
         self.stop_fulltext_builder();
         *self.cover_refresh_tx.lock() = None;
-        if let Some(handle) = self.cover_refresh_handle.lock().take()
-            && handle.thread().id() != std::thread::current().id()
-        {
-            let _ = handle.join();
+        if let Some(handle) = self.cover_refresh_handle.lock().take() {
+            debug_assert_ne!(handle.thread().id(), here, "cover-refresh worker dropped a handle");
+            if handle.thread().id() != here {
+                let _ = handle.join();
+            }
         }
 
         // Stop in-flight migration drivers (card 3/5). Drain the registry under
@@ -7622,12 +7656,10 @@ impl Drop for Database {
         // registry lock across a join (a driver self-deregisters under that same
         // lock on its normal exit). PAUSE (not CANCEL) = "stop at a chunk
         // boundary, leave the plan resumable"; the next open's auto-resume
-        // re-drives it. `Drop` runs only at refcount 0, so every `weak.upgrade`
-        // inside a driver returns `None` now — a driver cannot re-enter the
-        // database or take the registry lock, so there is no cycle. The same
-        // self-join-skip guard the cover-refresh worker uses covers the case
-        // where the LAST `Arc` was a driver's transient cutover upgrade, so this
-        // `Drop` is itself running on a driver thread.
+        // re-drives it. A driver holds only a `Weak<DatabaseCore>` (upgraded
+        // for a cutover) — it can still reach the core while we join, but it
+        // never takes the registry lock on that path and never holds a handle,
+        // so there is no cycle and no self-join.
         let drivers: Vec<MigrationDriver> =
             std::mem::take(&mut *self.migration_drivers.lock())
                 .into_values()
@@ -7639,10 +7671,11 @@ impl Drop for Database {
             );
         }
         for d in drivers {
-            if let Some(handle) = d.handle
-                && handle.thread().id() != std::thread::current().id()
-            {
-                let _ = handle.join();
+            if let Some(handle) = d.handle {
+                debug_assert_ne!(handle.thread().id(), here, "migration driver dropped a handle");
+                if handle.thread().id() != here {
+                    let _ = handle.join();
+                }
             }
         }
     }
@@ -7653,11 +7686,11 @@ impl Drop for Database {
 /// branch, including `?` propagation and a panic unwind — it wakes any
 /// `wait_for_migration` waiter and removes the registry entry. (The async create
 /// driver does this manually in `migration_driver_main`, since it holds only a
-/// `Weak<Database>`.) The inline drive runs under the operator's `Arc<Database>`,
+/// `Weak<DatabaseCore>`.) The inline drive runs under the operator's `Arc<Database>`,
 /// so `Database::drop` cannot run until the drive returns and the guard fires —
 /// no race against the registry drain.
 struct InlineDriveGuard<'a> {
-    db: &'a Database,
+    db: &'a DatabaseCore,
     plan_id: u64,
     signal: Arc<MigrationSignal>,
 }
@@ -7675,7 +7708,7 @@ impl Drop for InlineDriveGuard<'_> {
 
 /// Detached ASYNC migration driver entrypoint (shadow-field card 3/5). Owns the
 /// `N` partition workers for one plan's Converting phase, then the
-/// single-threaded cutover. Holds a `Weak<Database>` (+ a storage `Arc`) — it
+/// single-threaded cutover. Holds a `Weak<DatabaseCore>` (+ a storage `Arc`) — it
 /// upgrades to a strong `Arc<Database>` ONLY transiently for the cutover, so it
 /// never extends the database's lifetime: if external `Arc`s drop mid-backfill,
 /// `Database::drop` stores PAUSE + joins this thread, the cutover upgrade returns
@@ -7689,7 +7722,7 @@ impl Drop for InlineDriveGuard<'_> {
 /// `migration_lock` cleanly).
 #[allow(clippy::too_many_arguments)]
 fn migration_driver_main(
-    weak: std::sync::Weak<Database>,
+    weak: std::sync::Weak<DatabaseCore>,
     storage: Arc<LsmTree>,
     converter: crate::catalog::RegisteredConverter,
     control: Arc<std::sync::atomic::AtomicU8>,
@@ -7727,7 +7760,7 @@ fn migration_driver_main(
 /// a dropped-DB upgrade-`None` all return `Ok(())` (the plan is left for the next
 /// open in the drop case).
 fn drive_async_migration(
-    weak: &std::sync::Weak<Database>,
+    weak: &std::sync::Weak<DatabaseCore>,
     storage: &LsmTree,
     converter: &crate::catalog::RegisteredConverter,
     control: &std::sync::atomic::AtomicU8,
@@ -7823,13 +7856,13 @@ fn drive_async_migration(
 /// target `(type_id, object_id)` that just had its generation bumped and
 /// asking the database to repair every embedded cover for that target.
 ///
-/// Holds a `Weak<Database>` so the database's lifetime isn't extended by
+/// Holds a `Weak<DatabaseCore>` so the database's lifetime isn't extended by
 /// this thread — when external `Arc<Database>` refs all drop, our upgrade
 /// returns `None` and we exit. The channel-close signal from `Drop` covers
 /// the case where the worker is blocked in `recv()` at that moment.
 fn cover_refresh_worker(
     rx: std::sync::mpsc::Receiver<(u64, u64)>,
-    weak: std::sync::Weak<Database>,
+    weak: std::sync::Weak<DatabaseCore>,
 ) {
     while let Ok(first) = rx.recv() {
         // Coalesce: N updates to one target queued since the last round need
@@ -7892,7 +7925,7 @@ fn drain_coalesced(
 /// True when a field-type migration is in flight (the `<field>__shadow`
 /// double-write is active). Gates the shadow-strip in the cover builders so a
 /// non-migrating database pays one atomic load and no scan.
-fn migration_in_flight(db: &Database) -> bool {
+fn migration_in_flight(db: &DatabaseCore) -> bool {
     // Acquire pairs with the SeqCst store in `arm_field_hook`/`disarm_field_hook`
     // so a cover builder running under `migration_lock.read()` (the background
     // cover-refresh worker is NOT serialized against a disarm that happens
@@ -7914,7 +7947,7 @@ fn strip_shadow_from_cover(map: &mut FieldMap) {
 /// Return a serialized blob guaranteed shadow-free: if a migration is in flight
 /// and `data` carries shadow siblings, deserialize + strip + re-serialize;
 /// otherwise hand back the original `Bytes` (refcount only, no copy).
-fn shadow_stripped_blob(db: &Database, data: Bytes) -> Bytes {
+fn shadow_stripped_blob(db: &DatabaseCore, data: Bytes) -> Bytes {
     if !migration_in_flight(db) {
         return data;
     }
@@ -7929,7 +7962,7 @@ fn shadow_stripped_blob(db: &Database, data: Bytes) -> Bytes {
 }
 
 fn build_inflight_cover(
-    db: &Database,
+    db: &DatabaseCore,
     txn: &rhypedb_storage::mvcc::Transaction,
     this_field: &str,
     this_target: u64,
@@ -7971,7 +8004,7 @@ fn build_inflight_cover(
 /// per-id probe — the same path a stale cover takes. Copying a large object
 /// into every rev edge that reaches it is what made a text-heavy type grow
 /// ~15x on disk (GH #26).
-fn insert_target_cover(db: &Database, map: &mut FieldMap, name: &str, blob: Bytes, version: u64) {
+fn insert_target_cover(db: &DatabaseCore, map: &mut FieldMap, name: &str, blob: Bytes, version: u64) {
     if blob.len() > db.opts.cover_max_bytes {
         return;
     }
@@ -7980,7 +8013,7 @@ fn insert_target_cover(db: &Database, map: &mut FieldMap, name: &str, blob: Byte
 }
 
 fn build_covering_rev_value(
-    db: &Database,
+    db: &DatabaseCore,
     txn: &rhypedb_storage::mvcc::Transaction,
     source_type: &str,
     source_id: u64,
@@ -8103,7 +8136,7 @@ fn build_covering_rev_value(
 /// outgoing 1:1 on the target (the existing Movie/User shape) get
 /// `target_data` back verbatim.
 fn with_nested_forward_covers(
-    db: &Database,
+    db: &DatabaseCore,
     txn: &rhypedb_storage::mvcc::Transaction,
     target_type: &str,
     target_data: Bytes,
@@ -8536,7 +8569,7 @@ fn compare_bool(a: bool, op: rhypedb_storage::zone::CompareOp, b: bool) -> bool 
     compare_ord(&u8::from(a), op, &u8::from(b))
 }
 
-impl crate::catalog::FieldCoverMaintainer for Database {
+impl crate::catalog::FieldCoverMaintainer for DatabaseCore {
     /// Offline field-type change (`change_field_type` / `run_migrations`) cover
     /// maintenance: overwrite every SIBLING `@indexed` field's covering payload
     /// with the converted blob, so a covered `filter_scan` on that sibling stops
@@ -8679,7 +8712,7 @@ pub(crate) fn encode_int_for_zone(value: &Value) -> Option<[u8; 8]> {
 // FULL-TEXT SEARCH (see `crate::fulltext`)
 // =====================================================================
 
-impl Database {
+impl DatabaseCore {
     /// The `@fulltext` metadata for `type_name.field_name`, if that field
     /// carries the directive in the live schema.
     pub fn fulltext_field(&self, type_name: &str, field_name: &str) -> Option<&FulltextField> {
@@ -9840,7 +9873,7 @@ mod tests {
             },
         ];
         let report =
-            crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+            crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&**db))
                 .unwrap();
         // Per-verb counters: the chain rewrites the ONE object once per step
         // (3 verbs → 3), it is not an object COUNT.
@@ -9931,7 +9964,7 @@ mod tests {
                 new: "years".into(),
             },
         ];
-        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&**db))
             .unwrap();
         drop(db);
 
@@ -10009,7 +10042,7 @@ mod tests {
                 new: "years".into(),
             },
         ];
-        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&**db))
             .unwrap();
         drop(db);
 
@@ -10752,7 +10785,7 @@ mod tests {
                 new: "handle".into(),
             },
         ];
-        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&**db))
             .unwrap();
 
         let rev_key = KeyBuilder::reverse_edge(movie2.id, rec_id, user.id);
@@ -10831,7 +10864,7 @@ mod tests {
                 new: "suggested".into(),
             },
         ];
-        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&*db))
+        crate::catalog::apply_migration_with_cover(&db.storage, &db.schema, &verbs, Some(&**db))
             .unwrap();
 
         // suggested's (=recommendation's) rev cover holds top_pick's (=favourite's)
@@ -11147,7 +11180,7 @@ mod tests {
     /// also embedded the source's own scalar fields. Covers written today
     /// never carry them, but databases written before still do, and the
     /// catalog's rename passes must keep those consistent.
-    fn plant_legacy_source_scalars(db: &Database, rev_key: &[u8], scalars: &[(&str, Value)]) {
+    fn plant_legacy_source_scalars(db: &DatabaseCore, rev_key: &[u8], scalars: &[(&str, Value)]) {
         let mut txn = db.storage().begin_txn();
         let current = db.storage().get(&txn, rev_key).unwrap().expect("rev_edge exists");
         let mut fields = crate::object::deserialize_fields(&current);
@@ -12989,7 +13022,7 @@ mod tests {
             Value::I64(i) => Ok(Value::F64(*i as f64)),
             _ => unreachable!(),
         });
-        let seed = |db: &Database| -> Vec<u64> {
+        let seed = |db: &DatabaseCore| -> Vec<u64> {
             let mut ids = Vec::new();
             for i in 0..20i64 {
                 let mut f = FieldMap::new();
@@ -13191,7 +13224,7 @@ mod tests {
     /// blocked), sets the control byte, then releases — so every worker stops
     /// after exactly its first chunk, well before completion, on every host.
     fn register_gated_widen(
-        db: &Database,
+        db: &DatabaseCore,
     ) -> (std::sync::mpsc::Receiver<()>, impl Fn() + use<>) {
         use std::sync::{Arc, Condvar, Mutex};
         let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -13787,7 +13820,7 @@ mod tests {
 
     /// Seed `n` User rows with `score = i`, planting `score = -1` (the poison
     /// value) at `poison_ids` positions. Returns the created object ids.
-    fn seed_scores(db: &Database, n: i64, poison_idxs: &[i64]) -> Vec<u64> {
+    fn seed_scores(db: &DatabaseCore, n: i64, poison_idxs: &[i64]) -> Vec<u64> {
         let mut ids = Vec::new();
         for i in 0..n {
             let mut f = FieldMap::new();
@@ -14677,7 +14710,7 @@ mod tests {
     // Persist a Running plan WITHOUT driving it — simulates a crash after
     // create_migration_plan committed the plan but before the chunk loop
     // finished. Returns the plan id.
-    fn persist_running_plan(db: &Database, type_name: &str, field: &str) -> u64 {
+    fn persist_running_plan(db: &DatabaseCore, type_name: &str, field: &str) -> u64 {
         use rhypedb_schema::{FieldType, ScalarType};
         let target = crate::catalog::schema_kind_byte_public(&FieldType::Scalar(ScalarType::F64));
         crate::catalog::create_migration_plan(
@@ -16506,12 +16539,12 @@ mod tests {
     fn find_by_unique_prefix_value_survives_reopen() {
         const SCHEMA: &str = "type Thing {\n    key: String @unique\n}\n";
         let dir = tempfile::tempdir().unwrap();
-        let create = |db: &Database, k: &str| {
+        let create = |db: &DatabaseCore, k: &str| {
             let mut f = FieldMap::new();
             f.insert("key".to_string(), Value::String(k.into()));
             db.create("Thing", f)
         };
-        let find = |db: &Database, k: &str| {
+        let find = |db: &DatabaseCore, k: &str| {
             db.find_by_unique("Thing", "key", &Value::String(k.into()))
                 .unwrap()
                 .map(|o| o.id)
@@ -17250,7 +17283,7 @@ mod tests {
     /// Count the `i:` (secondary-index) entries currently visible in the LSM.
     /// Walks the global field-index prefix; used to verify create/update/
     /// delete maintain the index without leaking entries.
-    fn count_index_entries(db: &Database) -> usize {
+    fn count_index_entries(db: &DatabaseCore) -> usize {
         // Field-index prefix is just `i:` — works regardless of type/field.
         let snapshot = db.storage().read_snapshot();
         let entries = db.storage().scan_prefix_at(snapshot, b"i:").unwrap();
@@ -17352,7 +17385,7 @@ mod tests {
         parse_schema(r#"type Event { name: String  created: DateTime }"#).unwrap()
     }
 
-    fn make_event(db: &Database, name: &str, ms: i64) {
+    fn make_event(db: &DatabaseCore, name: &str, ms: i64) {
         let mut f = FieldMap::new();
         f.insert("name".into(), Value::String(name.into()));
         f.insert("created".into(), Value::DateTime(ms));
@@ -17372,7 +17405,7 @@ mod tests {
 
     /// Run all six comparison ops against a DateTime field and return the set of
     /// matching millis (sorted). Shared by the indexed and zone-map parity test.
-    fn datetime_op_results(db: &Database, target: i64) -> Vec<(rhypedb_storage::zone::CompareOp, Vec<i64>)> {
+    fn datetime_op_results(db: &DatabaseCore, target: i64) -> Vec<(rhypedb_storage::zone::CompareOp, Vec<i64>)> {
         use rhypedb_storage::zone::CompareOp;
         let ops = [
             CompareOp::Eq,
@@ -18534,7 +18567,7 @@ mod tests {
         // leaves the entry byte-for-byte unchanged instead of rewriting it.
         let (db, uid, mid, rid, _dir) = build_one_rating(covering_schema());
 
-        let read_cover = |db: &Database| {
+        let read_cover = |db: &DatabaseCore| {
             let groups = db.get_links_many("Movie", &[mid], "ratings").unwrap();
             assert_eq!(groups[0].len(), 1);
             assert_eq!(groups[0][0].0, rid);
@@ -18655,14 +18688,14 @@ mod tests {
     /// Helper: poll the `r:<movie>:movie:<rating>` rev_edge value and read
     /// the embedded `user__cover_v` stamp. Returns the stamp or `None` if
     /// the rev_edge isn't present or doesn't carry a cover.
-    fn read_movie_side_user_cover_v(db: &Database, movie_id: u64) -> Option<u64> {
+    fn read_movie_side_user_cover_v(db: &DatabaseCore, movie_id: u64) -> Option<u64> {
         let groups = db.get_links_many("Movie", &[movie_id], "ratings").ok()?;
         let group = groups.into_iter().next()?;
         let (_rid, cover) = group.into_iter().next()?;
         crate::object::find_u64_field_in_raw(&cover, "user__cover_v")
     }
 
-    fn read_movie_side_user_name(db: &Database, movie_id: u64) -> Option<String> {
+    fn read_movie_side_user_name(db: &DatabaseCore, movie_id: u64) -> Option<String> {
         let groups = db.get_links_many("Movie", &[movie_id], "ratings").ok()?;
         let group = groups.into_iter().next()?;
         let (_rid, cover) = group.into_iter().next()?;
@@ -18751,7 +18784,7 @@ mod tests {
 
     // --- Scoped / batched / coalesced cover refresh -------------------------
 
-    fn refresh_stats(db: &Database) -> (u64, u64, u64) {
+    fn refresh_stats(db: &DatabaseCore) -> (u64, u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         let st = &db.cover_refresh_stats;
         let targets = st.targets.load(std::sync::atomic::Ordering::Acquire);
@@ -18827,7 +18860,7 @@ mod tests {
 
     /// The thread subject embedded in a label-side entry for `label_id`
     /// (one per message), via the raw reverse-edge covers.
-    fn label_side_thread_subjects(db: &Database, label_id: u64) -> Vec<Option<String>> {
+    fn label_side_thread_subjects(db: &DatabaseCore, label_id: u64) -> Vec<Option<String>> {
         let groups = db.get_links_many("Label", &[label_id], "messages").unwrap();
         groups
             .into_iter()

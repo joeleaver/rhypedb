@@ -791,6 +791,62 @@ fn scan_budget_refuses_before_decoding() {
     );
 }
 
+/// GH #29: dropping the last handle while a background worker is mid-task
+/// (holding its reference to the database) must not return until the worker
+/// has stopped and the storage — files and data-dir lock — is released, so the
+/// directory can be reopened at once. The full-text builder is parked inside a
+/// chunk; under the old design the caller's drop returned right there with the
+/// builder still holding the lock, and a reopen could fail `DataDirLocked`.
+#[test]
+fn dropping_the_last_handle_waits_for_a_busy_worker_and_frees_the_dir() {
+    let rows = sample_rows(700);
+    let dir = TempDir::new().unwrap();
+    {
+        let db = open_sdl(&dir, SCHEMA_WITHOUT_TITLE_INDEX);
+        let batch: Vec<(u64, FieldMap)> = rows
+            .iter()
+            .map(|(id, title, tag)| {
+                let mut f = fields(&[("body", s("b")), ("tag", s(tag)), ("n", Value::I64(1))]);
+                if let Some(t) = title {
+                    f.insert("title".into(), s(t));
+                }
+                (*id, f)
+            })
+            .collect();
+        db.restore_objects("Note", batch, true).unwrap();
+    }
+    let db = open_no_build(&dir, SCHEMA);
+    let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = parking_lot::Mutex::new(Some(release_rx));
+    *db.fulltext_builder_test_hook() = Some(Box::new(move |cursor: u64| {
+        if cursor == 0
+            && let Some(rx) = release_rx.lock().take()
+        {
+            parked_tx.send(()).unwrap();
+            rx.recv().unwrap();
+        }
+    }));
+    db.spawn_fulltext_builder_for_test();
+    parked_rx.recv_timeout(BUILD_TIMEOUT).expect("builder reached its first chunk");
+
+    let core = db.core_weak_for_test();
+    let dropper = std::thread::spawn(move || drop(db)); // the last handle
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!dropper.is_finished(), "drop returned while the builder still held the database");
+    release_tx.send(()).unwrap();
+    dropper.join().unwrap();
+    assert!(core.upgrade().is_none(), "database state outlived the last handle's drop");
+
+    // Reopen at once: no DataDirLocked; the stopped build resumes from its marker.
+    let db = open_sdl(&dir, SCHEMA);
+    let deadline = std::time::Instant::now() + BUILD_TIMEOUT;
+    while state_of(&db, "title") != crate::fulltext::BuildState::Built {
+        assert!(std::time::Instant::now() < deadline, "resumed build never finished");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// A delete / set-to-null / rewrite racing the first backfill chunk from
 /// another thread: the writer blocks on the maintenance lock until the chunk
 /// has committed (proven by observing the chunk's rows before its own write
