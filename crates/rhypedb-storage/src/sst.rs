@@ -1633,6 +1633,11 @@ impl SstReader {
         SstEntryCursor { release_behind: true, ..self.entry_cursor() }
     }
 
+    /// [`release_pages`](Self::release_pages) over the whole file.
+    pub(crate) fn release_all_pages(&self) {
+        self.release_pages(0, self.mapping.1);
+    }
+
     /// Drop this process's mapping of the whole pages inside file range
     /// `[from, to)` (no-op off unix, or for a range with no whole page). Only
     /// ever applied inside the read-only file mapping recorded at `open` —

@@ -401,6 +401,20 @@ impl LsmCore {
     ///
     /// Use this for reads only. A transaction is still required for writes
     /// because conflict detection depends on the active set.
+    /// Hand this process's mapping of every SST's pages back to the kernel
+    /// (`MADV_DONTNEED` on the read-only file mappings; a no-op off unix).
+    /// Nothing is lost: the files are unchanged and later reads fault the
+    /// pages back in — from the page cache, usually, so it costs little. Use
+    /// after a large one-off read (an import, a maintenance pass, an
+    /// application's startup loads) so the pages it touched stop counting
+    /// toward the process's resident set, which is what system monitors show.
+    /// Steady-state reads re-establish only what they keep using.
+    pub fn release_file_pages(&self) {
+        for sst in self.sst_files.read().iter() {
+            sst.release_all_pages();
+        }
+    }
+
     /// Every live object id per type id, as of the current snapshot, built
     /// from each source's object-id summary (memtables, then SSTs newest
     /// first) without reading object values. Equivalent to scanning the whole

@@ -97,6 +97,19 @@ struct IncomingRelation {
     embeds_target: bool,
 }
 
+/// What [`DatabaseCore::rewrite_covers`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CoverRewriteStats {
+    /// Objects visited (of types with forward relations or `@indexed` fields).
+    pub objects: u64,
+    /// Reverse-edge values rewritten (they differed from what a fresh link
+    /// writes today).
+    pub rev_edges_rewritten: u64,
+    /// Secondary-index payloads rewritten (they differed from the current
+    /// covering rule, e.g. a copy of an object past `cover_max_bytes`).
+    pub index_entries_rewritten: u64,
+}
+
 /// Cover-refresh worker counters (diagnostic; also what tests observe).
 #[derive(Debug, Default)]
 pub(crate) struct CoverRefreshStats {
@@ -1762,6 +1775,17 @@ impl Database {
 impl DatabaseCore {
 
 
+
+    /// Stop counting the data files' pages toward this process's resident set
+    /// (`MADV_DONTNEED` on their read-only mappings; a no-op off unix). The
+    /// files are unchanged; later reads fault pages back in, usually from the
+    /// page cache. Pairs with [`release_free_memory`](Self::release_free_memory)
+    /// after large one-off reads — startup loads, an import, a maintenance pass
+    /// — when RSS as shown by system monitors matters. Steady-state reads
+    /// re-establish only the pages they keep using.
+    pub fn release_file_pages(&self) {
+        self.storage.release_file_pages();
+    }
 
     /// Return freed heap memory to the operating system now (glibc
     /// `malloc_trim`; a no-op on other allocators). The engine already does
@@ -7421,6 +7445,178 @@ impl DatabaseCore {
         Ok(())
     }
 
+    /// Bring every stored cover up to the current covering rules, once — for
+    /// databases written by an older rhypedb (GH #26).
+    ///
+    /// Before #26, each reverse edge carried a full copy of its source object
+    /// and every `@indexed` entry a copy of its object at any size. New writes
+    /// no longer do that, but compaction carries existing values over
+    /// verbatim, so an old store keeps the copies — dead weight on disk and,
+    /// because listings walk those entries, in resident file pages. This pass
+    /// visits every object of every type with forward relations or `@indexed`
+    /// fields and recomputes each of its non-empty reverse-edge values as the
+    /// current cover writer builds it (peer ids and capped peer covers, never
+    /// the source's own fields; stale peer covers refreshed), and each index
+    /// payload under [`OpenOptions::cover_max_bytes`]. Only entries whose
+    /// content differs are written; empty reverse-edge values (the valid "no
+    /// cover" form) are left as they are, so the pass never grows the store. Run a compaction afterwards
+    /// (`storage().compact()`) to reclaim the space.
+    ///
+    /// Works in batches of [`COVER_REFRESH_BATCH`] objects, each one
+    /// transaction under the same locks the background cover refresh uses, so
+    /// a user write waits at most one batch and a concurrent migration is
+    /// excluded. Every entry is valid in its old and its new form, so the pass
+    /// is safe to interrupt (a crash, an error) and simply run again: a rerun
+    /// rewrites only what is still out of date. Returns
+    /// [`EngineError::WriteConflict`] in the unlikely case a batch loses a
+    /// conflict; run it again.
+    pub fn rewrite_covers(&self) -> EngineResult<CoverRewriteStats> {
+        /// Batches between hand-backs of the files' mapped pages.
+        const RELEASE_EVERY_BATCHES: u64 = 16;
+        let _migration_guard = self.migration_lock.read();
+        let mut stats = CoverRewriteStats::default();
+        let mut batches = 0u64;
+        for type_def in self.schema.types.values() {
+            let Some(&type_id) = self.type_ids.get(&type_def.name) else {
+                continue;
+            };
+            if self.tombstoned_type_ids.contains(&type_id) {
+                continue;
+            }
+            let forward: Vec<(String, u64)> = type_def
+                .fields
+                .iter()
+                .filter(|f| matches!(f.field_type, FieldType::Relation(_)) && f.inverse().is_none())
+                .filter_map(|f| {
+                    let rel_id = *self.rel_ids.get(&format!("{}.{}", type_def.name, f.name))?;
+                    Some((f.name.clone(), rel_id))
+                })
+                .collect();
+            let indexed = self.indexed_fields.get(&type_def.name);
+            if forward.is_empty() && indexed.is_none_or(|v| v.is_empty()) {
+                continue;
+            }
+
+            let prefix = KeyBuilder::object_prefix(type_id);
+            let mut start = prefix.clone();
+            loop {
+                let snapshot = self.storage.read_snapshot();
+                let chunk = self.storage.scan_chunk_raw(snapshot, &prefix, &start, COVER_REFRESH_BATCH)?;
+                let ids: Vec<u64> = chunk
+                    .live
+                    .iter()
+                    .filter(|(k, _)| k.len() >= 8)
+                    .map(|(k, _)| u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap()))
+                    .collect();
+                if !ids.is_empty() {
+                    self.rewrite_covers_batch(&type_def.name, type_id, &forward, indexed, &ids, &mut stats)?;
+                    batches += 1;
+                    // The pass reads objects and edges all over the files; keep
+                    // what it has touched from piling up in resident pages.
+                    if batches.is_multiple_of(RELEASE_EVERY_BATCHES) {
+                        self.storage.release_file_pages();
+                    }
+                }
+                let (Some(hw), true) = (chunk.high_water, chunk.more) else {
+                    break;
+                };
+                let hw_id = u64::from_be_bytes(hw[hw.len() - 8..].try_into().unwrap());
+                let Some(next) = hw_id.checked_add(1) else { break };
+                start = KeyBuilder::object(type_id, next);
+            }
+        }
+        self.storage.release_file_pages();
+        rhypedb_storage::mem::maybe_release_free_memory();
+        Ok(stats)
+    }
+
+    /// One batch of [`rewrite_covers`](Self::rewrite_covers): one transaction,
+    /// holding `maintenance_lock.write()` from before `begin_txn` to after
+    /// commit (as the cover refresh does), objects re-read inside it.
+    fn rewrite_covers_batch(
+        &self,
+        type_name: &str,
+        type_id: u64,
+        forward: &[(String, u64)],
+        indexed: Option<&Vec<IndexedField>>,
+        ids: &[u64],
+        stats: &mut CoverRewriteStats,
+    ) -> EngineResult<()> {
+        let _maintenance_guard = self.maintenance_lock.write();
+        let mut txn = self.storage.begin_txn();
+        let mut wrote = false;
+        let staged: EngineResult<()> = (|| {
+            for &id in ids {
+                // Re-read inside the txn: an object deleted since the chunk
+                // scan has nothing to rewrite (and must not get entries back).
+                let Some(blob) = self.storage.get(&txn, &KeyBuilder::object(type_id, id))? else {
+                    continue;
+                };
+                stats.objects += 1;
+                for (field, rel_id) in forward {
+                    let edges = self.scan_prefix_raw(&txn, &KeyBuilder::edge_prefix(id, *rel_id))?;
+                    for (target, _) in edges {
+                        let key = KeyBuilder::reverse_edge(target, *rel_id, id);
+                        // An empty value is the valid "no cover" form (e.g. an
+                        // object's first to-one link, written before its other
+                        // target existed) and never an old copy: leave it, so
+                        // the pass only ever shrinks. (A missing entry would be
+                        // damage this pass doesn't invent a repair for.)
+                        let Some(have) = self.storage.get(&txn, &key)? else { continue };
+                        if have.is_empty() {
+                            continue;
+                        }
+                        let want = build_covering_rev_value(self, &txn, type_name, id, field, target)?;
+                        if !covers_equivalent(&have, &want) {
+                            self.storage.put(&mut txn, &key, want)?;
+                            stats.rev_edges_rewritten += 1;
+                            wrote = true;
+                        }
+                    }
+                }
+                if let Some(indexed) = indexed {
+                    let payload = self.index_cover_payload(&blob);
+                    let fields = deserialize_fields(&blob);
+                    for ifd in indexed {
+                        let Some(value) = fields.get(&ifd.name) else { continue };
+                        if matches!(value, Value::Null) {
+                            continue;
+                        }
+                        let Some(key) = build_field_index_key(type_id, ifd.field_id, ifd.kind, value, id)
+                        else {
+                            continue;
+                        };
+                        // Only an existing entry is rewritten (never created).
+                        if let Some(have) = self.storage.get(&txn, &key)?
+                            && have != payload
+                        {
+                            self.storage.put(&mut txn, &key, payload.clone())?;
+                            stats.index_entries_rewritten += 1;
+                            wrote = true;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = staged {
+            self.storage.abort(&mut txn);
+            return Err(e);
+        }
+        if !wrote {
+            self.storage.abort(&mut txn);
+            return Ok(());
+        }
+        if let Err(e) = self.storage.commit(&mut txn) {
+            self.storage.abort(&mut txn);
+            return Err(match e {
+                rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                other => EngineError::Storage(other),
+            });
+        }
+        Ok(())
+    }
+
     /// Rewrite every outbound rev_edge whose source is `(type_name, object_id)`.
     /// For each forward (non-inverse) relation, walk every linked target in
     /// the edge index and `put` a freshly built `build_covering_rev_value`
@@ -8010,6 +8206,26 @@ fn insert_target_cover(db: &DatabaseCore, map: &mut FieldMap, name: &str, blob: 
     }
     map.insert(format!("{name}__cover"), Value::Bytes(blob));
     map.insert(format!("{name}__cover_v"), Value::U64(version));
+}
+
+/// Whether two serialized cover values hold the same content. A FieldMap
+/// serializes in hash order, so equal covers can differ byte-wise — including
+/// the peer objects nested under `<field>__cover`, which are compared the same
+/// way, recursively.
+fn covers_equivalent(a: &[u8], b: &[u8]) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let (fa, fb) = (deserialize_fields(a), deserialize_fields(b));
+    fa.len() == fb.len()
+        && fa.iter().all(|(k, va)| match (va, fb.get(k)) {
+            (Value::Bytes(x), Some(Value::Bytes(y))) if k.ends_with("__cover") => covers_equivalent(x, y),
+            (x, Some(y)) => x == y,
+            (_, None) => false,
+        })
 }
 
 fn build_covering_rev_value(
@@ -17696,6 +17912,144 @@ mod tests {
             .filter_scan("Movie", "year", CompareOp::Eq, 1955, None)
             .unwrap();
         assert_eq!(mid.len(), 1);
+    }
+
+    /// `rewrite_covers` turns a pre-#26 store into exactly what the current
+    /// rules write. Two databases get identical histories; one then has its
+    /// covers rewritten into the old shapes (the source's own fields in every
+    /// non-empty reverse edge, full object copies in every index entry, a
+    /// stale peer cover). After the pass, its `r:` and `i:` keyspaces equal
+    /// the fresh database's byte for byte, queries agree, a second pass
+    /// rewrites nothing, and deleted objects get no entries back.
+    #[test]
+    fn rewrite_covers_turns_legacy_covers_into_current_ones() {
+        use rhypedb_storage::key::KeyBuilder;
+        let schema = r#"
+            type Thread { subject: String  notes: String }
+            type Label { name: String }
+            type Message {
+                date: u64 @indexed
+                body: String
+                thread: Thread
+                account: Thread
+                labels: [Label]
+            }
+        "#;
+        let build = |dir: &std::path::Path| {
+            let db = Database::open_with_options(
+                parse_schema(schema).unwrap(),
+                dir,
+                OpenOptions { background_cover_refresh: false, ..Default::default() },
+            )
+            .unwrap();
+            let mk = |t: &str, f: &[(&str, Value)]| {
+                let mut m = FieldMap::new();
+                for (k, v) in f {
+                    m.insert((*k).into(), v.clone());
+                }
+                db.create(t, m).unwrap().id
+            };
+            let threads: Vec<u64> = (0..4)
+                .map(|i| {
+                    let notes = if i % 2 == 0 { "n".repeat(3000) } else { "short".into() };
+                    mk("Thread", &[("subject", Value::String(format!("t{i}"))), ("notes", Value::String(notes))])
+                })
+                .collect();
+            let labels: Vec<u64> =
+                (0..3).map(|i| mk("Label", &[("name", Value::String(format!("L{i}")))])).collect();
+            let mut msgs = Vec::new();
+            for i in 0..40u64 {
+                let body = if i % 3 == 0 { "b".repeat(2500) } else { format!("m{i}") };
+                let m = mk("Message", &[("date", Value::U64(i)), ("body", Value::String(body))]);
+                db.link("Message", m, "thread", threads[(i % 4) as usize], None).unwrap();
+                db.link("Message", m, "account", threads[((i + 1) % 4) as usize], None).unwrap();
+                for l in 0..(i % 3) {
+                    db.link("Message", m, "labels", labels[l as usize], None).unwrap();
+                }
+                msgs.push(m);
+            }
+            // (No target update here: with the background refresh off, the
+            // fresh database would keep a stale peer cover the pass refreshes.
+            // The planted `thread__cover_v = 0` below covers that refresh.)
+            db.delete("Message", msgs[5]).unwrap();
+            (db, msgs)
+        };
+        let (fresh_dir, old_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (fresh, _) = build(fresh_dir.path());
+        let (old, msgs) = build(old_dir.path());
+
+        // Rewrite `old` into the pre-#26 shapes.
+        let msg_type = old.type_ids()["Message"];
+        {
+            let snap = old.storage().read_snapshot();
+            let mut txn = old.storage().begin_txn();
+            for (key, value) in old.storage().scan_prefix_at(snap, b"r:").unwrap() {
+                if value.is_empty() {
+                    continue;
+                }
+                let source = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                let blob = old.storage().get_at(snap, &KeyBuilder::object(msg_type, source)).unwrap();
+                let mut f = deserialize_fields(&value);
+                if let Some(blob) = blob {
+                    f.extend(deserialize_fields(&blob)); // the source's own fields
+                }
+                f.insert("thread__cover_v".into(), Value::U64(0)); // a stale stamp
+                old.storage().put(&mut txn, &key, serialize_fields(&f)).unwrap();
+            }
+            for (key, _) in old.storage().scan_prefix_at(snap, b"i:").unwrap() {
+                let id = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                let blob = old.storage().get_at(snap, &KeyBuilder::object(msg_type, id)).unwrap().unwrap();
+                old.storage().put(&mut txn, &key, blob).unwrap(); // full copy at any size
+            }
+            old.storage().commit(&mut txn).unwrap();
+        }
+        let keyspace = |db: &Database, p: &[u8]| {
+            db.storage().scan_prefix_at(db.storage().read_snapshot(), p).unwrap()
+        };
+        assert_ne!(keyspace(&old, b"r:"), keyspace(&fresh, b"r:"), "legacy shape planted");
+
+        let stats = old.rewrite_covers().unwrap();
+        assert!(stats.rev_edges_rewritten > 0 && stats.index_entries_rewritten > 0, "{stats:?}");
+        // Reverse edges by content (a cover's field order is hash order).
+        let (got, want) = (keyspace(&old, b"r:"), keyspace(&fresh, b"r:"));
+        assert_eq!(got.len(), want.len());
+        for ((gk, gv), (wk, wv)) in got.iter().zip(&want) {
+            assert_eq!(gk, wk);
+            assert!(covers_equivalent(gv, wv), "rev edge {gk:?} differs");
+            assert_eq!(gv.is_empty(), wv.is_empty());
+        }
+        // Index payloads: same keys; each is empty (object over the cap) or
+        // byte-equal to that object's own blob — exactly what writes produce.
+        let (got, want) = (keyspace(&old, b"i:"), keyspace(&fresh, b"i:"));
+        assert_eq!(got.len(), want.len());
+        let snap = old.storage().read_snapshot();
+        for ((gk, gv), (wk, wv)) in got.iter().zip(&want) {
+            assert_eq!(gk, wk);
+            assert_eq!(gv.is_empty(), wv.is_empty(), "index entry {gk:?}");
+            if !gv.is_empty() {
+                let id = u64::from_be_bytes(gk[gk.len() - 8..].try_into().unwrap());
+                let blob = old.storage().get_at(snap, &KeyBuilder::object(msg_type, id)).unwrap().unwrap();
+                assert_eq!(gv, &blob);
+            }
+        }
+        assert_eq!(keyspace(&old, b"e:"), keyspace(&fresh, b"e:"));
+
+        let again = old.rewrite_covers().unwrap();
+        assert_eq!((again.rev_edges_rewritten, again.index_entries_rewritten), (0, 0), "{again:?}");
+
+        // The deleted message stays gone; listings agree.
+        assert!(old.get("Message", msgs[5]).is_err());
+        for db in [&old, &fresh] {
+            assert!(db.get_links("Message", msgs[5], "labels").unwrap().is_empty());
+        }
+        let by_date = |db: &Database| {
+            db.filter_scan("Message", "date", rhypedb_storage::zone::CompareOp::Ge, 0, None)
+                .unwrap()
+                .into_iter()
+                .map(|o| (o.id, o.fields.get("body").cloned()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(by_date(&old), by_date(&fresh));
     }
 
     /// GH #26 storage shape. A small row's `i:` entry is a covering copy, a
