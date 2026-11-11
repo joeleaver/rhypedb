@@ -19,6 +19,8 @@ use crate::fulltext::{
 };
 
 mod fulltext_build;
+mod versions;
+pub(crate) use versions::VersionCounters;
 use crate::object::{
     FieldMap, Object, Value, deserialize_fields, deserialize_fields_projected, extract_field,
     serialize_fields,
@@ -378,12 +380,12 @@ pub struct Database {
     /// `update()` between carry-snapshot and the new handle taking over
     /// would persist to LSM but not to NEW's in-memory map, causing
     /// cover_v generation divergence on subsequent NEW updates.
-    version_counters: Arc<RwLock<HashMap<(u64, u64), u64>>>,
-    /// Cheap lockless "is `version_counters` non-empty?" check. Cascade
-    /// delete uses it to skip the per-cascaded-object `version_counters.read()
-    /// .contains_key()` when no object has ever been updated. For the bench
-    /// (insert + delete, no updates) this saves 100 RwLock acquires per
-    /// User-delete at K=100. Updated alongside every map mutation.
+    version_counters: Arc<RwLock<VersionCounters>>,
+    /// Cheap lockless count of UPDATED objects (generation >= 2). Cascade
+    /// delete uses it to skip the per-cascaded-object `was_updated` lookup
+    /// when no object has ever been updated. For the bench (insert + delete,
+    /// no updates) this saves 100 RwLock acquires per User-delete at K=100.
+    /// Stored after every counter mutation.
     version_counter_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Outbound channel to the cover-refresh worker. Each successful
     /// `update()` pushes the bumped target's `(type_id, object_id)` here;
@@ -646,7 +648,7 @@ pub(crate) struct CarryState {
     pub next_object_id: Arc<AtomicU64>,
     /// SAME `Arc<RwLock<...>>` the OLD handle holds — see
     /// `Database::version_counters` for the rationale.
-    pub version_counters: Arc<RwLock<HashMap<(u64, u64), u64>>>,
+    pub version_counters: Arc<RwLock<VersionCounters>>,
     pub version_counter_count: Arc<std::sync::atomic::AtomicUsize>,
     pub migration_lock: Arc<parking_lot::RwLock<()>>,
     /// SAME lock the OLD handle's cover-refresh worker takes, so it cannot
@@ -1159,30 +1161,39 @@ impl Database {
         // `g:*` override scan below only bumps the few objects that were
         // UPDATED (generation >= 2). The carry path skips this — it clones the
         // in-memory counters from the old handle verbatim.
-        let (max_object_id, mut version_counters): (u64, HashMap<(u64, u64), u64>) =
+        let (max_object_id, mut version_counters): (u64, VersionCounters) =
             if carry.is_some() {
                 // Unused: carry path constructs `next_object_id` from
                 // `Arc::clone(&c.next_object_id)` and clones `version_counters`.
-                (0u64, HashMap::new())
+                (0u64, VersionCounters::default())
             } else {
                 let mut max_object_id = 0u64;
-                let mut seed: HashMap<(u64, u64), u64> = HashMap::new();
-                let txn = storage.begin_txn();
+                let mut seed = VersionCounters::default();
+                let snapshot = storage.read_snapshot();
                 for &type_id in type_ids.values() {
+                    // Bounded chunks (tombstone-correct), not one merged copy
+                    // of the whole type's key range: only ids are kept.
                     let prefix = KeyBuilder::object_prefix(type_id);
-                    if let Ok(entries) = storage.scan_prefix(&txn, &prefix) {
-                        for (key, _) in &entries {
+                    let mut start = prefix.clone();
+                    loop {
+                        let chunk = storage.scan_chunk_raw(snapshot, &prefix, &start, 4096)?;
+                        for (key, _) in &chunk.live {
                             // Object key: o:<type_id>:<object_id> — last 8 bytes are the object ID.
                             if key.len() >= 8 {
                                 let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
                                 let object_id = u64::from_be_bytes(id_bytes);
                                 max_object_id = max_object_id.max(object_id);
-                                seed.insert((type_id, object_id), 1);
+                                seed.mark_born(type_id, object_id);
                             }
                         }
+                        let (Some(hw), true) = (chunk.high_water, chunk.more) else {
+                            break;
+                        };
+                        let hw_id = u64::from_be_bytes(hw[hw.len() - 8..].try_into().unwrap());
+                        let Some(next) = hw_id.checked_add(1) else { break };
+                        start = KeyBuilder::object(type_id, next);
                     }
                 }
-                drop(txn);
                 (max_object_id, seed)
             };
 
@@ -1349,11 +1360,9 @@ impl Database {
                     let type_id_bytes: [u8; 8] = key[2..10].try_into().unwrap();
                     let obj_id_bytes: [u8; 8] = key[11..19].try_into().unwrap();
                     let v_bytes: [u8; 8] = value[..].try_into().unwrap();
-                    version_counters.insert(
-                        (
-                            u64::from_be_bytes(type_id_bytes),
-                            u64::from_be_bytes(obj_id_bytes),
-                        ),
+                    version_counters.set(
+                        u64::from_be_bytes(type_id_bytes),
+                        u64::from_be_bytes(obj_id_bytes),
                         u64::from_be_bytes(v_bytes),
                     );
                 }
@@ -1426,7 +1435,7 @@ impl Database {
             fulltext_builder,
             version_counter_count: match &carry {
                 Some(c) => Arc::clone(&c.version_counter_count),
-                None => Arc::new(std::sync::atomic::AtomicUsize::new(version_counters.len())),
+                None => Arc::new(std::sync::atomic::AtomicUsize::new(version_counters.updated_len())),
             },
             version_counters: match &carry {
                 Some(c) => Arc::clone(&c.version_counters),
@@ -1519,50 +1528,29 @@ impl Database {
         let Some(&type_id) = self.type_ids.get(type_name) else {
             return 0;
         };
-        self.version_counters
-            .read()
-            .get(&(type_id, object_id))
-            .copied()
-            .unwrap_or(0)
+        self.version_counters.read().get(type_id, object_id)
     }
 
     fn bump_version(&self, type_id: u64, object_id: u64) -> u64 {
-        let mut map = self.version_counters.write();
-        let inserted = !map.contains_key(&(type_id, object_id));
-        let entry = map.entry((type_id, object_id)).or_insert(0);
-        *entry += 1;
-        let v = *entry;
-        if inserted {
-            self.version_counter_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        let mut counters = self.version_counters.write();
+        let v = counters.bump(type_id, object_id);
+        self.version_counter_count
+            .store(counters.updated_len(), std::sync::atomic::Ordering::Relaxed);
         v
     }
 
     fn rollback_version(&self, type_id: u64, object_id: u64) {
-        let mut map = self.version_counters.write();
-        if let Some(v) = map.get_mut(&(type_id, object_id)) {
-            if *v > 0 {
-                *v -= 1;
-            }
-            if *v == 0 {
-                map.remove(&(type_id, object_id));
-                self.version_counter_count
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+        let mut counters = self.version_counters.write();
+        counters.rollback(type_id, object_id);
+        self.version_counter_count
+            .store(counters.updated_len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn forget_version(&self, type_id: u64, object_id: u64) {
-        if self
-            .version_counters
-            .write()
-            .remove(&(type_id, object_id))
-            .is_some()
-        {
-            self.version_counter_count
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        let mut counters = self.version_counters.write();
+        counters.forget(type_id, object_id);
+        self.version_counter_count
+            .store(counters.updated_len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     // -----------------------------------------------------------------
@@ -6460,11 +6448,7 @@ impl Database {
             .load(std::sync::atomic::Ordering::Relaxed)
             != 0
         {
-            let was_updated = self
-                .version_counters
-                .read()
-                .get(&(type_id, object_id))
-                .is_some_and(|&v| v > 1);
+            let was_updated = self.version_counters.read().was_updated(type_id, object_id);
             if was_updated {
                 arena.push_object_version(type_id, object_id);
             }

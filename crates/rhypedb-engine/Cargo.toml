@@ -42,6 +42,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
+roaring = { workspace = true }
 arc-swap = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
