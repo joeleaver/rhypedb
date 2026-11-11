@@ -16254,6 +16254,42 @@ mod tests {
         assert!(!db.is_field_unique("User", "name"));
     }
 
+    /// GH #27: after a reopen (data in SSTs, not the memtable), a `@unique`
+    /// String that is a prefix of another stored value (`a1` vs `a10`) must
+    /// still be found, and creating a duplicate must still be refused.
+    #[test]
+    fn find_by_unique_prefix_value_survives_reopen() {
+        const SCHEMA: &str = "type Thing {\n    key: String @unique\n}\n";
+        let dir = tempfile::tempdir().unwrap();
+        let create = |db: &Database, k: &str| {
+            let mut f = FieldMap::new();
+            f.insert("key".to_string(), Value::String(k.into()));
+            db.create("Thing", f)
+        };
+        let find = |db: &Database, k: &str| {
+            db.find_by_unique("Thing", "key", &Value::String(k.into()))
+                .unwrap()
+                .map(|o| o.id)
+        };
+        let (id_a1, id_a10);
+        {
+            let db = Database::open(parse_schema(SCHEMA).unwrap(), dir.path()).unwrap();
+            id_a1 = create(&db, "a1").unwrap().id;
+            id_a10 = create(&db, "a10").unwrap().id;
+            create(&db, "a100").unwrap();
+            assert_eq!(find(&db, "a1"), Some(id_a1));
+            assert!(create(&db, "a1").is_err());
+        }
+        let db = Database::open(parse_schema(SCHEMA).unwrap(), dir.path()).unwrap();
+        assert_eq!(find(&db, "a10"), Some(id_a10));
+        assert_eq!(find(&db, "a1"), Some(id_a1), "prefix key lost after reopen");
+        assert!(
+            create(&db, "a1").is_err(),
+            "duplicate @unique value accepted after reopen"
+        );
+        assert_eq!(db.scan_type("Thing").unwrap().len(), 3);
+    }
+
     #[test]
     fn unique_constraint_on_update() {
         let dir = tempfile::tempdir().unwrap();
