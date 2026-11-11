@@ -133,13 +133,68 @@ const FOOTER_V4_SIZE: usize = 8 + 4 + FOOTER_V2_SIZE;
 /// ```
 const TOMBSTONE_MARKER: u32 = u32::MAX;
 
-/// In-memory representation of an SST index entry.
-///
-/// On-disk format: `[key_len: 4][key: key_len][offset: 8]`
-#[derive(Debug, Clone)]
-struct IndexEntry {
-    key: Bytes,
-    offset: u64,
+/// Forwards writes, counting the bytes (to size a block written in place).
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    written: u64,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A writer's sparse index while the data region is still being written.
+/// Entries are serialized exactly as they will appear in the file
+/// (`[key_len u32][key][block_offset u64]`) into an anonymous temp file next to
+/// the SST, and copied in after the data region at `finish`. Holding them in
+/// memory instead cost a copied key plus a 40-byte entry per 16-entry block —
+/// ~84 MB while compacting a 13M-entry file. The temp file is unlinked from
+/// the start (`tempfile::tempfile_in`), so a crash can't leave it behind.
+struct IndexSpill {
+    out: BufWriter<File>,
+    count: usize,
+    first_key: Option<Bytes>,
+    last_key: Vec<u8>,
+}
+
+impl IndexSpill {
+    fn new(dir: &Path) -> Result<Self> {
+        Ok(Self {
+            out: BufWriter::new(tempfile::tempfile_in(dir)?),
+            count: 0,
+            first_key: None,
+            last_key: Vec::new(),
+        })
+    }
+
+    fn push(&mut self, key: &[u8], offset: u64) -> Result<()> {
+        self.out.write_all(&(key.len() as u32).to_be_bytes())?;
+        self.out.write_all(key)?;
+        self.out.write_all(&offset.to_be_bytes())?;
+        if self.count == 0 {
+            self.first_key = Some(Bytes::copy_from_slice(key));
+        }
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Append the spilled entries to `dst`; returns the bytes copied.
+    fn copy_into(self, dst: &mut impl Write) -> Result<u64> {
+        use std::io::Seek;
+        let mut file = self.out.into_inner().map_err(|e| e.into_error())?;
+        file.rewind()?;
+        Ok(std::io::copy(&mut file, dst)?)
+    }
 }
 
 /// A reader's sparse index, read in place from the mapped file. Entry `i` is
@@ -224,7 +279,7 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 /// Writer for creating SST files from sorted key-value pairs.
 pub struct SstWriter {
     writer: BufWriter<File>,
-    index: Vec<IndexEntry>,
+    index: IndexSpill,
     current_offset: u64,
     entry_count: usize,
     /// Final published path (`NNNNNNNN.sst`). The file is written to `tmp_path`
@@ -344,7 +399,7 @@ impl SstWriter {
 
         Ok(Self {
             writer,
-            index: Vec::new(),
+            index: IndexSpill::new(path.parent().unwrap_or(Path::new(".")))?,
             current_offset: (SST_MAGIC.len() + 4) as u64, // past header
             entry_count: 0,
             path,
@@ -380,10 +435,7 @@ impl SstWriter {
         // post-header position, matching the legacy writer.)
         if self.entry_count.is_multiple_of(ENTRIES_PER_BLOCK) {
             self.flush_block()?;
-            self.index.push(IndexEntry {
-                key: Bytes::copy_from_slice(internal_key),
-                offset: self.current_offset,
-            });
+            self.index.push(internal_key, self.current_offset)?;
         }
 
         // Update zone bounds for opted-in integer fields. Skipped for tombstones
@@ -486,26 +538,21 @@ impl SstWriter {
         self.flush_block()?;
         let index_offset = self.current_offset;
 
-        // Write index entries.
-        let mut bytes_written = 0u64;
-        for entry in &self.index {
-            let key_len = entry.key.len() as u32;
-            let mut buf = BytesMut::with_capacity(4 + entry.key.len() + 8);
-            buf.put_u32(key_len);
-            buf.put_slice(&entry.key);
-            buf.put_u64(entry.offset);
-            self.writer.write_all(&buf)?;
-            bytes_written += buf.len() as u64;
-        }
+        // Write index entries (spilled while the data region was written).
+        let index_count = self.index.count;
+        let first_key = self.index.first_key.clone();
+        let last_key = (index_count > 0).then(|| Bytes::copy_from_slice(&self.index.last_key));
+        let bytes_written = self.index.copy_into(&mut self.writer)?;
 
         // Zone map block (v4): per-block min/max for opted-in fields. When
         // no extractor is configured, this writes just the empty header
         // (num_blocks=0, num_fields=0) — still a valid zero-overhead v4 file.
+        // Streamed straight into the file (counting its size) — the dense form
+        // can be tens of MB, so it is never assembled in memory.
         let zonemap_offset = index_offset + bytes_written;
-        let mut zone_buf = Vec::new();
-        self.zone_builder.write_to(&mut zone_buf)?;
-        let zonemap_size = zone_buf.len() as u32;
-        self.writer.write_all(&zone_buf)?;
+        let mut counted = CountingWriter { inner: &mut self.writer, written: 0 };
+        self.zone_builder.write_to(&mut counted)?;
+        let zonemap_size = counted.written as u32;
 
         // Finalize the bloom filter at the size `BloomFilter::new` picks for
         // the distinct-key count (identical bits either way).
@@ -525,11 +572,11 @@ impl SstWriter {
 
         // Bloom block (v3 layout: [algo_byte][bloom.write_to payload]).
         let bloom_offset = zonemap_offset + zonemap_size as u64;
-        let mut bloom_buf = Vec::with_capacity(6 + bloom.byte_size());
-        bloom_buf.push(bloom.algo().to_byte());
-        bloom.write_to(&mut bloom_buf)?;
-        let bloom_size = bloom_buf.len() as u32;
-        self.writer.write_all(&bloom_buf)?;
+        // Written directly (not via a second, full-size copy of the bits).
+        let mut counted = CountingWriter { inner: &mut self.writer, written: 0 };
+        counted.write_all(&[bloom.algo().to_byte()])?;
+        bloom.write_to(&mut counted)?;
+        let bloom_size = counted.written as u32;
 
         // v7/v8 meta block, then its pointer, then the unchanged v4 footer.
         let meta_offset = bloom_offset + bloom_size as u64;
@@ -554,7 +601,7 @@ impl SstWriter {
         footer.put_u64(bloom_offset);
         footer.put_u32(bloom_size);
         footer.put_u64(index_offset);
-        footer.put_u32(self.index.len() as u32);
+        footer.put_u32(index_count as u32);
         footer.put_slice(SST_MAGIC);
         self.writer.write_all(&footer)?;
         self.writer.flush()?;
@@ -566,12 +613,6 @@ impl SstWriter {
         // window where a partial `.sst` is visible to recovery.
         std::fs::rename(&self.tmp_path, &self.path)?;
         sync_parent_dir(&self.path);
-
-        let first_key = self.index.first().map(|e| e.key.clone());
-        let last_key = self
-            .index
-            .last()
-            .map(|e| e.key.clone());
 
         Ok(SstMeta {
             path: self.path,
