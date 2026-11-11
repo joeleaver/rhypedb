@@ -1160,6 +1160,11 @@ impl LsmTree {
         // only in the SST now.
         crash_inject::hit(Site::FlushAfterWalTruncate);
 
+        // The flushed memtable (its skiplist and every key/value it owned) is
+        // freed once the last reader drops it; hand those pages back.
+        drop(old_memtable);
+        drop(immutables);
+        crate::mem::maybe_release_free_memory();
         Ok(())
     }
 
@@ -1260,7 +1265,9 @@ impl LsmTree {
     /// (avoids two concurrent merges racing on the final swap).
     pub fn compact(&self) -> Result<()> {
         let _guard = self.compaction_mutex.lock();
-        self.compact_inner(CompactionScope::All).map(|_| ())
+        let result = self.compact_inner(CompactionScope::All).map(|_| ());
+        crate::mem::maybe_release_free_memory();
+        result
     }
 
     /// Run size-tiered compaction until no run qualifies (see
@@ -1269,8 +1276,18 @@ impl LsmTree {
     /// database every few flushes (GH #28). Synchronous.
     pub fn compact_tiered(&self) -> Result<()> {
         let _guard = self.compaction_mutex.lock();
-        while self.compact_inner(CompactionScope::Tiered)? {}
-        Ok(())
+        let mut merged = false;
+        let result = loop {
+            match self.compact_inner(CompactionScope::Tiered) {
+                Ok(true) => merged = true,
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        if merged {
+            crate::mem::maybe_release_free_memory();
+        }
+        result
     }
 
     /// The compaction body — the bytes-moving work. Called by `compact`,
@@ -1499,11 +1516,20 @@ fn compaction_worker(
             // trying again on the next signal.
             // Size-tiered, repeated while a run qualifies (one merge can
             // complete the next tier). Stop early on shutdown.
+            let mut merged = false;
             loop {
                 match lsm.compact_inner(CompactionScope::Tiered) {
-                    Ok(true) if !state.0.lock().shutdown => continue,
+                    Ok(true) => {
+                        merged = true;
+                        if state.0.lock().shutdown {
+                            break;
+                        }
+                    }
                     _ => break,
                 }
+            }
+            if merged {
+                crate::mem::maybe_release_free_memory();
             }
         }
 

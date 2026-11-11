@@ -6,6 +6,7 @@ pub mod wal;
 pub mod memtable;
 pub mod sst;
 pub mod lsm;
+pub mod mem;
 pub mod error;
 pub mod mvcc;
 pub mod zone;
