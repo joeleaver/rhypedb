@@ -1,10 +1,23 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
-/// Type alias for the conflict-detection key set. AHash is ~10× faster than the
-/// stdlib's SipHash on short keys (we measured ~30 µs saved per User delete at
-/// K=100 cascading rows once we counted the bytes hashed). Not HashDoS-resistant
-/// — fine for an in-process key set built from this process's own writes.
-type WriteSet = HashSet<bytes::Bytes, ahash::RandomState>;
+/// A committed transaction's written keys, for conflict detection: the SORTED,
+/// de-duplicated 64-bit fingerprints of the keys (8 bytes per key, binary
+/// searchable) rather than the keys themselves — which would also pin every
+/// written key's allocation for as long as the entry stays in the log. Two
+/// different keys sharing a fingerprint can only cause a spurious
+/// `WriteConflict` (the caller retries), never a missed one. AHash: ~10× faster
+/// than SipHash on short keys; not HashDoS-resistant, which is fine for keys
+/// this process writes itself.
+type WriteSet = Box<[u64]>;
+
+/// Conflict-log capacity, in total logged keys across all entries (8 bytes
+/// each: 8 MB). Entries are normally trimmed as soon as no active snapshot
+/// predates them; the caps only bite while a transaction stays open across a
+/// long stretch of other commits.
+const MAX_LOGGED_KEYS: usize = 1 << 20;
+/// Conflict-log capacity, in entries (bounds per-entry overhead for streams of
+/// tiny commits).
+const MAX_LOGGED_TXNS: usize = 1 << 16;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -31,6 +44,13 @@ fn release_hold(active: &RwLock<HashMap<u64, u64>>, snapshot: u64) {
     }
 }
 
+/// Whether two sorted fingerprint slices share an element. Binary-searches the
+/// smaller in the larger: O(small · log large).
+fn sorted_intersect(a: &[u64], b: &[u64]) -> bool {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    small.iter().any(|x| large.binary_search(x).is_ok())
+}
+
 /// Tracks a committed transaction for write-write conflict detection.
 struct CommittedTxn {
     commit_version: u64,
@@ -47,6 +67,15 @@ struct CommittedTxn {
 struct CommitState {
     next_version: u64,
     committed_log: VecDeque<CommittedTxn>,
+    /// Total fingerprints across `committed_log` (for `MAX_LOGGED_KEYS`).
+    logged_keys: usize,
+    /// Highest commit version dropped from the log by a CAPACITY trim while it
+    /// may still have been needed (0 = never). A transaction whose snapshot is
+    /// below this cannot be proven conflict-free — a write it must conflict
+    /// with may be among the dropped entries — so its commit is refused.
+    /// (Ordinary trimming only drops versions older than every active
+    /// snapshot, which no transaction can need, and does not move this.)
+    trimmed_through: u64,
 }
 
 /// MVCC transaction manager.
@@ -82,7 +111,11 @@ pub struct TransactionManager {
     /// (typically) the recovery version, so compaction kept every version
     /// written since process start — unbounded disk growth on hot keys.
     active_snapshots: ActiveSnapshots,
-    max_committed_log_size: usize,
+    /// Fingerprints keys for the conflict log (fixed per manager, so commit
+    /// and check agree).
+    key_hasher: ahash::RandomState,
+    max_logged_keys: usize,
+    max_logged_txns: usize,
 }
 
 impl Default for TransactionManager {
@@ -98,9 +131,13 @@ impl TransactionManager {
             commit_mu: Mutex::new(CommitState {
                 next_version: 1,
                 committed_log: VecDeque::new(),
+                logged_keys: 0,
+                trimmed_through: 0,
             }),
             active_snapshots: Arc::new(RwLock::new(HashMap::new())),
-            max_committed_log_size: 1024,
+            key_hasher: ahash::RandomState::new(),
+            max_logged_keys: MAX_LOGGED_KEYS,
+            max_logged_txns: MAX_LOGGED_TXNS,
         }
     }
 
@@ -112,9 +149,13 @@ impl TransactionManager {
             commit_mu: Mutex::new(CommitState {
                 next_version: version + 1,
                 committed_log: VecDeque::new(),
+                logged_keys: 0,
+                trimmed_through: 0,
             }),
             active_snapshots: Arc::new(RwLock::new(HashMap::new())),
-            max_committed_log_size: 1024,
+            key_hasher: ahash::RandomState::new(),
+            max_logged_keys: MAX_LOGGED_KEYS,
+            max_logged_txns: MAX_LOGGED_TXNS,
         }
     }
 
@@ -157,7 +198,23 @@ impl TransactionManager {
             return Ok(txn.snapshot);
         }
 
+        // Fingerprint our keys once, outside the lock.
+        let mut write_set: Vec<u64> = txn
+            .writes
+            .iter()
+            .map(|(k, _)| self.key_hasher.hash_one(k))
+            .collect();
+        write_set.sort_unstable();
+        write_set.dedup();
+
         let mut state = self.commit_mu.lock();
+
+        // The log no longer holds every commit since our snapshot: one we
+        // conflict with may have been trimmed for capacity. Refuse rather than
+        // risk a silent lost update.
+        if txn.snapshot < state.trimmed_through {
+            return Err(Error::WriteConflict);
+        }
 
         // Conflict check: any transaction committed AFTER our snapshot that wrote
         // one of our keys. Held continuously through publish — no relock window.
@@ -165,11 +222,9 @@ impl TransactionManager {
             if committed.commit_version <= txn.snapshot {
                 continue;
             }
-            for (key, _) in &txn.writes {
-                if committed.write_set.contains(key) {
-                    // Conflict: return WITHOUT applying or consuming a version.
-                    return Err(Error::WriteConflict);
-                }
+            if sorted_intersect(&write_set, &committed.write_set) {
+                // Conflict: return WITHOUT applying or consuming a version.
+                return Err(Error::WriteConflict);
             }
         }
 
@@ -188,10 +243,10 @@ impl TransactionManager {
         // aborts.
         apply(commit_version, &txn.writes)?;
 
-        let write_set: WriteSet = txn.writes.iter().map(|(k, _)| k.clone()).collect();
+        state.logged_keys += write_set.len();
         state.committed_log.push_back(CommittedTxn {
             commit_version,
-            write_set,
+            write_set: write_set.into_boxed_slice(),
         });
 
         // Trim entries no longer needed for conflict detection.
@@ -204,13 +259,20 @@ impl TransactionManager {
             .unwrap_or(u64::MAX);
         while let Some(front) = state.committed_log.front() {
             if front.commit_version < min_active {
-                state.committed_log.pop_front();
+                let popped = state.committed_log.pop_front().expect("front exists");
+                state.logged_keys -= popped.write_set.len();
             } else {
                 break;
             }
         }
-        while state.committed_log.len() > self.max_committed_log_size {
-            state.committed_log.pop_front();
+        // Capacity trim: these entries may still be needed by an open
+        // transaction, so record how far the log is now incomplete.
+        while state.committed_log.len() > self.max_logged_txns
+            || state.logged_keys > self.max_logged_keys
+        {
+            let Some(popped) = state.committed_log.pop_front() else { break };
+            state.logged_keys -= popped.write_set.len();
+            state.trimmed_through = state.trimmed_through.max(popped.commit_version);
         }
 
         // PUBLISH last (Release): the data is now in the memtable, so making the
@@ -511,6 +573,52 @@ mod tests {
         assert_eq!(tm.min_active_snapshot(), witness.snapshot());
         drop(witness);
         assert_eq!(tm.min_active_snapshot(), u64::MAX);
+    }
+
+    /// A transaction that stays open while more commits land than the conflict
+    /// log keeps must not slip a write-write conflict through: the conflicting
+    /// commit's entry may have been trimmed, so the log can no longer prove the
+    /// commit safe — it must refuse (conservatively), never silently overwrite.
+    #[test]
+    fn long_txn_conflict_is_detected_after_log_overflow() {
+        let tm = TransactionManager::new();
+        let mut long = tm.begin();
+        long.record_put(Bytes::from("K"), Bytes::from("long"));
+
+        let mut rival = tm.begin();
+        rival.record_put(Bytes::from("K"), Bytes::from("rival"));
+        tm.commit(&mut rival, noop_apply).unwrap();
+
+        // Far more unrelated commits than the log's capacity. Each writes many
+        // keys so a key-count cap is crossed too.
+        for i in 0..1_100u32 {
+            let mut t = tm.begin();
+            for j in 0..2_000u32 {
+                t.record_put(Bytes::from(format!("other-{i}-{j}")), Bytes::from("x"));
+            }
+            tm.commit(&mut t, noop_apply).unwrap();
+        }
+
+        assert!(
+            matches!(tm.commit(&mut long, noop_apply), Err(Error::WriteConflict)),
+            "lost update: the rival's write to K was overwritten"
+        );
+    }
+
+    /// The trim must not make a long transaction that touched NOTHING in
+    /// common fail... unless the log really had to drop entries it needed.
+    /// Without overflow, a disjoint long transaction commits fine.
+    #[test]
+    fn long_disjoint_txn_commits_without_overflow() {
+        let tm = TransactionManager::new();
+        let mut long = tm.begin();
+        long.record_put(Bytes::from("mine"), Bytes::from("v"));
+        for i in 0..2_000u32 {
+            let mut t = tm.begin();
+            t.record_put(Bytes::from(format!("other-{i}")), Bytes::from("x"));
+            tm.commit(&mut t, noop_apply).unwrap();
+        }
+        tm.commit(&mut long, noop_apply).unwrap();
     }
 
     #[test]
