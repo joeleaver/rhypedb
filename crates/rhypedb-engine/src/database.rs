@@ -4670,6 +4670,31 @@ impl Database {
         cursor: u64,
         max_distinct: usize,
     ) -> EngineResult<ObjectChunk> {
+        self.scan_chunk_inner(type_name, snapshot, cursor, max_distinct, None)
+    }
+
+    /// [`scan_chunk`](Self::scan_chunk), decoding only `fields` from each
+    /// object: the rest of every blob is skipped, never materialized. Same
+    /// resume protocol.
+    pub fn scan_chunk_projected(
+        &self,
+        type_name: &str,
+        snapshot: u64,
+        cursor: u64,
+        max_distinct: usize,
+        fields: &[&str],
+    ) -> EngineResult<ObjectChunk> {
+        self.scan_chunk_inner(type_name, snapshot, cursor, max_distinct, Some(fields))
+    }
+
+    fn scan_chunk_inner(
+        &self,
+        type_name: &str,
+        snapshot: u64,
+        cursor: u64,
+        max_distinct: usize,
+        projection: Option<&[&str]>,
+    ) -> EngineResult<ObjectChunk> {
         let type_id = self.resolve_type_id(type_name)?;
         let prefix = KeyBuilder::object_prefix(type_id);
 
@@ -4707,7 +4732,10 @@ impl Database {
                 continue;
             }
             let object_id = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
-            let mut fields = deserialize_fields(data);
+            let mut fields = match projection {
+                Some(wanted) => deserialize_fields_projected(data, wanted),
+                None => deserialize_fields(data),
+            };
             self.strip_tombstoned_fields(type_name, &mut fields);
             objects.push(Object {
                 type_name: type_name.into(),
