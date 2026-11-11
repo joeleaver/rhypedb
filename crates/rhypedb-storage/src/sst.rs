@@ -667,6 +667,10 @@ pub struct SstReader {
     version: u32,
     /// From the v7/v8 meta block; `None` for older files.
     file_meta: Option<SstFileMeta>,
+    /// `(address, length)` of the read-only file mapping behind `data`, the
+    /// only memory [`SstReader::release_pages`] may advise on.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    mapping: (usize, usize),
     /// Byte range of the meta block's object-id summary, when the writer
     /// recorded one. Decoded on demand ([`SstReader::object_id_summary`]) so
     /// an open file holds no decoded copy.
@@ -689,7 +693,16 @@ pub struct SstEntryCursor<'a> {
     blk: Bytes,
     pos: usize,
     failed: bool,
+    /// Release the file pages the walk has moved past (see
+    /// [`SstReader::entry_cursor_releasing`]).
+    release_behind: bool,
+    /// File offset up to which pages have been released.
+    released_to: usize,
 }
+
+/// A releasing cursor hands pages back in steps of at least this many bytes,
+/// so the `madvise` calls stay rare (one per 8 MiB walked).
+const RELEASE_STEP: usize = 8 << 20;
 
 impl Iterator for SstEntryCursor<'_> {
     type Item = Result<(Bytes, MemValue)>;
@@ -729,7 +742,19 @@ impl Iterator for SstEntryCursor<'_> {
             if self.next_block >= self.reader.index.len() {
                 // Release the last block's buffer as soon as the walk ends.
                 self.blk = Bytes::new();
+                if self.release_behind {
+                    self.reader.release_pages(self.released_to, self.reader.data_end);
+                    self.released_to = self.reader.data_end;
+                }
                 return None;
+            }
+            if self.release_behind {
+                // Everything before this block's start has been consumed.
+                let start = self.reader.index.offset(self.next_block) as usize;
+                if start >= self.released_to + RELEASE_STEP {
+                    self.reader.release_pages(self.released_to, start);
+                    self.released_to = start;
+                }
             }
             match self.reader.block(self.next_block) {
                 Ok(b) => {
@@ -768,6 +793,7 @@ impl SstReader {
         // memmap2 only defines `Advice` there; Windows gets no hint.
         #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Random);
+        let mapping = (mmap.as_ptr() as usize, mmap.len());
         let data: Bytes = Bytes::from_owner(mmap);
 
         if data.len() < SST_MAGIC.len() + 4 + FOOTER_V1_SIZE {
@@ -983,6 +1009,7 @@ impl SstReader {
             zone_map,
             version,
             file_meta,
+            mapping,
             object_ids_range,
             path,
         };
@@ -1019,6 +1046,10 @@ impl SstReader {
                 _ => break,
             }
         }
+        // The walk touched the pages around every object key (about half of a
+        // text-heavy file). It runs once, at open; hand them back rather than
+        // keep them mapped until something else happens to read them.
+        self.release_pages(0, self.data_end);
         Ok(summary)
     }
 
@@ -1586,7 +1617,52 @@ impl SstReader {
             blk: Bytes::new(),
             pos: 0,
             failed: false,
+            release_behind: false,
+            released_to: 0,
         }
+    }
+
+    /// [`entry_cursor`](Self::entry_cursor) that also hands the file pages it
+    /// has walked past back to the kernel (`MADV_DONTNEED`), so a full pass —
+    /// a compaction reading a multi-GB input — doesn't leave the whole file
+    /// mapped into this process's RSS. Only this process's mapping of those
+    /// pages is dropped: the data stays in the file, and any reader touching
+    /// them again (a concurrent query, or a slice this walk handed out) just
+    /// faults them back in. Results are identical to `entry_cursor`.
+    pub fn entry_cursor_releasing(&self) -> SstEntryCursor<'_> {
+        SstEntryCursor { release_behind: true, ..self.entry_cursor() }
+    }
+
+    /// Drop this process's mapping of the whole pages inside file range
+    /// `[from, to)` (no-op off unix, or for a range with no whole page). Only
+    /// ever applied inside the read-only file mapping recorded at `open` —
+    /// `MADV_DONTNEED` on anonymous memory would zero it, on a read-only file
+    /// mapping it only unmaps pages that re-fault from the file.
+    fn release_pages(&self, from: usize, to: usize) {
+        #[cfg(unix)]
+        {
+            let (map_start, map_len) = self.mapping;
+            if map_len == 0 || to <= from || to > map_len {
+                return;
+            }
+            // SAFETY: `sysconf` has no preconditions.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            let page = if page > 0 { page as usize } else { 4096 };
+            let start = (map_start + from).next_multiple_of(page);
+            let end = (map_start + to) / page * page;
+            if end > start {
+                // SAFETY: `[start, end)` lies inside the live read-only shared
+                // file mapping owned by `self.data` (checked against
+                // `self.mapping` above); DONTNEED on it only drops this
+                // process's page-table entries — later accesses re-fault the
+                // unchanged file contents. No memory is freed or invalidated.
+                unsafe {
+                    libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (from, to);
     }
 
     /// Whether the data region is LZ4-framed (v6 / v8).
@@ -2252,6 +2328,49 @@ pub(crate) mod legacy {
 mod tests {
     use super::*;
     use legacy::strip_meta_to_legacy;
+
+    /// A releasing walk (compaction's) yields exactly the plain walk's entries,
+    /// on both layouts, and slices it handed out before their pages were
+    /// released still read the original bytes afterwards (they re-fault from
+    /// the file).
+    #[test]
+    fn releasing_cursor_matches_plain_cursor_and_released_slices_stay_valid() {
+        for compression in [SstCompression::None, SstCompression::Lz4] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("r.sst");
+            let mut w = SstWriter::new_with_options(&path, None, compression).unwrap();
+            // ~40 MB: several RELEASE_STEPs, so pages really are released mid-walk.
+            for i in 0..20_000u32 {
+                let key = InternalKey::new(format!("k{i:08}").as_bytes(), 7);
+                let value: Vec<u8> = (0..2000).map(|j| (i as usize * 31 + j) as u8).collect();
+                w.add(key.as_bytes(), &Some(Bytes::from(value))).unwrap();
+            }
+            w.finish().unwrap();
+            let r = SstReader::open(&path).unwrap();
+            let plain: Vec<_> = r.entry_cursor().map(|e| e.unwrap()).collect();
+            let mut early: Option<(Bytes, MemValue)> = None;
+            let mut n = 0usize;
+            for (i, e) in r.entry_cursor_releasing().enumerate() {
+                let e = e.unwrap();
+                assert_eq!(e, plain[i], "{compression:?} entry {i}");
+                if i == 3 {
+                    early = Some(e);
+                }
+                n += 1;
+            }
+            assert_eq!(n, plain.len());
+            // The walk has released everything behind it, including entry 3's
+            // pages; its slices must still read the original bytes.
+            let (k, v) = early.unwrap();
+            assert_eq!(k, plain[3].0);
+            assert_eq!(v, plain[3].1);
+            let expected: Vec<u8> = (0..2000).map(|j| (3usize * 31 + j) as u8).collect();
+            assert_eq!(v.as_deref(), Some(&expected[..]));
+            // And the reader still serves point reads over released ranges.
+            let key = InternalKey::new(format!("k{:08}", 10u32).as_bytes(), 7);
+            assert_eq!(r.get(key.as_bytes()).unwrap(), Some(plain[10].1.clone()));
+        }
+    }
 
     #[test]
     fn meta_block_records_versions_and_legacy_files_still_walk() {
