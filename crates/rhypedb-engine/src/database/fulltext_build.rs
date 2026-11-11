@@ -32,7 +32,7 @@
 //! practice the two never interleave at all and a user write can never lose
 //! to the builder; the conflict retry is the belt to that suspenders.
 //!
-//! The thread holds only a `Weak<Database>` between chunks (upgraded per
+//! The thread holds only a `Weak<DatabaseCore>` between chunks (upgraded per
 //! chunk, like the migration driver), so dropping the last external `Arc`
 //! stops it at the next chunk boundary; `Database::drop` signals + joins.
 
@@ -45,7 +45,7 @@ use rhypedb_storage::crash_inject;
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::LsmTree;
 
-use super::Database;
+use super::DatabaseCore;
 use crate::error::{EngineError, EngineResult};
 use crate::fulltext::build::{BuildMarker, BuildProgress, BuildState, FulltextIndexStatus};
 use crate::fulltext::{Analyzer, FulltextField, FulltextStats, StatsDelta, tokenize_for_index};
@@ -382,7 +382,7 @@ pub(super) fn plan_fulltext_open(
 }
 
 /// Thread body: run every task in order; stop between chunks when asked.
-pub(super) fn fulltext_builder_main(weak: std::sync::Weak<Database>, builder: Arc<FulltextBuilder>) {
+pub(super) fn fulltext_builder_main(weak: std::sync::Weak<DatabaseCore>, builder: Arc<FulltextBuilder>) {
     let tasks = std::mem::take(&mut *builder.tasks.lock());
     for task in tasks {
         if builder.stop.load(Ordering::Acquire) {
@@ -431,7 +431,7 @@ pub(super) fn fulltext_builder_main(weak: std::sync::Weak<Database>, builder: Ar
 /// Backfill one field. `Ok(true)` = finished (marker Built), `Ok(false)` =
 /// stopped early (marker left Building at the last committed cursor).
 fn run_build(
-    weak: &std::sync::Weak<Database>,
+    weak: &std::sync::Weak<DatabaseCore>,
     builder: &FulltextBuilder,
     type_name: &str,
     type_id: u64,
@@ -623,7 +623,7 @@ pub(super) fn stage_backfill_chunk(
 /// Sweep index rows of `(type_id, field_id)` whose generation is not `keep`
 /// (all of them when `None`), then clear the stale flag / delete the marker.
 fn run_drop(
-    weak: &std::sync::Weak<Database>,
+    weak: &std::sync::Weak<DatabaseCore>,
     builder: &FulltextBuilder,
     type_id: u64,
     field_id: u64,
@@ -690,7 +690,7 @@ fn run_drop(
     Ok(true)
 }
 
-impl Database {
+impl DatabaseCore {
     /// Spawn the builder thread for this handle's pending tasks (no-op when
     /// there are none). Called once at the end of open / reload.
     pub(super) fn spawn_fulltext_builder(self: &Arc<Self>) -> EngineResult<()> {
@@ -716,15 +716,6 @@ impl Database {
         {
             let _ = handle.join();
         }
-    }
-
-    /// Test hook: run this handle's pending tasks ON THE CALLING THREAD (the
-    /// crash-fuzz injector arms a thread-local, so the builder must run where
-    /// the harness armed it). Requires the handle to have been opened with
-    /// `background_fulltext_build: false` (otherwise the thread owns them).
-    #[cfg(test)]
-    pub(crate) fn run_fulltext_tasks_inline(self: &Arc<Self>) {
-        fulltext_builder_main(Arc::downgrade(self), Arc::clone(&self.fulltext_builder));
     }
 
     /// Test seam: the builder's per-chunk hook (see `FulltextBuilder::chunk_hook`).
@@ -816,6 +807,31 @@ impl Database {
     }
 }
 
+impl super::Database {
+    /// Test hook: run this handle's pending tasks ON THE CALLING THREAD (the
+    /// crash-fuzz injector arms a thread-local, so the builder must run where
+    /// the harness armed it). Requires the handle to have been opened with
+    /// `background_fulltext_build: false` (otherwise the thread owns them).
+    #[cfg(test)]
+    pub(crate) fn run_fulltext_tasks_inline(&self) {
+        fulltext_builder_main(Arc::downgrade(&self.core), Arc::clone(&self.fulltext_builder));
+    }
+
+    /// Test hook: start the background builder thread now (for a handle opened
+    /// with `background_fulltext_build: false`, after installing a chunk hook).
+    #[cfg(test)]
+    pub(crate) fn spawn_fulltext_builder_for_test(&self) {
+        self.core.spawn_fulltext_builder().unwrap();
+    }
+
+    /// Test hook: a `Weak` to this handle's core, to observe when the state
+    /// behind the handle (storage, files, data-dir lock) is actually gone.
+    #[cfg(test)]
+    pub(crate) fn core_weak_for_test(&self) -> std::sync::Weak<DatabaseCore> {
+        Arc::downgrade(&self.core)
+    }
+}
+
 #[cfg(test)]
 mod staging_tests {
     use super::*;
@@ -865,3 +881,4 @@ mod staging_tests {
         assert_eq!((s.processed, s.cut_after), (4, Some(4)));
     }
 }
+

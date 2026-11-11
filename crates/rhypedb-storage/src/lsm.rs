@@ -91,6 +91,10 @@ struct CompactionState {
     pending: bool,
     running: bool,
     shutdown: bool,
+    /// Test-only gate: the worker, holding the core, waits here before
+    /// merging — the moment a caller's drop used to race (GH #29).
+    #[cfg(test)]
+    hold: bool,
 }
 
 /// What [`LsmTree::snapshot_to`] captured: the SST file names linked/copied into
@@ -110,12 +114,38 @@ pub struct SstSnapshotManifest {
 /// - Sorted string table (SST) files on disk
 /// - MVCC transaction manager for snapshot isolation
 /// - Optional background compaction worker (`background_compaction` config)
+///
+/// This is the handle callers hold (as `Arc<LsmTree>`); it derefs to the
+/// [`LsmCore`] holding the state. The background worker holds only the core,
+/// never a handle, so the handle's `Drop` always runs on a caller's thread
+/// when the LAST caller lets go: it stops and joins the worker, then drops the
+/// core, which releases the files and the data-dir lock — all before `drop`
+/// returns. (When the worker could hold the last strong reference itself, a
+/// caller's drop returned while the worker still held the lock, and an
+/// immediate reopen of the directory could fail with `DataDirLocked` — GH #29.)
 pub struct LsmTree {
+    core: Arc<LsmCore>,
+    /// Background-worker join handle. Taken on drop.
+    compaction_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl std::ops::Deref for LsmTree {
+    type Target = LsmCore;
+
+    fn deref(&self) -> &LsmCore {
+        &self.core
+    }
+}
+
+/// The state behind an [`LsmTree`] handle (reached through it via `Deref`).
+/// Shared with the background compaction worker.
+pub struct LsmCore {
     /// Single-writer guard for `config.data_dir`: an advisory `flock` (held for
     /// this tree's lifetime, released when this field drops) plus an owner-fence
-    /// token re-checked at destructive boundaries. Field drops run AFTER the
-    /// custom `Drop for LsmTree` body, which joins the compaction worker — so
-    /// the lock is released only once nothing is still touching the files.
+    /// token re-checked at destructive boundaries. The core drops only after
+    /// `Drop for LsmTree` has joined the compaction worker (the worker's own
+    /// reference is gone by then), so the lock is released only once nothing
+    /// is still touching the files.
     dir_guard: crate::lock::DataDirGuard,
     config: LsmConfig,
     active_memtable: Arc<RwLock<Arc<MemTable>>>,
@@ -149,9 +179,6 @@ pub struct LsmTree {
     /// which `Drop` signals shutdown).
     compaction_state:
         Arc<(parking_lot::Mutex<CompactionState>, parking_lot::Condvar)>,
-    /// Background-worker join handle. Taken on drop.
-    compaction_handle:
-        parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// One bounded, tombstone-aware step of a resumable range scan
@@ -318,7 +345,7 @@ impl LsmTree {
         let wal = Wal::open(&wal_path)?;
 
         let background_compaction = config.background_compaction;
-        let tree = Arc::new(Self {
+        let core = Arc::new(LsmCore {
             dir_guard,
             config,
             active_memtable: Arc::new(RwLock::new(memtable)),
@@ -333,7 +360,6 @@ impl LsmTree {
                 parking_lot::Mutex::new(CompactionState::default()),
                 parking_lot::Condvar::new(),
             )),
-            compaction_handle: parking_lot::Mutex::new(None),
         });
 
         // One-time upgrade: persist the legacy-WAL records to an SST and
@@ -341,20 +367,28 @@ impl LsmTree {
         // The recovered records are non-empty (a non-empty legacy WAL always
         // rebuilds a non-empty memtable), so the flush converts the file.
         if wal_was_legacy {
-            tree.flush()?;
+            core.flush()?;
         }
 
+        let mut compaction_handle = None;
         if background_compaction {
-            let weak = Arc::downgrade(&tree);
-            let state = Arc::clone(&tree.compaction_state);
-            let handle = std::thread::Builder::new()
-                .name("rhypedb-compaction".into())
-                .spawn(move || compaction_worker(state, weak))?;
-            *tree.compaction_handle.lock() = Some(handle);
+            let weak = Arc::downgrade(&core);
+            let state = Arc::clone(&core.compaction_state);
+            compaction_handle = Some(
+                std::thread::Builder::new()
+                    .name("rhypedb-compaction".into())
+                    .spawn(move || compaction_worker(state, weak))?,
+            );
         }
 
-        Ok(tree)
+        Ok(Arc::new(LsmTree {
+            core,
+            compaction_handle: parking_lot::Mutex::new(compaction_handle),
+        }))
     }
+}
+
+impl LsmCore {
 
     /// Begin a new transaction.
     pub fn begin_txn(&self) -> Transaction {
@@ -1488,41 +1522,31 @@ impl LsmTree {
 }
 
 impl Drop for LsmTree {
-    /// Tell the compaction worker to exit and wait for it. The shutdown
-    /// flag + notify wakes it whether it's blocked on the condvar or
-    /// mid-merge (it re-checks `shutdown` after each iteration). Joining
-    /// here keeps the tree alive until the worker has released its
-    /// `compaction_mutex` and stopped touching SST state.
-    ///
-    /// Self-join guard: the worker temporarily holds an `Arc<LsmTree>`
-    /// (upgraded from its `Weak`) while running `compact_inner`. If the
-    /// external holder drops their `Arc` during that window, the
-    /// worker's Arc becomes the last one — its end-of-scope drop fires
-    /// `LsmTree::drop` on the worker thread, where `handle.join()`
-    /// would deadlock against the current thread. Skip the join in that
-    /// case; the worker is already finishing and will exit on the next
-    /// condvar check (we just set `shutdown = true`).
+    /// Tell the compaction worker to exit and wait for it, then let the core
+    /// (files, data-dir lock) drop. The shutdown flag + notify wakes it whether
+    /// it's blocked on the condvar or between merges (it re-checks `shutdown`
+    /// after each one); a merge already under way finishes first. The worker
+    /// only ever holds the core, never this handle, so this always runs on a
+    /// caller's thread and the join can't be a self-join.
     fn drop(&mut self) {
         {
-            let mut guard = self.compaction_state.0.lock();
+            let mut guard = self.core.compaction_state.0.lock();
             guard.shutdown = true;
-            self.compaction_state.1.notify_all();
+            self.core.compaction_state.1.notify_all();
         }
-        if let Some(handle) = self.compaction_handle.lock().take()
-            && handle.thread().id() != std::thread::current().id()
-        {
+        if let Some(handle) = self.compaction_handle.lock().take() {
             let _ = handle.join();
         }
     }
 }
 
-/// Background compaction worker. Owns a `Weak<LsmTree>` so the tree's
-/// lifetime isn't extended by this thread — `Drop` flips the shutdown
-/// flag, the worker breaks out, the upgrade afterwards (if any) returns
-/// `None` because the strong count has already dropped to 0.
+/// Background compaction worker. Owns a `Weak<LsmCore>` — the core, never the
+/// [`LsmTree`] handle — so it can't keep a caller's handle alive or be the one
+/// that drops it. `LsmTree`'s `Drop` flips the shutdown flag and joins this
+/// thread before the core drops.
 fn compaction_worker(
     state: Arc<(parking_lot::Mutex<CompactionState>, parking_lot::Condvar)>,
-    weak: std::sync::Weak<LsmTree>,
+    weak: std::sync::Weak<LsmCore>,
 ) {
     loop {
         // Phase A: wait for work. Block on the condvar until something
@@ -1543,6 +1567,13 @@ fn compaction_worker(
         // Phase B: do the work. If the tree has dropped underneath us,
         // exit cleanly — the shutdown notify would have arrived too.
         if let Some(lsm) = weak.upgrade() {
+            #[cfg(test)]
+            {
+                let mut g = state.0.lock();
+                while g.hold {
+                    state.1.wait(&mut g);
+                }
+            }
             let _outer_guard = lsm.compaction_mutex.lock();
             // Errors are logged (best-effort) but don't kill the worker —
             // an SST write failure on one cycle shouldn't prevent us from
@@ -3127,6 +3158,47 @@ mod tests {
         let txn = tree2.begin_txn();
         let v = tree2.get(&txn, b"k0").unwrap();
         assert_eq!(v, Some(Bytes::from("v0")));
+    }
+
+    /// GH #29: dropping the last caller handle while the background worker is
+    /// mid-compaction (holding its reference to the core) must not return
+    /// until the files and the data-dir lock are released — an immediate
+    /// reopen must succeed. The worker is parked at the point it holds the
+    /// core; under the old design the drop returned right there, with the
+    /// worker still holding the lock.
+    #[test]
+    fn drop_during_background_compaction_releases_the_lock_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = LsmTree::open(test_config_with_bg_compaction(dir.path())).unwrap();
+        let state = Arc::clone(&tree.compaction_state);
+        state.0.lock().hold = true;
+        for i in 0..3 {
+            put_kv(&tree, format!("k{i}").as_bytes(), b"v");
+            tree.flush().unwrap();
+        }
+        tree.signal_compaction();
+        // Wait until the worker holds the core and is parked at the gate.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.0.lock().running {
+            assert!(std::time::Instant::now() < deadline, "worker never started");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let core = Arc::downgrade(&tree.core);
+
+        let dropper = std::thread::spawn(move || drop(tree));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!dropper.is_finished(), "drop returned while the worker still held the core");
+
+        {
+            let mut g = state.0.lock();
+            g.hold = false;
+            state.1.notify_all();
+        }
+        dropper.join().unwrap();
+        assert!(core.upgrade().is_none(), "core (files + lock) outlived drop");
+        let reopened = LsmTree::open(test_config(dir.path())).expect("reopen right after drop");
+        let txn = reopened.begin_txn();
+        assert_eq!(reopened.get(&txn, b"k0").unwrap(), Some(Bytes::from_static(b"v")));
     }
 
     // --- single-writer data-dir guard (crate::lock) ---------------------
