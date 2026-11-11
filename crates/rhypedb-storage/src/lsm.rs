@@ -1680,7 +1680,9 @@ struct KWayMerge<'a> {
 impl<'a> KWayMerge<'a> {
     fn new(inputs: &'a [Arc<SstReader>]) -> Result<Self> {
         let mut m = Self {
-            cursors: inputs.iter().map(|r| r.entry_cursor()).collect(),
+            // Each input is walked once, front to back: hand its pages back as
+            // the merge moves past them instead of mapping the whole file in.
+            cursors: inputs.iter().map(|r| r.entry_cursor_releasing()).collect(),
             heads: vec![None; inputs.len()],
             heap: std::collections::BinaryHeap::with_capacity(inputs.len()),
             last: None,
