@@ -4526,32 +4526,80 @@ impl Database {
     /// Scan all objects of a given type. Uses the LSM prefix scan on the
     /// object key prefix, so this is a real index scan — not a brute-force probe.
     pub fn scan_type(&self, type_name: &str) -> EngineResult<Vec<Object>> {
-        let type_id = self.resolve_type_id(type_name)?;
-
-        let prefix = KeyBuilder::object_prefix(type_id);
-        let snapshot = self.storage.read_snapshot();
-        let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
-
         let mut objects = Vec::new();
-        for (key, data) in entries {
-            // Object key: o:<type_id>:<object_id> — extract object_id from last 8 bytes.
-            if key.len() < 8 {
-                continue;
-            }
-            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-            let object_id = u64::from_be_bytes(id_bytes);
-
-            let mut fields = deserialize_fields(&data);
-            self.strip_tombstoned_fields(type_name, &mut fields);
-            objects.push(Object {
-                type_name: type_name.into(),
-                id: object_id,
-                fields,
-                raw_fields: None,
-            });
-        }
-
+        self.for_each_raw_object(type_name, self.storage.read_snapshot(), |id, data| {
+            objects.push(self.decode_object(type_name, id, data));
+            Ok::<_, EngineError>(true)
+        })?;
         Ok(objects)
+    }
+
+    /// Stream every live object of `type_name` visible at `snapshot`, in
+    /// ascending id order, as `(object_id, raw blob)`. `f` returns `Ok(true)`
+    /// to continue or `Ok(false)` to stop early. Walks the type in bounded
+    /// chunks ([`scan_chunk`](Self::scan_chunk)'s tombstone-correct protocol),
+    /// so peak memory is one chunk of blob handles — not a merged copy of the
+    /// whole type — whatever `f` keeps. Decode with
+    /// [`decode_object`](Self::decode_object) /
+    /// [`decode_object_projected`](Self::decode_object_projected).
+    pub fn for_each_raw_object<E: From<EngineError>>(
+        &self,
+        type_name: &str,
+        snapshot: u64,
+        mut f: impl FnMut(u64, &Bytes) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        const CHUNK: usize = 1024;
+        let type_id = self.resolve_type_id(type_name)?;
+        let prefix = KeyBuilder::object_prefix(type_id);
+        let mut start = prefix.clone();
+        loop {
+            let chunk = self
+                .storage
+                .scan_chunk_raw(snapshot, &prefix, &start, CHUNK)
+                .map_err(|e| E::from(EngineError::Storage(e)))?;
+            for (key, data) in &chunk.live {
+                if key.len() < 8 {
+                    continue;
+                }
+                let id = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                if !f(id, data)? {
+                    return Ok(());
+                }
+            }
+            let Some(hw) = chunk.high_water else {
+                return Ok(());
+            };
+            if !chunk.more {
+                return Ok(());
+            }
+            // Resume strictly after the highest key visited (live or not).
+            let hw_id = u64::from_be_bytes(hw[hw.len() - 8..].try_into().unwrap());
+            let Some(next) = hw_id.checked_add(1) else {
+                return Ok(());
+            };
+            start = KeyBuilder::object(type_id, next);
+        }
+    }
+
+    /// Decode a raw object blob (from [`for_each_raw_object`](Self::for_each_raw_object))
+    /// into an [`Object`], with retired fields stripped as on every read.
+    pub fn decode_object(&self, type_name: &str, object_id: u64, data: &Bytes) -> Object {
+        let mut fields = deserialize_fields(data);
+        self.strip_tombstoned_fields(type_name, &mut fields);
+        Object { type_name: type_name.into(), id: object_id, fields, raw_fields: None }
+    }
+
+    /// [`decode_object`](Self::decode_object), decoding only `fields`.
+    pub fn decode_object_projected(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        data: &Bytes,
+        fields: &[&str],
+    ) -> Object {
+        let mut projected = deserialize_fields_projected(data, fields);
+        self.strip_tombstoned_fields(type_name, &mut projected);
+        Object { type_name: type_name.into(), id: object_id, fields: projected, raw_fields: None }
     }
 
     /// Tombstone-CORRECT live count of one type's objects (a count-only keyspace
@@ -4630,30 +4678,11 @@ impl Database {
         type_name: &str,
         fields: &[&str],
     ) -> EngineResult<Vec<Object>> {
-        let type_id = self.resolve_type_id(type_name)?;
-
-        let prefix = KeyBuilder::object_prefix(type_id);
-        let snapshot = self.storage.read_snapshot();
-        let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
-
-        let mut objects = Vec::with_capacity(entries.len());
-        for (key, data) in entries {
-            if key.len() < 8 {
-                continue;
-            }
-            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-            let object_id = u64::from_be_bytes(id_bytes);
-
-            let mut projected = deserialize_fields_projected(&data, fields);
-            self.strip_tombstoned_fields(type_name, &mut projected);
-            objects.push(Object {
-                type_name: type_name.into(),
-                id: object_id,
-                fields: projected,
-                raw_fields: None,
-            });
-        }
-
+        let mut objects = Vec::new();
+        self.for_each_raw_object(type_name, self.storage.read_snapshot(), |id, data| {
+            objects.push(self.decode_object_projected(type_name, id, data, fields));
+            Ok::<_, EngineError>(true)
+        })?;
         Ok(objects)
     }
 
@@ -5486,37 +5515,23 @@ impl Database {
     where
         F: FnMut(&Value) -> Option<bool>,
     {
-        let type_id = self.resolve_type_id(type_name)?;
-        let prefix = KeyBuilder::object_prefix(type_id);
-        let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
-
+        // Streamed in bounded chunks: peak memory is one chunk plus the
+        // matches, not a merged copy of the whole type's key range.
         let cap = limit.unwrap_or(usize::MAX);
         let mut out = Vec::new();
-        for (key, data) in entries {
-            if out.len() >= cap {
-                break;
-            }
-            if key.len() < 8 {
-                continue;
-            }
-            let pass = extract_field(&data, field_name)
+        if cap == 0 {
+            return Ok(out);
+        }
+        self.for_each_raw_object(type_name, snapshot, |object_id, data| {
+            let pass = extract_field(data, field_name)
                 .as_ref()
                 .and_then(&mut predicate)
                 .unwrap_or(false);
-            if !pass {
-                continue;
+            if pass {
+                out.push(self.decode_object(type_name, object_id, data));
             }
-            let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-            let object_id = u64::from_be_bytes(id_bytes);
-            let mut fields = deserialize_fields(&data);
-            self.strip_tombstoned_fields(type_name, &mut fields);
-            out.push(Object {
-                type_name: type_name.into(),
-                id: object_id,
-                fields,
-                raw_fields: None,
-            });
-        }
+            Ok::<_, EngineError>(out.len() < cap)
+        })?;
         Ok(out)
     }
 
