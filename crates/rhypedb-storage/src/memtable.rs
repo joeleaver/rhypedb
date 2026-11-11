@@ -6,6 +6,17 @@ use crate::key::InternalKey;
 /// Value stored in the memtable. `None` represents a tombstone (deletion).
 pub type MemValue = Option<Bytes>;
 
+/// Heap bytes each entry costs BEYOND its key and value bytes, counted into
+/// [`MemTable::approximate_size`] so the flush threshold tracks real memory.
+/// Measured with a counting allocator (`tests/memtable_memory.rs`): the skiplist
+/// node — its `Bytes` key and `Option<Bytes>` value handles, the refcount/height
+/// word and an average tower of next-pointers — is 88 bytes for every row size;
+/// plus ~8 bytes of malloc chunk header on each of its three allocations (node,
+/// key buffer, value buffer), which the counting allocator can't see but RSS
+/// does. Without this a small-row memtable (index entries, postings) held
+/// ~3x the configured flush size.
+pub const ENTRY_OVERHEAD: usize = 88 + 3 * 8;
+
 /// In-memory sorted store backed by a lock-free skip list.
 ///
 /// Supports concurrent reads and writes without locking. Entries are
@@ -38,7 +49,7 @@ impl MemTable {
     pub fn put(&self, user_key: &[u8], version: u64, value: Bytes) {
         let ik = InternalKey::new(user_key, version);
         let key_bytes = ik.into_bytes();
-        let added = key_bytes.len() + value.len();
+        let added = key_bytes.len() + value.len() + ENTRY_OVERHEAD;
         self.map.insert(key_bytes, Some(value));
         self.size_bytes
             .fetch_add(added, std::sync::atomic::Ordering::Relaxed);
@@ -49,7 +60,7 @@ impl MemTable {
     pub fn delete(&self, user_key: &[u8], version: u64) {
         let ik = InternalKey::new(user_key, version);
         let key_bytes = ik.into_bytes();
-        let added = key_bytes.len();
+        let added = key_bytes.len() + ENTRY_OVERHEAD;
         self.map.insert(key_bytes, None);
         self.size_bytes
             .fetch_add(added, std::sync::atomic::Ordering::Relaxed);
@@ -95,7 +106,8 @@ impl MemTable {
         prefixes.iter().map(|p| self.scan_prefix(p, version)).collect()
     }
 
-    /// Approximate size in bytes of all entries in this memtable.
+    /// Approximate heap bytes held by this memtable: every entry's key and
+    /// value bytes plus [`ENTRY_OVERHEAD`].
     pub fn approximate_size(&self) -> usize {
         self.size_bytes
             .load(std::sync::atomic::Ordering::Relaxed)
