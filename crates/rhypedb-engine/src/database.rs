@@ -1501,6 +1501,16 @@ impl Database {
         Ok(db)
     }
 
+    /// Return freed heap memory to the operating system now (glibc
+    /// `malloc_trim`; a no-op on other allocators). The engine already does
+    /// this, throttled, after flushes, compactions and cover-refresh rounds;
+    /// call it after your own large transient work (a bulk import, a big
+    /// query) to bring RSS back down promptly. Never frees memory in use.
+    /// Returns whether the allocator reported releasing anything.
+    pub fn release_free_memory(&self) -> bool {
+        rhypedb_storage::mem::release_free_memory()
+    }
+
     /// Current generation of the object `(type_name, object_id)`. Returns 0
     /// when the object has never been updated (no entry in the counter map).
     /// Public so the query executor can compare against `<name>__cover_v`
@@ -7823,6 +7833,9 @@ fn cover_refresh_worker(
             // in the meantime.
             let _ = db.refresh_covers_for_target(type_id, object_id);
         }
+        // A round's batches staged and committed cover blobs that are freed
+        // now; hand the pages back (throttled).
+        rhypedb_storage::mem::maybe_release_free_memory();
     }
 }
 
