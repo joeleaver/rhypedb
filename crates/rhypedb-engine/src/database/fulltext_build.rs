@@ -52,8 +52,15 @@ use crate::fulltext::{Analyzer, FulltextField, FulltextStats, StatsDelta, tokeni
 use crate::object::Value;
 use std::collections::HashMap;
 
-/// Objects visited per backfill chunk (one commit each).
+/// Most objects visited per backfill chunk (one commit each).
 pub(super) const FULLTEXT_BUILD_CHUNK: usize = 512;
+/// Index-row bytes (keys + values) a backfill chunk stages before it commits
+/// early. A chunk's transaction, WAL batch and memtable inserts all scale with
+/// its rows — several hundred bytes of RAM per posting — so a fixed 512 long
+/// documents could stage tens of MB in one transaction. With this, a chunk
+/// commits once ~2 MiB of rows are staged (always at least one document) and
+/// the next chunk resumes right after the last document it indexed.
+pub(super) const FULLTEXT_BUILD_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 /// Rows deleted per drop-sweep commit.
 const FULLTEXT_DROP_CHUNK: usize = 2048;
 const WRITE_CONFLICT_RETRIES: u32 = 8;
@@ -475,7 +482,15 @@ fn run_build(
             // us is visible and nothing commits behind our back.
             let _maintenance_guard = db.maintenance_lock.write();
             let mut txn = db.storage.begin_txn();
-            let chunk = db.scan_chunk(type_name, txn.snapshot(), cursor, chunk_size)?;
+            // Decode only the indexed field: the rest of each blob (bodies,
+            // other columns) is never materialized.
+            let chunk = db.scan_chunk_projected(
+                type_name,
+                txn.snapshot(),
+                cursor,
+                chunk_size,
+                &[field.name.as_str()],
+            )?;
             // Test seam INSIDE the exclusion window (lock held, chunk read,
             // nothing committed): a hook that starts a foreground write on
             // another thread sees it park on the maintenance lock until this
@@ -485,24 +500,36 @@ fn run_build(
             if let Some(hook) = builder.chunk_hook.lock().as_mut() {
                 hook(cursor);
             }
-            let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
-            let mut delta = StatsDelta::default();
-            for obj in &chunk.objects {
-                let Some(Value::String(text)) = obj.fields.get(&field.name) else {
-                    continue;
-                };
-                // Already indexed (a live write got there first, or a prior
-                // pass of this chunk committed before a torn tail).
-                let doc_key = KeyBuilder::fulltext_doc(type_id, field.field_id, field.generation, obj.id);
-                if db.storage.get(&txn, &doc_key)?.is_some() {
-                    continue;
-                }
-                let doc = tokenize_for_index(field, text);
-                crate::fulltext::stage_doc_puts(type_id, field, obj.id, &doc, &mut puts);
-                delta.add(type_id, field.field_id, 1, doc.doc_len as i64);
-            }
-            let done = !chunk.more || chunk.next_cursor.is_none();
-            let next_cursor = chunk.next_cursor.unwrap_or(u64::MAX);
+            let staged = stage_backfill_chunk(
+                &chunk.objects,
+                FULLTEXT_BUILD_CHUNK_BYTES,
+                |obj, puts, delta| {
+                    let Some(Value::String(text)) = obj.fields.get(&field.name) else {
+                        return Ok(());
+                    };
+                    // Already indexed (a live write got there first, or a prior
+                    // pass of this chunk committed before a torn tail).
+                    let doc_key =
+                        KeyBuilder::fulltext_doc(type_id, field.field_id, field.generation, obj.id);
+                    if db.storage.get(&txn, &doc_key)?.is_some() {
+                        return Ok(());
+                    }
+                    let doc = tokenize_for_index(field, text);
+                    crate::fulltext::stage_doc_puts(type_id, field, obj.id, &doc, puts);
+                    delta.add(type_id, field.field_id, 1, doc.doc_len as i64);
+                    Ok(())
+                },
+            )?;
+            let StagedChunk { mut puts, delta, processed, cut_after } = staged;
+            // Cut early by the byte budget: resume right after the last object
+            // indexed (the rest of this chunk is re-scanned next time).
+            let (done, next_cursor) = match cut_after {
+                Some(last_id) => (false, last_id),
+                None => (
+                    !chunk.more || chunk.next_cursor.is_none(),
+                    chunk.next_cursor.unwrap_or(u64::MAX),
+                ),
+            };
             // The marker rides in the same framed txn as the rows: WAL replay
             // is all-or-nothing per commit, so a torn tail loses the WHOLE
             // chunk (rows + cursor advance) and the next open redoes it —
@@ -523,7 +550,7 @@ fn run_build(
                     crash_inject::hit(crash_inject::Site::FulltextBuildAfterChunkCommit);
                     db.apply_fulltext_delta(&delta);
                     chunk_size = FULLTEXT_BUILD_CHUNK;
-                    break (chunk.objects.len() as u64, next_cursor, done);
+                    break (processed as u64, next_cursor, done);
                 }
                 Err(rhypedb_storage::Error::WriteConflict) => {
                     // A live write inside this chunk's window landed first:
@@ -549,6 +576,48 @@ fn run_build(
             return Ok(true);
         }
     }
+}
+
+/// What [`stage_backfill_chunk`] staged for one chunk.
+pub(super) struct StagedChunk {
+    pub(super) puts: Vec<(Bytes, Bytes)>,
+    pub(super) delta: StatsDelta,
+    /// Objects handled (indexed, or skipped as textless / already indexed).
+    pub(super) processed: usize,
+    /// `Some(id)` when the byte budget cut the chunk short after object `id`;
+    /// `None` when every object was handled.
+    pub(super) cut_after: Option<u64>,
+}
+
+/// Run `index_one` over `objects` (ascending id) until the staged rows reach
+/// `budget` bytes. Always handles at least one object, so a single huge
+/// document can't stall the build; stops BEFORE the object that would start
+/// past the budget, never in the middle of one.
+pub(super) fn stage_backfill_chunk(
+    objects: &[crate::object::Object],
+    budget: usize,
+    mut index_one: impl FnMut(
+        &crate::object::Object,
+        &mut Vec<(Bytes, Bytes)>,
+        &mut StatsDelta,
+    ) -> EngineResult<()>,
+) -> EngineResult<StagedChunk> {
+    let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
+    let mut delta = StatsDelta::default();
+    let mut staged_bytes = 0usize;
+    let mut processed = 0usize;
+    let mut cut_after = None;
+    for (i, obj) in objects.iter().enumerate() {
+        if processed > 0 && staged_bytes >= budget {
+            cut_after = Some(objects[i - 1].id);
+            break;
+        }
+        let before = puts.len();
+        index_one(obj, &mut puts, &mut delta)?;
+        staged_bytes += puts[before..].iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        processed += 1;
+    }
+    Ok(StagedChunk { puts, delta, processed, cut_after })
 }
 
 /// Sweep index rows of `(type_id, field_id)` whose generation is not `keep`
@@ -744,5 +813,55 @@ impl Database {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use crate::object::{FieldMap, Object};
+
+    fn obj(id: u64) -> Object {
+        Object { type_name: "T".into(), id, fields: FieldMap::new(), raw_fields: None }
+    }
+
+    /// `index_one` that stages one row of `bytes[i]` bytes for object i.
+    fn run(bytes: &[usize], budget: usize) -> StagedChunk {
+        let objects: Vec<Object> = (1..=bytes.len() as u64).map(obj).collect();
+        stage_backfill_chunk(&objects, budget, |o, puts, _| {
+            let n = bytes[(o.id - 1) as usize];
+            if n > 0 {
+                puts.push((Bytes::new(), Bytes::from(vec![0u8; n])));
+            }
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn stops_before_the_object_that_would_start_past_the_budget() {
+        let s = run(&[400, 400, 400, 400], 1000);
+        // 400 + 400 = 800 < 1000 → third object staged (1200), then cut.
+        assert_eq!(s.processed, 3);
+        assert_eq!(s.cut_after, Some(3));
+        assert_eq!(s.puts.len(), 3);
+    }
+
+    #[test]
+    fn under_budget_handles_everything() {
+        let s = run(&[10, 0, 10, 10], 1000);
+        assert_eq!((s.processed, s.cut_after), (4, None));
+    }
+
+    #[test]
+    fn always_handles_at_least_one_object() {
+        let s = run(&[5000, 10], 1000);
+        assert_eq!((s.processed, s.cut_after), (1, Some(1)));
+    }
+
+    #[test]
+    fn skipped_objects_count_as_handled_and_cost_nothing() {
+        let s = run(&[0, 0, 0, 2000, 0], 1000);
+        assert_eq!((s.processed, s.cut_after), (4, Some(4)));
     }
 }

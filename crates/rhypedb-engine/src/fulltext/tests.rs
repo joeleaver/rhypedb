@@ -537,6 +537,54 @@ fn adding_the_directive_backfills_existing_objects_to_a_clean_build() {
     assert_eq!(scored(&db2, "title", "invoice"), scored(&clean, "title", "invoice"));
 }
 
+/// Long documents: each chunk hits the staged-bytes budget long before 512
+/// objects, so the build cuts chunks early and resumes after the last
+/// document it indexed — many times. The result must be byte-identical to a
+/// clean build (no document skipped or indexed twice at a cut).
+#[test]
+fn byte_budget_cuts_chunks_without_skipping_or_duplicating_documents() {
+    let n = 700u64;
+    let rows: Vec<(u64, Option<String>, String)> = (1..=n)
+        .map(|i| {
+            // ~350 distinct terms per document → ~20 KB of index rows each,
+            // so the 2 MiB budget cuts roughly every hundred documents.
+            let words: Vec<String> = (0..350).map(|w| format!("d{i}w{w}")).collect();
+            let title = if i % 50 == 0 { None } else { Some(format!("common {}", words.join(" "))) };
+            (i, title, format!("t{i}"))
+        })
+        .collect();
+    let dir = TempDir::new().unwrap();
+    {
+        let db = open_sdl(&dir, SCHEMA_WITHOUT_TITLE_INDEX);
+        let batch: Vec<(u64, FieldMap)> = rows
+            .iter()
+            .map(|(id, title, tag)| {
+                let mut f = fields(&[("body", s("b")), ("tag", s(tag)), ("n", Value::I64(1))]);
+                if let Some(t) = title {
+                    f.insert("title".into(), s(t));
+                }
+                (*id, f)
+            })
+            .collect();
+        db.restore_objects("Note", batch, true).unwrap();
+    }
+    let db = open(&dir);
+    assert!(db.wait_for_fulltext_builds(BUILD_TIMEOUT), "build did not finish");
+    assert_eq!(state_of(&db, "title"), crate::fulltext::BuildState::Built);
+    let st = db.fulltext_status();
+    let title = st.iter().find(|s| s.name == "Note.title").unwrap();
+    assert_eq!((title.indexed, title.total), (n, n));
+
+    let borrowed: Vec<(u64, Option<&str>, &str)> =
+        rows.iter().map(|(i, t, g)| (*i, t.as_deref(), g.as_str())).collect();
+    let (_cdir, clean) = clean_build(SCHEMA, &borrowed);
+    assert_eq!(raw_rows(&db, "title"), raw_rows(&clean, "title"));
+    assert_eq!(stats(&db, "title"), stats(&clean, "title"));
+    for q in ["common", "d1w0", "d699w349", "+common +d350w7"] {
+        assert_eq!(scored(&db, "title", q), scored(&clean, "title", q), "{q}");
+    }
+}
+
 #[test]
 fn writes_before_and_during_the_backfill_converge() {
     let rows = sample_rows(1100);
