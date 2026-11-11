@@ -257,6 +257,35 @@ impl MemTable {
         results
     }
 
+    /// The object ids in this memtable by the kind of their newest entry
+    /// visible at `version` (see [`crate::idsum`]). Walks only the object
+    /// keyspace and copies no keys.
+    pub fn object_id_summary(&self, version: u64) -> crate::idsum::ObjectIdSummary {
+        let prefix = [crate::key::KeyPrefix::Object as u8, crate::key::SEPARATOR];
+        let scan_start = InternalKey::new(&prefix, u64::MAX);
+        let scan_bytes = Bytes::copy_from_slice(scan_start.as_bytes());
+        let mut summary = crate::idsum::ObjectIdSummary::default();
+        for entry in self.map.range(scan_bytes..) {
+            let key = entry.key();
+            if key.len() < 8 {
+                continue;
+            }
+            let user_key = &key[..key.len() - 8];
+            if !user_key.starts_with(&prefix) {
+                break;
+            }
+            let entry_version = !u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+            if entry_version > version {
+                continue;
+            }
+            // Versions of a key come newest first; `record` keeps the first.
+            if let Some((type_id, object_id)) = crate::idsum::object_key_ids(user_key) {
+                summary.record(type_id, object_id, entry.value().is_some());
+            }
+        }
+        summary
+    }
+
     /// Scan for all entries whose user key starts with `prefix`, visible at `version`.
     /// Returns (user_key, value) pairs, deduplicated to the latest visible version per key.
     pub fn scan_prefix(&self, prefix: &[u8], version: u64) -> Vec<(Bytes, MemValue)> {

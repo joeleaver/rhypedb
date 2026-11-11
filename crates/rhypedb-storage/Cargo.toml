@@ -26,6 +26,8 @@ crossbeam-skiplist = { workspace = true }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 memmap2 = "0.9"
 parking_lot = { workspace = true }
+# Per-SST object-id summaries (idsum.rs).
+roaring = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

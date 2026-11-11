@@ -6,6 +6,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::bloom::{BloomFilter, HashAlgo};
 use crate::crash_inject::{self, Site};
+use crate::idsum::{META_TAG_OBJECT_IDS, ObjectIdSummary, object_key_ids};
 use crate::key::InternalKey;
 use crate::memtable::MemValue;
 use crate::zone::{ZoneBuilder, ZoneFieldExtractor, ZoneMap};
@@ -73,9 +74,12 @@ fn version_has_meta(version: u32) -> bool {
 /// v7/v8 meta pointer, stored immediately before the v4 footer.
 const META_PTR_SIZE: usize = 8 + 4;
 
-/// Meta block payload: `[min_version u64][max_version u64][entry_count u64]`.
-/// Readers take the fields they know and ignore any trailing bytes, so later
-/// versions can append fields.
+/// Meta block payload: `[min_version u64][max_version u64][entry_count u64]`,
+/// then zero or more tagged sections `[tag u8][len u32][payload]` — today
+/// only [`META_TAG_OBJECT_IDS`] (the file's object-id summary, see
+/// [`crate::idsum`]). Readers take the fields they know and skip unknown tags,
+/// so later versions can append sections; a file without a section is read as
+/// "not recorded", never as "empty".
 const META_BLOCK_MIN_SIZE: usize = 8 + 8 + 8;
 
 /// v6 per-block frame header: `[flag u8][uncomp_len u32 BE][payload_len u32 BE]`.
@@ -186,6 +190,10 @@ pub struct SstWriter {
     /// The previous entry's user key, to count each key once across its
     /// versions. One reused buffer — not a copy per key.
     last_user_key: Vec<u8>,
+    /// Object ids this file holds, by the kind of their newest entry —
+    /// written into the meta block so `open` can rebuild the live-object set
+    /// without reading object data (see [`crate::idsum`]).
+    object_ids: ObjectIdSummary,
     /// Optional callback that pulls zone-mapped (field-hash, encoded-bytes)
     /// pairs out of each entry's value bytes. `None` disables the zone-map
     /// block — useful for SSTs that carry only edges or other non-object
@@ -287,6 +295,7 @@ impl SstWriter {
             bloom_keys: BloomKeys::Hashes(Vec::new()),
             distinct_keys: 0,
             last_user_key: Vec::new(),
+            object_ids: ObjectIdSummary::default(),
             min_version: u64::MAX,
             max_version: 0,
             zone_extractor,
@@ -347,6 +356,10 @@ impl SstWriter {
                 self.distinct_keys += 1;
                 self.last_user_key.clear();
                 self.last_user_key.extend_from_slice(user_key);
+                // First (newest) entry of this key in the file.
+                if let Some((type_id, object_id)) = object_key_ids(user_key) {
+                    self.object_ids.record(type_id, object_id, value.is_some());
+                }
                 match &mut self.bloom_keys {
                     BloomKeys::Streaming(bloom) => bloom.add(user_key),
                     BloomKeys::Hashes(hashes) => hashes.push(BloomFilter::xxh3_hashes(user_key)),
@@ -463,12 +476,18 @@ impl SstWriter {
 
         // v7/v8 meta block, then its pointer, then the unchanged v4 footer.
         let meta_offset = bloom_offset + bloom_size as u64;
-        let mut meta = BytesMut::with_capacity(META_BLOCK_MIN_SIZE + META_PTR_SIZE);
+        // Fixed fields, then tagged sections `[tag u8][len u32][payload]`.
+        let ids = self.object_ids.encode();
+        let meta_size = META_BLOCK_MIN_SIZE + 1 + 4 + ids.len();
+        let mut meta = BytesMut::with_capacity(meta_size + META_PTR_SIZE);
         meta.put_u64(if self.entry_count == 0 { 0 } else { self.min_version });
         meta.put_u64(self.max_version);
         meta.put_u64(self.entry_count as u64);
+        meta.put_u8(META_TAG_OBJECT_IDS);
+        meta.put_u32(ids.len() as u32);
+        meta.put_slice(&ids);
         meta.put_u64(meta_offset);
-        meta.put_u32(META_BLOCK_MIN_SIZE as u32);
+        meta.put_u32(meta_size as u32);
         self.writer.write_all(&meta)?;
 
         // v4 footer.
@@ -550,6 +569,10 @@ pub struct SstReader {
     version: u32,
     /// From the v7/v8 meta block; `None` for older files.
     file_meta: Option<SstFileMeta>,
+    /// Byte range of the meta block's object-id summary, when the writer
+    /// recorded one. Decoded on demand ([`SstReader::object_id_summary`]) so
+    /// an open file holds no decoded copy.
+    object_ids_range: Option<std::ops::Range<usize>>,
     path: PathBuf,
 }
 
@@ -783,6 +806,7 @@ impl SstReader {
         };
 
         // v7/v8 meta block, via the pointer stored just before the v4 footer.
+        let mut object_ids_range = None;
         let file_meta = if version_has_meta(version) {
             let footer_start = data.len() - FOOTER_V4_SIZE;
             if footer_start < SST_MAGIC.len() + 4 + META_PTR_SIZE {
@@ -799,6 +823,20 @@ impl SstReader {
                 return Err(Error::SstCorrupted("v7/v8 meta block out of range".into()));
             }
             let m = &data[meta_offset..meta_offset + meta_size];
+            // Tagged sections after the fixed fields.
+            let mut pos = META_BLOCK_MIN_SIZE;
+            while pos + 5 <= m.len() {
+                let tag = m[pos];
+                let len = u32::from_be_bytes(m[pos + 1..pos + 5].try_into().unwrap()) as usize;
+                let start = pos + 5;
+                let Some(end) = start.checked_add(len).filter(|&e| e <= m.len()) else {
+                    return Err(Error::SstCorrupted("meta section out of range".into()));
+                };
+                if tag == META_TAG_OBJECT_IDS {
+                    object_ids_range = Some(meta_offset + start..meta_offset + end);
+                }
+                pos = end;
+            }
             Some(SstFileMeta {
                 min_version: u64::from_be_bytes(m[0..8].try_into().unwrap()),
                 max_version: u64::from_be_bytes(m[8..16].try_into().unwrap()),
@@ -848,10 +886,48 @@ impl SstReader {
             zone_map,
             version,
             file_meta,
+            object_ids_range,
             path,
         };
         reader.last_user_key = reader.compute_last_user_key()?;
         Ok(reader)
+    }
+
+    /// The object ids this file holds, by the kind of their newest entry:
+    /// decoded from the meta block when the writer recorded them, otherwise
+    /// (files written before the summary existed) collected by walking just
+    /// this file's object keyspace — the cost every open used to pay for every
+    /// file.
+    pub fn object_id_summary(&self) -> Result<ObjectIdSummary> {
+        if let Some(r) = &self.object_ids_range {
+            return ObjectIdSummary::decode(&self.data[r.clone()]);
+        }
+        let prefix = [crate::key::KeyPrefix::Object as u8, crate::key::SEPARATOR];
+        let mut summary = ObjectIdSummary::default();
+        let mut start = prefix.to_vec();
+        loop {
+            let rows = self.scan_from_max(&prefix, &start, u64::MAX, 4096);
+            let more = rows.len() == 4096;
+            for (key, value) in &rows {
+                if let Some((type_id, object_id)) = object_key_ids(key) {
+                    summary.record(type_id, object_id, value.is_some());
+                }
+            }
+            match rows.last() {
+                Some((last, _)) if more => {
+                    // Smallest key after `last`.
+                    start = last.to_vec();
+                    start.push(0);
+                }
+                _ => break,
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Whether the writer recorded an object-id summary in this file.
+    pub fn has_object_id_summary(&self) -> bool {
+        self.object_ids_range.is_some()
     }
 
     /// Walk the FINAL data block (the sparse index only records each block's
@@ -2030,15 +2106,16 @@ impl<'a> Iterator for SstIterator<'a> {
     }
 }
 
+/// Test helpers that rewrite files into older formats.
 #[cfg(test)]
-mod tests {
+pub(crate) mod legacy {
     use super::*;
 
     /// Rewrite a v7/v8 file in place as the v5/v6 file an older writer would
     /// have produced: drop the meta block and its pointer (they sit between
     /// the bloom block and the v4 footer, so no other offset moves) and patch
     /// the header version.
-    fn strip_meta_to_legacy(path: &Path) {
+    pub(crate) fn strip_meta_to_legacy(path: &Path) {
         let mut bytes = std::fs::read(path).unwrap();
         let version = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
         let legacy = match version {
@@ -2055,6 +2132,23 @@ mod tests {
         bytes[4..8].copy_from_slice(&legacy.to_be_bytes());
         std::fs::write(path, bytes).unwrap();
     }
+
+    /// Rewrite a v7/v8 file in place as one written before object-id summaries:
+    /// shrink the meta block to its fixed fields, which is all an older writer
+    /// emitted (the section's bytes stay in the file, unreferenced).
+    pub(crate) fn drop_object_id_section(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let ptr = bytes.len() - FOOTER_V4_SIZE - META_PTR_SIZE;
+        bytes[ptr + 8..ptr + 12].copy_from_slice(&(META_BLOCK_MIN_SIZE as u32).to_be_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use legacy::strip_meta_to_legacy;
 
     #[test]
     fn meta_block_records_versions_and_legacy_files_still_walk() {
