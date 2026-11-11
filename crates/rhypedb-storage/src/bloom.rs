@@ -92,6 +92,65 @@ impl BloomFilter {
         self.algo
     }
 
+    /// The `(h1, h2)` pair [`add`](Self::add) would derive for `key` under the
+    /// default (xxh3) algorithm. Lets a writer keep 16 bytes per distinct key
+    /// instead of the key itself when it can't size the filter up front; feed
+    /// the pairs back through [`add_hashed`](Self::add_hashed).
+    pub fn xxh3_hashes(key: &[u8]) -> (u64, u64) {
+        xxh3_double_hash(key)
+    }
+
+    /// Add a key by its precomputed [`xxh3_hashes`](Self::xxh3_hashes) pair.
+    /// Identical to `add(key)` on an xxh3 filter.
+    pub fn add_hashed(&mut self, h1: u64, h2: u64) {
+        debug_assert_eq!(self.algo, HashAlgo::Xxh3);
+        if let Some(mask) = self.mask {
+            for i in 0..self.k {
+                let bit = combined_hash(h1, h2, i) as u32 & mask;
+                self.set_bit(bit as usize);
+            }
+        } else {
+            for i in 0..self.k {
+                let bit = combined_hash(h1, h2, i) % self.num_bits as u64;
+                self.set_bit(bit as usize);
+            }
+        }
+    }
+
+    /// Shrink a power-of-two filter to the size [`new`](Self::new) would have
+    /// picked for `actual_entries` at `bits_per_entry`, without re-adding any
+    /// key. A bit position is `(u32)hash & (num_bits - 1)`, so with `m` a power
+    /// of two, position `p` in a filter of `m/2` bits is exactly `p mod m/2`:
+    /// OR-ing the upper half onto the lower half yields, bit for bit, the
+    /// filter that adding the same keys to an `m/2`-bit filter would build.
+    /// Repeated until the target size. This lets a writer size the filter from
+    /// an UPPER BOUND on its key count (known before writing), add keys as they
+    /// stream past, and still publish a right-sized filter.
+    ///
+    /// No-op for non-power-of-two (legacy) filters and when already at or
+    /// below the target.
+    pub fn fold_to_fit(&mut self, actual_entries: usize, bits_per_entry: usize) {
+        if self.mask.is_none() {
+            return;
+        }
+        let target = (actual_entries.max(1) * bits_per_entry)
+            .max(1)
+            .next_power_of_two();
+        // Fold at byte granularity only (each half a whole number of bytes);
+        // the last sub-byte steps would save under a byte.
+        while self.num_bits as usize > target && self.num_bits >= 16 {
+            let half_bytes = self.bits.len() / 2;
+            let (lo, hi) = self.bits.split_at_mut(half_bytes);
+            for (l, h) in lo.iter_mut().zip(hi.iter()) {
+                *l |= *h;
+            }
+            self.bits.truncate(half_bytes);
+            self.bits.shrink_to_fit();
+            self.num_bits /= 2;
+            self.mask = Some(self.num_bits - 1);
+        }
+    }
+
     /// Add a key to the filter.
     pub fn add(&mut self, key: &[u8]) {
         let (h1, h2) = self.double_hash(key);
@@ -241,6 +300,41 @@ fn combined_hash(h1: u64, h2: u64, i: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Folding a filter built oversized must give the exact bytes of a filter
+    /// built at the right size from the start.
+    #[test]
+    fn fold_to_fit_matches_a_filter_built_at_the_target_size() {
+        let keys: Vec<Vec<u8>> = (0..1_000).map(|i| format!("k-{i}").into_bytes()).collect();
+        for upper_bound in [1_000usize, 1_001, 5_000, 80_000] {
+            let mut big = BloomFilter::new(upper_bound);
+            let mut exact = BloomFilter::new(keys.len());
+            for k in &keys {
+                big.add(k);
+                let (h1, h2) = BloomFilter::xxh3_hashes(k);
+                exact.add_hashed(h1, h2);
+            }
+            big.fold_to_fit(keys.len(), DEFAULT_BITS_PER_ENTRY);
+            assert_eq!(big.num_bits(), exact.num_bits(), "upper bound {upper_bound}");
+            assert_eq!(big.bits, exact.bits, "upper bound {upper_bound}");
+            for k in &keys {
+                assert!(big.contains(k));
+            }
+        }
+    }
+
+    #[test]
+    fn add_hashed_matches_add() {
+        let mut a = BloomFilter::new(100);
+        let mut b = BloomFilter::new(100);
+        for i in 0..100 {
+            let k = format!("x{i}");
+            a.add(k.as_bytes());
+            let (h1, h2) = BloomFilter::xxh3_hashes(k.as_bytes());
+            b.add_hashed(h1, h2);
+        }
+        assert_eq!(a.bits, b.bits);
+    }
 
     #[test]
     fn no_false_negatives() {

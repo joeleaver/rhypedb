@@ -145,9 +145,14 @@ pub struct SstWriter {
     /// recovery scan ignores and `LsmTree::open` cleans up — so a partial SST
     /// never blocks reopen.
     tmp_path: PathBuf,
-    /// Collected user keys for the bloom filter. The bloom filter is
-    /// constructed in `finish()` once we know the entry count.
-    user_keys: Vec<Bytes>,
+    /// Bloom filter input, gathered without holding any user key. See
+    /// [`BloomKeys`].
+    bloom_keys: BloomKeys,
+    /// Distinct user keys added so far (sizes / folds the bloom in `finish`).
+    distinct_keys: usize,
+    /// The previous entry's user key, to count each key once across its
+    /// versions. One reused buffer — not a copy per key.
+    last_user_key: Vec<u8>,
     /// Optional callback that pulls zone-mapped (field-hash, encoded-bytes)
     /// pairs out of each entry's value bytes. `None` disables the zone-map
     /// block — useful for SSTs that carry only edges or other non-object
@@ -167,6 +172,19 @@ pub struct SstWriter {
     block_buf: BytesMut,
 }
 
+/// How an [`SstWriter`] gathers its bloom filter without keeping user keys.
+enum BloomKeys {
+    /// The caller gave an upper bound on distinct keys up front (flush knows
+    /// the memtable's entry count; compaction the inputs' entry counts): keys
+    /// go straight into a filter sized for the bound, folded down to the
+    /// actual count in `finish` ([`BloomFilter::fold_to_fit`]). Holds only the
+    /// filter itself.
+    Streaming(BloomFilter),
+    /// No bound known: keep each distinct key's 16-byte hash pair (instead of
+    /// a copy of the key) and build the right-sized filter in `finish`.
+    Hashes(Vec<(u64, u64)>),
+}
+
 /// Sparse-index block size (entries per block). Used both to decide when to
 /// emit a sparse-index entry and to compute the block_idx for zone maps.
 const ENTRIES_PER_BLOCK: usize = 16;
@@ -181,6 +199,23 @@ impl SstWriter {
         zone_extractor: Option<ZoneFieldExtractor>,
     ) -> Result<Self> {
         Self::new_with_options(path, zone_extractor, SstCompression::None)
+    }
+
+    /// Like [`new_with_options`](Self::new_with_options), for a caller that
+    /// knows an upper bound on the number of DISTINCT user keys it will add
+    /// (any count of entries is an upper bound). The bloom filter is then
+    /// built as keys arrive and right-sized in `finish`, so the writer holds
+    /// no per-key state at all. A bound that is too LOW only raises the false
+    /// positive rate; it never causes a false negative.
+    pub fn new_with_key_bound(
+        path: impl AsRef<Path>,
+        zone_extractor: Option<ZoneFieldExtractor>,
+        compression: SstCompression,
+        max_distinct_keys: usize,
+    ) -> Result<Self> {
+        let mut w = Self::new_with_options(path, zone_extractor, compression)?;
+        w.bloom_keys = BloomKeys::Streaming(BloomFilter::new(max_distinct_keys));
+        Ok(w)
     }
 
     /// Full constructor: a zone extractor (or `None`) and a compression choice.
@@ -216,7 +251,9 @@ impl SstWriter {
             entry_count: 0,
             path,
             tmp_path,
-            user_keys: Vec::new(),
+            bloom_keys: BloomKeys::Hashes(Vec::new()),
+            distinct_keys: 0,
+            last_user_key: Vec::new(),
             zone_extractor,
             zone_builder: ZoneBuilder::new(),
             compression,
@@ -258,17 +295,22 @@ impl SstWriter {
             }
         }
 
-        // Collect user key for the bloom filter. Same user key at different
-        // versions only needs to be added once, so de-dup against the last
-        // one we saw (keys arrive in sorted order, so duplicates are adjacent).
+        // Feed the bloom filter once per user key: a key's versions are
+        // adjacent (newest first), so de-dup against the previous entry's key.
+        // (A key extended by 0xFF bytes can sort between two versions of a
+        // shorter key and split them; that key is then added twice, which a
+        // bloom filter absorbs — it only nudges the size estimate up.)
         if internal_key.len() >= 8 {
             let user_key = &internal_key[..internal_key.len() - 8];
-            let is_new = self
-                .user_keys
-                .last()
-                .is_none_or(|prev| prev.as_ref() != user_key);
+            let is_new = self.distinct_keys == 0 || self.last_user_key != user_key;
             if is_new {
-                self.user_keys.push(Bytes::copy_from_slice(user_key));
+                self.distinct_keys += 1;
+                self.last_user_key.clear();
+                self.last_user_key.extend_from_slice(user_key);
+                match &mut self.bloom_keys {
+                    BloomKeys::Streaming(bloom) => bloom.add(user_key),
+                    BloomKeys::Hashes(hashes) => hashes.push(BloomFilter::xxh3_hashes(user_key)),
+                }
             }
         }
 
@@ -355,11 +397,21 @@ impl SstWriter {
         let zonemap_size = zone_buf.len() as u32;
         self.writer.write_all(&zone_buf)?;
 
-        // Build the bloom filter from collected user keys.
-        let mut bloom = BloomFilter::new(self.user_keys.len());
-        for k in &self.user_keys {
-            bloom.add(k);
-        }
+        // Finalize the bloom filter at the size `BloomFilter::new` picks for
+        // the distinct-key count (identical bits either way).
+        let bloom = match std::mem::replace(&mut self.bloom_keys, BloomKeys::Hashes(Vec::new())) {
+            BloomKeys::Streaming(mut bloom) => {
+                bloom.fold_to_fit(self.distinct_keys, crate::bloom::DEFAULT_BITS_PER_ENTRY);
+                bloom
+            }
+            BloomKeys::Hashes(hashes) => {
+                let mut bloom = BloomFilter::new(self.distinct_keys);
+                for (h1, h2) in hashes {
+                    bloom.add_hashed(h1, h2);
+                }
+                bloom
+            }
+        };
 
         // Bloom block (v3 layout: [algo_byte][bloom.write_to payload]).
         let bloom_offset = zonemap_offset + zonemap_size as u64;
@@ -447,6 +499,70 @@ pub struct SstReader {
     /// paths funnel through [`SstReader::block`], which branches on this.
     version: u32,
     path: PathBuf,
+}
+
+/// See [`SstReader::entry_cursor`].
+pub struct SstEntryCursor<'a> {
+    reader: &'a SstReader,
+    next_block: usize,
+    blk: Bytes,
+    pos: usize,
+    failed: bool,
+}
+
+impl Iterator for SstEntryCursor<'_> {
+    type Item = Result<(Bytes, MemValue)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            if self.pos + 8 <= self.blk.len() {
+                let blk = &self.blk;
+                let pos = self.pos;
+                let key_len = u32::from_be_bytes(blk[pos..pos + 4].try_into().unwrap()) as usize;
+                let value_len_raw = u32::from_be_bytes(blk[pos + 4..pos + 8].try_into().unwrap());
+                let key_start = pos + 8;
+                let key_end = key_start + key_len;
+                if key_end > blk.len() {
+                    self.failed = true;
+                    return Some(Err(Error::SstCorrupted(
+                        "entry key extends past block end".into(),
+                    )));
+                }
+                let is_tomb = value_len_raw == TOMBSTONE_MARKER;
+                let value_len = if is_tomb { 0 } else { value_len_raw as usize };
+                let val_end = key_end + value_len;
+                if val_end > blk.len() {
+                    self.failed = true;
+                    return Some(Err(Error::SstCorrupted(
+                        "entry value extends past block end".into(),
+                    )));
+                }
+                let key = blk.slice(key_start..key_end);
+                let value = if is_tomb { None } else { Some(blk.slice(key_end..val_end)) };
+                self.pos = val_end;
+                return Some(Ok((key, value)));
+            }
+            if self.next_block >= self.reader.index.len() {
+                // Release the last block's buffer as soon as the walk ends.
+                self.blk = Bytes::new();
+                return None;
+            }
+            match self.reader.block(self.next_block) {
+                Ok(b) => {
+                    self.blk = b;
+                    self.pos = 0;
+                    self.next_block += 1;
+                }
+                Err(e) => {
+                    self.failed = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
 }
 
 impl SstReader {
@@ -1191,36 +1307,41 @@ impl SstReader {
     /// truncation would lose data or restore a too-low version. The scan APIs
     /// keep the infallible iterator (a `Vec`-returning method can't propagate).
     pub fn try_for_each_entry<F: FnMut(Bytes, MemValue)>(&self, mut f: F) -> Result<()> {
-        for bi in 0..self.index.len() {
-            let blk = self.block(bi)?;
-            let mut pos = 0usize;
-            while pos + 8 <= blk.len() {
-                let key_len =
-                    u32::from_be_bytes(blk[pos..pos + 4].try_into().unwrap()) as usize;
-                let value_len_raw =
-                    u32::from_be_bytes(blk[pos + 4..pos + 8].try_into().unwrap());
-                let key_start = pos + 8;
-                let key_end = key_start + key_len;
-                if key_end > blk.len() {
-                    return Err(Error::SstCorrupted(
-                        "entry key extends past block end".into(),
-                    ));
-                }
-                let key = blk.slice(key_start..key_end);
-                let is_tomb = value_len_raw == TOMBSTONE_MARKER;
-                let value_len = if is_tomb { 0 } else { value_len_raw as usize };
-                let val_end = key_end + value_len;
-                if val_end > blk.len() {
-                    return Err(Error::SstCorrupted(
-                        "entry value extends past block end".into(),
-                    ));
-                }
-                let value = if is_tomb { None } else { Some(blk.slice(key_end..val_end)) };
-                f(key, value);
-                pos = val_end;
-            }
+        for entry in self.entry_cursor() {
+            let (key, value) = entry?;
+            f(key, value);
         }
         Ok(())
+    }
+
+    /// A fallible, pull-based walk over every entry in sorted (internal-key)
+    /// order, holding ONE block at a time: a zero-copy slice for v5, one
+    /// decompressed block for v6. Corruption semantics match
+    /// [`try_for_each_entry`](Self::try_for_each_entry): an inconsistent block
+    /// yields `Err(SstCorrupted)` (then the cursor ends), never a silent stop.
+    /// Built for streaming merges (compaction), where materializing a file's
+    /// entries would cost memory proportional to the file.
+    pub fn entry_cursor(&self) -> SstEntryCursor<'_> {
+        SstEntryCursor {
+            reader: self,
+            next_block: 0,
+            blk: Bytes::new(),
+            pos: 0,
+            failed: false,
+        }
+    }
+
+    /// An upper bound on the number of entries (hence distinct user keys) in
+    /// this file: every sparse-index block holds at most `ENTRIES_PER_BLOCK`.
+    /// Known without reading any data; sizes a merge output's bloom filter.
+    pub fn max_entry_count(&self) -> usize {
+        self.index.len() * ENTRIES_PER_BLOCK
+    }
+
+    /// Size of the file's mapped bytes — the compaction policy's measure of
+    /// how much data an SST holds.
+    pub fn file_size(&self) -> u64 {
+        self.data.len() as u64
     }
 
     /// Find the maximum version stored in this SST file.
