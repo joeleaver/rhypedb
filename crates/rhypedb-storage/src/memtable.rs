@@ -60,34 +60,20 @@ impl MemTable {
     /// Returns `Some(Some(value))` if found, `Some(None)` if deleted (tombstone),
     /// or `None` if no entry exists for this key at or before `version`.
     pub fn get(&self, user_key: &[u8], version: u64) -> Option<MemValue> {
-        // We want the first internal key whose user_key matches and whose
-        // version <= the requested version. Because versions are inverted in
-        // the encoding, the scan key with our target version is the lower bound.
-        let scan_key = InternalKey::new(user_key, version);
-        let scan_bytes = Bytes::copy_from_slice(scan_key.as_bytes());
-
-        // Scan forward from the target version.
-        for entry in self.map.range(scan_bytes..) {
-            let ik = InternalKey::new(&[], 0); // placeholder
-            let entry_key = entry.key();
-
-            // Decode the user key portion (everything except last 8 bytes).
-            if entry_key.len() < 8 {
-                continue;
-            }
-            let entry_user_key = &entry_key[..entry_key.len() - 8];
-
-            if entry_user_key != user_key {
-                // Passed our key range.
-                return None;
-            }
-
-            // This entry's version is <= our target version (due to inverted ordering).
-            drop(ik);
-            return Some(entry.value().clone());
-        }
-
-        None
+        // Keys are raw internal-key bytes, `user_key ‖ !version`, so the visible
+        // entries of `user_key` lie in `[user_key ‖ !version, user_key ‖ FF×8]`.
+        // Everything in that range starts with `user_key`; it is one of
+        // `user_key`'s OWN entries exactly when it is `user_key.len() + 8` bytes
+        // long. Keys that extend `user_key` with 0xFF bytes can sort between its
+        // versions, so they are skipped rather than ending the search (GH #27;
+        // the same rule as `SstReader::point_lookup_from`).
+        let lo = InternalKey::new(user_key, version).into_bytes();
+        let hi = InternalKey::new(user_key, 0).into_bytes();
+        let own_len = user_key.len() + 8;
+        self.map
+            .range(lo..=hi)
+            .find(|entry| entry.key().len() == own_len)
+            .map(|entry| entry.value().clone())
     }
 
     /// Batch point lookup. Returns one entry per input in the same order:

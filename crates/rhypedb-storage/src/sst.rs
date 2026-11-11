@@ -881,14 +881,12 @@ impl SstReader {
         Ok(None)
     }
 
-    /// Batch point lookup: walk the SST ONCE for a pre-sorted list of user keys
-    /// and return their latest visible versions at the given snapshot. Saves the
-    /// per-key sparse-index binary search when needles fall in the same block,
-    /// and uses a threshold gallop (re-binary-search at block boundaries) to
-    /// skip whole blocks when needles are scattered.
+    /// Batch point lookup: the latest visible version of each user key at the
+    /// given snapshot. Needles are probed in on-disk (seek-key) order so each
+    /// sparse-index binary search only covers the blocks past the previous
+    /// needle's. Any input order is correct; the name records that `LsmTree`
+    /// passes them sorted by user key.
     ///
-    /// `sorted_user_keys` MUST be sorted ascending by byte order — for object
-    /// keys (`o:<type_be>:<id_be>`) within one type, sorted-by-id is equivalent.
     /// Returns one entry per input in the same order:
     /// - `None` — needle is not in this SST (look in older layers).
     /// - `Some(None)` — tombstone is the latest visible version.
@@ -904,165 +902,33 @@ impl SstReader {
             return Ok(out);
         }
 
-        // v6: the single-walk + threshold-gallop cursor below addresses the
-        // uncompressed data region by absolute byte offset, which a compressed
-        // file doesn't have. Use per-needle `get_versioned` (block-aware, bloom-
-        // gated). This trades the batch's single-walk amortization for v6 only;
-        // a block-aware batch walk is a possible follow-up optimization.
-        if self.version >= SST_VERSION_COMPRESSED {
-            for (i, needle) in sorted_user_keys.iter().enumerate() {
-                out[i] = self.get_versioned(needle, version)?;
-            }
-            return Ok(out);
-        }
-
-        let data_end = self.data_end;
-        let mut i = 0usize;
-        let mut pos = 0usize;
-        let mut block_idx = 0usize;
-        let mut seeded = false;
-
-        while i < n {
+        // Probe the needles in the order their entries appear ON DISK, which is
+        // internal-key order (`user_key ‖ !version`, raw bytes) — NOT the caller's
+        // user-key order. The two disagree whenever one needle is a prefix of
+        // another: `a10‖…` sorts before `a1‖ff…` (GH #27). In seek-key order the
+        // block each needle starts in never moves backwards, so each sparse-index
+        // binary search only covers the suffix past the previous needle's block.
+        // All needles share the same 8-byte suffix, so comparing `a ‖ suffix`
+        // with `b ‖ suffix` orders them exactly like their seek keys.
+        let suffix = (!version).to_be_bytes();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by(|&a, &b| {
+            sorted_user_keys[a]
+                .iter()
+                .chain(suffix.iter())
+                .cmp(sorted_user_keys[b].iter().chain(suffix.iter()))
+        });
+        let mut block_floor = 0usize;
+        for i in order {
             let needle = sorted_user_keys[i];
-
-            // Bloom-skip needles that definitely aren't in this SST.
             if !self.might_contain(needle) {
-                i += 1;
                 continue;
             }
-
-            // Seed the cursor to the first live needle's block.
-            if !seeded {
-                block_idx = self.locate_block_from(needle, 0);
-                pos = self.index[block_idx].offset as usize;
-                seeded = true;
-            }
-
-            if pos >= data_end {
-                // Past end-of-data: every remaining needle is a miss in this SST.
-                i += 1;
-                continue;
-            }
-
-            // Decode entry at pos.
-            let key_len =
-                u32::from_be_bytes(self.data[pos..pos + 4].try_into().unwrap()) as usize;
-            let value_len_raw =
-                u32::from_be_bytes(self.data[pos + 4..pos + 8].try_into().unwrap());
-            let key_start = pos + 8;
-            let key_end = key_start + key_len;
-            let is_tomb = value_len_raw == TOMBSTONE_MARKER;
-            let val_len = if is_tomb { 0 } else { value_len_raw as usize };
-            let val_start = key_end;
-            let val_end = val_start + val_len;
-
-            if key_len < 8 {
-                pos = val_end;
-                continue;
-            }
-
-            let entry_user = &self.data[key_start..key_end - 8];
-
-            match entry_user.cmp(needle) {
-                std::cmp::Ordering::Less => {
-                    pos = val_end;
-                    // Threshold gallop: if pos crossed into the next sparse block,
-                    // re-binary-search the index to skip over blocks whose first key
-                    // is still less than needle.
-                    if block_idx + 1 < self.index.len()
-                        && pos >= self.index[block_idx + 1].offset as usize
-                    {
-                        block_idx = self.locate_block_from(needle, block_idx + 1);
-                        pos = self.index[block_idx].offset as usize;
-                    }
-                }
-                std::cmp::Ordering::Equal => {
-                    let entry_ver = !u64::from_be_bytes(
-                        self.data[key_end - 8..key_end].try_into().unwrap(),
-                    );
-                    if entry_ver <= version {
-                        out[i] = Some(if is_tomb {
-                            None
-                        } else {
-                            Some(self.data.slice(val_start..val_end))
-                        });
-                        // Skip past any older versions of this same user key so the
-                        // cursor lands on the next user key for the next needle.
-                        pos = val_end;
-                        while pos < data_end {
-                            let kl2 = u32::from_be_bytes(
-                                self.data[pos..pos + 4].try_into().unwrap(),
-                            ) as usize;
-                            if kl2 < 8 {
-                                break;
-                            }
-                            let vlr2 = u32::from_be_bytes(
-                                self.data[pos + 4..pos + 8].try_into().unwrap(),
-                            );
-                            let next_user = &self.data[pos + 8..pos + 8 + kl2 - 8];
-                            if next_user != needle {
-                                break;
-                            }
-                            let vl2 = if vlr2 == TOMBSTONE_MARKER {
-                                0
-                            } else {
-                                vlr2 as usize
-                            };
-                            pos += 8 + kl2 + vl2;
-                        }
-                        // Keep block_idx in sync with pos.
-                        while block_idx + 1 < self.index.len()
-                            && pos >= self.index[block_idx + 1].offset as usize
-                        {
-                            block_idx += 1;
-                        }
-                        i += 1;
-                    } else {
-                        // Newest version visible here is after the snapshot — walk
-                        // forward through same-user-key versions looking for an
-                        // older visible one (or a different user_key, which exits
-                        // via the Greater case on the next iteration).
-                        pos = val_end;
-                        while block_idx + 1 < self.index.len()
-                            && pos >= self.index[block_idx + 1].offset as usize
-                        {
-                            block_idx += 1;
-                        }
-                    }
-                }
-                std::cmp::Ordering::Greater => {
-                    // Needle is absent from this SST (entries already past it).
-                    // Leave pos where it is — the next needle may match this entry.
-                    i += 1;
-                }
-            }
+            let (found, block_idx) = self.point_lookup_from(needle, version, block_floor)?;
+            out[i] = found;
+            block_floor = block_idx;
         }
-
         Ok(out)
-    }
-
-    /// Find the sparse-index block at or before `user_key`'s FIRST
-    /// (highest-version) entry, restricted to the suffix `self.index[start..]`.
-    /// Returns an absolute index into `self.index`.
-    ///
-    /// Seeds with the SMALLEST internal key for `user_key` (version=u64::MAX,
-    /// inverted bytes = 0x00). Seeding with the largest (version=0) is WRONG:
-    /// when a user key's versions straddle a sparse-index block boundary it
-    /// lands on the block holding only the OLDER version, and the forward scan
-    /// starts there — returning a stale read. Same bug class as `get_versioned`
-    /// (fixed); this is the `multi_get` / batched-lookup seek.
-    fn locate_block_from(&self, user_key: &[u8], start: usize) -> usize {
-        let mut search_key = Vec::with_capacity(user_key.len() + 8);
-        search_key.extend_from_slice(user_key);
-        search_key.extend_from_slice(&[0u8; 8]);
-
-        let slice = &self.index[start..];
-        let rel = match slice.binary_search_by(|e| e.key.as_ref().cmp(&search_key)) {
-            Ok(i) => i,
-            Err(0) => 0,
-            Err(i) => i - 1,
-        };
-        start + rel
     }
 
     /// Sparse-index sibling of `locate_block_from` for prefix scans: returns
@@ -1222,44 +1088,51 @@ impl SstReader {
         if !self.might_contain(user_key) {
             return Ok(None);
         }
+        Ok(self.point_lookup_from(user_key, version, 0)?.0)
+    }
 
-        // Seek to the user key's SMALLEST internal key (highest version =
-        // inverted bytes 0x00..00), so the block we land on is at or before
-        // this user key's FIRST (highest-version) entry. We then scan forward
-        // and return the first entry whose version is <= the requested one.
-        //
-        // Using the LARGEST internal key (version 0) here is WRONG: when a
-        // user key's versions straddle a sparse-index block boundary, the
-        // largest-key search lands on the block holding the OLDER version and
-        // the forward scan starts there, silently skipping the newer version
-        // in the previous block — a stale-read data-loss bug. Surfaced by the
-        // chunked field-type migration, which flushes a memtable where every
-        // object carries two versions (create + convert).
-        let search_key = InternalKey::new(user_key, u64::MAX);
-        let search_bytes = search_key.as_bytes();
+    /// The newest entry of `user_key` with version `<= version`, searching
+    /// sparse-index blocks from `block_floor` on. Also returns the block the
+    /// search started in, so a batch caller probing needles in seek-key order
+    /// can pass it as the next needle's floor.
+    ///
+    /// Entries are ordered by raw internal-key bytes, `user_key ‖ !version`.
+    /// The visible entries of `user_key` therefore lie in the closed range
+    /// `[user_key ‖ !version, user_key ‖ FF×8]`: every internal key in that
+    /// range starts with `user_key`, and it is one of `user_key`'s OWN
+    /// entries exactly when it is `user_key.len() + 8` bytes long. Keys that
+    /// EXTEND `user_key` also fall in this range — `a10` lands before `a1`'s
+    /// entries, and a key continuing with 0xFF bytes can even sort between
+    /// two of `a1`'s versions — so they are skipped, never taken as "past the
+    /// key" (GH #27: that early exit made `a1` invisible once `a10` existed).
+    ///
+    /// Seeking to `user_key ‖ !version` (not `‖ !u64::MAX`) lands at or before
+    /// the first visible entry even when `user_key`'s versions straddle a
+    /// sparse-index block boundary, and never wades through the extending
+    /// keys that sit before `user_key`'s versions.
+    fn point_lookup_from(
+        &self,
+        user_key: &[u8],
+        version: u64,
+        block_floor: usize,
+    ) -> Result<(Option<MemValue>, usize)> {
+        let lo = InternalKey::new(user_key, version);
+        let lo = lo.as_bytes();
+        let hi = InternalKey::new(user_key, 0); // !0 = FF×8: user_key's largest internal key
+        let hi = hi.as_bytes();
+        let own_len = user_key.len() + 8;
 
-        let block_idx = match self
-            .index
-            .binary_search_by(|e| e.key.as_ref().cmp(search_bytes))
-        {
-            Ok(i) => i,
-            Err(i) => {
-                if i == 0 {
-                    0
-                } else {
-                    i - 1
-                }
-            }
-        };
+        let slice = &self.index[block_floor..];
+        let block_idx = block_floor
+            + match slice.binary_search_by(|e| e.key.as_ref().cmp(lo)) {
+                Ok(i) => i,
+                Err(0) => 0,
+                Err(i) => i - 1,
+            };
 
-        // Scan forward from the found block. Entries for one user key may span
-        // multiple sparse-index blocks, so we walk block-by-block via `block()`
-        // (decompressing on demand for v6). The seek above used the sparse
-        // INDEX, which is uncompressed and identical across v5/v6, so the
-        // straddle-block correctness fix is preserved: we land on the same
-        // block and scan every block forward. Unlike the scan iterators this is
-        // a `Result`-returning point read, so a corrupt block PROPAGATES as
-        // `SstCorrupted` (matching `get`) rather than silently ending.
+        // Walk block-by-block via `block()` (decompressing on demand for v6).
+        // A corrupt block PROPAGATES as `SstCorrupted` (matching `get`) rather
+        // than silently ending, since this is a `Result`-returning point read.
         let mut bi = block_idx;
         while bi < self.index.len() {
             let blk = self.block(bi)?;
@@ -1280,30 +1153,30 @@ impl SstReader {
                 if value_end > blk.len() {
                     break;
                 }
-
-                if key_len >= 8 {
-                    let entry_user_key = &blk[key_start..key_end - 8];
-                    if entry_user_key == user_key {
-                        let ver_bytes: [u8; 8] = blk[key_end - 8..key_end].try_into().unwrap();
-                        let entry_version = !u64::from_be_bytes(ver_bytes);
-                        if entry_version <= version {
-                            return if is_tombstone {
-                                Ok(Some(None))
-                            } else {
-                                Ok(Some(Some(blk.slice(value_start..value_end))))
-                            };
-                        }
-                    } else if entry_user_key > user_key {
-                        // Sorted past the target — it isn't in this SST.
-                        return Ok(None);
-                    }
-                }
                 pos = value_end;
+
+                let key = &blk[key_start..key_end];
+                if key < lo {
+                    continue;
+                }
+                if key > hi {
+                    return Ok((None, block_idx));
+                }
+                if key_len == own_len {
+                    // In range and exactly user_key's length: one of its own
+                    // entries, and the newest with version <= `version`.
+                    let found = if is_tombstone {
+                        Some(None)
+                    } else {
+                        Some(Some(blk.slice(value_start..value_end)))
+                    };
+                    return Ok((found, block_idx));
+                }
             }
             bi += 1;
         }
 
-        Ok(None)
+        Ok((None, block_idx))
     }
 
     pub fn path(&self) -> &Path {

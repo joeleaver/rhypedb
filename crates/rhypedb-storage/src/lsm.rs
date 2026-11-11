@@ -1753,7 +1753,7 @@ mod tests {
     }
 
     // Same straddle as above, but through the BATCHED point-lookup path
-    // (`multi_get_at` -> SstReader::multi_get / locate_block_from). The seek
+    // (`multi_get_at` -> SstReader::multi_get_versioned). The seek
     // there had the identical lowest-version seed bug; `get_many` /
     // traversals must agree with `get`.
     #[test]
@@ -3999,5 +3999,172 @@ mod tests {
             None,
             "a write made AFTER the snapshot must not appear in it"
         );
+    }
+
+    // --- GH #27: point reads of a user key that is a PREFIX of another -------
+    //
+    // Internal keys are `user_key ‖ !version` compared as raw bytes, so a
+    // LONGER user key sorts BEFORE a shorter key it extends whenever its next
+    // byte is below the inverted version's first byte (0xFF for any real
+    // version): `a10‖…` < `a1‖ff…`. A point read that seeks to the start of
+    // `a1` and treats "first different user key" as "past it" sees `a10` and
+    // misses `a1`. And a key that extends `a1` with 0xFF bytes can sort IN
+    // BETWEEN `a1`'s versions. Every point-read path (memtable, SST single and
+    // batch, both SST formats) must find exactly the right version anyway.
+
+    /// `a1`, plus keys that extend it: `a10`, `a1\0`, and two keys whose next
+    /// bytes are 0xFF so they interleave with `a1`'s own versions.
+    fn prefix_family() -> Vec<Vec<u8>> {
+        let mut ff_short = b"a1".to_vec();
+        ff_short.extend_from_slice(&[0xFF; 7]); // interleaves with a1's versions
+        let mut ff_long = b"a1".to_vec();
+        ff_long.extend_from_slice(&[0xFF; 9]);
+        // `a1` is written first: its v1 is a tiny version (inverted: FF×7 FE-ish)
+        // and its v2 comes after one commit per key (inverted: FF×7 F6-ish). This
+        // key's bytes after `a1` (FF×7 FA …) sort strictly BETWEEN a1's two
+        // versions in the SST, splitting them.
+        let mut ff_between = b"a1".to_vec();
+        ff_between.extend_from_slice(&[0xFF; 7]);
+        ff_between.extend_from_slice(&[0xFA, b'z']);
+        vec![
+            ff_between,
+            b"a1".to_vec(),
+            b"a10".to_vec(),
+            b"a1\0".to_vec(),
+            b"a100".to_vec(),
+            ff_short,
+            ff_long,
+            b"a".to_vec(),
+        ]
+    }
+
+    /// Writes v1 of every key, then v2 of every key, recording the snapshot
+    /// between them. Returns (snapshot after v1, snapshot after v2).
+    fn write_prefix_family(tree: &LsmTree, keys: &[Vec<u8>]) -> (u64, u64) {
+        for k in keys {
+            let mut txn = tree.begin_txn();
+            let mut v = b"v1:".to_vec();
+            v.extend_from_slice(k);
+            tree.put(&mut txn, k, Bytes::from(v)).unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+        let s1 = tree.read_snapshot();
+        for k in keys {
+            let mut txn = tree.begin_txn();
+            let mut v = b"v2:".to_vec();
+            v.extend_from_slice(k);
+            tree.put(&mut txn, k, Bytes::from(v)).unwrap();
+            tree.commit(&mut txn).unwrap();
+        }
+        (s1, tree.read_snapshot())
+    }
+
+    fn expect_family(tree: &LsmTree, keys: &[Vec<u8>], snap: u64, tag: &str, ctx: &str) {
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let batch = tree.multi_get_at(snap, &refs).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            let mut want = tag.as_bytes().to_vec();
+            want.extend_from_slice(k);
+            let got = tree.get_at(snap, k).unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(want.as_slice()),
+                "{ctx}: get_at({k:?}) at snapshot {snap}"
+            );
+            assert_eq!(
+                batch[i].as_deref(),
+                Some(want.as_slice()),
+                "{ctx}: multi_get_at[{k:?}] at snapshot {snap}"
+            );
+        }
+        // A key nobody wrote, sitting inside the family's range, stays a miss.
+        assert_eq!(tree.get_at(snap, b"a11").unwrap(), None, "{ctx}: a11 must miss");
+    }
+
+    fn check_prefix_family(compression: SstCompression) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.block_compression = compression;
+        cfg.memtable_flush_size = usize::MAX; // flush only when told to
+        let tree = LsmTree::open(cfg).unwrap();
+        let keys = prefix_family();
+        let (s1, s2) = write_prefix_family(&tree, &keys);
+
+        expect_family(&tree, &keys, s1, "v1:", "memtable");
+        expect_family(&tree, &keys, s2, "v2:", "memtable");
+
+        tree.flush().unwrap();
+        expect_family(&tree, &keys, s1, "v1:", "one SST");
+        expect_family(&tree, &keys, s2, "v2:", "one SST");
+
+        // Pin s2 with a live transaction so compaction must keep the versions
+        // it sees (unpinned old versions are legitimately GC'd).
+        let pin = tree.begin_txn();
+        assert_eq!(pin.snapshot(), s2);
+        // Reverse order of writes into a second SST, then merge both.
+        let rev: Vec<Vec<u8>> = keys.iter().rev().cloned().collect();
+        let (_, s3) = write_prefix_family(&tree, &rev);
+        tree.flush().unwrap();
+        expect_family(&tree, &keys, s2, "v2:", "two SSTs, old snapshot");
+        expect_family(&tree, &keys, s3, "v2:", "two SSTs");
+        tree.compact().unwrap();
+        expect_family(&tree, &keys, s2, "v2:", "compacted, old snapshot");
+        expect_family(&tree, &keys, s3, "v2:", "compacted");
+        drop(pin);
+        drop(tree);
+
+        let mut cfg = test_config(dir.path());
+        cfg.block_compression = compression;
+        let reopened = LsmTree::open(cfg).unwrap();
+        expect_family(&reopened, &keys, reopened.read_snapshot(), "v2:", "reopened");
+    }
+
+    #[test]
+    fn point_reads_find_a_key_that_is_a_prefix_of_another_uncompressed() {
+        check_prefix_family(SstCompression::None);
+    }
+
+    #[test]
+    fn point_reads_find_a_key_that_is_a_prefix_of_another_lz4() {
+        check_prefix_family(SstCompression::Lz4);
+    }
+
+    /// Many keys per family so the v5 batch cursor crosses sparse-index
+    /// blocks while the needles (sorted by user key) disagree with the
+    /// on-disk (internal-key) order.
+    #[test]
+    fn multi_get_at_prefix_families_across_blocks() {
+        for compression in [SstCompression::None, SstCompression::Lz4] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = test_config(dir.path());
+            cfg.block_compression = compression;
+            cfg.memtable_flush_size = usize::MAX;
+            let tree = LsmTree::open(cfg).unwrap();
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            for i in 0..300u32 {
+                keys.push(format!("k{i}").into_bytes()); // k1 ⊂ k10 ⊂ k100 …
+            }
+            let mut txn = tree.begin_txn();
+            for k in &keys {
+                tree.put(&mut txn, k, Bytes::from(k.clone())).unwrap();
+            }
+            tree.commit(&mut txn).unwrap();
+            tree.flush().unwrap();
+            let snap = tree.read_snapshot();
+            let mut probe = keys.clone();
+            probe.push(b"k".to_vec()); // misses
+            probe.push(b"k1000".to_vec());
+            let refs: Vec<&[u8]> = probe.iter().map(|k| k.as_slice()).collect();
+            let got = tree.multi_get_at(snap, &refs).unwrap();
+            for (i, k) in probe.iter().enumerate() {
+                let want = if i < keys.len() { Some(k.as_slice()) } else { None };
+                assert_eq!(got[i].as_deref(), want, "{compression:?} multi_get {k:?}");
+                assert_eq!(
+                    tree.get_at(snap, k).unwrap().as_deref(),
+                    want,
+                    "{compression:?} get {k:?}"
+                );
+            }
+        }
     }
 }
