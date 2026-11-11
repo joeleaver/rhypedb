@@ -10,7 +10,7 @@ use bytes::Bytes;
 use rhypedb_schema::{FieldType, OnDeletePolicy, ScalarType, Schema};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::{LsmConfig, LsmTree};
-use rhypedb_subscribe::{ChangeEvent, ChangeKind, SubscriptionHub};
+use rhypedb_subscribe::{ChangeKind, SubscriptionHub};
 
 use crate::error::{EngineError, EngineResult};
 use crate::fulltext::{
@@ -3749,10 +3749,10 @@ impl Database {
         self.create_with_origin(type_name, fields, None)
     }
 
-    /// Create an object, tagging the emitted [`ChangeEvent`] with `origin`.
+    /// Create an object, tagging the emitted [`ChangeEvent`](rhypedb_subscribe::ChangeEvent) with `origin`.
     ///
     /// `origin` is an opaque, caller-owned token surfaced on
-    /// [`ChangeEvent::origin`]; pass `None` for an untagged write. A subscriber
+    /// [`ChangeEvent::origin`](rhypedb_subscribe::ChangeEvent::origin); pass `None` for an untagged write. A subscriber
     /// that also writes in reaction to the change feed uses it — via
     /// [`SubscriptionFilter::exclude_origin`] — to skip its own writes and avoid
     /// a write → event → react → write loop.
@@ -3812,14 +3812,10 @@ impl Database {
         })?;
         self.apply_fulltext_delta(&ft_delta);
 
-        self.subscriptions.publish(ChangeEvent {
-            version,
-            kind: ChangeKind::Create,
-            type_name: type_name.into(),
-            object_id,
-            fields: Some(fields_to_json(&scalar_fields)),
-            origin,
-        });
+        self.subscriptions
+            .publish_with(version, ChangeKind::Create, type_name, object_id, origin, || {
+                Some(fields_to_json(&scalar_fields))
+            });
 
         Ok(Object {
             type_name: type_name.into(),
@@ -4157,14 +4153,10 @@ impl Database {
         // the edge index, not the object payload).
         let mut out = Vec::with_capacity(scalar_rows.len());
         for (id, scalar_fields) in object_ids.into_iter().zip(scalar_rows) {
-            self.subscriptions.publish(ChangeEvent {
-                version,
-                kind: ChangeKind::Create,
-                type_name: type_name.into(),
-                object_id: id,
-                fields: Some(fields_to_json(&scalar_fields)),
-                origin,
-            });
+            self.subscriptions
+                .publish_with(version, ChangeKind::Create, type_name, id, origin, || {
+                    Some(fields_to_json(&scalar_fields))
+                });
             out.push(Object {
                 type_name: type_name.into(),
                 id,
@@ -4292,14 +4284,10 @@ impl Database {
 
         // Publish create events (one per object), mirroring create_batch.
         for (object_id, scalar_fields) in &staged {
-            self.subscriptions.publish(ChangeEvent {
-                version,
-                kind: ChangeKind::Create,
-                type_name: type_name.into(),
-                object_id: *object_id,
-                fields: Some(fields_to_json(scalar_fields)),
-                origin,
-            });
+            self.subscriptions
+                .publish_with(version, ChangeKind::Create, type_name, *object_id, origin, || {
+                    Some(fields_to_json(scalar_fields))
+                });
         }
         Ok(())
     }
@@ -5669,7 +5657,7 @@ impl Database {
         self.update_with_origin(type_name, object_id, updates, None)
     }
 
-    /// Update an object, tagging the emitted [`ChangeEvent`] with `origin`
+    /// Update an object, tagging the emitted [`ChangeEvent`](rhypedb_subscribe::ChangeEvent) with `origin`
     /// (see [`create_with_origin`](Self::create_with_origin) for the rationale).
     pub fn update_with_origin(
         &self,
@@ -5851,14 +5839,10 @@ impl Database {
             let _ = tx.send((type_id, object_id));
         }
 
-        self.subscriptions.publish(ChangeEvent {
-            version,
-            kind: ChangeKind::Update,
-            type_name: type_name.into(),
-            object_id,
-            fields: Some(fields_to_json(&fields)),
-            origin,
-        });
+        self.subscriptions
+            .publish_with(version, ChangeKind::Update, type_name, object_id, origin, || {
+                Some(fields_to_json(&fields))
+            });
 
         Ok(Object {
             type_name: type_name.into(),
@@ -5988,7 +5972,7 @@ impl Database {
         self.delete_with_origin(type_name, object_id, None)
     }
 
-    /// Delete an object, tagging EVERY emitted [`ChangeEvent`] — the top-level
+    /// Delete an object, tagging EVERY emitted [`ChangeEvent`](rhypedb_subscribe::ChangeEvent) — the top-level
     /// delete and every cascaded delete — with the SAME `origin` (see
     /// [`create_with_origin`](Self::create_with_origin) for the rationale).
     pub fn delete_with_origin(
@@ -6051,20 +6035,14 @@ impl Database {
             self.forget_version(*del_type_id, *del_id);
         }
 
-        for ((del_type_id, del_id), fields) in &deleted {
+        for ((del_type_id, del_id), fields) in deleted {
             let type_name = self
                 .type_name_by_id
-                .get(del_type_id)
-                .cloned()
+                .get(&del_type_id)
+                .map(String::as_str)
                 .unwrap_or_default();
-            self.subscriptions.publish(ChangeEvent {
-                version,
-                kind: ChangeKind::Delete,
-                type_name,
-                object_id: *del_id,
-                fields: fields.clone(),
-                origin,
-            });
+            self.subscriptions
+                .publish_with(version, ChangeKind::Delete, type_name, del_id, origin, || fields);
         }
 
         Ok(())
@@ -6140,7 +6118,12 @@ impl Database {
         // is a superset of `has_unique`/`has_indexed`, so this gate is
         // effectively "scalar-bearing type OR a verify".
         let type_idx_fields = self.indexed_fields.get(&meta.type_name);
-        if meta.has_unique || meta.has_indexed || meta.has_scalar || verify_exists {
+        // The Delete event's field payload is only worth reading the blob for
+        // (and decoding + JSON-copying, inside the txn) when someone is
+        // subscribed. A subscriber added mid-delete gets the event without
+        // fields — the same shape an edge-only type's delete already has.
+        let capture_fields = meta.has_scalar && self.subscriptions.has_subscribers();
+        if meta.has_unique || meta.has_indexed || capture_fields || verify_exists {
             let obj_key = KeyBuilder::object(type_id, object_id);
             let obj_data = self.storage.get(txn, &obj_key)?;
             if obj_data.is_none() && verify_exists {
@@ -6293,7 +6276,7 @@ impl Database {
                 // scalar data — leave its slot `None` so a DIRECT delete of an
                 // edge-only row agrees with a CASCADE delete of the same type
                 // (both `None`) instead of emitting an empty `Some({})`.
-                if meta.has_scalar {
+                if capture_fields {
                     self.strip_tombstoned_fields(&meta.type_name, &mut fields);
                     if let Some(slot) = deleted.get_mut(&(type_id, object_id)) {
                         *slot = Some(fields_to_json(&fields));

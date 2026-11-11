@@ -91,21 +91,33 @@ impl SubscriptionFilter {
     }
 
     fn matches(&self, event: &ChangeEvent) -> bool {
+        self.matches_header(&event.type_name, event.object_id, event.kind, event.origin)
+    }
+
+    /// Filters never look at an event's fields, only at its header, so the
+    /// hub can decide whether ANYONE wants an event before it is built.
+    fn matches_header(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        kind: ChangeKind,
+        origin: Option<u64>,
+    ) -> bool {
         if let Some(ref tn) = self.type_name
-            && tn != &event.type_name {
+            && tn != type_name {
                 return false;
             }
         if let Some(oid) = self.object_id
-            && oid != event.object_id {
+            && oid != object_id {
                 return false;
             }
-        if !self.kinds.is_empty() && !self.kinds.contains(&event.kind) {
+        if !self.kinds.is_empty() && !self.kinds.contains(&kind) {
             return false;
         }
         // Loop-breaker: drop an event whose origin matches the excluded one. An
         // untagged event (origin = None) is never excluded.
         if let Some(ex) = self.exclude_origin
-            && event.origin == Some(ex) {
+            && origin == Some(ex) {
                 return false;
             }
         true
@@ -165,6 +177,9 @@ struct Subscription {
 pub struct SubscriptionHub {
     subscriptions: RwLock<Vec<Subscription>>,
     next_id: AtomicU64,
+    /// Live subscription count, readable without the lock: the engine's
+    /// "is anyone listening at all?" check on every write.
+    count: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for SubscriptionHub {
@@ -178,6 +193,7 @@ impl SubscriptionHub {
         Self {
             subscriptions: RwLock::new(Vec::new()),
             next_id: AtomicU64::new(1),
+            count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -201,11 +217,13 @@ impl SubscriptionHub {
     /// itself free of any buffering or transport concern.
     pub fn subscribe_sink(&self, filter: SubscriptionFilter, sink: Box<dyn EventSink>) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        self.subscriptions.write().push(Subscription {
+        let mut subs = self.subscriptions.write();
+        subs.push(Subscription {
             id,
             filter,
             sink,
         });
+        self.count.store(subs.len(), Ordering::Release);
         id
     }
 
@@ -214,6 +232,7 @@ impl SubscriptionHub {
         let mut subs = self.subscriptions.write();
         let len_before = subs.len();
         subs.retain(|s| s.id != id);
+        self.count.store(subs.len(), Ordering::Release);
         subs.len() < len_before
     }
 
@@ -238,12 +257,53 @@ impl SubscriptionHub {
         if !dead_ids.is_empty() {
             let mut subs = self.subscriptions.write();
             subs.retain(|s| !dead_ids.contains(&s.id));
+            self.count.store(subs.len(), Ordering::Release);
         }
+    }
+
+    /// Whether any subscription exists. Lock-free; lets a writer skip
+    /// gathering event payloads entirely when nobody is listening.
+    pub fn has_subscribers(&self) -> bool {
+        self.count.load(Ordering::Acquire) != 0
+    }
+
+    /// [`publish`](Self::publish) for an event whose `fields` payload is
+    /// expensive to build: `fields` runs only if some subscription's filter
+    /// matches the header (filters never inspect fields), and then exactly
+    /// once. With no matching subscriber nothing is allocated at all.
+    pub fn publish_with(
+        &self,
+        version: u64,
+        kind: ChangeKind,
+        type_name: &str,
+        object_id: u64,
+        origin: Option<u64>,
+        fields: impl FnOnce() -> Option<HashMap<String, serde_json::Value>>,
+    ) {
+        if !self.has_subscribers() {
+            return;
+        }
+        let wanted = self
+            .subscriptions
+            .read()
+            .iter()
+            .any(|s| s.filter.matches_header(type_name, object_id, kind, origin));
+        if !wanted {
+            return;
+        }
+        self.publish(ChangeEvent {
+            version,
+            kind,
+            type_name: type_name.to_string(),
+            object_id,
+            fields: fields(),
+            origin,
+        });
     }
 
     /// Number of active subscriptions.
     pub fn subscription_count(&self) -> usize {
-        self.subscriptions.read().len()
+        self.count.load(Ordering::Acquire)
     }
 }
 
@@ -251,6 +311,55 @@ impl SubscriptionHub {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn publish_with_builds_fields_only_for_a_matching_subscriber() {
+        let hub = SubscriptionHub::new();
+        let built = std::cell::Cell::new(0);
+        let fields = || {
+            built.set(built.get() + 1);
+            Some(HashMap::from([("k".to_string(), serde_json::json!(1))]))
+        };
+
+        // Nobody subscribed: the payload is never built.
+        assert!(!hub.has_subscribers());
+        hub.publish_with(1, ChangeKind::Create, "Post", 1, None, fields);
+        assert_eq!(built.get(), 0);
+
+        // A subscriber for another type: still never built.
+        let (_other, other_rx) = hub.subscribe(SubscriptionFilter::for_type("User"));
+        hub.publish_with(2, ChangeKind::Create, "Post", 1, None, fields);
+        assert_eq!(built.get(), 0);
+        assert!(other_rx.try_recv().is_err());
+
+        // An excluded origin doesn't count as wanting it either.
+        let (_mine, mine_rx) =
+            hub.subscribe(SubscriptionFilter::for_type("Post").excluding_origin(7));
+        hub.publish_with(3, ChangeKind::Create, "Post", 1, Some(7), fields);
+        assert_eq!(built.get(), 0);
+        assert!(mine_rx.try_recv().is_err());
+
+        // A matching one: built exactly once, delivered with the payload.
+        hub.publish_with(4, ChangeKind::Update, "Post", 1, None, fields);
+        assert_eq!(built.get(), 1);
+        let ev = mine_rx.try_recv().unwrap();
+        assert_eq!(ev.version, 4);
+        assert_eq!(ev.fields.unwrap()["k"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn subscriber_count_tracks_subscribe_unsubscribe_and_disconnect() {
+        let hub = SubscriptionHub::new();
+        let (a, _rx_a) = hub.subscribe(SubscriptionFilter::all());
+        let (_b, rx_b) = hub.subscribe(SubscriptionFilter::all());
+        assert_eq!(hub.subscription_count(), 2);
+        assert!(hub.unsubscribe(a));
+        assert_eq!(hub.subscription_count(), 1);
+        drop(rx_b); // consumer gone: reaped on the next publish
+        hub.publish(make_event(ChangeKind::Create, "T", 1));
+        assert_eq!(hub.subscription_count(), 0);
+        assert!(!hub.has_subscribers());
+    }
 
     fn make_event(kind: ChangeKind, type_name: &str, object_id: u64) -> ChangeEvent {
         ChangeEvent {
