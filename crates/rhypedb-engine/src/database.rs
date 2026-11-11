@@ -85,7 +85,36 @@ struct IncomingRelation {
     rel_id: u64,
     is_many: bool,
     policy: OnDeletePolicy,
+    /// Whether ANY of the source's reverse-edge entries can embed this
+    /// target. An entry for relation X embeds covers of the source's forward
+    /// 1:1 targets OTHER than X, so a 1:1 target reached through
+    /// `source_field` is embedded only when the source type has some other
+    /// forward relation. When it has none (Thread → Account as its only
+    /// relation, say), refreshing covers after the target changes rewrites
+    /// entries that never contained it.
+    embeds_target: bool,
 }
+
+/// Cover-refresh worker counters (diagnostic; also what tests observe).
+#[derive(Debug, Default)]
+pub(crate) struct CoverRefreshStats {
+    /// Targets whose refresh pass has FINISHED (after coalescing).
+    pub(crate) targets: std::sync::atomic::AtomicU64,
+    /// Refresh transactions committed (one per batch of sources).
+    pub(crate) batches: std::sync::atomic::AtomicU64,
+    /// Reverse-edge entries rewritten.
+    pub(crate) entries: std::sync::atomic::AtomicU64,
+}
+
+/// Sources refreshed per transaction. Each source's rewrite is independent
+/// (readers detect a stale cover by its `__cover_v` stamp), so a pass over a
+/// hub with tens of thousands of linked sources commits in bounded batches
+/// instead of buffering everything in one transaction — and releases
+/// `maintenance_lock` between batches so foreground writes get in.
+const COVER_REFRESH_BATCH: usize = 256;
+
+/// Most queued refresh targets the worker coalesces into one round.
+const COVER_REFRESH_COALESCE_MAX: usize = 4096;
 
 /// Arena for tombstone keys produced by a single `delete` cascade walk.
 /// All key bytes go into ONE owned `Vec<u8>` and each push records the
@@ -367,6 +396,8 @@ pub struct Database {
     cover_refresh_tx: parking_lot::Mutex<Option<std::sync::mpsc::Sender<(u64, u64)>>>,
     /// Join handle for the cover-refresh worker thread. Taken on drop.
     cover_refresh_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Cover-refresh worker counters.
+    pub(crate) cover_refresh_stats: CoverRefreshStats,
     /// A `Weak` to this very `Database`, stashed right after `Arc::new` so a
     /// `&self` method (`create_field_type_migration`) can hand a detached
     /// migration driver thread a `Weak<Database>` WITHOUT changing the public
@@ -1181,6 +1212,12 @@ impl Database {
                         OnDeletePolicy::Deny
                     });
                     let target_type_id = type_ids[&rel.target_type];
+                    let embeds_target = !rel.is_many
+                        && type_def.fields.iter().any(|other| {
+                            other.name != field.name
+                                && matches!(other.field_type, FieldType::Relation(_))
+                                && other.inverse().is_none()
+                        });
                     incoming_relations
                         .entry(target_type_id)
                         .or_default()
@@ -1191,6 +1228,7 @@ impl Database {
                             rel_id,
                             is_many: rel.is_many,
                             policy,
+                            embeds_target,
                         });
                 }
             }
@@ -1396,6 +1434,7 @@ impl Database {
             },
             cover_refresh_tx: parking_lot::Mutex::new(None),
             cover_refresh_handle: parking_lot::Mutex::new(None),
+            cover_refresh_stats: CoverRefreshStats::default(),
             self_weak: parking_lot::Mutex::new(std::sync::Weak::new()),
             migration_drivers: parking_lot::Mutex::new(HashMap::new()),
             migration_lock: match &carry {
@@ -5912,7 +5951,7 @@ impl Database {
         // covers for OTHER forward-1:1 targets) — both go stale when the
         // source's blob is rewritten. Bounded cost: number of outbound
         // relation endpoints.
-        self.refresh_outbound_rev_edges(txn, type_name, object_id, Some(serialized))?;
+        self.refresh_outbound_rev_edges(txn, type_name, object_id, Some(serialized), None)?;
 
         // Phase 2: bump this object's generation. Every rev_edge that
         // embedded us as `<name>__cover` earlier now has a stale snapshot;
@@ -7327,28 +7366,38 @@ impl Database {
     /// `source_data` provides the source object's effective scalar bytes —
     /// `Some(b)` for `update()` (where the new bytes haven't been committed
     /// yet) and the current persisted bytes for the worker path.
+    ///
+    /// `skip_field`: a relation whose entries need no rewrite (the worker
+    /// passes the field through which the updated target is reached — that
+    /// entry embeds the source and the source's OTHER targets, neither of
+    /// which changed). Returns how many entries were written.
     fn refresh_outbound_rev_edges(
         &self,
         txn: &mut rhypedb_storage::mvcc::Transaction,
         type_name: &str,
         object_id: u64,
         source_data: Option<&[u8]>,
-    ) -> EngineResult<()> {
+        skip_field: Option<&str>,
+    ) -> EngineResult<usize> {
         let Some(type_def) = self.schema.get_type(type_name) else {
-            return Ok(());
+            return Ok(0);
         };
         let has_forward_1to1 = type_def.fields.iter().any(|f| {
             matches!(&f.field_type, FieldType::Relation(rel) if !rel.is_many)
                 && f.inverse().is_none()
         });
         if !has_forward_1to1 {
-            return Ok(());
+            return Ok(0);
         }
+        let mut written = 0usize;
         for field in &type_def.fields {
             if !matches!(field.field_type, FieldType::Relation(_)) {
                 continue;
             }
             if field.inverse().is_some() {
+                continue;
+            }
+            if skip_field == Some(field.name.as_str()) {
                 continue;
             }
             let rel_key = format!("{type_name}.{}", field.name);
@@ -7369,9 +7418,10 @@ impl Database {
                 )?;
                 let rev_key = KeyBuilder::reverse_edge(target_id, rel_id, object_id);
                 self.storage.put(txn, &rev_key, rev_value)?;
+                written += 1;
             }
         }
-        Ok(())
+        Ok(written)
     }
 
     /// Refresh every stale embedded cover whose underlying target is
@@ -7379,19 +7429,26 @@ impl Database {
     /// a target update has bumped its generation.
     ///
     /// Algorithm:
-    ///   1. Scan every incoming 1:1 forward rev_edge of the target —
-    ///      `r:<target>:<rel>:*` for each relation listed in
-    ///      `incoming_relations` whose source field is 1:1. Each match gives
-    ///      us a source object S that has the target embedded as one of S's
-    ///      other-target covers.
-    ///   2. For each S, re-run Phase 1 — `refresh_outbound_rev_edges` —
-    ///      which rewrites every outbound rev_edge of S with fresh covers
-    ///      pulled from each peer's current state (including the target's
-    ///      newly written data + bumped generation).
+    ///   1. Scan the target's incoming 1:1 forward rev_edges —
+    ///      `r:<target>:<rel>:*` — but only for relations whose source type
+    ///      CAN embed the target (`IncomingRelation::embeds_target`): an
+    ///      entry for relation X embeds the source's 1:1 targets other than
+    ///      X, so a source with no other forward relation never carries the
+    ///      target anywhere. (Updating an Account that 22k Threads point to,
+    ///      when Thread has no other relation, used to rewrite all 22k
+    ///      entries with identical bytes.)
+    ///   2. For each source S, re-run Phase 1 — `refresh_outbound_rev_edges`
+    ///      — skipping the entry stored under the target itself when S
+    ///      reaches the target through just one relation (that entry embeds
+    ///      S and S's other targets, none of which changed).
     ///
-    /// All rewrites happen in one txn so partial work can't make the index
-    /// temporarily inconsistent. A commit failure (write conflict) is
-    /// surfaced; the next bump re-enqueues the target so retry is cheap.
+    /// Batched: sources are rewritten COVER_REFRESH_BATCH per transaction.
+    /// Each source's rewrite is independent and readers detect a stale cover
+    /// via `__cover_v`, so a pass interrupted between batches leaves only
+    /// covers the reader already falls through on — while memory stays
+    /// bounded and `maintenance_lock` is released between batches. A commit
+    /// failure (write conflict) aborts that batch's transaction (GH #15) and
+    /// is surfaced; the next bump re-enqueues the target.
     ///
     /// Card 2: takes `migration_lock.read()` for the whole pass. This worker
     /// runs on a background thread and writes rev-edge cover blobs that embed
@@ -7407,58 +7464,108 @@ impl Database {
     /// only the worker calls this (the enqueue at `update()` is async), so the
     /// guard is never re-entrant.
     fn refresh_covers_for_target(&self, target_type_id: u64, target_id: u64) -> EngineResult<()> {
+        let result = self.refresh_covers_for_target_inner(target_type_id, target_id);
+        // Counted once the pass is OVER (success or not), so an observer that
+        // sees the count also sees every batch the pass committed.
+        self.cover_refresh_stats
+            .targets
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        result
+    }
+
+    fn refresh_covers_for_target_inner(
+        &self,
+        target_type_id: u64,
+        target_id: u64,
+    ) -> EngineResult<()> {
+        use std::sync::atomic::Ordering::Relaxed;
         let _migration_guard = self.migration_lock.read();
         let Some(incoming) = self.incoming_relations.get(&target_type_id) else {
             return Ok(());
         };
 
-        // Phase A: read pass — find every (S_type_id, S_id) that links to
-        // the target via a 1:1 forward relation. Done in a read-only scan
-        // outside the write txn so the prefix scan doesn't see in-flight
-        // writes from this same worker pass.
+        // Phase A: read pass — find every (S_type_id, S_id) that embeds the
+        // target, and through which field(s) it reaches it. Done in a
+        // read-only scan outside the write txn so the prefix scan doesn't see
+        // in-flight writes from this same worker pass.
         let read_txn = self.storage.begin_txn();
-        let mut sources: Vec<(u64, u64)> = Vec::new();
+        // (source_type_id, source_id) -> the one field reaching the target,
+        // or None once it is reached through two or more (then every entry
+        // of S embeds the target via some other field, so none is skipped).
+        let mut sources: Vec<((u64, u64), Option<&str>)> = Vec::new();
+        let mut position: HashMap<(u64, u64), usize> = HashMap::new();
         for inc in incoming {
-            if inc.is_many {
+            if inc.is_many || !inc.embeds_target {
                 continue;
             }
             let rev_prefix = KeyBuilder::reverse_edge_prefix(target_id, inc.rel_id);
             let entries = self.scan_prefix_raw(&read_txn, &rev_prefix)?;
             for (source_id, _value) in entries {
-                sources.push((inc.source_type_id, source_id));
+                let key = (inc.source_type_id, source_id);
+                match position.get(&key) {
+                    Some(&i) => sources[i].1 = None,
+                    None => {
+                        position.insert(key, sources.len());
+                        sources.push((key, Some(inc.source_field.as_str())));
+                    }
+                }
             }
         }
         drop(read_txn);
+        drop(position);
 
-        if sources.is_empty() {
-            return Ok(());
-        }
-
-        // Phase B: write pass — for each source, re-run Phase 1 in a fresh
-        // txn so commit is atomic. We collect the source bytes inside the
-        // same txn that does the put so a concurrent S-update doesn't get
-        // overwritten with stale cover content.
-        //
-        // Held from before `begin_txn` to after `commit`: no foreground write
-        // can straddle this commit, so this maintenance pass can never turn a
-        // user's `delete`/`unlink`/`link`/`update` into the conflict loser.
-        let _maintenance_guard = self.maintenance_lock.write();
-        let mut txn = self.storage.begin_txn();
-        for (s_type_id, s_id) in sources {
-            let Some(s_type_name) = self.type_name_by_id.get(&s_type_id) else {
+        // Phase B: write pass, in bounded batches. Each batch collects the
+        // source bytes inside the same txn that does the put, so a concurrent
+        // S-update doesn't get overwritten with stale cover content.
+        for batch in sources.chunks(COVER_REFRESH_BATCH) {
+            // Held from before `begin_txn` to after `commit`: no foreground
+            // write can straddle this commit, so this maintenance pass can
+            // never turn a user's `delete`/`unlink`/`link`/`update` into the
+            // conflict loser.
+            let _maintenance_guard = self.maintenance_lock.write();
+            let mut txn = self.storage.begin_txn();
+            let mut written = 0usize;
+            let staged: EngineResult<()> = (|| {
+                for &((s_type_id, s_id), skip_field) in batch {
+                    let Some(s_type_name) = self.type_name_by_id.get(&s_type_id) else {
+                        continue;
+                    };
+                    let obj_key = KeyBuilder::object(s_type_id, s_id);
+                    let Some(s_bytes) = self.storage.get(&txn, &obj_key)? else {
+                        continue;
+                    };
+                    let s_type_name = s_type_name.clone();
+                    written += self.refresh_outbound_rev_edges(
+                        &mut txn,
+                        &s_type_name,
+                        s_id,
+                        Some(&s_bytes),
+                        skip_field,
+                    )?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = staged {
+                self.storage.abort(&mut txn);
+                return Err(e);
+            }
+            if written == 0 {
+                // Nothing staged (every source vanished): no commit needed.
+                self.storage.abort(&mut txn);
                 continue;
-            };
-            let obj_key = KeyBuilder::object(s_type_id, s_id);
-            let Some(s_bytes) = self.storage.get(&txn, &obj_key)? else {
-                continue;
-            };
-            let s_type_name = s_type_name.clone();
-            self.refresh_outbound_rev_edges(&mut txn, &s_type_name, s_id, Some(&s_bytes))?;
+            }
+            if let Err(e) = self.storage.commit(&mut txn) {
+                // GH #15: release the conflict loser explicitly instead of
+                // leaving it to the drop-without-commit warning path.
+                self.storage.abort(&mut txn);
+                return Err(match e {
+                    rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                    other => EngineError::Storage(other),
+                });
+            }
+            self.cover_refresh_stats.batches.fetch_add(1, Relaxed);
+            self.cover_refresh_stats.entries.fetch_add(written as u64, Relaxed);
         }
-        self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
-            other => EngineError::Storage(other),
-        })?;
         Ok(())
     }
 }
@@ -7703,14 +7810,37 @@ fn cover_refresh_worker(
     rx: std::sync::mpsc::Receiver<(u64, u64)>,
     weak: std::sync::Weak<Database>,
 ) {
-    while let Ok((type_id, object_id)) = rx.recv() {
+    while let Ok(first) = rx.recv() {
+        // Coalesce: N updates to one target queued since the last round need
+        // ONE pass — a pass reads the target's and sources' CURRENT state, so
+        // running it once after them all lands the same result.
+        let round = drain_coalesced(&rx, first);
         let Some(db) = weak.upgrade() else { break };
-        // Best-effort: a refresh failure (write conflict, IO error) is
-        // self-healing. The next update on the target re-enqueues it; the
-        // reader fall-through continues to detect staleness via cover_v
-        // in the meantime.
-        let _ = db.refresh_covers_for_target(type_id, object_id);
+        for (type_id, object_id) in round {
+            // Best-effort: a refresh failure (write conflict, IO error) is
+            // self-healing. The next update on the target re-enqueues it; the
+            // reader fall-through continues to detect staleness via cover_v
+            // in the meantime.
+            let _ = db.refresh_covers_for_target(type_id, object_id);
+        }
     }
+}
+
+/// `first` plus everything already queued behind it (up to
+/// `COVER_REFRESH_COALESCE_MAX`), de-duplicated, in first-seen order.
+fn drain_coalesced(
+    rx: &std::sync::mpsc::Receiver<(u64, u64)>,
+    first: (u64, u64),
+) -> Vec<(u64, u64)> {
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::from([first]);
+    let mut round = vec![first];
+    while round.len() < COVER_REFRESH_COALESCE_MAX {
+        let Ok(next) = rx.try_recv() else { break };
+        if seen.insert(next) {
+            round.push(next);
+        }
+    }
+    round
 }
 
 /// Build the serialized FieldMap that gets stored as the reverse-edge entry's
@@ -18415,6 +18545,185 @@ mod tests {
             200,
         );
         assert!(landed, "sweeper did not converge on the final state");
+    }
+
+    // --- Scoped / batched / coalesced cover refresh -------------------------
+
+    fn refresh_stats(db: &Database) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let st = &db.cover_refresh_stats;
+        let targets = st.targets.load(std::sync::atomic::Ordering::Acquire);
+        (targets, st.batches.load(Relaxed), st.entries.load(Relaxed))
+    }
+
+    /// Hub shape: every Thread points at one Account and has no other
+    /// relation, so no Thread entry can embed the Account. Updating the
+    /// Account must not rewrite any of them (it used to rewrite all of them,
+    /// byte-identical, in one transaction under the maintenance lock).
+    #[test]
+    fn hub_update_rewrites_nothing_when_no_source_can_embed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(
+            parse_schema(
+                r#"
+                type Account {
+                    cursor: String
+                    threads: [Thread] @inverse(Thread.account)
+                }
+                type Thread {
+                    subject: String
+                    account: Account
+                }
+                "#,
+            )
+            .unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let mut af = FieldMap::new();
+        af.insert("cursor".into(), Value::String("c0".into()));
+        let acct = db.create("Account", af).unwrap();
+        for i in 0..300 {
+            let mut tf = FieldMap::new();
+            tf.insert("subject".into(), Value::String(format!("t{i}")));
+            let t = db.create("Thread", tf).unwrap();
+            db.link("Thread", t.id, "account", acct.id, None).unwrap();
+        }
+        let mut upd = FieldMap::new();
+        upd.insert("cursor".into(), Value::String("c1".into()));
+        db.update("Account", acct.id, upd).unwrap();
+        assert!(
+            poll_until(|| refresh_stats(&db).0 >= 1, 200),
+            "worker never processed the Account update"
+        );
+        let (_, batches, entries) = refresh_stats(&db);
+        assert_eq!(entries, 0, "rewrote {entries} entries that cannot embed the Account");
+        assert_eq!(batches, 0);
+        assert_eq!(db.get_links("Account", acct.id, "threads").unwrap().len(), 300);
+    }
+
+    fn mail_schema() -> Schema {
+        parse_schema(
+            r#"
+            type Thread {
+                subject: String
+                messages: [Message] @inverse(Message.thread)
+            }
+            type Label {
+                name: String
+                messages: [Message] @inverse(Message.labels)
+            }
+            type Message {
+                n: u32
+                thread: Thread
+                labels: [Label]
+            }
+            "#,
+        )
+        .unwrap()
+    }
+
+    /// The thread subject embedded in a label-side entry for `label_id`
+    /// (one per message), via the raw reverse-edge covers.
+    fn label_side_thread_subjects(db: &Database, label_id: u64) -> Vec<Option<String>> {
+        let groups = db.get_links_many("Label", &[label_id], "messages").unwrap();
+        groups
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_mid, cover)| {
+                let inner = crate::object::find_bytes_field_in_raw(&cover, "thread__cover")?;
+                match deserialize_fields(&inner).get("subject")? {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Messages reach the Thread through `thread` only. Their label-side
+    /// entries embed the Thread (as `thread__cover`) and must be refreshed;
+    /// the thread-side entries embed the Message and its labels — unchanged —
+    /// and must not be rewritten.
+    #[test]
+    fn refresh_rewrites_only_entries_that_embed_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(mail_schema(), dir.path()).unwrap();
+        let mut tf = FieldMap::new();
+        tf.insert("subject".into(), Value::String("old".into()));
+        let thread = db.create("Thread", tf).unwrap();
+        let labels: Vec<u64> = (0..2)
+            .map(|i| {
+                let mut lf = FieldMap::new();
+                lf.insert("name".into(), Value::String(format!("L{i}")));
+                db.create("Label", lf).unwrap().id
+            })
+            .collect();
+        for n in 0..3u32 {
+            let mut mf = FieldMap::new();
+            mf.insert("n".into(), Value::U32(n));
+            let m = db.create("Message", mf).unwrap();
+            db.link("Message", m.id, "thread", thread.id, None).unwrap();
+            for &l in &labels {
+                db.link("Message", m.id, "labels", l, None).unwrap();
+            }
+        }
+        assert_eq!(label_side_thread_subjects(&db, labels[0]), vec![Some("old".into()); 3]);
+
+        let mut upd = FieldMap::new();
+        upd.insert("subject".into(), Value::String("new".into()));
+        db.update("Thread", thread.id, upd).unwrap();
+        assert!(poll_until(|| refresh_stats(&db).0 >= 1, 200));
+        let (_, batches, entries) = refresh_stats(&db);
+        assert_eq!(entries, 3 * 2, "3 messages x 2 label-side entries; thread-side skipped");
+        assert_eq!(batches, 1);
+        for &l in &labels {
+            assert_eq!(label_side_thread_subjects(&db, l), vec![Some("new".into()); 3]);
+        }
+    }
+
+    /// A target with more sources than one batch commits in several bounded
+    /// transactions, and every embedded cover still ends up fresh.
+    #[test]
+    fn refresh_commits_in_bounded_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(mail_schema(), dir.path()).unwrap();
+        let mut tf = FieldMap::new();
+        tf.insert("subject".into(), Value::String("old".into()));
+        let thread = db.create("Thread", tf).unwrap();
+        let mut lf = FieldMap::new();
+        lf.insert("name".into(), Value::String("Inbox".into()));
+        let label = db.create("Label", lf).unwrap();
+        let n_msgs = 2 * COVER_REFRESH_BATCH + 88;
+        for n in 0..n_msgs {
+            let mut mf = FieldMap::new();
+            mf.insert("n".into(), Value::U32(n as u32));
+            let m = db.create("Message", mf).unwrap();
+            db.link("Message", m.id, "thread", thread.id, None).unwrap();
+            db.link("Message", m.id, "labels", label.id, None).unwrap();
+        }
+        let mut upd = FieldMap::new();
+        upd.insert("subject".into(), Value::String("new".into()));
+        db.update("Thread", thread.id, upd).unwrap();
+        assert!(poll_until(|| refresh_stats(&db).0 >= 1 && refresh_stats(&db).1 >= 3, 500));
+        let (_, batches, entries) = refresh_stats(&db);
+        assert_eq!(batches, 3);
+        assert_eq!(entries, n_msgs as u64);
+        let subjects = label_side_thread_subjects(&db, label.id);
+        assert_eq!(subjects.len(), n_msgs);
+        assert!(subjects.iter().all(|s| s.as_deref() == Some("new")));
+    }
+
+    #[test]
+    fn drain_coalesced_dedups_queued_targets_in_order() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for t in [(1, 7), (2, 9), (1, 7), (1, 7), (3, 1), (2, 9)] {
+            tx.send(t).unwrap();
+        }
+        let first = rx.recv().unwrap();
+        assert_eq!(drain_coalesced(&rx, first), vec![(1, 7), (2, 9), (3, 1)]);
+        assert!(rx.try_recv().is_err(), "everything queued was taken");
     }
 
     #[test]
