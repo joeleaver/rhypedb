@@ -768,8 +768,8 @@ pub fn decode_vector_batch_payload(data: &[u8]) -> io::Result<VectorBatch> {
             return Err(err("vector-batch: vector data truncated"));
         }
         let mut v = Vec::with_capacity(dim);
-        for c in data[pos..pos + byte_len].chunks_exact(4) {
-            v.push(f32::from_le_bytes(c.try_into().unwrap()));
+        for c in data[pos..pos + byte_len].as_chunks::<4>().0 {
+            v.push(f32::from_le_bytes(*c));
         }
         pos += byte_len;
         rows.push((object_id, v));

@@ -1,0 +1,85 @@
+name: ci
+
+# Build, lint and test on every push to master and every PR. Before this, CI
+# only ran the crash-fuzz ship guard: nothing built the code or ran a test, and
+# a Windows-only compile break (PR #23) reached a downstream release first.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned so a new clippy lint lands as a deliberate toolchain bump, not as a
+  # surprise red build. Bump together with any lint fixes it needs.
+  RUST_TOOLCHAIN: "1.98.1"
+  CARGO_TERM_COLOR: always
+  # Embedding/reranker model files (rhypedb-embed tests); cached below.
+  FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.fastembed_cache
+
+jobs:
+  test:
+    name: test (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache embedding models
+        uses: actions/cache@v4
+        with:
+          path: .fastembed_cache
+          key: fastembed-models-v1
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --no-fail-fast
+      - name: Test storage crash-recovery fuzz harness
+        run: cargo test -p rhypedb-storage --features crash-fuzz --no-fail-fast
+
+  windows-check:
+    # The dependency shape a Windows embedder (Pimble) builds; guards against
+    # Unix-only APIs leaking into the cross-platform crates.
+    name: check (windows, embedder crates)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check -p rhypedb-engine -p rhypedb-schema -p rhypedb-query --no-default-features
+
+  typescript-client:
+    name: typescript client
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

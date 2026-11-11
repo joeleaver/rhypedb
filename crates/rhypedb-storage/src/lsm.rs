@@ -1517,15 +1517,10 @@ fn compaction_worker(
             // Size-tiered, repeated while a run qualifies (one merge can
             // complete the next tier). Stop early on shutdown.
             let mut merged = false;
-            loop {
-                match lsm.compact_inner(CompactionScope::Tiered) {
-                    Ok(true) => {
-                        merged = true;
-                        if state.0.lock().shutdown {
-                            break;
-                        }
-                    }
-                    _ => break,
+            while let Ok(true) = lsm.compact_inner(CompactionScope::Tiered) {
+                merged = true;
+                if state.0.lock().shutdown {
+                    break;
                 }
             }
             if merged {

@@ -12191,68 +12191,117 @@ mod tests {
     /// converter that takes a fixed time per row (uniform load), the rate-based
     /// ETA sampled mid-flight predicts the actual completion within 25%.
     /// Single-partition for deterministic linear pacing.
+    ///
+    /// "Uniform" is the PREMISE, and a loaded machine can break it: `sleep(2ms)`
+    /// overshoots by a varying amount, so a run can slow down after the sample
+    /// and the (correctly computed) ETA then misses — this test flaked that way
+    /// under full-suite load. So each attempt also samples LATER in the
+    /// conversion and compares the conversion rate up to the ETA sample with
+    /// the rate between the two samples (both windows are pure conversion;
+    /// cutover is excluded). The 25% bound is asserted only on an attempt whose
+    /// load really was uniform (rates within 15%), retrying otherwise.
     #[test]
     fn card5_eta_within_25pct_on_uniform_load() {
         use rhypedb_schema::{FieldType, ScalarType};
         use std::time::{Duration, Instant};
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
-            .unwrap();
-        // ~2ms per row → ~800ms over 400 rows; uniform load.
-        db.register_converter("widen", 1, |_oid, v| {
-            std::thread::sleep(Duration::from_millis(2));
-            match v {
-                Value::I64(i) => Ok(Value::F64(*i as f64)),
-                _ => unreachable!(),
-            }
-        });
         const N: i64 = 400;
-        for i in 0..N {
-            let mut f = FieldMap::new();
-            f.insert("score".into(), Value::I64(i));
-            db.create("User", f).unwrap();
-        }
-        let t0 = Instant::now();
-        let handle = db
-            .start_field_type_migration_async(MigrationPlanSpec {
-                type_name: "User".into(),
-                field_name: "score".into(),
-                target_field_type: FieldType::Scalar(ScalarType::F64),
-                converter_name: "widen".into(),
-                converter_version: 1,
-                chunk_size: 8,
-                parallel_degree: Some(1), // single worker → linear pacing
-                ..Default::default()
-            })
-            .unwrap();
-        // Sample once a stable fraction (20–70%) has converted.
-        let mut sample = None;
-        for _ in 0..5000 {
-            let p = db.query_migration_progress(handle.plan_id).unwrap();
-            if p.status == crate::catalog::MigrationStatus::Running
-                && (80..=280).contains(&p.objects_converted)
-                && p.eta_unix_ms.is_some()
-            {
-                sample = Some(p);
-                break;
+        const ATTEMPTS: usize = 5;
+        let mut skewed = Vec::new();
+        for attempt in 0..ATTEMPTS {
+            let dir = tempfile::tempdir().unwrap();
+            let db =
+                Database::open(parse_schema(r#"type User { score: i64 }"#).unwrap(), dir.path())
+                    .unwrap();
+            // ~2ms per row → ~800ms over 400 rows; uniform load.
+            db.register_converter("widen", 1, |_oid, v| {
+                std::thread::sleep(Duration::from_millis(2));
+                match v {
+                    Value::I64(i) => Ok(Value::F64(*i as f64)),
+                    _ => unreachable!(),
+                }
+            });
+            for i in 0..N {
+                let mut f = FieldMap::new();
+                f.insert("score".into(), Value::I64(i));
+                db.create("User", f).unwrap();
             }
-            if !p.status.quiesces() {
-                break; // finished too fast — fail below
+            let t0 = Instant::now();
+            let handle = db
+                .start_field_type_migration_async(MigrationPlanSpec {
+                    type_name: "User".into(),
+                    field_name: "score".into(),
+                    target_field_type: FieldType::Scalar(ScalarType::F64),
+                    converter_name: "widen".into(),
+                    converter_version: 1,
+                    chunk_size: 8,
+                    parallel_degree: Some(1), // single worker → linear pacing
+                    ..Default::default()
+                })
+                .unwrap();
+            // ETA sample once 20–45% has converted; a second, uniformity-check
+            // sample once 70–95% has, while still converting.
+            let mut sample = None;
+            let mut later: Option<(u64, Duration)> = None;
+            for _ in 0..10_000 {
+                let p = db.query_migration_progress(handle.plan_id).unwrap();
+                let running = p.status == crate::catalog::MigrationStatus::Running;
+                if sample.is_none()
+                    && running
+                    && (80..=180).contains(&p.objects_converted)
+                    && p.eta_unix_ms.is_some()
+                {
+                    let at = t0.elapsed();
+                    sample = Some((p, at));
+                } else if sample.is_some()
+                    && running
+                    && (280..=380).contains(&p.objects_converted)
+                {
+                    later = Some((p.objects_converted, t0.elapsed()));
+                    break;
+                } else if !p.status.quiesces() {
+                    break; // finished before a sample — handled below
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
-            std::thread::sleep(Duration::from_millis(1));
+            db.wait_for_migration(handle.plan_id).unwrap();
+            let actual = t0.elapsed();
+            let (p, at_sample) = sample.expect("should have caught an in-flight sample");
+            let Some((later_done, at_later)) = later else {
+                skewed.push(format!("attempt {attempt}: no second in-flight sample"));
+                continue;
+            };
+
+            // Was the load uniform on THIS attempt? Conversion rate up to the
+            // ETA sample vs. between the two samples.
+            let done = p.objects_converted as f64;
+            let pre_rate = done / at_sample.as_secs_f64();
+            let mid_rate = (later_done as f64 - done)
+                / (at_later - at_sample).as_secs_f64().max(1e-3);
+            let skew = (pre_rate / mid_rate - 1.0).abs();
+            if skew > 0.15 {
+                skewed.push(format!(
+                    "attempt {attempt}: {pre_rate:.0}/s before vs {mid_rate:.0}/s after the sample"
+                ));
+                continue;
+            }
+
+            let actual_ms = actual.as_millis() as u64;
+            let predicted_total_ms = p.eta_unix_ms.unwrap().saturating_sub(p.created_at_ms);
+            let lo = actual_ms * 75 / 100;
+            let hi = actual_ms * 125 / 100;
+            assert!(
+                predicted_total_ms >= lo && predicted_total_ms <= hi,
+                "ETA predicted total {predicted_total_ms}ms not within 25% of actual {actual_ms}ms \
+                 under uniform load (rate skew {:.0}%, sampled at {} / {} converted)",
+                skew * 100.0,
+                p.objects_converted,
+                p.total_objects
+            );
+            return;
         }
-        db.wait_for_migration(handle.plan_id).unwrap();
-        let actual_ms = t0.elapsed().as_millis() as u64;
-        let p = sample.expect("should have caught an in-flight sample");
-        let predicted_total_ms = p.eta_unix_ms.unwrap().saturating_sub(p.created_at_ms);
-        let lo = actual_ms * 75 / 100;
-        let hi = actual_ms * 125 / 100;
-        assert!(
-            predicted_total_ms >= lo && predicted_total_ms <= hi,
-            "ETA predicted total {predicted_total_ms}ms not within 25% of actual {actual_ms}ms \
-             (sampled at {} / {} converted)",
-            p.objects_converted,
-            p.total_objects
+        panic!(
+            "no attempt ran under uniform load (machine too busy to test the ETA): {}",
+            skewed.join("; ")
         );
     }
 

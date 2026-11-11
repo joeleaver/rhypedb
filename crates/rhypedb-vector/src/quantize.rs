@@ -583,20 +583,18 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// bit-identical to a naive `.sum()`.
 fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
-    let mut ca = a.chunks_exact(8);
-    let mut cb = b.chunks_exact(8);
-    for (x, y) in ca.by_ref().zip(cb.by_ref()) {
-        // `chunks_exact(8)` yields length-8 slices; the array conversion lets
-        // the optimizer drop the bounds checks on the unrolled inner loop.
-        let x: &[f32; 8] = x.try_into().unwrap();
-        let y: &[f32; 8] = y.try_into().unwrap();
+    // `as_chunks::<8>` yields `&[f32; 8]` arrays, so the optimizer drops the
+    // bounds checks on the unrolled inner loop; the remainders are the tails.
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb) {
         for l in 0..8 {
             acc[l] += x[l] * y[l];
         }
     }
     let mut total =
         ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in ra.iter().zip(rb) {
         total += x * y;
     }
     total
