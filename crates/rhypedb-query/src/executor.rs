@@ -4590,4 +4590,179 @@ mod tests {
             Err(QueryError::ResourceLimitExceeded(_))
         ));
     }
+
+    /// GH #26 oracle: covers are a read-path cache, so a database that writes
+    /// none (`cover_max_bytes: 0`) and one that copies everything
+    /// (`usize::MAX`) must answer every query identically — same rows, same
+    /// fields, same order — and the default cap (mixed covered/uncovered
+    /// rows) must agree with both. Exercises covering index reads (Eq, range,
+    /// limited range, String Eq), inverse traversals with 2- and 3-hop fusion,
+    /// and the same after updates that move rows across the cap.
+    #[test]
+    fn cover_size_cap_never_changes_query_results() {
+        use rhypedb_engine::database::OpenOptions;
+        let schema_src = r#"
+            type User {
+                name: String
+                bio: String
+                ratings: [Rating] @inverse(Rating.user)
+            }
+            type Director { name: String  notes: String }
+            type Movie {
+                title: String @indexed
+                year: u32 @indexed
+                synopsis: String
+                director: Director
+                ratings: [Rating] @inverse(Rating.movie)
+            }
+            type Rating {
+                stars: u32 @indexed
+                review: String
+                user: User
+                movie: Movie
+            }
+        "#;
+        // Even-numbered rows carry 2 KiB of text — past the default 1 KiB cap.
+        let text = |i: u32, tag: &str| {
+            if i.is_multiple_of(2) {
+                format!("{tag}{i}-").repeat(2048 / (tag.len() + 4))
+            } else {
+                format!("{tag}{i}")
+            }
+        };
+        let build = |dir: &std::path::Path, cap: usize| {
+            let db = Database::open_with_options(
+                parse_schema(schema_src).unwrap(),
+                dir,
+                OpenOptions {
+                    cover_max_bytes: cap,
+                    background_cover_refresh: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut ids = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for i in 0..4u32 {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String(format!("D{i}")));
+                f.insert("notes".into(), Value::String(text(i, "n")));
+                ids.0.push(db.create("Director", f).unwrap().id);
+            }
+            for i in 0..6u32 {
+                let mut f = FieldMap::new();
+                f.insert("name".into(), Value::String(format!("U{i}")));
+                f.insert("bio".into(), Value::String(text(i, "b")));
+                ids.1.push(db.create("User", f).unwrap().id);
+            }
+            for i in 0..8u32 {
+                let mut f = FieldMap::new();
+                f.insert("title".into(), Value::String(format!("M{}", i % 3)));
+                f.insert("year".into(), Value::U32(1990 + (i * 7) % 20));
+                f.insert("synopsis".into(), Value::String(text(i + 1, "s")));
+                let m = db.create("Movie", f).unwrap().id;
+                db.link("Movie", m, "director", ids.0[i as usize % 4], None).unwrap();
+                ids.2.push(m);
+            }
+            for i in 0..30u32 {
+                let mut f = FieldMap::new();
+                f.insert("stars".into(), Value::U32(i % 5));
+                f.insert("review".into(), Value::String(text(i, "r")));
+                let r = db.create("Rating", f).unwrap().id;
+                db.link("Rating", r, "user", ids.1[i as usize % 6], None).unwrap();
+                db.link("Rating", r, "movie", ids.2[(i as usize * 3) % 8], None).unwrap();
+                ids.3.push(r);
+            }
+            (db, ids)
+        };
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let dbs: Vec<_> = [0usize, rhypedb_engine::database::DEFAULT_COVER_MAX_BYTES, usize::MAX]
+            .iter()
+            .zip(&dirs)
+            .map(|(&cap, d)| build(d.path(), cap))
+            .collect();
+        // Ids are allocated identically in each database.
+        let (_, ids) = &dbs[0];
+        for (_, other) in &dbs[1..] {
+            assert_eq!(other, ids);
+        }
+        let (u, m) = (ids.1.clone(), ids.2.clone());
+
+        let rows = |db: &Database, q: &str| -> Vec<(u64, Vec<(String, Value)>)> {
+            let out = execute(&ExecContext::new(db, None), &parse_query(q).unwrap())
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            let objs = match out {
+                QueryOutput::Objects(o) => o,
+                QueryOutput::Single(o) => vec![o],
+                other => panic!("{q}: unexpected {other:?}"),
+            };
+            objs.into_iter()
+                .map(|mut o| {
+                    o.ensure_fields_deserialized();
+                    let mut f: Vec<_> = o.fields.into_iter().collect();
+                    f.sort_by(|a, b| a.0.cmp(&b.0));
+                    (o.id, f)
+                })
+                .collect()
+        };
+        let queries = |u: &[u64], m: &[u64]| {
+            vec![
+                "Movie.filter(.year > 1995)".to_string(),
+                "Movie.filter(.year >= 1997).limit(3)".to_string(),
+                "Movie.filter(.year < 2003).limit(4)".to_string(),
+                "Movie.filter(.year == 1997)".to_string(),
+                r#"Movie.filter(.title == "M1")"#.to_string(),
+                "Rating.filter(.stars == 2)".to_string(),
+                "Rating.filter(.stars >= 3).limit(5)".to_string(),
+                format!("Movie.get({}).ratings", m[0]),
+                format!("Movie.get({}).ratings.user", m[0]),
+                format!("Movie.get({}).ratings.user", m[3]),
+                format!("User.get({}).ratings.movie", u[0]),
+                format!("User.get({}).ratings.movie", u[1]),
+                format!("User.get({}).ratings.movie.director", u[2]),
+                format!("User.get({}).ratings.movie.director", u[3]),
+            ]
+        };
+        // Index reads must match in ORDER (index order is the contract a
+        // `.limit` relies on). Traversal output order is not a contract — the
+        // fusion path already emits fresh-covered targets before probed ones,
+        // so it shifts whenever a cover goes stale even with every copy kept —
+        // so traversals compare as sets.
+        let check = |stage: &str| {
+            for q in queries(&u, &m) {
+                let ordered = !q.contains(".get(");
+                let norm = |mut r: Vec<(u64, Vec<(String, Value)>)>| {
+                    if !ordered {
+                        r.sort_by_key(|(id, _)| *id);
+                    }
+                    r
+                };
+                let want = norm(rows(&dbs[2].0, &q));
+                assert!(!want.is_empty(), "{stage}: query `{q}` should match rows");
+                for (db, _) in &dbs[..2] {
+                    assert_eq!(norm(rows(db, &q)), want, "{stage}: `{q}` differs from copy-everything");
+                }
+            }
+        };
+        check("after load");
+
+        // Move rows across the cap in both directions and touch peers, so
+        // index payloads, peer covers and their staleness stamps all change.
+        for (db, ids) in &dbs {
+            let mut f = FieldMap::new();
+            f.insert("synopsis".into(), Value::String("short now".into()));
+            db.update("Movie", ids.2[1], f).unwrap(); // big -> small
+            let mut f = FieldMap::new();
+            f.insert("synopsis".into(), Value::String("x".repeat(4096)));
+            f.insert("year".into(), Value::U32(1999));
+            db.update("Movie", ids.2[2], f).unwrap(); // small -> big, re-keyed
+            let mut f = FieldMap::new();
+            f.insert("bio".into(), Value::String("y".repeat(3000)));
+            db.update("User", ids.1[1], f).unwrap(); // a covered peer grows
+            let mut f = FieldMap::new();
+            f.insert("name".into(), Value::String("U0-renamed".into()));
+            db.update("User", ids.1[0], f).unwrap(); // stale peer cover
+            db.delete("Rating", ids.3[4]).unwrap();
+        }
+        check("after updates");
+    }
 }

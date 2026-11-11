@@ -130,6 +130,8 @@ On a scalar field, builds a secondary index so `filter` queries on that field do
 year: i64 @indexed
 ```
 
+Each indexed field adds one index entry per object. For small objects that entry also holds a copy of the object, so an indexed query returns rows without a second lookup; see [Storage cost of indexes and relations](#storage-cost-of-indexes-and-relations).
+
 ### `@fulltext` / `@fulltext(analyzer: "simple", positions: false)`
 
 On a `String` field, builds a **full-text inverted index** so the field can be searched by keyword with `Type.matches(.field, "terms", k: N)` (see [Queries → Full-text search](queries.md#full-text-search--matchesfield-query-k-n)). The index is maintained synchronously inside each object's transaction, like `@unique` and `@indexed`, so it is never stale and survives a crash exactly as the object does.
@@ -212,6 +214,15 @@ embedding: Vector<384> @vectorize(source: "text", model: "all-MiniLM-L6-v2")
 - `model` — the embedding model identifier (e.g. `all-MiniLM-L6-v2`). The vector dimension `N` must match the model's output size.
 
 Combine it with `@index(hnsw, ...)` on the same field to both auto-embed and index. See **[Vector Search](vectors.md)**.
+
+## Storage cost of indexes and relations
+
+rhypedb keeps each object once, under its id. Two read-path caches can add copies, and both are bounded by size:
+
+- **`@indexed` fields.** Every indexed field writes one index entry per object (key: field value + id). If the object serializes to at most 1 KiB, the entry also carries a copy of it, so `filter` on that field returns rows straight from the index. A larger object's entry carries only the key; the query fetches the object by id, one point lookup per row. Results and their order are the same either way.
+- **To-one relations.** A link's reverse entry (what `@inverse` traversals walk) holds the ids of the linking object's *other* to-one targets, plus a copy of each such target that is at most 1 KiB, so a hop like `Movie.ratings.user` can return users without looking each one up. The linking object's own fields are never copied there, so a large type with many to-many links (a mail message with labels and recipients, say) costs a few dozen bytes per link.
+
+So a text-heavy type costs about its own size plus small per-index and per-link entries. Embedded users can move the threshold with `OpenOptions::cover_max_bytes` (`usize::MAX` copies everything, `0` nothing); the server uses the default. A new threshold applies to entries written from then on. Entries written by older versions keep their copies until the object is next written, or until the link is next rewritten (reverse entries).
 
 ## A complete example
 
