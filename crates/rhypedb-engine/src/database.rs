@@ -701,7 +701,24 @@ pub struct OpenOptions {
     /// density matters and reads are scan-heavy or rare. Both formats are always
     /// readable; compaction migrates files to whichever is set.
     pub block_compression: rhypedb_storage::SstCompression,
+    /// Largest serialized object, in bytes, that is copied into a read-path
+    /// cover. Defaults to [`DEFAULT_COVER_MAX_BYTES`] (1 KiB).
+    ///
+    /// Two caches copy objects so a read can skip the per-id lookup in `o:`:
+    /// every `@indexed` field's index entry carries the object's scalars, and
+    /// a reverse edge carries its source's OTHER to-one targets. Past this
+    /// size the copy is not written; the index entry or edge is still written
+    /// (queries find exactly the same rows) and the read fetches the object
+    /// from `o:` instead — one point lookup per row, against a copy per index
+    /// and per incoming edge. Applies to writes from now on; existing entries
+    /// keep their copies until the object is next written. `usize::MAX`
+    /// restores copy-everything; `0` disables the copies.
+    pub cover_max_bytes: usize,
 }
+
+/// Default for [`OpenOptions::cover_max_bytes`]: small rows (ids, names,
+/// dates, flags) keep their covers; text-heavy rows are looked up instead.
+pub const DEFAULT_COVER_MAX_BYTES: usize = 1024;
 
 impl Default for OpenOptions {
     fn default() -> Self {
@@ -711,6 +728,7 @@ impl Default for OpenOptions {
             background_fulltext_build: true,
             allow_schema_shrink: false,
             block_compression: rhypedb_storage::SstCompression::None,
+            cover_max_bytes: DEFAULT_COVER_MAX_BYTES,
         }
     }
 }
@@ -3965,15 +3983,17 @@ impl Database {
             }
         }
 
-        // Secondary index entries — covering payload = serialized scalars.
+        // Secondary index entries — covering payload = serialized scalars,
+        // or empty past `cover_max_bytes` (the read then probes `o:`).
         if let Some(idx_fields) = self.indexed_fields.get(type_name) {
+            let payload = self.index_cover_payload(&serialized);
             for ifd in idx_fields {
                 if let Some(value) = scalar_fields.get(&ifd.name)
                     && !matches!(value, Value::Null)
                     && let Some(key) =
                         build_field_index_key(type_id, ifd.field_id, ifd.kind, value, object_id)
                 {
-                    puts.push((key, serialized.clone()));
+                    puts.push((key, payload.clone()));
                 }
             }
         }
@@ -4008,7 +4028,7 @@ impl Database {
             ));
 
             let rev_value =
-                build_inflight_cover(self, txn, &scalar_fields, field_name, *target_id, &links, i)?;
+                build_inflight_cover(self, txn, field_name, *target_id, &links, i)?;
             puts.push((
                 KeyBuilder::reverse_edge(*target_id, *rel_id, object_id),
                 rev_value,
@@ -5110,10 +5130,9 @@ impl Database {
             } else {
                 self.storage.scan_prefix_at(snapshot, &prefix)?
             };
-            let mut out = Vec::with_capacity(entries.len().min(cap));
-            let mut fallback_ids: Vec<u64> = Vec::new();
+            let mut hits: Vec<(u64, Bytes)> = Vec::with_capacity(entries.len().min(cap));
             for (key, value) in entries {
-                if out.len() + fallback_ids.len() >= cap {
+                if hits.len() >= cap {
                     break;
                 }
                 if key.len() < 8 {
@@ -5121,23 +5140,9 @@ impl Database {
                 }
                 let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
                 let object_id = u64::from_be_bytes(id_bytes);
-                if value.is_empty() {
-                    fallback_ids.push(object_id);
-                } else {
-                    let mut fields = deserialize_fields(&value);
-                    self.strip_tombstoned_fields(type_name, &mut fields);
-                    out.push(Object {
-                        type_name: type_name.into(),
-                        id: object_id,
-                        fields,
-                        raw_fields: None,
-                    });
-                }
+                hits.push((object_id, value));
             }
-            if !fallback_ids.is_empty() {
-                out.extend(self.get_many_at(snapshot, type_name, &fallback_ids)?);
-            }
-            return Ok(out);
+            return self.materialize_index_hits(snapshot, type_name, hits);
         }
 
         let prefix = KeyBuilder::field_index_prefix(type_id, field_id);
@@ -5170,10 +5175,9 @@ impl Database {
             _ => self.storage.scan_prefix_at(snapshot, &prefix)?,
         };
 
-        let mut out = Vec::with_capacity(entries.len().min(cap));
-        let mut fallback_ids: Vec<u64> = Vec::new();
+        let mut hits: Vec<(u64, Bytes)> = Vec::with_capacity(entries.len().min(cap));
         for (key, value) in entries {
-            if out.len() + fallback_ids.len() >= cap {
+            if hits.len() >= cap {
                 break;
             }
             if key.len() != plen + 8 + 1 + 8 {
@@ -5197,24 +5201,10 @@ impl Database {
             }
             let id_bytes: [u8; 8] = key[plen + 9..plen + 17].try_into().unwrap();
             let object_id = u64::from_be_bytes(id_bytes);
-            if value.is_empty() {
-                fallback_ids.push(object_id);
-            } else {
-                let mut fields = deserialize_fields(&value);
-                self.strip_tombstoned_fields(type_name, &mut fields);
-                out.push(Object {
-                    type_name: type_name.into(),
-                    id: object_id,
-                    fields,
-                    raw_fields: None,
-                });
-            }
+            hits.push((object_id, value));
         }
 
-        if !fallback_ids.is_empty() {
-            out.extend(self.get_many_at(snapshot, type_name, &fallback_ids)?);
-        }
-        Ok(out)
+        self.materialize_index_hits(snapshot, type_name, hits)
     }
 
     /// Bool-valued filtered scan. Routes to the secondary index when the
@@ -5573,10 +5563,9 @@ impl Database {
             } else {
                 self.storage.scan_prefix_at(snapshot, &prefix)?
             };
-            let mut out = Vec::with_capacity(entries.len().min(cap));
-            let mut fallback_ids: Vec<u64> = Vec::new();
+            let mut hits: Vec<(u64, Bytes)> = Vec::with_capacity(entries.len().min(cap));
             for (key, value) in entries {
-                if out.len() + fallback_ids.len() >= cap {
+                if hits.len() >= cap {
                     break;
                 }
                 if key.len() < 8 {
@@ -5584,23 +5573,9 @@ impl Database {
                 }
                 let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
                 let object_id = u64::from_be_bytes(id_bytes);
-                if value.is_empty() {
-                    fallback_ids.push(object_id);
-                } else {
-                    let mut fields = deserialize_fields(&value);
-                    self.strip_tombstoned_fields(type_name, &mut fields);
-                    out.push(Object {
-                        type_name: type_name.into(),
-                        id: object_id,
-                        fields,
-                        raw_fields: None,
-                    });
-                }
+                hits.push((object_id, value));
             }
-            if !fallback_ids.is_empty() {
-                out.extend(self.get_many_at(snapshot, type_name, &fallback_ids)?);
-            }
-            return Ok(out);
+            return self.materialize_index_hits(snapshot, type_name, hits);
         }
 
         // === Range/Ne path — scan the whole field prefix ===
@@ -5608,10 +5583,9 @@ impl Database {
         let plen = prefix.len();
         let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
 
-        let mut out = Vec::with_capacity(entries.len().min(cap));
-        let mut fallback_ids: Vec<u64> = Vec::new();
+        let mut hits: Vec<(u64, Bytes)> = Vec::with_capacity(entries.len().min(cap));
         for (key, value) in entries {
-            if out.len() + fallback_ids.len() >= cap {
+            if hits.len() >= cap {
                 break;
             }
             // Need plen + at least one 0x00 0x00 terminator + 8 byte id.
@@ -5655,24 +5629,10 @@ impl Database {
             }
             let id_bytes: [u8; 8] = key[term + 2..term + 10].try_into().unwrap();
             let object_id = u64::from_be_bytes(id_bytes);
-            if value.is_empty() {
-                fallback_ids.push(object_id);
-            } else {
-                let mut fields = deserialize_fields(&value);
-                self.strip_tombstoned_fields(type_name, &mut fields);
-                out.push(Object {
-                    type_name: type_name.into(),
-                    id: object_id,
-                    fields,
-                    raw_fields: None,
-                });
-            }
+            hits.push((object_id, value));
         }
 
-        if !fallback_ids.is_empty() {
-            out.extend(self.get_many_at(snapshot, type_name, &fallback_ids)?);
-        }
-        Ok(out)
+        self.materialize_index_hits(snapshot, type_name, hits)
     }
 
     /// Update an object's fields. Only the provided fields are updated;
@@ -5970,13 +5930,10 @@ impl Database {
             }
         }
 
-        // Phase 1: refresh covering reverse-edges on THIS object's own
-        // outbound forward relations. The rev_edge value stored at each
-        // linked target carries the source object's effective fields (and
-        // covers for OTHER forward-1:1 targets) — both go stale when the
-        // source's blob is rewritten. Bounded cost: number of outbound
-        // relation endpoints.
-        self.refresh_outbound_rev_edges(txn, type_name, object_id, Some(serialized), None)?;
+        // No outbound rev-edge rewrite: a rev_edge value carries only peer
+        // ids and the PEERS' covers, never this object's own fields (GH #26),
+        // so rewriting this object's blob stales none of its outbound
+        // entries. (It used to rewrite every one of them on every update.)
 
         // Phase 2: bump this object's generation. Every rev_edge that
         // embedded us as `<name>__cover` earlier now has a stale snapshot;
@@ -6575,7 +6532,6 @@ impl Database {
             &txn,
             source_type,
             source_id,
-            source_data.as_deref(),
             field_name,
             target_id,
         )?;
@@ -7337,9 +7293,72 @@ impl Database {
         covering: Bytes,
     ) -> EngineResult<()> {
         if let Some(key) = build_field_index_key(type_id, field_id, kind, value, object_id) {
-            self.storage.put(txn, &key, covering)?;
+            self.storage.put(txn, &key, self.index_cover_payload(&covering))?;
         }
         Ok(())
+    }
+
+    /// Turn index hits `(object_id, i: value)` — in INDEX order — into
+    /// Objects, keeping that order. A covering value builds the row in place;
+    /// an empty one (an object over `cover_max_bytes`, or a legacy entry) is
+    /// fetched from `o:` at the same snapshot in one batched `get_many_at`
+    /// and spliced back into its slot. (Appending the fetched rows at the end,
+    /// as this used to, put uncovered rows after covered ones and in id order
+    /// — fine while empty values were rare legacy leftovers, wrong once the
+    /// size cap makes mixed covered/uncovered results normal.)
+    fn materialize_index_hits(
+        &self,
+        snapshot: u64,
+        type_name: &str,
+        hits: Vec<(u64, Bytes)>,
+    ) -> EngineResult<Vec<Object>> {
+        let probe_ids: Vec<u64> = hits
+            .iter()
+            .filter(|(_, v)| v.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        let mut probed: HashMap<u64, Object> = if probe_ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.get_many_at(snapshot, type_name, &probe_ids)?
+                .into_iter()
+                .map(|o| (o.id, o))
+                .collect()
+        };
+        let mut out = Vec::with_capacity(hits.len());
+        for (object_id, value) in hits {
+            if value.is_empty() {
+                // Absent only if the object is gone at this snapshot, which
+                // a consistent index never shows — skip rather than invent.
+                if let Some(obj) = probed.remove(&object_id) {
+                    out.push(obj);
+                }
+            } else {
+                let mut fields = deserialize_fields(&value);
+                self.strip_tombstoned_fields(type_name, &mut fields);
+                out.push(Object {
+                    type_name: type_name.into(),
+                    id: object_id,
+                    fields,
+                    raw_fields: None,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// The value stored in an `i:` entry for an object serialized as
+    /// `serialized`: the object itself (a covering index — the read builds
+    /// the row straight from the entry), or nothing once the object is larger
+    /// than [`OpenOptions::cover_max_bytes`]. An empty value is the
+    /// long-standing "not covering" form every index reader already handles
+    /// by fetching the row from `o:` (GH #26).
+    fn index_cover_payload(&self, serialized: &Bytes) -> Bytes {
+        if serialized.len() > self.opts.cover_max_bytes {
+            Bytes::new()
+        } else {
+            serialized.clone()
+        }
     }
 
     /// Remove a secondary index entry. Same dispatch as `insert_field_index`.
@@ -7378,14 +7397,9 @@ impl Database {
     /// Rewrite every outbound rev_edge whose source is `(type_name, object_id)`.
     /// For each forward (non-inverse) relation, walk every linked target in
     /// the edge index and `put` a freshly built `build_covering_rev_value`
-    /// payload at `r:<target>:<rel>:<source>`. This is the Phase 1 work
-    /// `update()` does for the source-side cover refresh; the cover-refresh
-    /// worker calls the same code to repair stale covers in OTHER sources
-    /// after a target's data changes.
-    ///
-    /// `source_data` provides the source object's effective scalar bytes —
-    /// `Some(b)` for `update()` (where the new bytes haven't been committed
-    /// yet) and the current persisted bytes for the worker path.
+    /// payload at `r:<target>:<rel>:<source>`. The cover-refresh worker calls
+    /// this to repair stale peer covers in a source after one of its targets'
+    /// data changes.
     ///
     /// `skip_field`: a relation whose entries need no rewrite (the worker
     /// passes the field through which the updated target is reached — that
@@ -7396,7 +7410,6 @@ impl Database {
         txn: &mut rhypedb_storage::mvcc::Transaction,
         type_name: &str,
         object_id: u64,
-        source_data: Option<&[u8]>,
         skip_field: Option<&str>,
     ) -> EngineResult<usize> {
         let Some(type_def) = self.schema.get_type(type_name) else {
@@ -7432,7 +7445,6 @@ impl Database {
                     txn,
                     type_name,
                     object_id,
-                    source_data,
                     &field.name,
                     target_id,
                 )?;
@@ -7551,15 +7563,16 @@ impl Database {
                         continue;
                     };
                     let obj_key = KeyBuilder::object(s_type_id, s_id);
-                    let Some(s_bytes) = self.storage.get(&txn, &obj_key)? else {
+                    // Existence check inside the write txn: a source deleted
+                    // since Phase A must not get its rev edges resurrected.
+                    if self.storage.get(&txn, &obj_key)?.is_none() {
                         continue;
-                    };
+                    }
                     let s_type_name = s_type_name.clone();
                     written += self.refresh_outbound_rev_edges(
                         &mut txn,
                         &s_type_name,
                         s_id,
-                        Some(&s_bytes),
                         skip_field,
                     )?;
                 }
@@ -7930,7 +7943,6 @@ fn shadow_stripped_blob(db: &Database, data: Bytes) -> Bytes {
 fn build_inflight_cover(
     db: &Database,
     txn: &rhypedb_storage::mvcc::Transaction,
-    scalar_fields: &FieldMap,
     this_field: &str,
     this_target: u64,
     links: &[(String, u64, String, Bytes, u64, u64, bool)],
@@ -7945,11 +7957,10 @@ fn build_inflight_cover(
         return Ok(Bytes::new());
     }
 
-    let mut effective = scalar_fields.clone();
-    // Card 2: never bake the source's `<field>__shadow` siblings into a cover.
-    if migration_in_flight(db) {
-        strip_shadow_from_cover(&mut effective);
-    }
+    // GH #26: the source's own scalars are NOT embedded — no reader consumes
+    // them (see `build_covering_rev_value`). The value carries only the peer
+    // ids and the peers' capped covers.
+    let mut effective = FieldMap::new();
     effective.insert(this_field.to_string(), Value::U64(this_target));
     for link in &other_1to1 {
         effective.insert(link.0.clone(), Value::U64(link.1));
@@ -7959,10 +7970,25 @@ fn build_inflight_cover(
         // recursion as build_covering_rev_value does at link() time. The
         // type of the link's target is stored as link.2.
         let nested = with_nested_forward_covers(db, txn, &link.2, link.3.clone(), link.1)?;
-        effective.insert(format!("{}__cover", link.0), Value::Bytes(nested));
-        effective.insert(format!("{}__cover_v", link.0), Value::U64(link.4));
+        insert_target_cover(db, &mut effective, &link.0, nested, link.4);
     }
     Ok(serialize_fields(&effective))
+}
+
+/// Embed one peer target's serialized object under `<name>__cover` with its
+/// generation stamp under `<name>__cover_v` — unless the blob is larger than
+/// [`OpenOptions::cover_max_bytes`]. An oversized target is left uncovered:
+/// the peer id (already in the map) still lets the executor's fusion path
+/// find it, and an absent `__cover` routes that id through the ordinary
+/// per-id probe — the same path a stale cover takes. Copying a large object
+/// into every rev edge that reaches it is what made a text-heavy type grow
+/// ~15x on disk (GH #26).
+fn insert_target_cover(db: &Database, map: &mut FieldMap, name: &str, blob: Bytes, version: u64) {
+    if blob.len() > db.opts.cover_max_bytes {
+        return;
+    }
+    map.insert(format!("{name}__cover"), Value::Bytes(blob));
+    map.insert(format!("{name}__cover_v"), Value::U64(version));
 }
 
 fn build_covering_rev_value(
@@ -7970,7 +7996,6 @@ fn build_covering_rev_value(
     txn: &rhypedb_storage::mvcc::Transaction,
     source_type: &str,
     source_id: u64,
-    source_data: Option<&[u8]>,
     field_name: &str,
     target_id: u64,
 ) -> EngineResult<Bytes> {
@@ -8020,14 +8045,15 @@ fn build_covering_rev_value(
     // Cost: one extra `storage.get` per other_target at link() time. For the
     // bench's setup (1M ratings × 1 extra probe per second link), that's
     // ~30 seconds added to load — paid once, amortized across every read.
-    let mut effective = match source_data {
-        Some(bytes) => deserialize_fields(bytes),
-        None => FieldMap::new(),
-    };
-    // Card 2: never bake the source's `<field>__shadow` siblings into the cover.
-    if migration_in_flight(db) {
-        strip_shadow_from_cover(&mut effective);
-    }
+    //
+    // GH #26: the SOURCE's own scalar fields are deliberately NOT embedded.
+    // Nothing reads them: the executor's fusion path only extracts peer ids
+    // (`find_u64_field_in_raw`) and `<peer>__cover` blobs, a terminal
+    // materialize re-probes `o:`, a filter re-probes `o:`, and cascade delete
+    // only extracts peer ids. Embedding them copied the whole source object
+    // (a mail body, say) into every to-many rev edge, and forced every source
+    // update to rewrite all of its outbound rev edges.
+    let mut effective = FieldMap::new();
     effective.insert(field_name.to_string(), Value::U64(target_id));
     for (name, tid) in &other_targets {
         effective.insert(name.clone(), Value::U64(*tid));
@@ -8064,9 +8090,8 @@ fn build_covering_rev_value(
             if let Ok(Some(target_data)) = db.storage.get(txn, &target_key) {
                 let nested =
                     with_nested_forward_covers(db, txn, &rel.target_type, target_data, *tid)?;
-                effective.insert(format!("{name}__cover"), Value::Bytes(nested));
                 let target_version = db.object_version(&rel.target_type, *tid);
-                effective.insert(format!("{name}__cover_v"), Value::U64(target_version));
+                insert_target_cover(db, &mut effective, name, nested, target_version);
             }
         }
     }
@@ -8146,12 +8171,14 @@ fn with_nested_forward_covers(
         wrote_any = true;
         effective.insert(field.name.clone(), Value::U64(next_tid));
         // Card 2: the next-hop blob is embedded verbatim — strip its shadows.
-        effective.insert(
-            format!("{}__cover", field.name),
-            Value::Bytes(shadow_stripped_blob(db, next_data)),
-        );
         let next_v = db.object_version(&rel.target_type, next_tid);
-        effective.insert(format!("{}__cover_v", field.name), Value::U64(next_v));
+        insert_target_cover(
+            db,
+            &mut effective,
+            &field.name,
+            shadow_stripped_blob(db, next_data),
+            next_v,
+        );
     }
 
     if !wrote_any {
@@ -8550,7 +8577,7 @@ impl crate::catalog::FieldCoverMaintainer for Database {
                 && let Some(key) =
                     build_field_index_key(type_id, ifd.field_id, ifd.kind, value, object_id)
             {
-                out.push((key, serialized.clone()));
+                out.push((key, self.index_cover_payload(serialized)));
             }
         }
         out
@@ -8586,7 +8613,7 @@ impl crate::catalog::FieldCoverMaintainer for Database {
                 && let Some(key) =
                     build_field_index_key(type_id, ifd.field_id, ifd.kind, value, object_id)
             {
-                out.push((key, serialized.clone()));
+                out.push((key, self.index_cover_payload(serialized)));
             }
         }
         out
@@ -10712,6 +10739,13 @@ mod tests {
         // verb must refresh — the only shape that fails under name-based relation
         // enumeration.
         let rec_id = db.rel_ids()["User.recommendation"];
+        // Fresh covers carry no source scalars (GH #26); plant the legacy shape
+        // so the scalar verb's cover rewrite is exercised.
+        plant_legacy_source_scalars(
+            &db,
+            &KeyBuilder::reverse_edge(movie2.id, rec_id, user.id),
+            &[("name", Value::String("Alice".into()))],
+        );
 
         // Relation rename FIRST, then the scalar rename — the order that broke.
         // verb 1 re-keys cat.rel_ids (recommendation→suggested); verb 2 (scalar)
@@ -11121,6 +11155,23 @@ mod tests {
         assert_eq!(links[0].0, ub.id);
     }
 
+    /// Rewrite the rev_edge at `rev_key` into the PRE-GH-#26 shape, which
+    /// also embedded the source's own scalar fields. Covers written today
+    /// never carry them, but databases written before still do, and the
+    /// catalog's rename passes must keep those consistent.
+    fn plant_legacy_source_scalars(db: &Database, rev_key: &[u8], scalars: &[(&str, Value)]) {
+        let mut txn = db.storage().begin_txn();
+        let current = db.storage().get(&txn, rev_key).unwrap().expect("rev_edge exists");
+        let mut fields = crate::object::deserialize_fields(&current);
+        for (k, v) in scalars {
+            fields.insert((*k).into(), v.clone());
+        }
+        db.storage()
+            .put(&mut txn, rev_key, crate::object::serialize_fields(&fields))
+            .unwrap();
+        db.storage().commit(&mut txn).unwrap();
+    }
+
     /// rename_field rewrites the embedded source-side FieldMap inside
     /// every `r:<target>:<rel>:<source>` reverse-edge cover blob whose
     /// source is an object of the renamed type. Without this, the
@@ -11170,6 +11221,13 @@ mod tests {
         db.link("User", user.id, "favourite", movie1.id, None).unwrap();
         db.link("User", user.id, "recommendation", movie2.id, None).unwrap();
 
+        // Fresh covers carry no source scalars (GH #26); give this one the
+        // legacy shape so the rename's cover pass has something to rewrite.
+        use rhypedb_storage::key::KeyBuilder;
+        let rec_rel_id = db.rel_ids()["User.recommendation"];
+        let rev_key = KeyBuilder::reverse_edge(movie2.id, rec_rel_id, user.id);
+        plant_legacy_source_scalars(&db, &rev_key, &[("name", Value::String("Alice".into()))]);
+
         let report = db.rename_field("User", "name", "handle").unwrap();
         assert_eq!(report.renamed_fields.len(), 1);
         let pair = &report.renamed_fields[0];
@@ -11182,9 +11240,6 @@ mod tests {
 
         // Read the rev_edge for the second link directly and assert
         // its embedded FieldMap has `handle` (not `name`).
-        use rhypedb_storage::key::KeyBuilder;
-        let rec_rel_id = db.rel_ids()["User.recommendation"];
-        let rev_key = KeyBuilder::reverse_edge(movie2.id, rec_rel_id, user.id);
         let txn = db.storage().begin_txn();
         let rev_val = db
             .storage()
@@ -17622,6 +17677,89 @@ mod tests {
         assert_eq!(mid.len(), 1);
     }
 
+    /// GH #26 storage shape. A small row's `i:` entry is a covering copy, a
+    /// row past `cover_max_bytes` gets an empty entry; a rev edge never holds
+    /// its source's own scalars; a peer target past the cap keeps its id in
+    /// the rev edge but not a `__cover` copy.
+    #[test]
+    fn cover_cap_storage_shape() {
+        use rhypedb_storage::key::KeyBuilder;
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Thread { subject: String  notes: String }
+            type Label { name: String }
+            type Message {
+                date: u64 @indexed
+                body: String
+                thread: Thread
+                account: Thread
+                labels: [Label]
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mk = |t: &str, f: &[(&str, Value)]| {
+            let mut m = FieldMap::new();
+            for (k, v) in f {
+                m.insert((*k).into(), v.clone());
+            }
+            db.create(t, m).unwrap().id
+        };
+        let small_thread = mk("Thread", &[("subject", Value::String("hi".into()))]);
+        let big_thread = mk("Thread", &[("notes", Value::String("n".repeat(4000)))]);
+        let label = mk("Label", &[("name", Value::String("Inbox".into()))]);
+        let small = mk("Message", &[("date", Value::U64(1)), ("body", Value::String("short".into()))]);
+        let big = mk("Message", &[("date", Value::U64(2)), ("body", Value::String("b".repeat(4000)))]);
+        for (msg, account) in [(small, small_thread), (big, big_thread)] {
+            db.link("Message", msg, "thread", small_thread, None).unwrap();
+            db.link("Message", msg, "account", account, None).unwrap();
+            db.link("Message", msg, "labels", label, None).unwrap();
+        }
+
+        let snap = db.storage().read_snapshot();
+        let type_id = db.type_ids()["Message"];
+        let field_id = db.field_ids()["Message.date"];
+        let idx = db
+            .storage()
+            .scan_prefix_at(snap, &KeyBuilder::field_index_prefix(type_id, field_id))
+            .unwrap();
+        assert_eq!(idx.len(), 2);
+        assert!(!idx[0].1.is_empty(), "small row keeps its covering copy");
+        assert!(idx[1].1.is_empty(), "big row's index entry carries no copy");
+
+        let labels_rel = db.rel_ids()["Message.labels"];
+        for (msg, account) in [(small, small_thread), (big, big_thread)] {
+            let txn = db.storage().begin_txn();
+            let rev = db
+                .storage()
+                .get(&txn, &KeyBuilder::reverse_edge(label, labels_rel, msg))
+                .unwrap()
+                .unwrap();
+            drop(txn);
+            let f = deserialize_fields(&rev);
+            assert!(!f.contains_key("date") && !f.contains_key("body"), "no source scalars: {f:?}");
+            assert_eq!(f.get("thread"), Some(&Value::U64(small_thread)));
+            assert_eq!(f.get("account"), Some(&Value::U64(account)));
+            assert!(f.contains_key("thread__cover"), "small peer is covered");
+            assert_eq!(
+                f.contains_key("account__cover"),
+                account == small_thread,
+                "a peer past the cap is referenced by id only: {f:?}"
+            );
+            assert!(rev.len() < 200, "rev edge stays small: {} bytes", rev.len());
+        }
+
+        // Reads are unchanged: both messages come back whole through the index.
+        let got = db
+            .filter_scan("Message", "date", rhypedb_storage::zone::CompareOp::Ge, 0, None)
+            .unwrap();
+        let ids: Vec<u64> = got.iter().map(|o| o.id).collect();
+        assert_eq!(ids, vec![small, big]);
+        assert_eq!(got[1].fields.get("body"), Some(&Value::String("b".repeat(4000))));
+    }
+
     #[test]
     fn indexed_field_covering_returns_full_fieldmap() {
         // Covering index: filter_scan should return Movies with their full
@@ -18401,32 +18539,36 @@ mod tests {
     }
 
     #[test]
-    fn covered_rev_edge_refreshes_after_source_field_update() {
-        // Phase 1 staleness: the rev_edge stored on Movie's side for this
-        // Rating carries the Rating's effective fields verbatim (stars=5).
-        // Updating Rating.stars must rewrite that rev_edge value, or a
-        // downstream consumer reading the source covering sees stale data.
-        let (db, _uid, mid, rid, _dir) = build_one_rating(covering_schema());
+    fn rev_edge_cover_omits_source_scalars_and_survives_source_update() {
+        // GH #26: the rev_edge stored on Movie's side for this Rating carries
+        // the Rating's PEER ids and the peer's (User's) cover — never the
+        // Rating's own scalars, which no reader consumes. So a Rating update
+        // leaves the entry byte-for-byte unchanged instead of rewriting it.
+        let (db, uid, mid, rid, _dir) = build_one_rating(covering_schema());
+
+        let read_cover = |db: &Database| {
+            let groups = db.get_links_many("Movie", &[mid], "ratings").unwrap();
+            assert_eq!(groups[0].len(), 1);
+            assert_eq!(groups[0][0].0, rid);
+            groups[0][0].1.clone()
+        };
+        let before = read_cover(&db);
+        let cover_fields = deserialize_fields(&before);
+        assert_eq!(cover_fields.get("user"), Some(&Value::U64(uid)));
+        assert_eq!(cover_fields.get("movie"), Some(&Value::U64(mid)));
+        assert!(cover_fields.contains_key("user__cover"), "{cover_fields:?}");
+        assert!(
+            !cover_fields.contains_key("stars"),
+            "source scalars must not be copied into rev edges: {cover_fields:?}"
+        );
 
         let mut upd = FieldMap::new();
         upd.insert("stars".into(), Value::U32(1));
         db.update("Rating", rid, upd).unwrap();
-
-        let groups = db.get_links_many("Movie", &[mid], "ratings").unwrap();
-        let group = &groups[0];
-        assert_eq!(group.len(), 1);
-        let (got_rid, cover) = &group[0];
-        assert_eq!(*got_rid, rid);
-
-        // Decode the rev_edge value (it's a serialized FieldMap carrying the
-        // Rating's effective fields) and assert stars reflects the update.
-        let cover_fields = deserialize_fields(cover);
-        assert_eq!(
-            cover_fields.get("stars"),
-            Some(&Value::U32(1)),
-            "Phase 1: source object's update must propagate to its own \
-             covering rev_edge values"
-        );
+        assert_eq!(read_cover(&db), before, "a source update must not rewrite its rev edges");
+        // And the row itself reads the new value (from `o:`).
+        let r = db.get("Rating", rid).unwrap();
+        assert_eq!(r.fields.get("stars"), Some(&Value::U32(1)));
     }
 
     /// Open the covering-schema database with the background cover-refresh
