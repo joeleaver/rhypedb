@@ -19,9 +19,14 @@ const DEFAULT_COMPACT_TRIGGER_SSTS: usize = 4;
 pub struct LsmConfig {
     pub data_dir: PathBuf,
     pub memtable_flush_size: usize,
-    /// Auto-compact when the SST count reaches this many. Compaction merges
-    /// all SSTs into a single file; reduces read amplification (fewer bloom
-    /// checks, fewer cross-layer BTreeMap merges per scan).
+    /// Size-tiered compaction's minimum run: after a flush, merge a run of at
+    /// least this many similarly-sized SSTs (see `pick_tiered_run`). New data
+    /// is merged with data of similar size, never with the whole database, so
+    /// a compaction's cost tracks the data merged rather than the database
+    /// size. Reduces read amplification (fewer bloom checks, fewer
+    /// cross-layer merges per scan); the SST count grows roughly with
+    /// log2(database / memtable size). `LsmTree::compact` still merges
+    /// everything on request.
     pub compact_trigger_ssts: usize,
     /// Optional closure that pulls zone-mapped integer field values out of
     /// each SST entry's value bytes. Set by the engine at construction time
@@ -115,7 +120,9 @@ pub struct LsmTree {
     config: LsmConfig,
     active_memtable: Arc<RwLock<Arc<MemTable>>>,
     immutable_memtables: Arc<RwLock<Vec<Arc<MemTable>>>>,
-    sst_files: Arc<RwLock<Vec<SstReader>>>,
+    /// Oldest → newest. `Arc` so a compaction can hold its inputs for a long
+    /// streaming merge without holding this lock (which would stall flushes).
+    sst_files: Arc<RwLock<Vec<Arc<SstReader>>>>,
     wal: Arc<parking_lot::Mutex<Wal>>,
     txn_manager: Arc<TransactionManager>,
     /// Coordinates concurrent writers against `flush()`. Every writer holds
@@ -263,7 +270,7 @@ impl LsmTree {
                 with_id.push((id, sst_max_version, reader));
             }
             with_id.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-            sst_readers = with_id.into_iter().map(|(_, _, r)| r).collect();
+            sst_readers = with_id.into_iter().map(|(_, _, r)| Arc::new(r)).collect();
         }
 
         // Replay WAL into a memtable, tracking max version.
@@ -1036,7 +1043,7 @@ impl LsmTree {
                 if self.config.background_compaction {
                     self.signal_compaction();
                 } else {
-                    self.compact()?;
+                    self.compact_tiered()?;
                 }
             }
         }
@@ -1113,10 +1120,13 @@ impl LsmTree {
         // (Not a Drop guard: a crash-injected panic must leave the tmp behind
         // for the open-time sweep, exactly like a real crash.)
         let discard_tmp = |_: &Error| discard_sst_tmp(&sst_path);
-        let mut writer = SstWriter::new_with_options(
+        // The memtable's entry count bounds its distinct keys, so the bloom
+        // filter is built as entries stream out (no per-key buffering).
+        let mut writer = SstWriter::new_with_key_bound(
             &sst_path,
             self.config.zone_extractor.clone(),
             self.config.block_compression,
+            old_memtable.len(),
         )
         .inspect_err(discard_tmp)?;
         for (key, value) in old_memtable.iter() {
@@ -1130,7 +1140,7 @@ impl LsmTree {
 
         // Open the new SST for reads and remove from immutable list.
         let reader = SstReader::open(&sst_path)?;
-        self.sst_files.write().push(reader);
+        self.sst_files.write().push(Arc::new(reader));
         // CRASH BOUNDARY: SST registered in RAM, WAL still full. In-RAM
         // registration is lost on reopen (rebuilt by the SST dir scan).
         crash_inject::hit(Site::FlushAfterSstRegister);
@@ -1241,61 +1251,70 @@ impl LsmTree {
         })
     }
 
-    /// Compact all SST files into a single new SST, dropping old versions
-    /// and tombstones that are no longer needed by any active transaction.
+    /// Compact ALL SST files into a single new SST (a "major" compaction),
+    /// dropping versions no active transaction can see and tombstones that no
+    /// longer shadow anything.
     ///
     /// Synchronous: blocks until the merge is done. Acquires
     /// `compaction_mutex` so it serializes against the background worker
     /// (avoids two concurrent merges racing on the final swap).
     pub fn compact(&self) -> Result<()> {
         let _guard = self.compaction_mutex.lock();
-        self.compact_inner()
+        self.compact_inner(CompactionScope::All).map(|_| ())
     }
 
-    /// The compaction body — the bytes-moving work. Called by both the
-    /// public sync `compact()` and the background worker, both of which
-    /// hold `compaction_mutex` so this body never runs concurrently with
-    /// itself.
-    fn compact_inner(&self) -> Result<()> {
+    /// Run size-tiered compaction until no run qualifies (see
+    /// [`pick_tiered_run`]). What the automatic trigger does — merges new
+    /// data with data of similar size instead of rewriting the whole
+    /// database every few flushes (GH #28). Synchronous.
+    pub fn compact_tiered(&self) -> Result<()> {
+        let _guard = self.compaction_mutex.lock();
+        while self.compact_inner(CompactionScope::Tiered)? {}
+        Ok(())
+    }
+
+    /// The compaction body — the bytes-moving work. Called by `compact`,
+    /// `compact_tiered` and the background worker, all of which hold
+    /// `compaction_mutex` so this body never runs concurrently with itself.
+    /// Returns whether it merged anything.
+    ///
+    /// Memory is bounded by the number of inputs, not their size (GH #28):
+    /// a k-way merge pulls one entry at a time from each input's block cursor
+    /// and streams it to the writer, whose bloom filter is built as keys pass.
+    fn compact_inner(&self, scope: CompactionScope) -> Result<bool> {
         // Destructive boundary: compaction writes a merged SST and unlinks the
         // inputs. Confirm data-dir ownership before mutating the SST set.
         self.dir_guard.verify_owner()?;
-        let ssts = self.sst_files.read();
-        if ssts.len() < 2 {
-            return Ok(());
-        }
 
-        let min_snapshot = self.txn_manager.min_active_snapshot();
-
-        // Merge all SST iterators into a single sorted stream.
-        // Since each SST is already sorted and SSTs are ordered oldest→newest,
-        // we collect all entries and sort. For a production system you'd use
-        // a merge iterator, but this is correct and simple.
-        // Capture the EXACT set of SSTs being merged while still holding the
-        // read lock. `flush()` only ever APPENDS to `sst_files`, and the read
-        // lock blocks it from doing so right now — so any SST that appears after
-        // we `drop(ssts)` is a flush that raced the (lock-free) merge below and
-        // carries committed data we must NEITHER merge NOR delete. The old code
-        // replaced the whole list (`clear()`) and deleted every file, silently
-        // destroying those concurrently-flushed SSTs.
+        // Capture the EXACT set of SSTs being merged while holding the read
+        // lock. `flush()` only ever APPENDS to `sst_files`, and the read lock
+        // blocks it right now — so any SST that appears after we release it is
+        // a flush that raced the (lock-free) merge below and carries committed
+        // data we must NEITHER merge NOR delete. The run is CONTIGUOUS in the
+        // oldest→newest order, so the merged output can take its place without
+        // reordering shadowing between files.
+        let (inputs, bottommost, min_snapshot) = {
+            let ssts = self.sst_files.read();
+            let run = match scope {
+                CompactionScope::All if ssts.len() >= 2 => 0..ssts.len(),
+                CompactionScope::All => return Ok(false),
+                CompactionScope::Tiered => {
+                    let sizes: Vec<u64> = ssts.iter().map(|s| s.file_size()).collect();
+                    match pick_tiered_run(&sizes, self.config.compact_trigger_ssts) {
+                        Some(run) => run,
+                        None => return Ok(false),
+                    }
+                }
+            };
+            // No SST older than the run: a tombstone at the run's floor then
+            // shadows nothing and can go.
+            let bottommost = run.start == 0;
+            let inputs: Vec<Arc<SstReader>> = ssts[run].to_vec();
+            (inputs, bottommost, self.txn_manager.min_active_snapshot())
+        };
         let merged_paths: Vec<PathBuf> =
-            ssts.iter().map(|s| s.path().to_path_buf()).collect();
+            inputs.iter().map(|s| s.path().to_path_buf()).collect();
 
-        let mut all_entries: Vec<(Bytes, Option<Bytes>)> = Vec::new();
-        for sst in ssts.iter() {
-            // Fallible walk: a corrupt block ABORTS the compaction (propagated
-            // up) BEFORE the merged SST is written and the inputs are deleted —
-            // preserving the inputs, exactly as the old v5 iterator's panic did.
-            // The silent-stopping `iter()` would truncate the merge and then the
-            // inputs would be unlinked = permanent data loss.
-            sst.try_for_each_entry(|key, value| all_entries.push((key, value)))?;
-        }
-        drop(ssts);
-
-        all_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        // Write merged entries to a new SST, keeping only the latest version
-        // of each user key that's still needed.
         let sst_id = self
             .next_sst_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1310,56 +1329,27 @@ impl LsmTree {
         // that error path — otherwise each retry (the background worker
         // re-triggers) strands another one until a restart's open-time sweep.
         let discard_tmp = |_: &Error| discard_sst_tmp(&sst_path);
-        let mut writer = SstWriter::new_with_options(
+        let key_bound: usize = inputs.iter().map(|s| s.max_entry_count()).sum();
+        let mut writer = SstWriter::new_with_key_bound(
             &sst_path,
             self.config.zone_extractor.clone(),
             self.config.block_compression,
+            key_bound,
         )
         .inspect_err(discard_tmp)?;
-        let mut prev_user_key: Option<Vec<u8>> = None;
-        // Entries arrive newest-version-first within each user key (version is
-        // stored bit-complemented, so larger versions sort first). For each key
-        // we keep every version down to AND INCLUDING the "floor" — the newest
-        // version that is <= min_snapshot. That floor is the value the OLDEST
-        // active reader (min_active_snapshot) still sees; every version strictly
-        // older than the floor is invisible to all readers and is dropped.
-        //
-        // Keeping only "latest + versions >= min_snapshot" (the previous rule)
-        // wrongly dropped a floor version that sits STRICTLY BELOW min_snapshot,
-        // stranding a long-lived reader whose visible version of a
-        // concurrently-updated key is below its snapshot — e.g. a logical export
-        // that pins a snapshot while another txn updates a row it has not yet
-        // scanned. With no active reader, min_snapshot is u64::MAX, the latest
-        // version is itself the floor, and this collapses to "keep only latest".
-        let mut floor_kept_for_key = false;
 
-        for (key, value) in &all_entries {
-            if key.len() < 8 {
-                continue;
+        // Fallible walks: a corrupt block ABORTS the compaction (propagated up)
+        // BEFORE the merged SST is published and the inputs are deleted —
+        // preserving the inputs. A silently-stopping walk would truncate the
+        // merge and then the inputs would be unlinked = permanent data loss.
+        let mut merge = KWayMerge::new(&inputs).inspect_err(discard_tmp)?;
+        let mut gc = VersionGc::new(min_snapshot, bottommost);
+        while let Some((key, value)) = merge.next_entry().inspect_err(discard_tmp)? {
+            if gc.keep(&key, value.is_none()) {
+                writer.add(&key, &value).inspect_err(discard_tmp)?;
             }
-            let user_key = &key[..key.len() - 8];
-            let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-            let version = !u64::from_be_bytes(ver_bytes);
-
-            let same_key = prev_user_key
-                .as_ref()
-                .is_some_and(|prev| prev.as_slice() == user_key);
-
-            if !same_key {
-                prev_user_key = Some(user_key.to_vec());
-                floor_kept_for_key = false;
-            }
-
-            if !floor_kept_for_key {
-                // Newest-first: keep until (and including) the floor at
-                // min_snapshot. The latest version is always the first kept.
-                writer.add(key, value).inspect_err(discard_tmp)?;
-                if version <= min_snapshot {
-                    floor_kept_for_key = true;
-                }
-            }
-            // Once the floor is kept, strictly older versions are dropped.
         }
+        drop(merge);
 
         let meta = writer.finish().inspect_err(discard_tmp)?;
         // CRASH BOUNDARY: merged SST published on disk; inputs still present and
@@ -1367,48 +1357,46 @@ impl LsmTree {
         // but correct — same versions dedupe; the next compaction reclaims them).
         crash_inject::hit(Site::CompactionAfterMergedPublished);
 
-        // The exact set of files we merged (captured under the read lock). Any
-        // SST NOT in this set was flushed concurrently and must be preserved.
         let merged: HashSet<&Path> = merged_paths.iter().map(|p| p.as_path()).collect();
-
-        if meta.entry_count == 0 {
-            // Everything we merged was compacted away — drop the empty output
-            // and the merged SSTs, but KEEP any concurrently-flushed SSTs.
+        let new_reader = if meta.entry_count == 0 {
+            // Everything we merged was compacted away — drop the empty output.
             let _ = std::fs::remove_file(&sst_path);
-            {
-                let mut ssts = self.sst_files.write();
-                let kept: Vec<SstReader> = std::mem::take(&mut *ssts)
-                    .into_iter()
-                    .filter(|s| !merged.contains(s.path()))
-                    .collect();
-                *ssts = kept;
-            }
-            for path in &merged_paths {
-                let _ = std::fs::remove_file(path);
-            }
-            return Ok(());
-        }
+            None
+        } else {
+            Some(Arc::new(SstReader::open(&sst_path)?))
+        };
 
-        // Swap the merged SSTs for the new compacted one, PRESERVING any SST
-        // flushed while the merge ran. The merged SST holds the oldest data, so
-        // it goes first; concurrently-flushed (newer) SSTs follow, keeping
-        // `sst_files` oldest→newest so point reads' newest-first `.rev()` and the
-        // scan readers' oldest-first BTreeMap merge both resolve the newest
-        // version of every key. `open()` reconstructs this exact order by max
-        // version (not file id), so it survives a restart too — see `open()`.
-        let new_reader = SstReader::open(&sst_path)?;
+        // Splice the output in where the merged run was, PRESERVING every SST
+        // outside the run — older ones before it, and newer ones after it
+        // (including any flushed while the merge ran). This keeps `sst_files`
+        // oldest→newest, so point reads' newest-first `.rev()` and the scan
+        // readers' oldest-first BTreeMap merge both resolve the newest version
+        // of every key. `open()` reconstructs this exact order by max version
+        // (not file id), so it survives a restart too — see `open()`.
         {
             let mut ssts = self.sst_files.write();
-            let kept: Vec<SstReader> = std::mem::take(&mut *ssts)
-                .into_iter()
-                .filter(|s| !merged.contains(s.path()))
-                .collect();
-            ssts.push(new_reader);
-            ssts.extend(kept);
+            let old = std::mem::take(&mut *ssts);
+            let mut spliced = Vec::with_capacity(old.len() + 1);
+            let mut output = new_reader;
+            for s in old {
+                if merged.contains(s.path()) {
+                    if let Some(r) = output.take() {
+                        spliced.push(r);
+                    }
+                } else {
+                    spliced.push(s);
+                }
+            }
+            *ssts = spliced;
         }
         // CRASH BOUNDARY: in-RAM swap done (lost on reopen — rebuilt by the dir
         // scan), inputs still on disk. Same recoverable state as above.
         crash_inject::hit(Site::CompactionAfterSwap);
+
+        // Release our handles on the inputs BEFORE unlinking them: once no
+        // `Arc` remains, their mappings are unmapped (and on platforms that
+        // refuse to delete a mapped file, the unlink can succeed).
+        drop(inputs);
 
         // Delete ONLY the files we actually merged.
         for path in &merged_paths {
@@ -1419,7 +1407,7 @@ impl LsmTree {
             crash_inject::hit(Site::CompactionMidUnlink);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Returns a reference to the transaction manager.
@@ -1509,7 +1497,14 @@ fn compaction_worker(
             // Errors are logged (best-effort) but don't kill the worker —
             // an SST write failure on one cycle shouldn't prevent us from
             // trying again on the next signal.
-            let _ = lsm.compact_inner();
+            // Size-tiered, repeated while a run qualifies (one merge can
+            // complete the next tier). Stop early on shutdown.
+            loop {
+                match lsm.compact_inner(CompactionScope::Tiered) {
+                    Ok(true) if !state.0.lock().shutdown => continue,
+                    _ => break,
+                }
+            }
         }
 
         // Phase C: mark idle and wake any `wait_for_compaction` callers.
@@ -1524,6 +1519,198 @@ fn compaction_worker(
     guard.pending = false;
     guard.running = false;
     state.1.notify_all();
+}
+
+
+/// Which SSTs a compaction merges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionScope {
+    /// Every SST into one (explicit `compact()`).
+    All,
+    /// A contiguous run of similarly-sized SSTs ([`pick_tiered_run`]).
+    Tiered,
+}
+
+/// An older SST joins a candidate run when it is at most this many times the
+/// run's accumulated size. 1 means new data is merged with old data only once
+/// it has grown to the old data's size, so each byte is rewritten about
+/// log2(database / memtable) times over the database's life, instead of on
+/// every compaction.
+const TIER_SIZE_RATIO: u64 = 1;
+
+/// Read-amplification backstop: with this many times `min_merge` SSTs and no
+/// run qualifying by size, merge the cheapest window of `min_merge` anyway.
+const MAX_SSTS_FACTOR: usize = 8;
+
+/// Size-tiered run selection over SST sizes ordered oldest → newest. Returns
+/// a contiguous index range to merge, or `None`.
+///
+/// Candidate runs start at each file from the newest down and grow toward
+/// older files while the next older file is no bigger than
+/// `TIER_SIZE_RATIO` × the run so far; the first run of at least `min_merge`
+/// files wins. Merging new data with data of similar size keeps the cost of
+/// a compaction proportional to the data being merged, not to the database
+/// (GH #28: merging everything rewrote a 275 MB file every 16 MB of writes).
+fn pick_tiered_run(sizes: &[u64], min_merge: usize) -> Option<std::ops::Range<usize>> {
+    let min_merge = min_merge.max(2);
+    let n = sizes.len();
+    if n < min_merge {
+        return None;
+    }
+    for end in (0..n).rev() {
+        if end + 1 < min_merge {
+            break;
+        }
+        let mut start = end;
+        let mut sum = sizes[end];
+        while start > 0 && sizes[start - 1] <= sum.saturating_mul(TIER_SIZE_RATIO) {
+            start -= 1;
+            sum = sum.saturating_add(sizes[start]);
+        }
+        if end + 1 - start >= min_merge {
+            return Some(start..end + 1);
+        }
+    }
+    if n >= min_merge.saturating_mul(MAX_SSTS_FACTOR) {
+        let start = (0..=n - min_merge)
+            .min_by_key(|&i| sizes[i..i + min_merge].iter().sum::<u64>())
+            .expect("n >= min_merge");
+        return Some(start..start + min_merge);
+    }
+    None
+}
+
+/// Streaming k-way merge of SSTs' entries in internal-key order, holding one
+/// block per input. An internal key present in more than one input (left by a
+/// compaction that crashed before unlinking its inputs) is yielded once — its
+/// copies are identical.
+struct KWayMerge<'a> {
+    cursors: Vec<crate::sst::SstEntryCursor<'a>>,
+    /// Each cursor's current entry's value; its key lives in `heap`.
+    heads: Vec<Option<Bytes>>,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(Bytes, usize)>>,
+    last: Option<Bytes>,
+}
+
+impl<'a> KWayMerge<'a> {
+    fn new(inputs: &'a [Arc<SstReader>]) -> Result<Self> {
+        let mut m = Self {
+            cursors: inputs.iter().map(|r| r.entry_cursor()).collect(),
+            heads: vec![None; inputs.len()],
+            heap: std::collections::BinaryHeap::with_capacity(inputs.len()),
+            last: None,
+        };
+        for i in 0..m.cursors.len() {
+            m.advance(i)?;
+        }
+        Ok(m)
+    }
+
+    fn advance(&mut self, i: usize) -> Result<()> {
+        if let Some(entry) = self.cursors[i].next() {
+            let (key, value) = entry?;
+            self.heads[i] = value;
+            self.heap.push(std::cmp::Reverse((key, i)));
+        }
+        Ok(())
+    }
+
+    fn next_entry(&mut self) -> Result<Option<(Bytes, Option<Bytes>)>> {
+        while let Some(std::cmp::Reverse((key, i))) = self.heap.pop() {
+            let value = self.heads[i].take();
+            self.advance(i)?;
+            if self.last.as_ref() == Some(&key) {
+                continue;
+            }
+            self.last = Some(key.clone());
+            return Ok(Some((key, value)));
+        }
+        Ok(None)
+    }
+}
+
+/// Decides which merged entries a compaction keeps.
+///
+/// Per user key, entries arrive newest version first (the version is stored
+/// bit-complemented). Keep every version down to AND INCLUDING the "floor" —
+/// the newest version `<= min_snapshot`, the value the OLDEST active reader
+/// still sees; every version strictly older than the floor is invisible to all
+/// readers and is dropped. (Keeping only "latest + versions >= min_snapshot"
+/// would wrongly drop a floor STRICTLY BELOW min_snapshot, stranding a
+/// long-lived reader.) With no active reader, min_snapshot is u64::MAX and
+/// this collapses to "keep only the latest".
+///
+/// When the merge is bottommost (no older SST outside it), a floor that is a
+/// TOMBSTONE shadows nothing any reader can see, so it is dropped too.
+///
+/// A key's entries are NOT always adjacent: internal keys are compared as raw
+/// bytes, so a key extending `K` with 0xFF bytes can sort between two of K's
+/// versions (GH #27). K's entries all lie in `[K ‖ 00×8, K ‖ FF×8]`, so this
+/// tracks every key whose range is still open — at most the keys that are
+/// prefixes of the current one, in practice one — instead of only the
+/// previous key, which would re-emit K's older versions as if new (and
+/// resurrect a deleted value once its tombstone is dropped).
+struct VersionGc {
+    min_snapshot: u64,
+    bottommost: bool,
+    open: Vec<OpenKey>,
+    spare: Vec<Vec<u8>>,
+}
+
+struct OpenKey {
+    user_key: Vec<u8>,
+    floor_kept: bool,
+}
+
+impl VersionGc {
+    fn new(min_snapshot: u64, bottommost: bool) -> Self {
+        Self { min_snapshot, bottommost, open: Vec::new(), spare: Vec::new() }
+    }
+
+    /// Whether to write `internal_key` (`is_tombstone`: its value is a delete).
+    fn keep(&mut self, internal_key: &[u8], is_tombstone: bool) -> bool {
+        if internal_key.len() < 8 {
+            return false;
+        }
+        let user_key = &internal_key[..internal_key.len() - 8];
+        let version = !u64::from_be_bytes(internal_key[internal_key.len() - 8..].try_into().unwrap());
+
+        // Close every key whose range this entry is past.
+        let mut i = 0;
+        while i < self.open.len() {
+            let past = internal_key
+                .iter()
+                .cmp(self.open[i].user_key.iter().chain([0xFFu8; 8].iter()))
+                == std::cmp::Ordering::Greater;
+            if past {
+                self.spare.push(self.open.swap_remove(i).user_key);
+            } else {
+                i += 1;
+            }
+        }
+        let idx = match self.open.iter().position(|o| o.user_key == user_key) {
+            Some(idx) => idx,
+            None => {
+                // First (newest) entry of this key.
+                let mut buf = self.spare.pop().unwrap_or_default();
+                buf.clear();
+                buf.extend_from_slice(user_key);
+                self.open.push(OpenKey { user_key: buf, floor_kept: false });
+                self.open.len() - 1
+            }
+        };
+        let key = &mut self.open[idx];
+        if key.floor_kept {
+            return false;
+        }
+        if version <= self.min_snapshot {
+            key.floor_kept = true;
+            if is_tombstone && self.bottommost {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -4163,6 +4350,260 @@ mod tests {
                     tree.get_at(snap, k).unwrap().as_deref(),
                     want,
                     "{compression:?} get {k:?}"
+                );
+            }
+        }
+    }
+
+    // --- GH #28: size-tiered, streaming compaction --------------------------
+
+    #[test]
+    fn pick_tiered_run_merges_similar_sizes_from_the_newest_end() {
+        // Too few files.
+        assert_eq!(pick_tiered_run(&[4, 4, 4], 4), None);
+        // Four equal flushes merge.
+        assert_eq!(pick_tiered_run(&[4, 4, 4, 4], 4), Some(0..4));
+        // A big old file is left alone until the newer data reaches its size.
+        assert_eq!(pick_tiered_run(&[275, 4, 4, 4, 4], 4), Some(1..5));
+        assert_eq!(pick_tiered_run(&[275, 64, 16, 4], 4), None);
+        // ...and joins once it has.
+        assert_eq!(pick_tiered_run(&[16, 4, 4, 4, 4], 4), Some(0..5));
+        // A newer, bigger file absorbs the smaller ones behind it...
+        assert_eq!(pick_tiered_run(&[275, 4, 4, 4, 4, 100], 4), Some(1..6));
+        // ...but a run need not end at the newest file.
+        assert_eq!(pick_tiered_run(&[275, 4, 4, 4, 4, 1], 4), Some(1..5));
+        // Read-amplification backstop: strictly growing sizes never form a
+        // run, but 8x min_merge files force the cheapest window.
+        let growing: Vec<u64> = (0..32).map(|i| 1u64 << (32 - i)).collect();
+        assert_eq!(pick_tiered_run(&growing[..31], 4), None);
+        assert_eq!(pick_tiered_run(&growing, 4), Some(28..32));
+    }
+
+    fn put_kv(tree: &LsmTree, k: &[u8], v: &[u8]) {
+        let mut txn = tree.begin_txn();
+        tree.put(&mut txn, k, Bytes::copy_from_slice(v)).unwrap();
+        tree.commit(&mut txn).unwrap();
+    }
+
+    fn del_k(tree: &LsmTree, k: &[u8]) {
+        let mut txn = tree.begin_txn();
+        tree.delete(&mut txn, k).unwrap();
+        tree.commit(&mut txn).unwrap();
+    }
+
+    fn sst_names(tree: &LsmTree) -> Vec<PathBuf> {
+        tree.sst_files.read().iter().map(|s| s.path().to_path_buf()).collect()
+    }
+
+    /// The point of #28: new data no longer forces a rewrite of the big old
+    /// SST — tiered compaction merges the small new files among themselves.
+    #[test]
+    fn tiered_compaction_leaves_a_big_old_sst_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.memtable_flush_size = usize::MAX;
+        cfg.compact_trigger_ssts = 4;
+        let tree = LsmTree::open(cfg).unwrap();
+        let big_val = vec![b'x'; 1000];
+        for i in 0..2000u32 {
+            put_kv(&tree, format!("big{i:05}").as_bytes(), &big_val);
+        }
+        tree.flush().unwrap();
+        let big = sst_names(&tree);
+        assert_eq!(big.len(), 1);
+        for f in 0..4u32 {
+            put_kv(&tree, format!("small{f}").as_bytes(), b"v");
+            tree.flush().unwrap();
+        }
+        assert_eq!(tree.sst_count(), 5);
+        tree.compact_tiered().unwrap();
+        let after = sst_names(&tree);
+        assert_eq!(after.len(), 2, "the four small SSTs merge into one");
+        assert_eq!(after[0], big[0], "the big SST is untouched (same file)");
+        let snap = tree.read_snapshot();
+        for f in 0..4u32 {
+            assert_eq!(
+                tree.get_at(snap, format!("small{f}").as_bytes()).unwrap().as_deref(),
+                Some(&b"v"[..])
+            );
+        }
+        assert_eq!(
+            tree.get_at(snap, b"big00042").unwrap().as_deref(),
+            Some(big_val.as_slice())
+        );
+    }
+
+    /// A tombstone is dropped only when the merge is bottommost; above older
+    /// data it must survive, or the deleted value would reappear.
+    #[test]
+    fn tombstones_drop_only_in_a_bottommost_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.memtable_flush_size = usize::MAX;
+        cfg.compact_trigger_ssts = 4;
+        let tree = LsmTree::open(cfg).unwrap();
+        // Big old SST holding the value.
+        let filler = vec![b'f'; 1000];
+        for i in 0..1000u32 {
+            put_kv(&tree, format!("fill{i:05}").as_bytes(), &filler);
+        }
+        put_kv(&tree, b"victim", b"alive");
+        tree.flush().unwrap();
+        // Four small SSTs, one carrying the tombstone.
+        del_k(&tree, b"victim");
+        tree.flush().unwrap();
+        for f in 0..3u32 {
+            put_kv(&tree, format!("s{f}").as_bytes(), b"v");
+            tree.flush().unwrap();
+        }
+        tree.compact_tiered().unwrap();
+        assert_eq!(tree.sst_count(), 2, "small SSTs merged above the big one");
+        let snap = tree.read_snapshot();
+        assert_eq!(tree.get_at(snap, b"victim").unwrap(), None, "tombstone kept");
+        let mut tomb = 0;
+        tree.sst_files.read()[1]
+            .try_for_each_entry(|k, v| {
+                if &k[..k.len() - 8] == b"victim" && v.is_none() {
+                    tomb += 1;
+                }
+            })
+            .unwrap();
+        assert_eq!(tomb, 1, "non-bottommost merge must keep the tombstone");
+
+        // A full (bottommost) compaction removes both the value and the tombstone.
+        tree.compact().unwrap();
+        assert_eq!(tree.get_at(tree.read_snapshot(), b"victim").unwrap(), None);
+        let mut victim_entries = 0;
+        tree.sst_files.read()[0]
+            .try_for_each_entry(|k, _| {
+                if &k[..k.len() - 8] == b"victim" {
+                    victim_entries += 1;
+                }
+            })
+            .unwrap();
+        assert_eq!(victim_entries, 0);
+        drop(tree);
+        let reopened = LsmTree::open(test_config(dir.path())).unwrap();
+        assert_eq!(reopened.get_at(reopened.read_snapshot(), b"victim").unwrap(), None);
+    }
+
+    /// A key that extends `K` with 0xFF bytes sorts BETWEEN K's tombstone and
+    /// K's older value. Version GC must still treat them as one key: drop the
+    /// older value (not re-emit it as a "new" key) when the tombstone goes.
+    #[test]
+    fn compaction_gc_groups_versions_split_by_an_interleaved_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.memtable_flush_size = usize::MAX;
+        let tree = LsmTree::open(cfg).unwrap();
+        put_kv(&tree, b"K", b"old"); // version 1: inverted ..FE
+        for i in 0..8u32 {
+            put_kv(&tree, format!("pad{i}").as_bytes(), b"p");
+        }
+        del_k(&tree, b"K"); // version 10: inverted ..F5
+        // K ‖ FF×7 ‖ F8 ‖ 'z' sorts between ..F5 and ..FE.
+        let mut between = b"K".to_vec();
+        between.extend_from_slice(&[0xFF; 7]);
+        between.extend_from_slice(&[0xF8, b'z']);
+        put_kv(&tree, &between, b"neighbor");
+        tree.flush().unwrap();
+        put_kv(&tree, b"other", b"o");
+        tree.flush().unwrap();
+        tree.compact().unwrap();
+        let snap = tree.read_snapshot();
+        assert_eq!(tree.get_at(snap, b"K").unwrap(), None, "deleted K resurrected");
+        assert_eq!(tree.get_at(snap, &between).unwrap().as_deref(), Some(&b"neighbor"[..]));
+        let mut k_entries = 0;
+        tree.sst_files.read()[0]
+            .try_for_each_entry(|k, _| {
+                if &k[..k.len() - 8] == b"K" {
+                    k_entries += 1;
+                }
+            })
+            .unwrap();
+        assert_eq!(k_entries, 0, "bottommost merge leaves nothing of K");
+    }
+
+    /// Randomized model check: puts / deletes over a small key space with
+    /// prefix-related keys, interleaved flushes, tiered and full compactions
+    /// and reopens, against a BTreeMap.
+    #[test]
+    fn compaction_matches_a_model_under_random_workload() {
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for compression in [SstCompression::None, SstCompression::Lz4] {
+            let dir = tempfile::tempdir().unwrap();
+            let mk_cfg = || {
+                let mut cfg = test_config(dir.path());
+                cfg.block_compression = compression;
+                cfg.memtable_flush_size = usize::MAX;
+                cfg.compact_trigger_ssts = 3;
+                cfg.sync_on_commit = false; // 6000 commits; durability isn't under test
+                cfg
+            };
+            let mut tree = LsmTree::open(mk_cfg()).unwrap();
+            let keys: Vec<Vec<u8>> = (0..60u32)
+                .map(|i| format!("k{}", i % 30).into_bytes())
+                .chain((0..10u32).map(|i| {
+                    let mut k = format!("k{i}").into_bytes();
+                    k.extend_from_slice(&[0xFF; 7]);
+                    k.push(0xF0 + (i as u8));
+                    k
+                }))
+                .collect();
+            let mut model: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+            for step in 0..3000u32 {
+                let k = &keys[(next() % keys.len() as u64) as usize];
+                match next() % 10 {
+                    0..=5 => {
+                        let v = format!("v{step}").into_bytes();
+                        put_kv(&tree, k, &v);
+                        model.insert(k.clone(), v);
+                    }
+                    6..=7 => {
+                        del_k(&tree, k);
+                        model.remove(k);
+                    }
+                    _ => {}
+                }
+                match step % 97 {
+                    13 | 41 | 70 => tree.flush().unwrap(),
+                    90 => {
+                        tree.flush().unwrap();
+                        tree.compact_tiered().unwrap();
+                    }
+                    _ => {}
+                }
+                if step % 1000 == 999 {
+                    if step == 1999 {
+                        tree.compact().unwrap();
+                    }
+                    drop(tree);
+                    tree = LsmTree::open(mk_cfg()).unwrap();
+                }
+            }
+            tree.flush().unwrap();
+            tree.compact_tiered().unwrap();
+            let snap = tree.read_snapshot();
+            for k in &keys {
+                assert_eq!(
+                    tree.get_at(snap, k).unwrap().as_deref(),
+                    model.get(k).map(|v| v.as_slice()),
+                    "{compression:?} key {k:?}"
+                );
+            }
+            tree.compact().unwrap();
+            let snap = tree.read_snapshot();
+            for k in &keys {
+                assert_eq!(
+                    tree.get_at(snap, k).unwrap().as_deref(),
+                    model.get(k).map(|v| v.as_slice()),
+                    "{compression:?} after full compaction, key {k:?}"
                 );
             }
         }

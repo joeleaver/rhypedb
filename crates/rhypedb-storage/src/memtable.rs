@@ -101,6 +101,12 @@ impl MemTable {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Number of entries (every version of every key, tombstones included) —
+    /// an upper bound on distinct user keys, e.g. to size a flush's bloom.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
     /// Returns true if the memtable has no entries.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
