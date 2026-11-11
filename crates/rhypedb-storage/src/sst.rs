@@ -40,14 +40,43 @@ const SST_MAGIC: &[u8; 4] = b"RSST";
 ///   transient owned buffer. The compression algorithm/granularity is a
 ///   write-time choice ([`SstCompression`]); a tree may hold a mix of
 ///   v5 and v6 files and natural compaction migrates them.
-const SST_VERSION_UNCOMPRESSED: u32 = 5;
+/// - v7 / v8: v5 / v6 respectively, plus a META block (`SstFileMeta`:
+///   min/max version, entry count) between the bloom block and the footer,
+///   located by a `[meta_offset u64][meta_size u32]` pointer stored just
+///   BEFORE the unchanged v4 footer. Lets `LsmTree::open` recover each file's
+///   max version from the footer instead of walking (and, for v6,
+///   decompressing) every block of every SST.
+#[cfg_attr(not(test), allow(dead_code))] // named for the format history + tests
+const SST_VERSION_V5: u32 = 5;
+const SST_VERSION_V6_LZ4: u32 = 6;
 
-/// SST version written when per-block LZ4 compression is enabled. See the
-/// [`SST_VERSION_UNCOMPRESSED`] doc comment for the format history.
-const SST_VERSION_COMPRESSED: u32 = 6;
+/// Written for `SstCompression::None`: v5 data layout + meta block.
+const SST_VERSION_UNCOMPRESSED: u32 = 7;
+
+/// Written for `SstCompression::Lz4`: v6 (LZ4) data layout + meta block. See
+/// the [`SST_VERSION_V5`] doc comment for the format history.
+const SST_VERSION_COMPRESSED: u32 = 8;
 
 /// Highest SST version this build can read.
-const SST_VERSION_MAX: u32 = 6;
+const SST_VERSION_MAX: u32 = 8;
+
+/// Whether a file of `version` stores its data region as LZ4 frames.
+fn version_is_compressed(version: u32) -> bool {
+    version == SST_VERSION_V6_LZ4 || version == SST_VERSION_COMPRESSED
+}
+
+/// Whether a file of `version` carries a meta block.
+fn version_has_meta(version: u32) -> bool {
+    version >= SST_VERSION_UNCOMPRESSED
+}
+
+/// v7/v8 meta pointer, stored immediately before the v4 footer.
+const META_PTR_SIZE: usize = 8 + 4;
+
+/// Meta block payload: `[min_version u64][max_version u64][entry_count u64]`.
+/// Readers take the fields they know and ignore any trailing bytes, so later
+/// versions can append fields.
+const META_BLOCK_MIN_SIZE: usize = 8 + 8 + 8;
 
 /// v6 per-block frame header: `[flag u8][uncomp_len u32 BE][payload_len u32 BE]`.
 /// Fixed width whether the block is stored raw or LZ4 — keeps the writer offset
@@ -150,6 +179,10 @@ pub struct SstWriter {
     bloom_keys: BloomKeys,
     /// Distinct user keys added so far (sizes / folds the bloom in `finish`).
     distinct_keys: usize,
+    /// Smallest / largest MVCC version among added entries (for the v7/v8
+    /// meta block). `u64::MAX` / 0 while empty.
+    min_version: u64,
+    max_version: u64,
     /// The previous entry's user key, to count each key once across its
     /// versions. One reused buffer — not a copy per key.
     last_user_key: Vec<u8>,
@@ -254,6 +287,8 @@ impl SstWriter {
             bloom_keys: BloomKeys::Hashes(Vec::new()),
             distinct_keys: 0,
             last_user_key: Vec::new(),
+            min_version: u64::MAX,
+            max_version: 0,
             zone_extractor,
             zone_builder: ZoneBuilder::new(),
             compression,
@@ -301,6 +336,11 @@ impl SstWriter {
         // shorter key and split them; that key is then added twice, which a
         // bloom filter absorbs — it only nudges the size estimate up.)
         if internal_key.len() >= 8 {
+            let version = !u64::from_be_bytes(
+                internal_key[internal_key.len() - 8..].try_into().unwrap(),
+            );
+            self.min_version = self.min_version.min(version);
+            self.max_version = self.max_version.max(version);
             let user_key = &internal_key[..internal_key.len() - 8];
             let is_new = self.distinct_keys == 0 || self.last_user_key != user_key;
             if is_new {
@@ -421,6 +461,16 @@ impl SstWriter {
         let bloom_size = bloom_buf.len() as u32;
         self.writer.write_all(&bloom_buf)?;
 
+        // v7/v8 meta block, then its pointer, then the unchanged v4 footer.
+        let meta_offset = bloom_offset + bloom_size as u64;
+        let mut meta = BytesMut::with_capacity(META_BLOCK_MIN_SIZE + META_PTR_SIZE);
+        meta.put_u64(if self.entry_count == 0 { 0 } else { self.min_version });
+        meta.put_u64(self.max_version);
+        meta.put_u64(self.entry_count as u64);
+        meta.put_u64(meta_offset);
+        meta.put_u32(META_BLOCK_MIN_SIZE as u32);
+        self.writer.write_all(&meta)?;
+
         // v4 footer.
         let mut footer = BytesMut::with_capacity(FOOTER_V4_SIZE);
         footer.put_u64(zonemap_offset);
@@ -498,7 +548,17 @@ pub struct SstReader {
     /// (block reads decompress into a transient owned buffer). All the read
     /// paths funnel through [`SstReader::block`], which branches on this.
     version: u32,
+    /// From the v7/v8 meta block; `None` for older files.
+    file_meta: Option<SstFileMeta>,
     path: PathBuf,
+}
+
+/// Per-file facts recorded by the writer in the v7/v8 meta block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SstFileMeta {
+    pub min_version: u64,
+    pub max_version: u64,
+    pub entry_count: u64,
 }
 
 /// See [`SstReader::entry_cursor`].
@@ -722,6 +782,32 @@ impl SstReader {
             (index_offset, index_count, None, None)
         };
 
+        // v7/v8 meta block, via the pointer stored just before the v4 footer.
+        let file_meta = if version_has_meta(version) {
+            let footer_start = data.len() - FOOTER_V4_SIZE;
+            if footer_start < SST_MAGIC.len() + 4 + META_PTR_SIZE {
+                return Err(Error::SstCorrupted("v7/v8 meta pointer truncated".into()));
+            }
+            let ptr = footer_start - META_PTR_SIZE;
+            let meta_offset =
+                u64::from_be_bytes(data[ptr..ptr + 8].try_into().unwrap()) as usize;
+            let meta_size =
+                u32::from_be_bytes(data[ptr + 8..ptr + 12].try_into().unwrap()) as usize;
+            if meta_size < META_BLOCK_MIN_SIZE
+                || meta_offset.checked_add(meta_size).is_none_or(|end| end > ptr)
+            {
+                return Err(Error::SstCorrupted("v7/v8 meta block out of range".into()));
+            }
+            let m = &data[meta_offset..meta_offset + meta_size];
+            Some(SstFileMeta {
+                min_version: u64::from_be_bytes(m[0..8].try_into().unwrap()),
+                max_version: u64::from_be_bytes(m[8..16].try_into().unwrap()),
+                entry_count: u64::from_be_bytes(m[16..24].try_into().unwrap()),
+            })
+        } else {
+            None
+        };
+
         // Parse index entries.
         let mut index = Vec::with_capacity(index_count);
         let mut pos = index_offset;
@@ -761,6 +847,7 @@ impl SstReader {
             last_user_key: None,
             zone_map,
             version,
+            file_meta,
             path,
         };
         reader.last_user_key = reader.compute_last_user_key()?;
@@ -814,8 +901,8 @@ impl SstReader {
         if start > end || end > self.data_end {
             return Err(Error::SstCorrupted("block bounds out of range".into()));
         }
-        if self.version < SST_VERSION_COMPRESSED {
-            // v1-v5: the data region is the raw entry stream; a block is a
+        if !self.compressed() {
+            // v1-v5, v7: the data region is the raw entry stream; a block is a
             // contiguous zero-copy slice.
             return Ok(self.data.slice(start..end));
         }
@@ -1092,7 +1179,7 @@ impl SstReader {
         // single-walk doesn't apply to a compressed file. `scan_prefix` is
         // block-aware (it drives the block-walking iterator), and the prefixes
         // are disjoint, so a per-prefix scan returns identical results.
-        if self.version >= SST_VERSION_COMPRESSED {
+        if self.compressed() {
             for (i, prefix) in sorted_prefixes.iter().enumerate() {
                 out[i] = self.scan_prefix(prefix, version);
             }
@@ -1331,11 +1418,24 @@ impl SstReader {
         }
     }
 
+    /// Whether the data region is LZ4-framed (v6 / v8).
+    fn compressed(&self) -> bool {
+        version_is_compressed(self.version)
+    }
+
+    /// The v7/v8 meta block, or `None` for a file written before it existed.
+    pub fn file_meta(&self) -> Option<SstFileMeta> {
+        self.file_meta
+    }
+
     /// An upper bound on the number of entries (hence distinct user keys) in
     /// this file: every sparse-index block holds at most `ENTRIES_PER_BLOCK`.
     /// Known without reading any data; sizes a merge output's bloom filter.
     pub fn max_entry_count(&self) -> usize {
-        self.index.len() * ENTRIES_PER_BLOCK
+        match self.file_meta {
+            Some(m) => m.entry_count as usize,
+            None => self.index.len() * ENTRIES_PER_BLOCK,
+        }
     }
 
     /// Size of the file's mapped bytes — the compaction policy's measure of
@@ -1348,7 +1448,13 @@ impl SstReader {
     /// Used during recovery to restore the transaction version counter.
     /// Fallible: a corrupt block must NOT silently undercount the version (which
     /// would let later commits reuse versions) — it surfaces as `SstCorrupted`.
+    ///
+    /// v7/v8 files answer from their meta block without reading any data;
+    /// older files fall back to the walk (until compaction rewrites them).
     pub fn max_version(&self) -> Result<u64> {
+        if let Some(meta) = self.file_meta {
+            return Ok(meta.max_version);
+        }
         let mut max_ver = 0u64;
         self.try_for_each_entry(|key, _| {
             if key.len() >= 8 {
@@ -1379,7 +1485,7 @@ impl SstReader {
         // v6 walks block-by-block (the absolute-offset cursor below has no
         // compressed-file analogue). The block-aware path additionally skips
         // decompressing any zone-pruned block.
-        if self.version >= SST_VERSION_COMPRESSED {
+        if self.compressed() {
             return self.scan_prefix_filtered_v6(prefix, version, predicate);
         }
 
@@ -1921,6 +2027,83 @@ impl<'a> Iterator for SstIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rewrite a v7/v8 file in place as the v5/v6 file an older writer would
+    /// have produced: drop the meta block and its pointer (they sit between
+    /// the bloom block and the v4 footer, so no other offset moves) and patch
+    /// the header version.
+    fn strip_meta_to_legacy(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let version = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+        let legacy = match version {
+            SST_VERSION_UNCOMPRESSED => SST_VERSION_V5,
+            SST_VERSION_COMPRESSED => SST_VERSION_V6_LZ4,
+            v => panic!("not a v7/v8 file: {v}"),
+        };
+        let footer_start = bytes.len() - FOOTER_V4_SIZE;
+        let ptr = footer_start - META_PTR_SIZE;
+        let meta_offset = u64::from_be_bytes(bytes[ptr..ptr + 8].try_into().unwrap()) as usize;
+        let footer = bytes[footer_start..].to_vec();
+        bytes.truncate(meta_offset);
+        bytes.extend_from_slice(&footer);
+        bytes[4..8].copy_from_slice(&legacy.to_be_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn meta_block_records_versions_and_legacy_files_still_walk() {
+        for compression in [SstCompression::None, SstCompression::Lz4] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("m.sst");
+            let mut w = SstWriter::new_with_options(&path, None, compression).unwrap();
+            // Versions deliberately out of key order: max is NOT the last entry.
+            let entries: Vec<(Vec<u8>, u64)> = vec![
+                (b"a".to_vec(), 3),
+                (b"b".to_vec(), 900),
+                (b"c".to_vec(), 7),
+                (b"c".to_vec(), 2),
+            ];
+            for (k, v) in &entries {
+                let ik = InternalKey::new(k, *v);
+                w.add(ik.as_bytes(), &Some(Bytes::from_static(b"x"))).unwrap();
+            }
+            w.finish().unwrap();
+
+            let r = SstReader::open(&path).unwrap();
+            assert_eq!(
+                r.file_meta(),
+                Some(SstFileMeta { min_version: 2, max_version: 900, entry_count: 4 }),
+                "{compression:?}"
+            );
+            assert_eq!(r.max_version().unwrap(), 900);
+            assert_eq!(r.max_entry_count(), 4);
+            let all: Vec<_> = r.iter().collect();
+            drop(r);
+
+            strip_meta_to_legacy(&path);
+            let legacy = SstReader::open(&path).unwrap();
+            assert!(legacy.version == SST_VERSION_V5 || legacy.version == SST_VERSION_V6_LZ4);
+            assert_eq!(legacy.file_meta(), None);
+            assert_eq!(legacy.max_version().unwrap(), 900, "legacy walk");
+            assert_eq!(legacy.iter().collect::<Vec<_>>(), all, "legacy data identical");
+            assert_eq!(
+                legacy.get_versioned(b"b", u64::MAX).unwrap(),
+                Some(Some(Bytes::from_static(b"x")))
+            );
+        }
+    }
+
+    #[test]
+    fn empty_sst_meta_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("e.sst");
+        SstWriter::new(&path).unwrap().finish().unwrap();
+        let r = SstReader::open(&path).unwrap();
+        assert_eq!(
+            r.file_meta(),
+            Some(SstFileMeta { min_version: 0, max_version: 0, entry_count: 0 })
+        );
+    }
     use crate::key::KeyBuilder;
 
     #[test]
@@ -2065,9 +2248,10 @@ mod tests {
         let r5 = SstReader::open(&p5).unwrap();
         let r6 = SstReader::open(&p6).unwrap();
 
-        // Sanity: the v6 header records version 6, v5 records 5.
-        assert_eq!(r5.version, 5);
-        assert_eq!(r6.version, 6);
+        // Sanity: the LZ4 file records the compressed version, the other the
+        // uncompressed one (v8 / v7: the v6 / v5 layouts plus a meta block).
+        assert_eq!(r5.version, SST_VERSION_UNCOMPRESSED);
+        assert_eq!(r6.version, SST_VERSION_COMPRESSED);
 
         // Full iteration order + values.
         let i5: Vec<_> = r5.iter().collect();
@@ -2239,7 +2423,7 @@ mod tests {
         let pe = dir.path().join("empty.sst");
         write_entries(&pe, &[], SstCompression::Lz4);
         let re = SstReader::open(&pe).unwrap();
-        assert_eq!(re.version, 6);
+        assert_eq!(re.version, SST_VERSION_COMPRESSED);
         assert_eq!(re.iter().count(), 0);
         assert_eq!(re.max_version().unwrap(), 0);
         assert!(re.get(b"anything........").unwrap().is_none());
@@ -3234,8 +3418,8 @@ mod tests {
         let entries: Vec<(u64, u32)> = (0u64..64).map(|i| (i, 1900 + i as u32)).collect();
         let r5 = build_movie_sst_with(&dir.path().join("v5.sst"), &entries, SstCompression::None);
         let r6 = build_movie_sst_with(&dir.path().join("v6.sst"), &entries, SstCompression::Lz4);
-        assert_eq!(r5.version, 5);
-        assert_eq!(r6.version, 6);
+        assert_eq!(r5.version, SST_VERSION_UNCOMPRESSED);
+        assert_eq!(r6.version, SST_VERSION_COMPRESSED);
 
         let prefix = KeyBuilder::object_prefix(1);
         for (op, target) in [
@@ -3257,10 +3441,11 @@ mod tests {
 
     #[test]
     fn v6_corrupt_block_fails_fallible_walks() {
-        // The fallible paths (try_for_each_entry, max_version) — used by
-        // compaction and version recovery — must ERROR on a corrupt block, not
-        // silently truncate (which would lose data on a compaction rewrite or
-        // restore a too-low version counter).
+        // The fallible walks — used by compaction and (for legacy files)
+        // version recovery — must ERROR on a corrupt block, not silently
+        // truncate (which would lose data on a compaction rewrite or restore a
+        // too-low version counter). A v8 file answers `max_version` from its
+        // meta block, which a corrupt data block cannot make too low.
         let entries = gen_objects(1, 40, 1); // ~3 blocks
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.sst");
@@ -3274,7 +3459,19 @@ mod tests {
             r.try_for_each_entry(|_, _| {}),
             Err(Error::SstCorrupted(_))
         ));
-        assert!(matches!(r.max_version(), Err(Error::SstCorrupted(_))));
+        let true_max = entries.iter().map(|(k, _)| InternalKey_version(k)).max().unwrap();
+        assert_eq!(r.max_version().unwrap(), true_max, "meta block: exact, never undercounted");
+        drop(r);
+
+        // The same corrupt file as a legacy v6 (no meta) must still error.
+        strip_meta_to_legacy(&path);
+        let legacy = SstReader::open(&path).unwrap();
+        assert!(matches!(legacy.max_version(), Err(Error::SstCorrupted(_))));
+    }
+
+    #[allow(non_snake_case)]
+    fn InternalKey_version(internal_key: &[u8]) -> u64 {
+        !u64::from_be_bytes(internal_key[internal_key.len() - 8..].try_into().unwrap())
     }
 
     #[test]
