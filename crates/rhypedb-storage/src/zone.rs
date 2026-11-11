@@ -59,23 +59,36 @@ pub type ZoneFieldExtractor = Arc<dyn Fn(&[u8], &[u8]) -> Vec<(u32, [u8; 8])> + 
 
 /// Writer-side accumulator for per-block zone bounds. Updated entry-by-entry
 /// inside `SstWriter::add`; serialized as the zone-map block in `finish()`.
+///
+/// Only blocks that actually saw a zone-field value are held (in block
+/// order); every other block up to `num_blocks` is written as the no-data
+/// sentinel at serialization time. In an SST of mostly edges, index entries
+/// and postings, ~1% of blocks carry bounds, so a dense in-memory table
+/// (a `Vec` per block) cost ~50x what the data needs — tens of MB per
+/// compaction of a large file. The serialized bytes are unchanged.
 pub struct ZoneBuilder {
     /// field_id → index in `field_ids`. Built lazily as new fields appear.
     field_id_to_idx: HashMap<u32, usize>,
     /// Insertion-ordered list of field IDs; defines column order in the
     /// per-block bounds tables.
     field_ids: Vec<u32>,
-    /// Per-block per-field (min, max). `bounds[block_idx][field_idx]`.
-    /// `(u64::MAX, u64::MIN)` is the "no entry with this field yet" sentinel.
-    bounds: Vec<Vec<(u64, u64)>>,
+    /// One past the highest block index recorded (the serialized block count).
+    num_blocks: usize,
+    /// `(block_idx, per-field (min, max))` for blocks with any recorded value,
+    /// ascending by block. A row may be shorter than `field_ids` (fields first
+    /// seen later); missing columns are the `(u64::MAX, u64::MIN)` sentinel.
+    rows: Vec<(usize, Vec<(u64, u64)>)>,
 }
+
+const NO_DATA: (u64, u64) = (u64::MAX, u64::MIN);
 
 impl ZoneBuilder {
     pub fn new() -> Self {
         Self {
             field_id_to_idx: HashMap::new(),
             field_ids: Vec::new(),
-            bounds: Vec::new(),
+            num_blocks: 0,
+            rows: Vec::new(),
         }
     }
 
@@ -84,50 +97,87 @@ impl ZoneBuilder {
     /// the previous value (or the no-data sentinel if this is the first entry
     /// in the block).
     pub fn record(&mut self, block_idx: usize, zone_fields: &[(u32, [u8; 8])]) {
-        // Grow the per-block bounds list to cover `block_idx`.
-        while self.bounds.len() <= block_idx {
-            self.bounds
-                .push(vec![(u64::MAX, u64::MIN); self.field_ids.len()]);
+        self.num_blocks = self.num_blocks.max(block_idx + 1);
+        if zone_fields.is_empty() {
+            return;
         }
+        // The writer records blocks in order, so the row is almost always the
+        // last one or a new last one.
+        let row_pos = match self.rows.last() {
+            Some((b, _)) if *b == block_idx => self.rows.len() - 1,
+            Some((b, _)) if *b > block_idx => {
+                match self.rows.binary_search_by_key(&block_idx, |(b, _)| *b) {
+                    Ok(i) => i,
+                    Err(i) => {
+                        self.rows.insert(i, (block_idx, Vec::new()));
+                        i
+                    }
+                }
+            }
+            _ => {
+                self.rows.push((block_idx, Vec::new()));
+                self.rows.len() - 1
+            }
+        };
         for &(field_id, bytes) in zone_fields {
-            // Allocate a column for first-time field IDs; pad existing
-            // blocks with the no-data sentinel.
+            // Allocate a column for first-time field IDs.
             let field_idx = match self.field_id_to_idx.get(&field_id) {
                 Some(&idx) => idx,
                 None => {
                     let idx = self.field_ids.len();
                     self.field_ids.push(field_id);
                     self.field_id_to_idx.insert(field_id, idx);
-                    for block in &mut self.bounds {
-                        block.push((u64::MAX, u64::MIN));
-                    }
                     idx
                 }
             };
+            let row = &mut self.rows[row_pos].1;
+            if row.len() <= field_idx {
+                row.resize(field_idx + 1, NO_DATA);
+            }
             let value = u64::from_be_bytes(bytes);
-            let (cur_min, cur_max) = self.bounds[block_idx][field_idx];
-            self.bounds[block_idx][field_idx] = (cur_min.min(value), cur_max.max(value));
+            let (cur_min, cur_max) = row[field_idx];
+            row[field_idx] = (cur_min.min(value), cur_max.max(value));
         }
     }
 
-    /// Serialize the accumulated zone map. Format is documented at the top
-    /// of this module.
-    pub fn write_to(&self, w: &mut dyn Write) -> io::Result<()> {
-        let num_blocks = self.bounds.len() as u32;
-        let num_fields = self.field_ids.len() as u32;
+    /// `(min, max)` of every field (in column order) for `block_idx`; the
+    /// sentinel for fields without a value there.
+    pub fn block_bounds(&self, block_idx: usize) -> Vec<(u64, u64)> {
+        let mut out = vec![NO_DATA; self.field_ids.len()];
+        if let Ok(i) = self.rows.binary_search_by_key(&block_idx, |(b, _)| *b) {
+            out[..self.rows[i].1.len()].copy_from_slice(&self.rows[i].1);
+        }
+        out
+    }
 
-        let mut buf = BytesMut::with_capacity(
-            8 + (num_fields as usize) * 4 + (num_blocks as usize) * (num_fields as usize) * 16,
-        );
-        buf.put_u32(num_blocks);
-        buf.put_u32(num_fields);
+    /// Serialize the accumulated zone map, streaming it in small chunks (the
+    /// dense form can be tens of MB). Format is documented at the top of this
+    /// module.
+    pub fn write_to(&self, w: &mut dyn Write) -> io::Result<()> {
+        let num_fields = self.field_ids.len();
+        let mut buf = BytesMut::with_capacity(64 * 1024);
+        buf.put_u32(self.num_blocks as u32);
+        buf.put_u32(num_fields as u32);
         for &id in &self.field_ids {
             buf.put_u32(id);
         }
-        for block in &self.bounds {
-            for &(min, max) in block {
+        let mut rows = self.rows.iter().peekable();
+        for block in 0..self.num_blocks {
+            let row = match rows.peek() {
+                Some((b, r)) if *b == block => {
+                    rows.next();
+                    r.as_slice()
+                }
+                _ => &[],
+            };
+            for f in 0..num_fields {
+                let (min, max) = row.get(f).copied().unwrap_or(NO_DATA);
                 buf.put_u64(min);
                 buf.put_u64(max);
+            }
+            if buf.len() >= 60 * 1024 {
+                w.write_all(&buf)?;
+                buf.clear();
             }
         }
         w.write_all(&buf)
@@ -307,16 +357,92 @@ mod tests {
         b.record(0, &[(YEAR_ID, 50u64.to_be_bytes())]);
         b.record(1, &[(AGE_ID, 30u64.to_be_bytes()), (YEAR_ID, 200u64.to_be_bytes())]);
 
-        assert_eq!(b.bounds.len(), 2);
+        assert_eq!(b.num_blocks, 2);
         assert_eq!(b.field_ids.len(), 2);
         let year_idx = b.field_id_to_idx[&YEAR_ID];
         let age_idx = b.field_id_to_idx[&AGE_ID];
-        assert_eq!(b.bounds[0][year_idx], (50, 100));
+        assert_eq!(b.block_bounds(0)[year_idx], (50, 100));
         // Block 0 never saw age — sentinel still in place.
-        assert_eq!(b.bounds[0][age_idx], (u64::MAX, u64::MIN));
+        assert_eq!(b.block_bounds(0)[age_idx], (u64::MAX, u64::MIN));
         // Block 1 has year=200, age=30 — both singletons.
-        assert_eq!(b.bounds[1][year_idx], (200, 200));
-        assert_eq!(b.bounds[1][age_idx], (30, 30));
+        assert_eq!(b.block_bounds(1)[year_idx], (200, 200));
+        assert_eq!(b.block_bounds(1)[age_idx], (30, 30));
+    }
+
+    /// The sparse builder must serialize byte-for-byte what the original dense
+    /// builder (reproduced here verbatim in behaviour) wrote, over random
+    /// histories: blocks skipped, fields first seen late, blocks recorded with
+    /// no fields, out-of-order block indices.
+    #[test]
+    fn sparse_builder_writes_the_dense_builders_bytes() {
+        struct Dense {
+            ids: Vec<u32>,
+            idx: HashMap<u32, usize>,
+            bounds: Vec<Vec<(u64, u64)>>,
+        }
+        impl Dense {
+            fn record(&mut self, block_idx: usize, zone_fields: &[(u32, [u8; 8])]) {
+                while self.bounds.len() <= block_idx {
+                    self.bounds.push(vec![(u64::MAX, u64::MIN); self.ids.len()]);
+                }
+                for &(field_id, bytes) in zone_fields {
+                    let fi = match self.idx.get(&field_id) {
+                        Some(&i) => i,
+                        None => {
+                            let i = self.ids.len();
+                            self.ids.push(field_id);
+                            self.idx.insert(field_id, i);
+                            for b in &mut self.bounds {
+                                b.push((u64::MAX, u64::MIN));
+                            }
+                            i
+                        }
+                    };
+                    let v = u64::from_be_bytes(bytes);
+                    let (lo, hi) = self.bounds[block_idx][fi];
+                    self.bounds[block_idx][fi] = (lo.min(v), hi.max(v));
+                }
+            }
+            fn bytes(&self) -> Vec<u8> {
+                let mut out = Vec::new();
+                out.extend_from_slice(&(self.bounds.len() as u32).to_be_bytes());
+                out.extend_from_slice(&(self.ids.len() as u32).to_be_bytes());
+                for id in &self.ids {
+                    out.extend_from_slice(&id.to_be_bytes());
+                }
+                for b in &self.bounds {
+                    for (lo, hi) in b {
+                        out.extend_from_slice(&lo.to_be_bytes());
+                        out.extend_from_slice(&hi.to_be_bytes());
+                    }
+                }
+                out
+            }
+        }
+        for seed in 1..=200u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut next = move |n: u64| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % n
+            };
+            let mut dense = Dense { ids: Vec::new(), idx: HashMap::new(), bounds: Vec::new() };
+            let mut sparse = ZoneBuilder::new();
+            let mut block = 0usize;
+            for _ in 0..next(300) {
+                block += next(40) as usize; // gaps, often long
+                let b = if next(10) == 0 { block.saturating_sub(next(50) as usize) } else { block };
+                let fields: Vec<(u32, [u8; 8])> = (0..next(3))
+                    .map(|_| (next(5) as u32 + 1, next(1000).to_be_bytes()))
+                    .collect();
+                dense.record(b, &fields);
+                sparse.record(b, &fields);
+            }
+            let mut got = Vec::new();
+            sparse.write_to(&mut got).unwrap();
+            assert_eq!(got, dense.bytes(), "seed {seed}");
+        }
     }
 
     #[test]

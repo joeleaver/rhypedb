@@ -28,6 +28,8 @@ memmap2 = "0.9"
 parking_lot = { workspace = true }
 # Per-SST object-id summaries (idsum.rs).
 roaring = { workspace = true }
+# Anonymous (already-unlinked) scratch file for an SST writer's sparse index.
+tempfile = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
