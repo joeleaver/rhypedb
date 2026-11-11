@@ -4471,6 +4471,34 @@ impl DatabaseCore {
         type_name: &str,
         ids: &[u64],
     ) -> EngineResult<Vec<Object>> {
+        self.get_many_decoded(snapshot, type_name, ids, |data| deserialize_fields(data))
+    }
+
+    /// [`get_many`](Self::get_many) decoding only `fields` of each object —
+    /// the batch form of [`get_projected`](Self::get_projected). Same id
+    /// handling (sorted, deduplicated, missing ids skipped); each returned
+    /// Object's `fields` holds exactly the requested-and-present columns. For
+    /// reading one or two fields across many objects (counting unread
+    /// messages, say), where a full decode would build every field of every
+    /// object only to drop them.
+    pub fn get_many_projected(
+        &self,
+        type_name: &str,
+        ids: &[u64],
+        fields: &[&str],
+    ) -> EngineResult<Vec<Object>> {
+        self.get_many_decoded(self.storage.read_snapshot(), type_name, ids, |data| {
+            deserialize_fields_projected(data, fields)
+        })
+    }
+
+    fn get_many_decoded(
+        &self,
+        snapshot: u64,
+        type_name: &str,
+        ids: &[u64],
+        decode: impl Fn(&Bytes) -> FieldMap,
+    ) -> EngineResult<Vec<Object>> {
         let type_id = self.resolve_type_id(type_name)?;
 
         // Sort + dedup. Streaming traversal already dedups across hops;
@@ -4493,7 +4521,7 @@ impl DatabaseCore {
         let mut out = Vec::with_capacity(sorted.len());
         for (id, value) in sorted.into_iter().zip(values) {
             if let Some(data) = value {
-                let mut fields = deserialize_fields(&data);
+                let mut fields = decode(&data);
                 self.strip_tombstoned_fields(type_name, &mut fields);
                 out.push(Object {
                     type_name: type_name.into(),
@@ -6702,6 +6730,55 @@ impl DatabaseCore {
 
         let prefix = KeyBuilder::edge_prefix(source_id, rel_id);
         self.scan_prefix_at(snapshot, &prefix)
+    }
+
+    /// The ids [`get_links`](Self::get_links) would return, without decoding
+    /// each link's stored value. Through an `@inverse` field that value is the
+    /// reverse edge's cover (peer ids and peer copies), which `get_links`
+    /// decodes into a FieldMap per link; a caller that only wants the linked
+    /// ids — listing a label's messages, say — pays nothing for it here.
+    pub fn get_link_ids(
+        &self,
+        source_type: &str,
+        source_id: u64,
+        field_name: &str,
+    ) -> EngineResult<Vec<u64>> {
+        let _ = self.resolve_type_id(source_type)?;
+        let type_def = self
+            .schema
+            .get_type(source_type)
+            .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
+        let field = type_def.get_field(field_name).ok_or_else(|| {
+            self.field_retired_error(source_type, field_name)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
+                    type_name: source_type.into(),
+                    field: field_name.into(),
+                })
+        })?;
+        let prefix = if let Some(inv) = field.inverse() {
+            let inv_rel_key = format!("{}.{}", inv.type_name, inv.field_name);
+            let inv_rel_id = *self.rel_ids.get(&inv_rel_key).ok_or_else(|| {
+                EngineError::FieldNotFound {
+                    type_name: inv.type_name.clone(),
+                    field: inv.field_name.clone(),
+                }
+            })?;
+            KeyBuilder::reverse_edge_prefix(source_id, inv_rel_id)
+        } else {
+            let rel_key = format!("{source_type}.{field_name}");
+            let rel_id = *self.rel_ids.get(&rel_key).ok_or_else(|| EngineError::FieldNotFound {
+                type_name: source_type.into(),
+                field: field_name.into(),
+            })?;
+            KeyBuilder::edge_prefix(source_id, rel_id)
+        };
+        let snapshot = self.storage.read_snapshot();
+        let entries = self.storage.scan_prefix_at(snapshot, &prefix)?;
+        Ok(entries
+            .iter()
+            .filter(|(k, _)| k.len() >= 8)
+            .map(|(k, _)| u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap()))
+            .collect())
     }
 
     /// Batched variant of `get_links`: walk the relation for N source IDs
@@ -17912,6 +17989,74 @@ mod tests {
             .filter_scan("Movie", "year", CompareOp::Eq, 1955, None)
             .unwrap();
         assert_eq!(mid.len(), 1);
+    }
+
+    /// `get_link_ids` returns exactly the ids `get_links` does (forward and
+    /// `@inverse` relations, in the same order, nothing for an object without
+    /// links), and `get_many_projected` exactly `get_many`'s objects with only
+    /// the requested fields (same order, dedup, missing ids skipped, unknown
+    /// field names ignored).
+    #[test]
+    fn id_only_links_and_projected_get_many_match_their_full_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Label { name: String  messages: [Message] @inverse(Message.labels) }
+            type Thread { subject: String }
+            type Message {
+                unread: Bool
+                body: String
+                thread: Thread
+                account: Thread
+                labels: [Label]
+            }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mk = |t: &str, f: &[(&str, Value)]| {
+            let mut m = FieldMap::new();
+            for (k, v) in f {
+                m.insert((*k).into(), v.clone());
+            }
+            db.create(t, m).unwrap().id
+        };
+        let t = mk("Thread", &[("subject", Value::String("s".into()))]);
+        let labels: Vec<u64> = (0..3).map(|i| mk("Label", &[("name", Value::String(format!("L{i}")))])).collect();
+        let mut msgs = Vec::new();
+        for i in 0..20u64 {
+            let m = mk("Message", &[("unread", Value::Bool(i % 2 == 0)), ("body", Value::String("b".repeat(50 * i as usize)))]);
+            db.link("Message", m, "thread", t, None).unwrap();
+            db.link("Message", m, "account", t, None).unwrap();
+            for l in 0..=(i % 3) {
+                db.link("Message", m, "labels", labels[l as usize], None).unwrap();
+            }
+            msgs.push(m);
+        }
+        let ids = |v: Vec<(u64, FieldMap)>| v.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        for &l in &labels {
+            assert_eq!(db.get_link_ids("Label", l, "messages").unwrap(), ids(db.get_links("Label", l, "messages").unwrap()));
+        }
+        for &m in &msgs {
+            for f in ["labels", "thread", "account"] {
+                assert_eq!(db.get_link_ids("Message", m, f).unwrap(), ids(db.get_links("Message", m, f).unwrap()));
+            }
+        }
+        let lone = mk("Label", &[("name", Value::String("none".into()))]);
+        assert!(db.get_link_ids("Label", lone, "messages").unwrap().is_empty());
+        assert!(db.get_link_ids("Label", lone, "nope").is_err());
+
+        let mut wanted: Vec<u64> = msgs.iter().rev().copied().collect();
+        wanted.push(msgs[3]); // duplicate
+        wanted.push(999_999); // missing
+        let full = db.get_many("Message", &wanted).unwrap();
+        let proj = db.get_many_projected("Message", &wanted, &["unread", "no_such_field"]).unwrap();
+        assert_eq!(proj.len(), full.len());
+        for (p, f) in proj.iter().zip(&full) {
+            assert_eq!(p.id, f.id);
+            assert_eq!(p.fields.len(), 1);
+            assert_eq!(p.fields.get("unread"), f.fields.get("unread"));
+        }
     }
 
     /// `rewrite_covers` turns a pre-#26 store into exactly what the current
