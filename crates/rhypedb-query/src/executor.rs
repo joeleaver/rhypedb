@@ -279,7 +279,24 @@ fn execute_source(
             let pushed_limit = leading_limit(steps)
                 .filter(|_| ctx.rules.is_none())
                 .map(|n| ctx.governor.clamp_limit(n));
-            if let Some(mut objects) = plan_filter_scan(db, type_name, predicate, pushed_limit)? {
+            // Under a row budget, an UNINDEXED single comparison must be
+            // governed like any other unindexed scan (refused up front when
+            // over budget, charged per row examined). The engine's typed
+            // fallback scans the whole type but reports only its matches, so
+            // route it through the streamed scan below instead. Ungoverned
+            // callers keep the engine path (its zone maps can skip blocks).
+            let unindexed_compare = matches!(
+                predicate,
+                Predicate::Compare { field_path, .. }
+                    if !db.is_field_indexed(type_name, field_path)
+                        && !db.is_field_unique(type_name, field_path)
+            );
+            let planned = if unindexed_compare && ctx.governor.scan_cap().is_some() {
+                None
+            } else {
+                plan_filter_scan(db, type_name, predicate, pushed_limit)?
+            };
+            if let Some(mut objects) = planned {
                 // Fast-path objects may carry `raw_fields` — if a downstream
                 // step inspects them via `obj.fields`, eagerly populate now.
                 // No-op when raw_fields is None.
@@ -292,15 +309,14 @@ fn execute_source(
             }
             // No index/zone pushdown applied — this is an UNINDEXED full scan, the
             // sharpest DoS. The governor refuses it (fail-closed) if the type is
-            // over budget, before materializing anything.
-            let mut all = scan_all_objects(ctx, type_name)?;
-            for obj in &mut all {
-                obj.ensure_fields_deserialized();
-            }
-            let filtered = all
-                .into_iter()
-                .filter(|obj| evaluate_predicate(predicate, &obj.fields))
-                .collect();
+            // over budget, before materializing anything. Streamed: each object
+            // decodes only the predicate's fields to be tested; only matches are
+            // decoded whole, and a pushed `.limit(N)` stops the walk at N.
+            let mut wanted: Vec<&str> = Vec::new();
+            predicate_fields(predicate, &mut wanted);
+            wanted.sort_unstable();
+            wanted.dedup();
+            let filtered = stream_objects(ctx, type_name, Some((predicate, &wanted)), pushed_limit)?;
             Ok(QueryOutput::Objects(filtered))
         }
 
@@ -343,12 +359,17 @@ fn execute_source(
         }
 
         Source::All { type_name } => {
-            // A bare listing. The governor refuses it (fail-closed) if the type is
-            // over the row budget; a leading `.limit(N)` is NOT pushed into the scan
-            // (the underlying limited scan drops leading tombstones and would return
-            // incomplete results), so a `.limit` on a huge unindexed listing is
-            // refused — add an indexed filter to page a large type.
-            let all = scan_all_objects(ctx, type_name)?;
+            // A bare listing, streamed in chunks. A leading `.limit(N)` stops the
+            // walk after N live objects — the chunked scan is tombstone-correct,
+            // so a run of deleted ids can't make it return too few (the old
+            // limited scan could, which is why limits weren't pushed before).
+            // Not under read rules: a pushed limit is cut BEFORE the read rule
+            // (see the Filter arm). Without a limit, the governor refuses an
+            // over-budget type up front, as before.
+            let pushed_limit = leading_limit(steps)
+                .filter(|_| ctx.rules.is_none())
+                .map(|n| ctx.governor.clamp_limit(n));
+            let all = stream_objects(ctx, type_name, None, pushed_limit)?;
             Ok(QueryOutput::Objects(all))
         }
     }
@@ -1589,17 +1610,44 @@ fn literal_to_value(lit: &Literal, target: Option<rhypedb_schema::ScalarType>) -
 /// leading deleted-but-uncompacted rows could make it return fewer live rows than
 /// exist, silently corrupting `Type.limit(N)` and the filter fallback. The
 /// count-then-scan here is correct because the count merges the WHOLE prefix.
-fn scan_all_objects(ctx: &ExecContext<'_>, type_name: &str) -> QueryResult<Vec<Object>> {
-    let g = &ctx.governor;
-    if !g.is_enabled() {
-        return Ok(ctx.db.scan_type(type_name)?);
+/// Field names a predicate reads (the projection needed to evaluate it).
+fn predicate_fields<'a>(predicate: &'a Predicate, out: &mut Vec<&'a str>) {
+    match predicate {
+        Predicate::Compare { field_path, .. } | Predicate::Contains { field_path, .. } => {
+            out.push(field_path.as_str())
+        }
+        Predicate::And(l, r) | Predicate::Or(l, r) => {
+            predicate_fields(l, out);
+            predicate_fields(r, out);
+        }
     }
-    if let Some(cap) = g.scan_cap() {
-        // Refuse before materializing if the type is larger than the budget. The
-        // count is bool-per-key (no object payloads), so this bounds peak memory of
-        // an over-budget scan to the key-set rather than the (much larger) object
-        // set — and it never truncates.
-        let live = ctx.db.count_type(type_name)?;
+}
+
+/// Walk every live object of `type_name` in bounded chunks (one MVCC
+/// snapshot), keeping those matching `filter` — tested on a decode of just
+/// the predicate's fields; only matches are decoded whole — and stopping
+/// after `limit` kept objects. Peak memory is one chunk plus the result,
+/// never the whole type.
+///
+/// Governor: rows examined are charged as they are walked. With no `limit`,
+/// an over-budget type is refused up front (fail-closed, before decoding
+/// anything), as an unbounded unindexed scan always was; with a `limit` the
+/// walk is bounded by it and the running charge enforces the cap.
+fn stream_objects(
+    ctx: &ExecContext<'_>,
+    type_name: &str,
+    filter: Option<(&Predicate, &[&str])>,
+    limit: Option<usize>,
+) -> QueryResult<Vec<Object>> {
+    const CHARGE_EVERY: u64 = 256;
+    let g = &ctx.governor;
+    let db = ctx.db;
+    if limit.is_none()
+        && let Some(cap) = g.scan_cap()
+    {
+        // The count is bool-per-key (no object payloads), so this bounds peak
+        // memory of an over-budget scan to the key-set — and it never truncates.
+        let live = db.count_type(type_name)?;
         if live > cap as u64 {
             return Err(QueryError::ResourceLimitExceeded(format!(
                 "query scans more than {cap} rows of type '{type_name}'; \
@@ -1607,9 +1655,34 @@ fn scan_all_objects(ctx: &ExecContext<'_>, type_name: &str) -> QueryResult<Vec<O
             )));
         }
     }
-    let objs = ctx.db.scan_type(type_name)?;
-    g.charge(objs.len() as u64)?;
-    Ok(objs)
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut uncharged = 0u64;
+    db.for_each_raw_object(type_name, db.read_snapshot(), |id, data| {
+        uncharged += 1;
+        if uncharged == CHARGE_EVERY {
+            g.charge(uncharged)?;
+            uncharged = 0;
+        }
+        let keep = match filter {
+            None => true,
+            Some((predicate, fields)) => {
+                let probe = db.decode_object_projected(type_name, id, data, fields);
+                evaluate_predicate(predicate, &probe.fields)
+            }
+        };
+        if keep {
+            out.push(db.decode_object(type_name, id, data));
+            if limit.is_some_and(|n| out.len() >= n) {
+                return Ok(false);
+            }
+        }
+        Ok::<_, QueryError>(true)
+    })?;
+    g.charge(uncharged)?;
+    Ok(out)
 }
 
 /// Recognize the shape `Filter(Compare { int_field, op, int_literal })` and
@@ -1722,7 +1795,7 @@ fn try_filter_scan(
 ///
 /// Behavior-preserving by construction: every materialized branch produces a
 /// SUPERSET of the result, re-filters by the full predicate, and restores
-/// object-id order — so the output equals `scan_all_objects + evaluate_predicate`,
+/// object-id order — so the output equals `the streamed full scan + evaluate_predicate`,
 /// incl. a trailing `.limit`/`.offset`. One snapshot is pinned for the whole
 /// filter, so a multi-scan intersection / union is a single point-in-time view.
 fn plan_filter_scan(
@@ -1930,7 +2003,7 @@ fn intersect_by_id(mut sets: Vec<Vec<Object>>) -> Vec<Object> {
 
 /// Re-filter `candidates` (a superset of the result) by the FULL predicate, then
 /// restore object-id order and dedup by id. Shared by every materialized planner
-/// branch so each is a drop-in for `scan_all_objects + evaluate_predicate` (the
+/// branch so each is a drop-in for `the streamed full scan + evaluate_predicate` (the
 /// index yields value order, and a union can repeat an object across disjuncts).
 fn refilter_and_sort(predicate: &Predicate, mut candidates: Vec<Object>) -> Vec<Object> {
     for obj in &mut candidates {
@@ -3301,12 +3374,17 @@ mod tests {
         // materializing (the count-gate refuses it), never silently truncating.
         let err = execute(&gov_ctx(&db, tight), &parse_query("User").unwrap()).unwrap_err();
         assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "got {err:?}");
-        // A leading `.limit(2)` does NOT rescue it — a `.limit` on an unindexed
-        // listing is not pushed into the scan (the limited scan drops tombstones and
-        // would return incomplete results), so it is refused too. Correctness over a
-        // cheap-but-wrong pushdown.
-        let err = execute(&gov_ctx(&db, tight), &parse_query("User.limit(2)").unwrap()).unwrap_err();
-        assert!(matches!(err, QueryError::ResourceLimitExceeded(_)), "got {err:?}");
+        // A leading `.limit(2)` bounds the walk itself: the listing is streamed in
+        // tombstone-correct chunks and stops after 2 live rows, so it examines 2
+        // rows, fits the budget, and returns exactly the first 2 (see
+        // `leading_limit_stops_the_stream_at_the_first_n_live_rows` for the
+        // tombstone case that once made this pushdown unsafe).
+        match execute(&gov_ctx(&db, tight), &parse_query("User.limit(2)").unwrap()).unwrap() {
+            QueryOutput::Objects(objs) => {
+                assert_eq!(objs.iter().map(|o| o.id).collect::<Vec<_>>(), vec![1, 2])
+            }
+            other => panic!("expected Objects, got {other:?}"),
+        }
         // A type WITHIN the budget scans fully and correctly.
         let roomy = crate::governor::GovernorLimits {
             max_rows_scanned: 10,
@@ -3929,7 +4007,7 @@ mod tests {
     //
     // The planner must be behavior-preserving: every query returns exactly the
     // rows (and, for the AND path, the object-id order) that
-    // `scan_all_objects + evaluate_predicate` would. These tests compare the
+    // `the streamed full scan + evaluate_predicate` would. These tests compare the
     // live `execute` path against an independent full-scan oracle across many
     // predicate shapes — including the counterexamples the design review raised:
     // value-order vs id-order under `.limit`, non-selective indexed conjuncts
@@ -4387,5 +4465,129 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, want, "intersection/union parity failed for `{q}`");
         }
+    }
+
+    // --- Streamed unindexed scans -------------------------------------------
+
+    /// 2,600 objects (crossing the stream's 1,024-key chunks), with runs of
+    /// deleted ids at the front and straddling a chunk boundary.
+    fn streamed_db() -> (tempfile::TempDir, std::sync::Arc<Database>, Vec<u64>) {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = rhypedb_schema::parser::parse_schema(
+            "type Item { n: i64  tag: String  body: String }",
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let mut live = Vec::new();
+        for i in 0..2600i64 {
+            let mut f = FieldMap::new();
+            f.insert("n".into(), Value::I64(i));
+            f.insert("tag".into(), Value::String(if i % 3 == 0 { "x".into() } else { "y".into() }));
+            f.insert("body".into(), Value::String(format!("body {i}")));
+            let id = db.create("Item", f).unwrap().id;
+            let deleted = i < 700 || (1000..1100).contains(&i);
+            if deleted {
+                db.delete("Item", id).unwrap();
+            } else {
+                live.push(id);
+            }
+        }
+        (dir, db, live)
+    }
+
+    fn objects(out: QueryOutput) -> Vec<Object> {
+        match out {
+            QueryOutput::Objects(o) => o,
+            other => panic!("expected objects, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streamed_scans_match_a_full_materialization() {
+        let (_dir, db, live) = streamed_db();
+        let ctx = ExecContext::new(&db, None);
+        let run = |q: &str| objects(execute(&ctx, &parse_query(q).unwrap()).unwrap());
+        let all = db.scan_type("Item").unwrap();
+        assert_eq!(all.iter().map(|o| o.id).collect::<Vec<_>>(), live);
+
+        // Bare listing: every live object, whole, in id order.
+        let listed = run("Item");
+        assert_eq!(listed.len(), live.len());
+        assert_eq!(listed.iter().map(|o| o.id).collect::<Vec<_>>(), live);
+        assert_eq!(listed[0].fields, all[0].fields, "whole objects, not projections");
+
+        // Unindexed filter (String compare, AND/OR, contains): same rows as
+        // filtering the full materialization, and matches come back whole.
+        for q in [
+            r#"Item.filter(.tag == "x")"#,
+            r#"Item.filter(.tag == "x" && .n > 2000)"#,
+            r#"Item.filter(.tag == "y" || .body.contains("99"))"#,
+        ] {
+            let pred = match parse_query(q).unwrap().source {
+                Source::Filter { predicate, .. } => predicate,
+                _ => unreachable!(),
+            };
+            let want: Vec<u64> = all
+                .iter()
+                .filter(|o| evaluate_predicate(&pred, &o.fields))
+                .map(|o| o.id)
+                .collect();
+            let got = run(q);
+            assert_eq!(got.iter().map(|o| o.id).collect::<Vec<_>>(), want, "{q}");
+            assert!(got.iter().all(|o| o.fields.contains_key("body")), "{q}: whole objects");
+        }
+    }
+
+    #[test]
+    fn leading_limit_stops_the_stream_at_the_first_n_live_rows() {
+        let (_dir, db, live) = streamed_db();
+        let ctx = ExecContext::new(&db, None);
+        let run = |q: &str| objects(execute(&ctx, &parse_query(q).unwrap()).unwrap());
+        // Past 700 leading tombstones: still the 10 lowest LIVE ids.
+        let ids: Vec<u64> = run("Item.limit(10)").iter().map(|o| o.id).collect();
+        assert_eq!(ids, live[..10].to_vec());
+        // Across the deleted run near the chunk boundary.
+        let ids: Vec<u64> = run("Item.limit(400)").iter().map(|o| o.id).collect();
+        assert_eq!(ids, live[..400].to_vec());
+        // Filter + limit: the first N matches in id order.
+        let all = db.scan_type("Item").unwrap();
+        let want: Vec<u64> = all
+            .iter()
+            .filter(|o| o.fields.get("tag") == Some(&Value::String("x".into())))
+            .take(25)
+            .map(|o| o.id)
+            .collect();
+        let ids: Vec<u64> =
+            run(r#"Item.filter(.tag == "x").limit(25)"#).iter().map(|o| o.id).collect();
+        assert_eq!(ids, want);
+        assert!(run("Item.limit(0)").is_empty());
+    }
+
+    /// A limited listing walks only as far as its limit, so it fits a row
+    /// budget the whole type would exceed; an unlimited one is still refused
+    /// up front, and a filter that would scan past the budget still fails.
+    #[test]
+    fn governor_bounds_streamed_scans() {
+        let (_dir, db, _live) = streamed_db();
+        let limits = crate::governor::GovernorLimits {
+            max_rows_scanned: 500,
+            ..crate::governor::GovernorLimits::DEFAULT
+        };
+        let run = |q: &str| {
+            let mut ctx = ExecContext::new(&db, None);
+            ctx.governor = Governor::new(limits, std::time::Instant::now());
+            execute(&ctx, &parse_query(q).unwrap())
+        };
+        assert_eq!(objects(run("Item.limit(20)").unwrap()).len(), 20);
+        assert!(matches!(run("Item"), Err(QueryError::ResourceLimitExceeded(_))));
+        assert!(matches!(
+            run(r#"Item.filter(.tag == "nope")"#),
+            Err(QueryError::ResourceLimitExceeded(_))
+        ));
+        // A limited filter whose matches are too rare to find within budget.
+        assert!(matches!(
+            run(r#"Item.filter(.tag == "nope").limit(1)"#),
+            Err(QueryError::ResourceLimitExceeded(_))
+        ));
     }
 }
