@@ -142,6 +142,63 @@ struct IndexEntry {
     offset: u64,
 }
 
+/// A reader's sparse index, read in place from the mapped file. Entry `i` is
+/// `[key_len u32][key][block_offset u64]` at `data[pos[i]..]`; only those
+/// positions live in memory (8 bytes per block, against ~40 for an owned
+/// entry per block plus its slice handle), and the keys and offsets are read
+/// from the file pages as lookups touch them.
+struct SparseIndex {
+    data: Bytes,
+    pos: Vec<u64>,
+}
+
+impl SparseIndex {
+    fn len(&self) -> usize {
+        self.pos.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pos.is_empty()
+    }
+
+    fn key_range(&self, i: usize) -> std::ops::Range<usize> {
+        let p = self.pos[i] as usize;
+        let len = u32::from_be_bytes(self.data[p..p + 4].try_into().unwrap()) as usize;
+        p + 4..p + 4 + len
+    }
+
+    /// Internal key of block `i`'s first entry.
+    fn key(&self, i: usize) -> &[u8] {
+        &self.data[self.key_range(i)]
+    }
+
+    /// [`key`](Self::key) as a zero-copy `Bytes`.
+    fn key_bytes(&self, i: usize) -> Bytes {
+        self.data.slice(self.key_range(i))
+    }
+
+    /// File offset of block `i`.
+    fn offset(&self, i: usize) -> u64 {
+        let end = self.key_range(i).end;
+        u64::from_be_bytes(self.data[end..end + 8].try_into().unwrap())
+    }
+
+    /// `binary_search_by` over entries `from..` comparing their keys with
+    /// `target`; the result is relative to `from`, like searching the slice.
+    fn binary_search_from(&self, from: usize, target: &[u8]) -> std::result::Result<usize, usize> {
+        let (mut lo, mut hi) = (from, self.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.key(mid).cmp(target) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(mid - from),
+            }
+        }
+        Err(lo - from)
+    }
+}
+
 /// Best-effort fsync of a file's parent directory, so a rename into it is
 /// durable across power loss. Failures are ignored: not all platforms/filesystems
 /// permit opening a directory for fsync, and the renamed data is independently
@@ -544,7 +601,7 @@ pub struct SstReader {
     /// return to callers can be zero-copy ref-counted views (`data.slice(..)`)
     /// instead of allocating + memcpy via `Bytes::copy_from_slice`.
     data: Bytes,
-    index: Vec<IndexEntry>,
+    index: SparseIndex,
     /// Bloom filter for user keys. v1 files don't have one — `None` means
     /// "no filter, assume might contain anything".
     bloom: Option<BloomFilter>,
@@ -728,8 +785,7 @@ impl SstReader {
             // wired into the reader for v5/v6. v4 SSTs serve correct results
             // without block pruning until natural compaction rewrites them.
             let zone_map = if version >= 5 {
-                let zone_slice = &data[zonemap_offset..zonemap_offset + zonemap_size];
-                Some(ZoneMap::read_from(&mut &zone_slice[..])?)
+                Some(ZoneMap::from_bytes(data.slice(zonemap_offset..zonemap_offset + zonemap_size))?)
             } else {
                 None
             };
@@ -744,7 +800,7 @@ impl SstReader {
             let algo = HashAlgo::from_byte(bloom_slice[0]).ok_or_else(|| {
                 Error::SstCorrupted(format!("unknown bloom algo byte: {}", bloom_slice[0]))
             })?;
-            let bloom = BloomFilter::read_from(&mut &bloom_slice[1..], algo)
+            let bloom = BloomFilter::from_bytes(&data.slice(bloom_offset + 1..bloom_offset + bloom_size), algo)
                 .map_err(|e| Error::SstCorrupted(format!("bloom: {e}")))?;
 
             (index_offset, index_count, Some(bloom), zone_map)
@@ -846,29 +902,29 @@ impl SstReader {
             None
         };
 
-        // Parse index entries.
-        let mut index = Vec::with_capacity(index_count);
+        // Locate the index entries (validated once here; read in place later).
+        let mut positions = Vec::with_capacity(index_count);
         let mut pos = index_offset;
         for _ in 0..index_count {
             if pos + 4 > data.len() {
                 return Err(Error::SstCorrupted("index truncated".into()));
             }
             let key_len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-            let key = data.slice(pos..pos + key_len);
-            pos += key_len;
-            let offset = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            index.push(IndexEntry { key, offset });
+            if pos + 4 + key_len + 8 > data.len() {
+                return Err(Error::SstCorrupted("index truncated".into()));
+            }
+            positions.push(pos as u64);
+            pos += 4 + key_len + 8;
         }
+        let index = SparseIndex { data: data.clone(), pos: positions };
 
         let data_end = index_offset;
 
         // First user key: strip the 8-byte version suffix off the first
         // sparse-index entry (which is the first entry's full internal key).
-        let first_user_key = index.first().and_then(|e| {
-            if e.key.len() >= 8 {
-                Some(e.key.slice(..e.key.len() - 8))
+        let first_user_key = (!index.is_empty()).then(|| index.key_bytes(0)).and_then(|k| {
+            if k.len() >= 8 {
+                Some(k.slice(..k.len() - 8))
             } else {
                 None
             }
@@ -972,7 +1028,7 @@ impl SstReader {
     /// monotonically and hold the current block in a local, so each block is
     /// decompressed at most once per call regardless.
     fn block(&self, block_idx: usize) -> Result<Bytes> {
-        let start = self.index[block_idx].offset as usize;
+        let start = self.index.offset(block_idx) as usize;
         let end = self.block_end_offset(block_idx);
         if start > end || end > self.data_end {
             return Err(Error::SstCorrupted("block bounds out of range".into()));
@@ -1116,7 +1172,7 @@ impl SstReader {
         }
 
         // Binary search the sparse index to find the block to scan.
-        let block_idx = match self.index.binary_search_by(|e| e.key.as_ref().cmp(target_key)) {
+        let block_idx = match self.index.binary_search_from(0, target_key) {
             Ok(i) => i,
             Err(0) => return Ok(None), // target is before all entries
             Err(i) => i - 1,
@@ -1218,8 +1274,7 @@ impl SstReader {
         search_key.extend_from_slice(prefix);
         search_key.extend_from_slice(&[0u8; 8]);
 
-        let slice = &self.index[start..];
-        let rel = match slice.binary_search_by(|e| e.key.as_ref().cmp(&search_key)) {
+        let rel = match self.index.binary_search_from(start, &search_key) {
             Ok(i) => i,
             Err(0) => 0,
             Err(i) => i - 1,
@@ -1275,7 +1330,7 @@ impl SstReader {
             // Seed cursor at the first prefix's starting block.
             if !seeded {
                 block_idx = self.prefix_start_block_from(prefix, 0);
-                pos = self.index[block_idx].offset as usize;
+                pos = self.index.offset(block_idx) as usize;
                 seeded = true;
                 last_user_key = None;
             }
@@ -1311,10 +1366,10 @@ impl SstReader {
                 pos = val_end;
                 // Threshold gallop: re-seek for the active prefix on block crossing.
                 if block_idx + 1 < self.index.len()
-                    && pos >= self.index[block_idx + 1].offset as usize
+                    && pos >= self.index.offset(block_idx + 1) as usize
                 {
                     block_idx = self.prefix_start_block_from(prefix, block_idx + 1);
-                    pos = self.index[block_idx].offset as usize;
+                    pos = self.index.offset(block_idx) as usize;
                 }
             } else if entry_user.starts_with(prefix) {
                 // In range — match per scan_prefix's rules.
@@ -1339,7 +1394,7 @@ impl SstReader {
                 }
                 pos = val_end;
                 while block_idx + 1 < self.index.len()
-                    && pos >= self.index[block_idx + 1].offset as usize
+                    && pos >= self.index.offset(block_idx + 1) as usize
                 {
                     block_idx += 1;
                 }
@@ -1401,9 +1456,8 @@ impl SstReader {
         let hi = hi.as_bytes();
         let own_len = user_key.len() + 8;
 
-        let slice = &self.index[block_floor..];
         let block_idx = block_floor
-            + match slice.binary_search_by(|e| e.key.as_ref().cmp(lo)) {
+            + match self.index.binary_search_from(block_floor, lo) {
                 Ok(i) => i,
                 Err(0) => 0,
                 Err(i) => i - 1,
@@ -1623,7 +1677,7 @@ impl SstReader {
             if user_key < prefix {
                 pos = val_end;
                 while block_idx + 1 < self.index.len()
-                    && pos >= self.index[block_idx + 1].offset as usize
+                    && pos >= self.index.offset(block_idx + 1) as usize
                 {
                     block_idx += 1;
                 }
@@ -1638,7 +1692,7 @@ impl SstReader {
             if entry_version > version {
                 pos = val_end;
                 while block_idx + 1 < self.index.len()
-                    && pos >= self.index[block_idx + 1].offset as usize
+                    && pos >= self.index.offset(block_idx + 1) as usize
                 {
                     block_idx += 1;
                 }
@@ -1659,7 +1713,7 @@ impl SstReader {
             }
             pos = val_end;
             while block_idx + 1 < self.index.len()
-                && pos >= self.index[block_idx + 1].offset as usize
+                && pos >= self.index.offset(block_idx + 1) as usize
             {
                 block_idx += 1;
             }
@@ -1766,19 +1820,27 @@ impl SstReader {
     /// Block index containing `offset`. Linear in the worst case but cheap —
     /// only called when seeding a filtered scan (typically once per call).
     fn block_idx_for_offset(&self, offset: usize) -> usize {
-        for (i, entry) in self.index.iter().enumerate() {
-            if entry.offset as usize > offset {
-                return i.saturating_sub(1);
+        // First block starting after `offset`, minus one (offsets ascend).
+        let (mut lo, mut hi) = (0, self.index.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.index.offset(mid) as usize > offset {
+                hi = mid;
+            } else {
+                lo = mid + 1;
             }
         }
-        self.index.len().saturating_sub(1)
+        if lo == self.index.len() {
+            return self.index.len().saturating_sub(1);
+        }
+        lo.saturating_sub(1)
     }
 
     /// First-byte offset of the block AFTER `block_idx` (or `data_end` if
     /// `block_idx` is the last block). Used to jump past zone-excluded blocks.
     fn block_end_offset(&self, block_idx: usize) -> usize {
         if block_idx + 1 < self.index.len() {
-            self.index[block_idx + 1].offset as usize
+            self.index.offset(block_idx + 1) as usize
         } else {
             self.data_end
         }
@@ -1870,13 +1932,13 @@ impl SstReader {
         search_key.extend_from_slice(&[0u8; 8]);
         let block_idx = match self
             .index
-            .binary_search_by(|e| e.key.as_ref().cmp(&search_key))
+            .binary_search_from(0, &search_key)
         {
             Ok(i) => i,
             Err(0) => 0,
             Err(i) => i - 1,
         };
-        self.index[block_idx].offset as usize
+        self.index.offset(block_idx) as usize
     }
 
     /// Bounded variant: stop after collecting `max_distinct` user keys. Used
@@ -1969,14 +2031,14 @@ impl SstReader {
 
         let block_idx = match self
             .index
-            .binary_search_by(|e| e.key.as_ref().cmp(&search_key))
+            .binary_search_from(0, &search_key)
         {
             Ok(i) => i,
             Err(0) => 0,
             Err(i) => i - 1,
         };
 
-        self.index[block_idx].offset as usize
+        self.index.offset(block_idx) as usize
     }
 
     /// Iterate all entries in the SST in sorted order.
@@ -2003,7 +2065,7 @@ impl SstReader {
             };
         }
         let block_idx = self.block_idx_for_offset(start);
-        let block_start = self.index[block_idx].offset as usize;
+        let block_start = self.index.offset(block_idx) as usize;
         match self.block(block_idx) {
             Ok(block) => SstIterator {
                 reader: self,

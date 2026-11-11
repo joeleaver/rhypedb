@@ -142,44 +142,72 @@ impl Default for ZoneBuilder {
 
 /// Reader-side view of a serialized zone map. Lookup is `(block_idx,
 /// field_id) -> Option<(min, max)>` in O(1) via the id → column index map.
+///
+/// The bounds are read in place from `raw` — for an open SST, a slice of the
+/// mapped file — rather than decoded into a heap array at open: a large file
+/// has a bound pair per field for every 16-entry block (tens of MB), while a
+/// query touches only the blocks it prunes.
 #[derive(Debug, Clone, Default)]
 pub struct ZoneMap {
     field_id_to_idx: HashMap<u32, usize>,
     num_fields: usize,
-    /// Per-block per-field flat array: `bounds[block_idx * num_fields * 2 + field_idx * 2 + {0=min, 1=max}]`.
-    /// Flat representation is more cache-friendly than `Vec<Vec<(u64, u64)>>`.
-    bounds: Vec<u64>,
+    /// Flat big-endian u64 array, exactly as written:
+    /// `[block_idx * num_fields * 2 + field_idx * 2 + {0=min, 1=max}]`.
+    raw: bytes::Bytes,
+    /// Number of u64 bounds in `raw`.
+    num_bounds: usize,
 }
 
 impl ZoneMap {
+    /// Parse a serialized zone map from a reader (copies it once).
     pub fn read_from(r: &mut dyn Read) -> Result<Self> {
-        let mut buf4 = [0u8; 4];
-        r.read_exact(&mut buf4).map_err(io_err)?;
-        let num_blocks = u32::from_be_bytes(buf4) as usize;
-        r.read_exact(&mut buf4).map_err(io_err)?;
-        let num_fields = u32::from_be_bytes(buf4) as usize;
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).map_err(io_err)?;
+        Self::from_bytes(bytes::Bytes::from(all))
+    }
 
+    /// View a serialized zone map held in `data` (e.g. a slice of a mapped
+    /// SST) without copying its bounds. Trailing bytes past the bounds are
+    /// ignored, as `read_from` always did.
+    pub fn from_bytes(data: bytes::Bytes) -> Result<Self> {
+        let truncated = || Error::SstCorrupted("zone map truncated".into());
+        if data.len() < 8 {
+            return Err(truncated());
+        }
+        let num_blocks = u32::from_be_bytes(data[0..4].try_into().unwrap()) as usize;
+        let num_fields = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
+        let header = num_fields.checked_mul(4).and_then(|n| n.checked_add(8)).ok_or_else(truncated)?;
+        if data.len() < header {
+            return Err(truncated());
+        }
         let mut field_id_to_idx = HashMap::with_capacity(num_fields);
         for idx in 0..num_fields {
-            r.read_exact(&mut buf4).map_err(io_err)?;
-            let field_id = u32::from_be_bytes(buf4);
+            let at = 8 + idx * 4;
+            let field_id = u32::from_be_bytes(data[at..at + 4].try_into().unwrap());
             field_id_to_idx.insert(field_id, idx);
         }
-
         // num_blocks × num_fields × 2 u64s.
-        let bound_count = num_blocks * num_fields * 2;
-        let mut bounds = Vec::with_capacity(bound_count);
-        let mut buf8 = [0u8; 8];
-        for _ in 0..bound_count {
-            r.read_exact(&mut buf8).map_err(io_err)?;
-            bounds.push(u64::from_be_bytes(buf8));
+        let num_bounds = num_blocks
+            .checked_mul(num_fields)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(truncated)?;
+        let end = num_bounds
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(header))
+            .ok_or_else(truncated)?;
+        if data.len() < end {
+            return Err(truncated());
         }
-
         Ok(Self {
             field_id_to_idx,
             num_fields,
-            bounds,
+            raw: data.slice(header..end),
+            num_bounds,
         })
+    }
+
+    fn bound(&self, i: usize) -> u64 {
+        u64::from_be_bytes(self.raw[i * 8..i * 8 + 8].try_into().unwrap())
     }
 
     /// Number of blocks this map covers. Should equal the SST's sparse-index
@@ -188,11 +216,10 @@ impl ZoneMap {
         if self.num_fields == 0 {
             // Zone maps with zero fields don't carry per-block data — treat
             // as covering whatever the SST has (always returns true on check).
-            // `bounds` is empty when `num_fields == 0` (it was built with
-            // `num_blocks * num_fields * 2 == 0` capacity), so this is 0.
-            return self.bounds.len();
+            // There are no bounds when `num_fields == 0`, so this is 0.
+            return self.num_bounds;
         }
-        self.bounds.len() / (self.num_fields * 2)
+        self.num_bounds / (self.num_fields * 2)
     }
 
     /// Returns `(min, max)` for `field_id` at `block_idx`, or `None` if
@@ -201,10 +228,10 @@ impl ZoneMap {
     pub fn bounds(&self, block_idx: usize, field_id: u32) -> Option<(u64, u64)> {
         let field_idx = *self.field_id_to_idx.get(&field_id)?;
         let pos = (block_idx * self.num_fields + field_idx) * 2;
-        if pos + 1 >= self.bounds.len() {
+        if pos + 1 >= self.num_bounds {
             return None;
         }
-        Some((self.bounds[pos], self.bounds[pos + 1]))
+        Some((self.bound(pos), self.bound(pos + 1)))
     }
 
     /// `true` iff the block could contain a key whose `field_id` value
@@ -308,6 +335,32 @@ mod tests {
         assert_eq!(zmap.bounds(1, YEAR_ID), Some((2000, 2000)));
         // Unrelated field id: not tracked.
         assert_eq!(zmap.bounds(0, 0xdeadbeef), None);
+    }
+
+    #[test]
+    fn from_bytes_reads_bounds_in_place_and_rejects_truncation() {
+        let mut b = ZoneBuilder::new();
+        b.record(0, &[(YEAR_ID, 1900u64.to_be_bytes()), (AGE_ID, 30u64.to_be_bytes())]);
+        b.record(2, &[(YEAR_ID, 2020u64.to_be_bytes())]);
+        let mut buf = Vec::new();
+        b.write_to(&mut buf).unwrap();
+        let full = bytes::Bytes::from(buf);
+        let z = ZoneMap::from_bytes(full.clone()).unwrap();
+        assert_eq!(z.num_blocks(), 3);
+        assert_eq!(z.bounds(0, YEAR_ID), Some((1900, 1900)));
+        assert_eq!(z.bounds(0, AGE_ID), Some((30, 30)));
+        assert_eq!(z.bounds(2, YEAR_ID), Some((2020, 2020)));
+        assert_eq!(z.bounds(3, YEAR_ID), None, "past the last block");
+        // Same answers as the copying reader.
+        let copied = ZoneMap::read_from(&mut &full[..]).unwrap();
+        for blk in 0..4 {
+            for f in [YEAR_ID, AGE_ID, 7] {
+                assert_eq!(z.bounds(blk, f), copied.bounds(blk, f));
+            }
+        }
+        for cut in [0, 7, 8 + 4, full.len() - 1] {
+            assert!(ZoneMap::from_bytes(full.slice(..cut)).is_err(), "cut {cut}");
+        }
     }
 
     #[test]
