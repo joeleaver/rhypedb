@@ -186,6 +186,9 @@ impl MemTable {
                 continue;
             }
 
+            if max_distinct != usize::MAX {
+                crate::key::debug_assert_prefix_free(last_user_key.as_deref(), user_key);
+            }
             last_user_key = Some(user_key.to_vec());
             results.push((Bytes::copy_from_slice(user_key), entry.value().clone()));
             if results.len() >= max_distinct {
@@ -241,6 +244,9 @@ impl MemTable {
                 continue;
             }
 
+            if max_distinct != usize::MAX {
+                crate::key::debug_assert_prefix_free(last_user_key.as_deref(), user_key);
+            }
             last_user_key = Some(user_key.to_vec());
             results.push((Bytes::copy_from_slice(user_key), entry.value().clone()));
             if results.len() >= max_distinct {
