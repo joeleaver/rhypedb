@@ -34,9 +34,46 @@ impl HashAlgo {
     }
 }
 
+/// A filter's bit array: built in memory by the writer, or (for a filter read
+/// from an SST) a zero-copy view of the mapped file — so an open SST's filter
+/// costs reclaimable file pages, touched only by lookups, instead of a heap
+/// copy held for the life of the file.
+#[derive(Debug, Clone)]
+enum Bits {
+    Owned(Vec<u8>),
+    Mapped(bytes::Bytes),
+}
+
+impl Bits {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Bits::Owned(v) => v,
+            Bits::Mapped(b) => b,
+        }
+    }
+
+    /// Mutable access for building; a mapped filter is copied first (never
+    /// happens on the read path — only writers add keys).
+    fn owned_mut(&mut self) -> &mut Vec<u8> {
+        if let Bits::Mapped(b) = self {
+            *self = Bits::Owned(b.to_vec());
+        }
+        match self {
+            Bits::Owned(v) => v,
+            Bits::Mapped(_) => unreachable!(),
+        }
+    }
+}
+
+impl PartialEq for Bits {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BloomFilter {
-    bits: Vec<u8>,
+    bits: Bits,
     num_bits: u32, // total number of bits (m); always a power of two for newly-built filters
     k: u8,         // number of hash functions
     /// Set when `num_bits` is a power of two — lets `add`/`contains` use a
@@ -80,7 +117,7 @@ impl BloomFilter {
         let num_bits = raw_bits.next_power_of_two();
         let num_bytes = num_bits.div_ceil(8);
         Self {
-            bits: vec![0u8; num_bytes],
+            bits: Bits::Owned(vec![0u8; num_bytes]),
             num_bits: num_bits as u32,
             k,
             mask: Some((num_bits - 1) as u32),
@@ -139,13 +176,14 @@ impl BloomFilter {
         // Fold at byte granularity only (each half a whole number of bytes);
         // the last sub-byte steps would save under a byte.
         while self.num_bits as usize > target && self.num_bits >= 16 {
-            let half_bytes = self.bits.len() / 2;
-            let (lo, hi) = self.bits.split_at_mut(half_bytes);
+            let bits = self.bits.owned_mut();
+            let half_bytes = bits.len() / 2;
+            let (lo, hi) = bits.split_at_mut(half_bytes);
             for (l, h) in lo.iter_mut().zip(hi.iter()) {
                 *l |= *h;
             }
-            self.bits.truncate(half_bytes);
-            self.bits.shrink_to_fit();
+            bits.truncate(half_bytes);
+            bits.shrink_to_fit();
             self.num_bits /= 2;
             self.mask = Some(self.num_bits - 1);
         }
@@ -212,19 +250,19 @@ impl BloomFilter {
     }
 
     pub fn byte_size(&self) -> usize {
-        self.bits.len()
+        self.bits.as_slice().len()
     }
 
     fn set_bit(&mut self, bit: usize) {
         let byte = bit / 8;
         let mask = 1u8 << (bit % 8);
-        self.bits[byte] |= mask;
+        self.bits.owned_mut()[byte] |= mask;
     }
 
     fn get_bit(&self, bit: usize) -> bool {
         let byte = bit / 8;
         let mask = 1u8 << (bit % 8);
-        (self.bits[byte] & mask) != 0
+        (self.bits.as_slice()[byte] & mask) != 0
     }
 
     /// Serialize the bloom payload: [num_bits: u32 BE][k: u8][bits: ceil(num_bits/8) bytes].
@@ -236,7 +274,7 @@ impl BloomFilter {
     pub fn write_to(&self, w: &mut dyn Write) -> io::Result<()> {
         w.write_all(&self.num_bits.to_be_bytes())?;
         w.write_all(&[self.k])?;
-        w.write_all(&self.bits)
+        w.write_all(self.bits.as_slice())
     }
 
     /// Deserialize a bloom payload. `algo` is supplied by the caller from
@@ -262,6 +300,27 @@ impl BloomFilter {
             None
         };
 
+        Ok(Self { bits: Bits::Owned(bits), num_bits, k, mask, algo })
+    }
+
+    /// Like [`read_from`](Self::read_from) over a payload held in `data`, but
+    /// the bit array is a zero-copy slice of `data` rather than a copy.
+    pub fn from_bytes(data: &bytes::Bytes, algo: HashAlgo) -> io::Result<Self> {
+        if data.len() < 5 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "bloom header truncated"));
+        }
+        let num_bits = u32::from_be_bytes(data[0..4].try_into().unwrap());
+        let k = data[4];
+        let num_bytes = (num_bits as usize).div_ceil(8);
+        if data.len() < 5 + num_bytes {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "bloom bits truncated"));
+        }
+        let mask = if num_bits > 0 && num_bits.is_power_of_two() {
+            Some(num_bits - 1)
+        } else {
+            None
+        };
+        let bits = Bits::Mapped(data.slice(5..5 + num_bytes));
         Ok(Self { bits, num_bits, k, mask, algo })
     }
 }
@@ -321,6 +380,28 @@ mod tests {
                 assert!(big.contains(k));
             }
         }
+    }
+
+    #[test]
+    fn from_bytes_is_a_zero_copy_twin_of_read_from() {
+        let mut built = BloomFilter::new(5_000);
+        for i in 0..5_000u32 {
+            built.add(&i.to_be_bytes());
+        }
+        let mut payload = Vec::new();
+        built.write_to(&mut payload).unwrap();
+        let copied = BloomFilter::read_from(&mut &payload[..], HashAlgo::Xxh3).unwrap();
+        let shared = bytes::Bytes::from(payload.clone());
+        let mapped = BloomFilter::from_bytes(&shared, HashAlgo::Xxh3).unwrap();
+        // The mapped filter's bits ARE the payload's bytes, not a copy.
+        assert!(matches!(&mapped.bits, Bits::Mapped(b) if b.as_ptr() == shared[5..].as_ptr()));
+        assert_eq!(mapped.bits, copied.bits);
+        for i in 0..20_000u32 {
+            let k = i.to_be_bytes();
+            assert_eq!(mapped.contains(&k), copied.contains(&k), "key {i}");
+        }
+        assert!(BloomFilter::from_bytes(&shared.slice(..4), HashAlgo::Xxh3).is_err());
+        assert!(BloomFilter::from_bytes(&shared.slice(..shared.len() - 1), HashAlgo::Xxh3).is_err());
     }
 
     #[test]
@@ -428,7 +509,7 @@ mod tests {
         let k = 7u8;
         let num_bytes = (num_bits as usize).div_ceil(8);
         let mut legacy = BloomFilter {
-            bits: vec![0u8; num_bytes],
+            bits: Bits::Owned(vec![0u8; num_bytes]),
             num_bits,
             k,
             mask: None, // forces modulo path
