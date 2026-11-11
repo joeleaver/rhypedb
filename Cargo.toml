@@ -45,6 +45,8 @@ crc32fast = "1"
 fastembed = { version = "5.17", default-features = false }
 crossbeam-skiplist = "0.1"
 parking_lot = "0.12"
+# Compressed bitmap of live object ids (engine version counters).
+roaring = "0.10"
 boxcar = "0.2"
 arc-swap = "1"
 rand = "0.9"
