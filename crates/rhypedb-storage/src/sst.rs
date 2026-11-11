@@ -1767,6 +1767,9 @@ impl SstReader {
                 continue;
             }
 
+            if max_distinct != usize::MAX {
+                crate::key::debug_assert_prefix_free(last_user_key.as_deref(), user_key);
+            }
             last_user_key = Some(user_key.to_vec());
             let user_key_len = key.len() - 8;
             results.push((key.slice(..user_key_len), value));
@@ -1857,6 +1860,9 @@ impl SstReader {
                 continue;
             }
 
+            if max_distinct != usize::MAX {
+                crate::key::debug_assert_prefix_free(last_user_key.as_deref(), user_key);
+            }
             last_user_key = Some(user_key.to_vec());
             // Zero-copy slice into the iterator's key Bytes (which already
             // shares the SstReader's data refcount).

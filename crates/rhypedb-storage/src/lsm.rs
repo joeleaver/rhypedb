@@ -758,6 +758,11 @@ impl LsmTree {
     /// `start_user_key` is inclusive (same seek semantics as
     /// `scan_from_at_limited`); pass the key strictly after the last cursor
     /// to avoid re-visiting it.
+    ///
+    /// Requires a PREFIX-FREE keyspace under `prefix` (no user key a strict
+    /// prefix of another): fixed-length ids or escaped-and-terminated values.
+    /// See [`crate::key::debug_assert_prefix_free`] for why, and for the
+    /// debug-build guard that enforces it.
     pub fn scan_chunk_raw(
         &self,
         version: u64,
@@ -4633,5 +4638,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Scan order with prefix-related user keys ---------------------------
+
+    fn prefix_related_tree(flush: bool) -> (tempfile::TempDir, Arc<LsmTree>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(dir.path());
+        cfg.memtable_flush_size = usize::MAX;
+        let tree = LsmTree::open(cfg).unwrap();
+        // Written in a scrambled order; internal (raw-byte) order of these is
+        // a10, a1\0, a1, a — the reverse of user order for each prefix chain.
+        for k in [&b"p:a1"[..], b"p:a", b"p:a10", b"p:a1\0", b"p:b"] {
+            put_kv(&tree, k, k);
+        }
+        if flush {
+            tree.flush().unwrap();
+        }
+        (dir, tree)
+    }
+
+    /// Unbounded scans merge layers into a map keyed by USER key, so they
+    /// return true user-key order even where internal order differs.
+    #[test]
+    fn unbounded_scans_return_user_key_order_for_prefix_related_keys() {
+        for flush in [false, true] {
+            let (_dir, tree) = prefix_related_tree(flush);
+            let got: Vec<Vec<u8>> = tree
+                .scan_prefix_at(tree.read_snapshot(), b"p:")
+                .unwrap()
+                .into_iter()
+                .map(|(k, _)| k.to_vec())
+                .collect();
+            let want: Vec<Vec<u8>> = [&b"p:a"[..], b"p:a1", b"p:a1\0", b"p:a10", b"p:b"]
+                .iter()
+                .map(|k| k.to_vec())
+                .collect();
+            assert_eq!(got, want, "flush={flush}");
+        }
+    }
+
+    /// The bounded scans' prefix-free requirement is enforced in debug builds:
+    /// a chunked walk over prefix-related keys fails loudly instead of
+    /// silently skipping rows.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "not prefix-free")]
+    fn bounded_scan_over_prefix_related_keys_trips_the_debug_guard() {
+        let (_dir, tree) = prefix_related_tree(true);
+        let _ = tree.scan_chunk_raw(tree.read_snapshot(), b"p:", b"p:", 10);
     }
 }

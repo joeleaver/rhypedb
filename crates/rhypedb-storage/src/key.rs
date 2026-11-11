@@ -87,6 +87,35 @@ fn push_fulltext_prefix(
     buf.push(SEPARATOR);
 }
 
+/// Debug guard for the BOUNDED scans (`scan_from_max` / `scan_prefix_max` on
+/// memtables and SSTs, and `LsmTree::scan_chunk_raw` built on them).
+///
+/// Internal keys are `user_key ‖ !version` compared as raw bytes, so a user
+/// key that is a strict prefix of another sorts AFTER its extensions (`a10`,
+/// `a1`, `a` — the reverse of user order). A bounded scan takes the first N
+/// keys in internal order, so over a keyspace where one key prefixes another
+/// it could return a later user key and skip an earlier one, and a resumed
+/// chunked walk would then never visit the skipped key. Every keyspace those
+/// scans run over today is prefix-free — fixed-length ids (`o:`, `e:`, `r:`,
+/// `g:`) or escaped-and-terminated values (`i:`, `f:`) — so this cannot
+/// happen; the guard makes a future caller that breaks the rule fail loudly in
+/// tests instead of silently skipping rows. (Unbounded scans merge into a map
+/// keyed by user key and are correct for any keyspace.)
+///
+/// In internal order a prefix arrives right after one of its extensions, so
+/// comparing with the previously emitted key detects it. Callers apply it only
+/// when a real bound is set (`usize::MAX` = unbounded, which is always safe).
+#[inline]
+pub(crate) fn debug_assert_prefix_free(prev: Option<&[u8]>, next: &[u8]) {
+    debug_assert!(
+        !prev.is_some_and(|p| p.len() > next.len() && p.starts_with(next)),
+        "bounded scan over a keyspace that is not prefix-free: {:?} is a prefix of the \
+         previously emitted {:?}; bounded scans require fixed-length or terminated keys",
+        next,
+        prev.unwrap_or_default()
+    );
+}
+
 /// Encodes an internal key with a version suffix for MVCC.
 ///
 /// Format: `<user_key><version_u64_be>`
