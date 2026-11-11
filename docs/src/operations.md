@@ -212,6 +212,8 @@ curl -s -X POST http://127.0.0.1:4200/admin/compact \
 { "flush_ok": true, "flush_ms": 50, "compact_ok": true, "compact_ms": 200 }
 ```
 
+**Opening a large database.** Each data file records which object ids it holds, so startup rebuilds its set of live objects from those small records without reading object data. Files written by versions before 2026-11 lack the record. For those files, startup walks their object keys instead, which pages in roughly half of their object bytes on every open. A compaction rewrites them in the current format, after which opens stay fast; one `POST /admin/compact` (or `compact()` when embedding) converts an older data directory in one go.
+
 ## Monitoring
 
 - **`GET /health`** — liveness. Returns `200 OK` with a short status string.

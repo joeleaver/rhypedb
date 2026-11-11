@@ -367,6 +367,34 @@ impl LsmTree {
     ///
     /// Use this for reads only. A transaction is still required for writes
     /// because conflict detection depends on the active set.
+    /// Every live object id per type id, as of the current snapshot, built
+    /// from each source's object-id summary (memtables, then SSTs newest
+    /// first) without reading object values. Equivalent to scanning the whole
+    /// object keyspace and keeping the live keys: per id the newest source
+    /// mentioning it decides, the same precedence the read path's merge
+    /// applies across sources. SSTs written before summaries existed are
+    /// walked (their object keyspace only), as a full scan would have.
+    ///
+    /// Meant for open, before concurrent writers start. Sources are read
+    /// newest first and data only ever moves toward older sources (active →
+    /// immutable → SST), so a concurrent flush can make it see an entry twice
+    /// (same content, harmless) but never miss one; writes committed after
+    /// it starts may or may not be reflected.
+    pub fn live_object_ids(&self) -> Result<std::collections::BTreeMap<u64, roaring::RoaringTreemap>> {
+        let version = self.read_snapshot();
+        let mut merge = crate::idsum::LiveIdMerge::default();
+        merge.apply(&self.active_memtable.read().object_id_summary(version));
+        let immutables = self.immutable_memtables.read().clone();
+        for mt in immutables.iter().rev() {
+            merge.apply(&mt.object_id_summary(version));
+        }
+        let ssts = self.sst_files.read().clone();
+        for sst in ssts.iter().rev() {
+            merge.apply(&sst.object_id_summary()?);
+        }
+        Ok(merge.finish())
+    }
+
     pub fn read_snapshot(&self) -> u64 {
         self.txn_manager.current_version()
     }
@@ -4682,5 +4710,129 @@ mod tests {
     fn bounded_scan_over_prefix_related_keys_trips_the_debug_guard() {
         let (_dir, tree) = prefix_related_tree(true);
         let _ = tree.scan_chunk_raw(tree.read_snapshot(), b"p:", b"p:", 10);
+    }
+
+    /// `live_object_ids` against a full scan of the object keyspace, over
+    /// random histories of object puts/deletes (and non-object keys around
+    /// them) with flushes, compactions and reopens — including reopens after
+    /// rewriting some SSTs into the two older formats (no meta block; meta
+    /// block without the id section), which must be walked instead.
+    #[test]
+    fn live_object_ids_matches_a_full_object_scan() {
+        use crate::key::KeyBuilder;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        fn scan_live(tree: &LsmTree) -> BTreeMap<u64, BTreeSet<u64>> {
+            let prefix = [crate::key::KeyPrefix::Object as u8, crate::key::SEPARATOR];
+            let mut out: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+            for (k, _) in tree.scan_prefix_at(tree.read_snapshot(), &prefix).unwrap() {
+                let (t, id) = crate::idsum::object_key_ids(&k).expect("object key");
+                out.entry(t).or_default().insert(id);
+            }
+            out
+        }
+        fn summarized(tree: &LsmTree) -> BTreeMap<u64, BTreeSet<u64>> {
+            tree.live_object_ids()
+                .unwrap()
+                .into_iter()
+                .map(|(t, ids)| (t, ids.iter().collect()))
+                .collect()
+        }
+
+        for seed in 1..=10u64 {
+            let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut next = move |n: u64| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % n
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let config = || {
+                let mut c = test_config(dir.path());
+                c.sync_on_commit = false; // durability isn't under test; fsync dominates
+                if seed % 2 == 0 {
+                    c.block_compression = SstCompression::None;
+                }
+                c
+            };
+            let mut tree = LsmTree::open(config()).unwrap();
+            let mut model: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+            let mut reopens = 0;
+            let mut step = 0u32;
+            for _ in 0..400 {
+                let op = next(100);
+                let structural = op >= 85;
+                match op {
+                    0..=44 => {
+                        // One txn of 1-4 object writes, maybe with a neighbour key.
+                        let mut txn = tree.begin_txn();
+                        for _ in 0..1 + next(4) {
+                            let (t, id) = (1 + next(3), next(40));
+                            let key = KeyBuilder::object(t, id);
+                            if next(3) == 0 {
+                                tree.delete(&mut txn, &key).unwrap();
+                                model.entry(t).or_default().remove(&id);
+                            } else {
+                                let v = vec![b'x'; next(300) as usize];
+                                tree.put(&mut txn, &key, Bytes::from(v)).unwrap();
+                                model.entry(t).or_default().insert(id);
+                            }
+                        }
+                        if next(2) == 0 {
+                            let edge = KeyBuilder::edge(next(40), 1, next(40));
+                            tree.put(&mut txn, &edge, Bytes::from_static(b"e")).unwrap();
+                        }
+                        tree.commit(&mut txn).unwrap();
+                    }
+                    45..=84 => {
+                        // Keys of the neighbouring keyspaces, sharing ids and type ids
+                        // with the objects (`o:` itself only ever holds object keys).
+                        let mut txn = tree.begin_txn();
+                        let (t, id) = (1 + next(3), next(40));
+                        tree.put(&mut txn, &KeyBuilder::object_version(t, id), Bytes::from_static(b"g"))
+                            .unwrap();
+                        tree.put(&mut txn, &KeyBuilder::reverse_edge(id, t, next(40)), Bytes::from_static(b"r"))
+                            .unwrap();
+                        if next(4) == 0 {
+                            tree.delete(&mut txn, &KeyBuilder::edge(id, 1, next(40))).unwrap();
+                        }
+                        tree.commit(&mut txn).unwrap();
+                    }
+                    85..=92 => tree.flush().unwrap(),
+                    93..=95 => tree.compact().unwrap(),
+                    _ => {
+                        tree.flush().unwrap();
+                        drop(tree);
+                        reopens += 1;
+                        let ssts: Vec<_> = std::fs::read_dir(dir.path().join("sst"))
+                            .unwrap()
+                            .map(|e| e.unwrap().path())
+                            .filter(|p| p.extension().is_some_and(|e| e == "sst"))
+                            .collect();
+                        for p in &ssts {
+                            let header = std::fs::read(p).unwrap();
+                            let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
+                            if version < 7 {
+                                continue; // already rewritten as a pre-meta file
+                            }
+                            match next(4) {
+                                0 => crate::sst::legacy::strip_meta_to_legacy(p),
+                                1 => crate::sst::legacy::drop_object_id_section(p),
+                                _ => {}
+                            }
+                        }
+                        tree = LsmTree::open(config()).unwrap();
+                    }
+                }
+                model.retain(|_, ids| !ids.is_empty());
+                step += 1;
+                if structural || step.is_multiple_of(20) {
+                    assert_eq!(scan_live(&tree), model, "seed {seed}: scan vs model");
+                    assert_eq!(summarized(&tree), model, "seed {seed}: summaries vs model");
+                }
+            }
+            assert!(reopens > 0, "seed {seed} never reopened");
+        }
     }
 }

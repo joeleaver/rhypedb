@@ -1185,34 +1185,22 @@ impl Database {
                 // `Arc::clone(&c.next_object_id)` and clones `version_counters`.
                 (0u64, VersionCounters::default())
             } else {
+                // Read from each source's object-id summary, not by scanning
+                // `o:` — a scan pages in the data around every object key
+                // (about half of all object bytes in a text-heavy store) on
+                // every open. Only the schema's types are kept, as the scan
+                // did.
+                let live = storage.live_object_ids()?;
+                let known: std::collections::HashSet<u64> = type_ids.values().copied().collect();
                 let mut max_object_id = 0u64;
-                let mut seed = VersionCounters::default();
-                let snapshot = storage.read_snapshot();
-                for &type_id in type_ids.values() {
-                    // Bounded chunks (tombstone-correct), not one merged copy
-                    // of the whole type's key range: only ids are kept.
-                    let prefix = KeyBuilder::object_prefix(type_id);
-                    let mut start = prefix.clone();
-                    loop {
-                        let chunk = storage.scan_chunk_raw(snapshot, &prefix, &start, 4096)?;
-                        for (key, _) in &chunk.live {
-                            // Object key: o:<type_id>:<object_id> — last 8 bytes are the object ID.
-                            if key.len() >= 8 {
-                                let id_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
-                                let object_id = u64::from_be_bytes(id_bytes);
-                                max_object_id = max_object_id.max(object_id);
-                                seed.mark_born(type_id, object_id);
-                            }
-                        }
-                        let (Some(hw), true) = (chunk.high_water, chunk.more) else {
-                            break;
-                        };
-                        let hw_id = u64::from_be_bytes(hw[hw.len() - 8..].try_into().unwrap());
-                        let Some(next) = hw_id.checked_add(1) else { break };
-                        start = KeyBuilder::object(type_id, next);
+                let mut born = HashMap::new();
+                for (type_id, ids) in live {
+                    if known.contains(&type_id) {
+                        max_object_id = max_object_id.max(ids.max().unwrap_or(0));
+                        born.insert(type_id, ids);
                     }
                 }
-                (max_object_id, seed)
+                (max_object_id, VersionCounters::from_born(born))
             };
 
         // Precompute the reverse-relation index used by cascade delete.

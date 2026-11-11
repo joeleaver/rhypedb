@@ -39,6 +39,12 @@ impl VersionCounters {
         self.born.get(&type_id).is_some_and(|b| b.contains(object_id))
     }
 
+    /// Counters with every object in `born` live at generation 1 (open-time
+    /// seeding from the storage's live-id sets).
+    pub(crate) fn from_born(born: HashMap<u64, RoaringTreemap>) -> Self {
+        Self { born, updated: HashMap::new() }
+    }
+
     /// Record a live object at generation 1 (open-time seeding).
     pub(crate) fn mark_born(&mut self, type_id: u64, object_id: u64) {
         self.born.entry(type_id).or_default().insert(object_id);
