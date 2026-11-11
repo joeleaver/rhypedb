@@ -97,7 +97,8 @@ impl VersionCounters {
         self.updated.len()
     }
 
-    /// Heap bytes held, approximately (diagnostics and tests).
+    /// Heap bytes held, approximately (the memory regression test).
+    #[cfg(test)]
     pub(crate) fn approx_heap_bytes(&self) -> usize {
         let bitmaps: usize = self.born.values().map(|b| b.serialized_size()).sum();
         let map = self.updated.capacity() * (std::mem::size_of::<((u64, u64), u64)>() + 1);
