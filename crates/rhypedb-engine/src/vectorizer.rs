@@ -2285,8 +2285,8 @@ fn deserialize_f32_vec(data: &[u8]) -> Option<Vec<f32>> {
         return None;
     }
     let mut vec = Vec::with_capacity(data.len() / 4);
-    for chunk in data.chunks_exact(4) {
-        vec.push(f32::from_be_bytes(chunk.try_into().ok()?));
+    for chunk in data.as_chunks::<4>().0 {
+        vec.push(f32::from_be_bytes(*chunk));
     }
     Some(vec)
 }

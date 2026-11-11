@@ -366,9 +366,7 @@ fn flush_objects(
 /// Decode a big-endian f32 vector payload (as stored in `v:` keys / shipped in a
 /// dump) into a `Vec<f32>`.
 fn bytes_to_f32_be(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_be_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    b.as_chunks::<4>().0.iter().map(|c| f32::from_be_bytes(*c)).collect()
 }
 
 fn flush_vectors(

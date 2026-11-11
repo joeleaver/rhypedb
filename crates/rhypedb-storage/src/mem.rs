@@ -9,7 +9,7 @@
 //! RSS sitting in glibc thread arenas after a sync.
 //!
 //! `malloc_trim(0)` releases every whole free page in EVERY arena (glibc
-//! >= 2.8) back to the kernel (`madvise(MADV_DONTNEED)`). It frees nothing in
+//! 2.8 and later) back to the kernel (`madvise(MADV_DONTNEED)`). It frees nothing in
 //! use and changes no behavior; it only costs a walk of the free lists. The
 //! engine calls [`maybe_release_free_memory`] after phases that free a lot
 //! (flush, compaction, cover-refresh rounds), throttled so a hot write path
