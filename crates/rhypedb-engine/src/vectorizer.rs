@@ -236,7 +236,7 @@ impl Default for VectorizerConfig {
 
 // Hand-rolled rather than `#[derive(PartialEq)]`: `rhypedb_embed::EmbedOptions`
 // doesn't implement `PartialEq` (its `cache_dir`/`max_length`/`intra_threads`/
-// `quantized` fields all do, so compare those directly instead). Lets a
+// `quantized`/`cpu_arena` fields all do, so compare those directly instead). Lets a
 // consumer's own config struct (e.g. `rhypedb-server`'s `ServerConfig`) derive
 // `PartialEq` while embedding a `VectorizerConfig`.
 impl PartialEq for VectorizerConfig {
@@ -251,6 +251,7 @@ impl PartialEq for VectorizerConfig {
             && self.embed.max_length == other.embed.max_length
             && self.embed.intra_threads == other.embed.intra_threads
             && self.embed.quantized == other.embed.quantized
+            && self.embed.cpu_arena == other.embed.cpu_arena
     }
 }
 

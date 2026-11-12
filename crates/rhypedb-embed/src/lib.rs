@@ -44,6 +44,16 @@ pub struct EmbedOptions {
     /// (`AllMiniLML6V2Q`, `BGESmallENV15Q`); otherwise the fp32 model.
     /// Default true.
     pub quantized: bool,
+    /// Use ONNX Runtime's CPU memory arena. With it, the session keeps every
+    /// block it has allocated and grows to the largest batch shape it has
+    /// seen, never shrinking; without it, each run's tensors are allocated and
+    /// freed through the process allocator. Default **false**: measured on
+    /// all-MiniLM-L6-v2 with 4 threads, a loaded model held ~580–680 MB of
+    /// heap with the arena and ~90–170 MB without, with query embedding
+    /// unchanged. Batch embedding may be somewhat slower without it. Set true
+    /// for ONNX Runtime's own default when bulk-embedding throughput matters
+    /// more than memory.
+    pub cpu_arena: bool,
 }
 
 impl Default for EmbedOptions {
@@ -56,6 +66,7 @@ impl Default for EmbedOptions {
             max_length: 256,
             intra_threads: (cores / 2).max(1),
             quantized: true,
+            cpu_arena: false,
         }
     }
 }
@@ -139,6 +150,14 @@ impl FastEmbedder {
             .with_max_length(options.max_length)
             .with_intra_threads(options.intra_threads)
             .with_show_download_progress(false);
+        // With the arena on, register nothing, so the session is built exactly
+        // as ONNX Runtime builds it by default (implicit CPU provider, arena
+        // on). Off (our default) registers the CPU provider with its arena off.
+        if !options.cpu_arena {
+            init_options = init_options.with_execution_providers(vec![
+                ort::ep::CPU::default().with_arena_allocator(false).build(),
+            ]);
+        }
         if let Some(cache_dir) = &options.cache_dir {
             init_options = init_options.with_cache_dir(cache_dir.clone());
         }

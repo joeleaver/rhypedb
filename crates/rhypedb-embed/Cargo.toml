@@ -31,7 +31,7 @@ default = ["onnx-download"]
 # Compile the fastembed-backed Embedder/Reranker and pull in fastembed + hf-hub.
 # Does NOT by itself select an ONNX linking strategy — use one of the onnx-* arms
 # (which each imply this), or set fastembed's ort feature yourself.
-fastembed = ["dep:fastembed", "dep:hf-hub"]
+fastembed = ["dep:fastembed", "dep:hf-hub", "dep:ort"]
 onnx-download = [
     "fastembed",
     "fastembed/ort-download-binaries-native-tls",
@@ -58,3 +58,8 @@ thiserror = { workspace = true }
 # Used to fetch the default int8 reranker (Xenova/bge-reranker-base) on first
 # use. Features matched to fastembed's hf-hub usage (sync ureq + native-tls).
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "native-tls"], optional = true }
+# fastembed's own ONNX Runtime binding, named directly only to configure its
+# CPU execution provider (`EmbedOptions::cpu_arena`). Pinned to fastembed's
+# exact version, no default features: it adds no linking choice of its own —
+# fastembed's features (via the onnx-* arms) still decide that.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std"], optional = true }

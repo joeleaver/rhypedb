@@ -89,6 +89,8 @@ pub struct VectorizerFileConfig {
     /// Prefer the int8-quantized model variant, forwarded to
     /// `EmbedOptions::quantized`.
     pub quantized: Option<bool>,
+    /// ONNX Runtime's CPU memory arena, forwarded to `EmbedOptions::cpu_arena`.
+    pub cpu_arena: Option<bool>,
     /// ANN candidates the cross-encoder scores per text query; forwarded to
     /// `VectorizerConfig::rerank_candidates` (default `min(k * 3, 48)`).
     pub rerank_candidates: Option<i64>,
@@ -347,6 +349,9 @@ fn resolve_vectorizer_config(
     }
     if let Some(q) = vz.quantized {
         cfg.embed.quantized = q;
+    }
+    if let Some(a) = vz.cpu_arena {
+        cfg.embed.cpu_arena = a;
     }
     if let Some(n) = vz.rerank_candidates {
         if n >= 1 {
@@ -946,6 +951,7 @@ mod tests {
             intra_threads = 4
             cache_dir = "/var/cache/rhypedb-models"
             quantized = false
+            cpu_arena = false
             rerank_candidates = 24
             reranker_dir = "/opt/reranker"
             reranker_fp32 = true
@@ -955,6 +961,7 @@ mod tests {
         assert_eq!(c.vectorizer.batch_size, 64);
         assert_eq!(c.vectorizer.embed.max_length, 128);
         assert_eq!(c.vectorizer.embed.intra_threads, 4);
+        assert!(!c.vectorizer.embed.cpu_arena);
         assert_eq!(c.vectorizer.embed.cache_dir, Some(PathBuf::from("/var/cache/rhypedb-models")));
         assert!(!c.vectorizer.embed.quantized);
         assert_eq!(c.vectorizer.rerank_candidates, Some(24));

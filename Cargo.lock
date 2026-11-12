@@ -2604,6 +2604,7 @@ version = "0.1.0"
 dependencies = [
  "fastembed",
  "hf-hub",
+ "ort",
  "thiserror",
 ]
 
