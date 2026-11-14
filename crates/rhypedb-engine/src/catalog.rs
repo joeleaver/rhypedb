@@ -3153,6 +3153,10 @@ fn recover_partial_into_txn(
     // worse, forget a stale generation that still needs dropping.
     let fulltext_prefix = KeyBuilder::catalog_fulltext_marker_prefix();
     let counter_key = KeyBuilder::catalog_next_migration();
+    // The cover-peer soundness marker (`c:C:`) records a fact about the data,
+    // not the schema; wiping it would only distrust sound covers until the
+    // next `rewrite_covers`, but there is no reason to.
+    let cover_peers_key = KeyBuilder::catalog_cover_peers();
     let stale = storage.scan_prefix_at(snap, &KeyBuilder::catalog_prefix_all())?;
     let deletes: Vec<Bytes> = stale
         .into_iter()
@@ -3163,6 +3167,7 @@ fn recover_partial_into_txn(
                 && !k.starts_with(&quarantine_prefix)
                 && !k.starts_with(&fulltext_prefix)
                 && k != &counter_key
+                && k != &cover_peers_key
         })
         .collect();
     if !deletes.is_empty() {

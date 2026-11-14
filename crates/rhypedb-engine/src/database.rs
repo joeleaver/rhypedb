@@ -20,6 +20,8 @@ use crate::fulltext::{
 
 mod fulltext_build;
 mod versions;
+#[cfg(test)]
+mod cover_peer_tests;
 pub(crate) use versions::VersionCounters;
 use crate::object::{
     FieldMap, Object, Value, deserialize_fields, deserialize_fields_projected, extract_field,
@@ -95,6 +97,67 @@ struct IncomingRelation {
     /// relation, say), refreshing covers after the target changes rewrites
     /// entries that never contained it.
     embeds_target: bool,
+}
+
+/// Current format of the `c:C:` cover-peer soundness marker.
+const COVER_PEERS_FORMAT: u32 = 1;
+
+/// Whether this store's reverse-edge covers carry trustworthy to-one peer ids
+/// (see [`DatabaseCore::cover_peers_sound`]). The `c:C:` marker answers it;
+/// without one, a store with no reverse edges at all — a new database, or one
+/// that never linked anything — is trivially sound, so the marker is written
+/// now. Any other unmarked store was written by a rhypedb that let peer ids
+/// go stale and stays distrusted until `rewrite_covers` repairs it.
+fn open_cover_peers_state(storage: &LsmTree) -> EngineResult<bool> {
+    let key = KeyBuilder::catalog_cover_peers();
+    let snapshot = storage.read_snapshot();
+    if let Some(v) = storage.get_at(snapshot, &key)? {
+        return Ok(v.len() == 4 && u32::from_be_bytes(v[..4].try_into().unwrap()) >= COVER_PEERS_FORMAT);
+    }
+    // Tombstone-correct existence probe: walk raw keys (tombstones included)
+    // until one is live or the keyspace ends. `r:` keys are fixed-length, so
+    // the prefix is prefix-free as `scan_chunk_raw` requires.
+    let prefix = [rhypedb_storage::key::KeyPrefix::ReverseEdge as u8, rhypedb_storage::key::SEPARATOR];
+    let mut start = prefix.to_vec();
+    loop {
+        let chunk = storage.scan_chunk_raw(snapshot, &prefix, &start, 256)?;
+        if !chunk.live.is_empty() {
+            return Ok(false);
+        }
+        let (Some(hw), true) = (chunk.high_water, chunk.more) else {
+            break;
+        };
+        start = hw.to_vec();
+        start.push(0); // the smallest key strictly after `hw`
+    }
+    write_cover_peers_marker(storage)?;
+    Ok(true)
+}
+
+fn write_cover_peers_marker(storage: &LsmTree) -> EngineResult<()> {
+    let mut txn = storage.begin_txn();
+    storage.put(
+        &mut txn,
+        &KeyBuilder::catalog_cover_peers(),
+        Bytes::copy_from_slice(&COVER_PEERS_FORMAT.to_be_bytes()),
+    )?;
+    storage.commit(&mut txn).map_err(|e| match e {
+        rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+        other => EngineError::Storage(other),
+    })?;
+    Ok(())
+}
+
+/// A to-one edge a cascade delete removes from an object that survives it
+/// (`@on_delete(remove)`): `source.field` pointed at a deleted object of
+/// `target_type_id`. Collected by `delete_inner`, consumed by
+/// `restage_after_peer_losses`.
+struct PeerLoss {
+    source_type_id: u64,
+    source_id: u64,
+    rel_id: u64,
+    field: String,
+    target_type_id: u64,
 }
 
 /// What [`DatabaseCore::rewrite_covers`] did.
@@ -406,6 +469,10 @@ pub struct DatabaseCore {
     /// handle; see `database/fulltext_build.rs`. Stopped + joined on drop and
     /// before any rebuild of the handle.
     fulltext_builder: Arc<fulltext_build::FulltextBuilder>,
+    /// Whether reverse-edge covers' to-one peer ids can be trusted: the
+    /// persisted `c:C:` marker is present (see
+    /// [`cover_peers_sound`](DatabaseCore::cover_peers_sound)).
+    cover_peers_sound: std::sync::atomic::AtomicBool,
     /// Per-object monotonic generation counter, bumped on every successful
     /// `update`. Lives in-memory for cheap reads (cover-write stamps the
     /// target's current generation into `<name>__cover_v`; executor fusion
@@ -1386,6 +1453,7 @@ impl Database {
         let fulltext_fields = ft_plan.fields;
         let fulltext_stats = ft_plan.stats;
         let fulltext_builder = Arc::new(fulltext_build::FulltextBuilder::new(ft_plan.tasks));
+        let cover_peers_sound = open_cover_peers_state(&storage)?;
 
         // Override the born-bit seed with persisted generations for objects
         // that have been UPDATED at least once. A `g:` key is written only on
@@ -1476,6 +1544,7 @@ impl Database {
             fulltext_fields,
             fulltext_stats,
             fulltext_builder,
+            cover_peers_sound: std::sync::atomic::AtomicBool::new(cover_peers_sound),
             version_counter_count: match &carry {
                 Some(c) => Arc::clone(&c.version_counter_count),
                 None => Arc::new(std::sync::atomic::AtomicUsize::new(version_counters.updated_len())),
@@ -1801,6 +1870,17 @@ impl DatabaseCore {
     /// when the object has never been updated (no entry in the counter map).
     /// Public so the query executor can compare against `<name>__cover_v`
     /// embedded in rev_edge values without pulling more `Database` internals.
+    /// Whether the to-one peer ids that reverse-edge covers carry match the
+    /// edge index, so a reader may take them as the truth (the query
+    /// executor's 1:1 fusion and cascade delete do). True for a store this
+    /// rhypedb created, or once [`rewrite_covers`](Self::rewrite_covers) has
+    /// repaired an older one; false for a store an older rhypedb wrote, whose
+    /// covers can list a peer that was since relinked or unlinked — readers
+    /// then resolve to-one hops through the edge index instead.
+    pub fn cover_peers_sound(&self) -> bool {
+        self.cover_peers_sound.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn object_version(&self, type_name: &str, object_id: u64) -> u64 {
         let Some(&type_id) = self.type_ids.get(type_name) else {
             return 0;
@@ -6071,6 +6151,7 @@ impl DatabaseCore {
         // mallocs replaced by ONE.
         let mut arena = TombstoneArena::new();
         let mut ft_delta = StatsDelta::default();
+        let mut peer_losses: Vec<PeerLoss> = Vec::new();
 
         // Top-level delete: verify existence (per public API contract).
         // Pass `None` for the cascade context — there's no parent rev_edge
@@ -6084,16 +6165,37 @@ impl DatabaseCore {
             &mut arena,
             &mut ft_delta,
             None,
+            &mut peer_losses,
         )?;
 
-        let tombstones = arena.into_keys();
-        self.storage.delete_batch(&mut txn, &tombstones)?;
+        // Surviving objects that lost a to-one peer (an `@on_delete(remove)`
+        // edge to a deleted object): rebuild their other reverse-edge covers
+        // so none still lists the deleted peer. Staged BEFORE the tombstones:
+        // the last write per key wins, so an entry this cascade also deletes
+        // stays deleted.
+        let bumped = self.restage_after_peer_losses(&mut txn, &deleted, &peer_losses)?;
 
-        let version = self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
-            other => EngineError::Storage(other),
+        let tombstones = arena.into_keys();
+        if let Err(e) = self.storage.delete_batch(&mut txn, &tombstones) {
+            for (t, id) in &bumped {
+                self.rollback_version(*t, *id);
+            }
+            return Err(e.into());
+        }
+
+        let version = self.storage.commit(&mut txn).map_err(|e| {
+            for (t, id) in &bumped {
+                self.rollback_version(*t, *id);
+            }
+            match e {
+                rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                other => EngineError::Storage(other),
+            }
         })?;
         self.apply_fulltext_delta(&ft_delta);
+        for (t, id) in &bumped {
+            self.enqueue_cover_refresh(*t, *id);
+        }
 
         // Drop the in-memory version-counter entries for everything the
         // commit just removed. The persisted `g:` keys were already
@@ -6149,6 +6251,7 @@ impl DatabaseCore {
         arena: &mut TombstoneArena,
         ft_delta: &mut StatsDelta,
         cascade_ctx: Option<(u64, Bytes)>,
+        peer_losses: &mut Vec<PeerLoss>,
     ) -> EngineResult<()> {
         if deleted.contains_key(&(type_id, object_id)) {
             return Ok(()); // already deleted in this cascade chain
@@ -6381,6 +6484,15 @@ impl DatabaseCore {
                         for (source_id, _) in reverse_edges {
                             arena.push_edge(source_id, inc.rel_id, object_id);
                             arena.push_reverse_edge(object_id, inc.rel_id, source_id);
+                            if !inc.is_many {
+                                peer_losses.push(PeerLoss {
+                                    source_type_id: inc.source_type_id,
+                                    source_id,
+                                    rel_id: inc.rel_id,
+                                    field: inc.source_field.clone(),
+                                    target_type_id: type_id,
+                                });
+                            }
                         }
                     }
                     OnDeletePolicy::Cascade => {
@@ -6426,6 +6538,7 @@ impl DatabaseCore {
                 arena,
                 ft_delta,
                 Some((cascade_rel_id, cascade_cover)),
+                peer_losses,
             )?;
         }
 
@@ -6442,7 +6555,10 @@ impl DatabaseCore {
         let mut covered_rel_ids: Vec<u64> = Vec::with_capacity(4);
         if let Some((parent_rel_id, ref cover)) = cascade_ctx {
             covered_rel_ids.push(parent_rel_id);
-            if !cover.is_empty() {
+            // Peer ids from an unsound store's cover may be stale: taking one
+            // would tombstone an edge that is gone and leave the real one
+            // dangling, so those stores scan the edge index instead.
+            if !cover.is_empty() && self.cover_peers_sound() {
                 for rel in &meta.forward_relations {
                     if rel.is_many || rel.rel_id == parent_rel_id {
                         continue;
@@ -6606,6 +6722,15 @@ impl DatabaseCore {
         // prefix scans per link() call (one per OTHER forward 1:1 field on
         // the source type) — paid once at setup, amortized across every
         // subsequent traversal.
+        // The cover lists the source's to-one peers as of this snapshot; a
+        // concurrent transaction changing one of them must conflict with this
+        // one, or the cover keeps the old peer (see `KeyPrefix::PeerGuard`).
+        let has_to_one = type_def.fields.iter().any(|f| {
+            matches!(&f.field_type, FieldType::Relation(r) if !r.is_many) && f.inverse().is_none()
+        });
+        if has_to_one {
+            self.storage.delete(&mut txn, &KeyBuilder::peer_guard(source_type_id, source_id))?;
+        }
         let rev_value = build_covering_rev_value(
             self,
             &txn,
@@ -6613,15 +6738,35 @@ impl DatabaseCore {
             source_id,
             field_name,
             target_id,
+            &[],
         )?;
 
         self.storage.put(&mut txn, &edge_key, edge_value)?;
         self.storage.put(&mut txn, &rev_key, rev_value)?;
 
-        self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
-            other => EngineError::Storage(other),
+        // A to-one link changes a peer id that the source's OTHER reverse
+        // edges carry (and that covers embedding the source carry nested):
+        // rebuild them in this transaction, or they keep the old peer.
+        let to_one = !rel.is_many && field.inverse().is_none();
+        let bumped = if to_one {
+            self.restage_peer_covers(&mut txn, source_type, source_id, &[(field_name, Some(target_id))])?;
+            self.stage_peer_change_bump(&mut txn, source_type_id, source_id)?
+        } else {
+            false
+        };
+
+        self.storage.commit(&mut txn).map_err(|e| {
+            if bumped {
+                self.rollback_version(source_type_id, source_id);
+            }
+            match e {
+                rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                other => EngineError::Storage(other),
+            }
         })?;
+        if bumped {
+            self.enqueue_cover_refresh(source_type_id, source_id);
+        }
 
         Ok(())
     }
@@ -6636,7 +6781,7 @@ impl DatabaseCore {
     ) -> EngineResult<()> {
         let _migration_guard = self.migration_lock.read();
         let _maintenance_guard = self.maintenance_lock.read();
-        let _ = self.resolve_type_id(source_type)?;
+        let source_type_id = self.resolve_type_id(source_type)?;
         let rel_key = format!("{source_type}.{field_name}");
         let rel_id = *self
             .rel_ids
@@ -6663,15 +6808,197 @@ impl DatabaseCore {
         let edge_key = KeyBuilder::edge(source_id, rel_id, target_id);
         let rev_key = KeyBuilder::reverse_edge(target_id, rel_id, source_id);
 
+        // Removing a to-one link changes a peer id the source's other reverse
+        // edges carry (see `link`). Only when the edge exists: unlinking a
+        // missing edge changes nothing.
+        let to_one = self.schema.get_type(source_type).and_then(|t| t.get_field(field_name)).is_some_and(
+            |f| matches!(&f.field_type, FieldType::Relation(r) if !r.is_many) && f.inverse().is_none(),
+        );
+        let existed = to_one && self.storage.get(&txn, &edge_key)?.is_some();
+
         self.storage.delete(&mut txn, &edge_key)?;
         self.storage.delete(&mut txn, &rev_key)?;
 
-        self.storage.commit(&mut txn).map_err(|e| match e {
-            rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
-            other => EngineError::Storage(other),
+        let bumped = if existed {
+            // The relation's peer from now on: any OTHER edge it still has.
+            let remaining = self
+                .scan_prefix_raw(&txn, &KeyBuilder::edge_prefix(source_id, rel_id))?
+                .into_iter()
+                .map(|(t, _)| t)
+                .find(|t| *t != target_id);
+            self.restage_peer_covers(&mut txn, source_type, source_id, &[(field_name, remaining)])?;
+            self.stage_peer_change_bump(&mut txn, source_type_id, source_id)?
+        } else {
+            false
+        };
+
+        self.storage.commit(&mut txn).map_err(|e| {
+            if bumped {
+                self.rollback_version(source_type_id, source_id);
+            }
+            match e {
+                rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
+                other => EngineError::Storage(other),
+            }
         })?;
+        if bumped {
+            self.enqueue_cover_refresh(source_type_id, source_id);
+        }
 
         Ok(())
+    }
+
+    /// The cascade-delete half of [`restage_peer_covers`](Self::restage_peer_covers):
+    /// for every object that survives the cascade but lost a to-one edge to a
+    /// deleted object, rebuild its other reverse-edge covers with the lost
+    /// relations' new peers (an edge to a surviving target if the relation
+    /// still has one, else none), and stage its generation bump. Returns the
+    /// bumped objects, for the caller to roll back on a failed commit and to
+    /// enqueue for cover refresh after a successful one.
+    fn restage_after_peer_losses(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        deleted: &HashMap<(u64, u64), Option<HashMap<String, serde_json::Value>>>,
+        peer_losses: &[PeerLoss],
+    ) -> EngineResult<Vec<(u64, u64)>> {
+        // Group by surviving source, keeping one entry per lost relation.
+        let mut by_source: Vec<((u64, u64), Vec<&PeerLoss>)> = Vec::new();
+        for loss in peer_losses {
+            let key = (loss.source_type_id, loss.source_id);
+            if deleted.contains_key(&key) {
+                continue;
+            }
+            match by_source.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, losses)) => {
+                    if !losses.iter().any(|l| l.rel_id == loss.rel_id) {
+                        losses.push(loss);
+                    }
+                }
+                None => by_source.push((key, vec![loss])),
+            }
+        }
+        let mut bumped = Vec::new();
+        let staged: EngineResult<()> = (|| {
+            for ((source_type_id, source_id), losses) in &by_source {
+                let Some(source_type) = self.type_name_by_id.get(source_type_id) else {
+                    continue;
+                };
+                let mut overrides: Vec<(&str, Option<u64>)> = Vec::with_capacity(losses.len());
+                for loss in losses {
+                    let remaining = self
+                        .scan_prefix_raw(txn, &KeyBuilder::edge_prefix(*source_id, loss.rel_id))?
+                        .into_iter()
+                        .map(|(t, _)| t)
+                        .find(|t| !deleted.contains_key(&(loss.target_type_id, *t)));
+                    overrides.push((loss.field.as_str(), remaining));
+                }
+                self.restage_peer_covers(txn, source_type, *source_id, &overrides)?;
+                if self.stage_peer_change_bump(txn, *source_type_id, *source_id)? {
+                    bumped.push((*source_type_id, *source_id));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = staged {
+            for (t, id) in &bumped {
+                self.rollback_version(*t, *id);
+            }
+            return Err(e);
+        }
+        Ok(bumped)
+    }
+
+    /// Rebuild, inside `txn`, the reverse-edge cover of every outbound edge
+    /// of `(source_type, source_id)` EXCEPT those of the relations named in
+    /// `overrides` — the to-one relations this transaction is relinking or
+    /// unlinking (their own entries are written or tombstoned by the caller).
+    /// Each rebuilt cover takes those relations' peers from `overrides`, since
+    /// the transaction cannot read its own buffered edge writes.
+    ///
+    /// A reverse edge's cover lists the source's to-one peer ids, which the
+    /// query executor's fusion path and cascade delete read as the truth; a
+    /// relink that left them alone would serve the old peer (or none).
+    fn restage_peer_covers(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        source_type: &str,
+        source_id: u64,
+        overrides: &[(&str, Option<u64>)],
+    ) -> EngineResult<()> {
+        let Some(type_def) = self.schema.get_type(source_type) else {
+            return Ok(());
+        };
+        // Serialize against any other transaction changing a to-one peer of
+        // this object (see `KeyPrefix::PeerGuard`).
+        if let Some(&type_id) = self.type_ids.get(source_type) {
+            self.storage.delete(txn, &KeyBuilder::peer_guard(type_id, source_id))?;
+        }
+        for field in &type_def.fields {
+            if !matches!(field.field_type, FieldType::Relation(_)) || field.inverse().is_some() {
+                continue;
+            }
+            if overrides.iter().any(|(name, _)| *name == field.name) {
+                continue;
+            }
+            let Some(&rel_id) = self.rel_ids.get(&format!("{source_type}.{}", field.name)) else {
+                continue;
+            };
+            if self.tombstoned_rel_ids.contains(&rel_id) {
+                continue;
+            }
+            let edges = self.scan_prefix_raw(txn, &KeyBuilder::edge_prefix(source_id, rel_id))?;
+            for (target_id, _) in edges {
+                let value = build_covering_rev_value(
+                    self,
+                    txn,
+                    source_type,
+                    source_id,
+                    &field.name,
+                    target_id,
+                    overrides,
+                )?;
+                self.storage.put(txn, &KeyBuilder::reverse_edge(target_id, rel_id, source_id), value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// After a to-one peer of `(type_id, object_id)` changed: bump the
+    /// object's generation (staging its persisted `g:` key in `txn`) when
+    /// some cover can embed it. Such a cover carries the object's own to-one
+    /// peers nested inside it (`with_nested_forward_covers`), so the bump is
+    /// what makes readers stop trusting it. Returns whether it bumped — the
+    /// caller then rolls the bump back if the commit fails, and enqueues a
+    /// cover refresh after it succeeds.
+    fn stage_peer_change_bump(
+        &self,
+        txn: &mut rhypedb_storage::mvcc::Transaction,
+        type_id: u64,
+        object_id: u64,
+    ) -> EngineResult<bool> {
+        let embedded = self
+            .incoming_relations
+            .get(&type_id)
+            .is_some_and(|incoming| incoming.iter().any(|inc| !inc.is_many && inc.embeds_target));
+        if !embedded {
+            return Ok(false);
+        }
+        let new_version = self.bump_version(type_id, object_id);
+        self.storage.put(
+            txn,
+            &KeyBuilder::object_version(type_id, object_id),
+            Bytes::copy_from_slice(&new_version.to_be_bytes()),
+        )?;
+        Ok(true)
+    }
+
+    /// Hand `(type_id, object_id)` to the cover-refresh worker (after a
+    /// committed generation bump). A closed channel (drop in progress) is
+    /// fine: readers still detect the stale covers via `__cover_v`.
+    fn enqueue_cover_refresh(&self, type_id: u64, object_id: u64) {
+        if let Some(tx) = self.cover_refresh_tx.lock().as_ref() {
+            let _ = tx.send((type_id, object_id));
+        }
     }
 
     /// Get all targets of a relationship from a source object.
@@ -7535,9 +7862,17 @@ impl DatabaseCore {
     /// current cover writer builds it (peer ids and capped peer covers, never
     /// the source's own fields; stale peer covers refreshed), and each index
     /// payload under [`OpenOptions::cover_max_bytes`]. Only entries whose
-    /// content differs are written; empty reverse-edge values (the valid "no
-    /// cover" form) are left as they are, so the pass never grows the store. Run a compaction afterwards
+    /// content differs are written. Run a compaction afterwards
     /// (`storage().compact()`) to reclaim the space.
+    ///
+    /// It also repairs covers' to-one peer ids, which an older rhypedb let go
+    /// stale: an object's first link got an empty cover that never learned
+    /// its later to-one targets, and relinking or unlinking a to-one relation
+    /// left the old peer in its other covers. Until a store has had this pass
+    /// (or was created by a rhypedb that keeps peers in step),
+    /// [`cover_peers_sound`](Self::cover_peers_sound) is false and readers
+    /// resolve to-one hops through the edge index — correct, but without the
+    /// covers' shortcut. A completed pass sets it, persistently.
     ///
     /// Works in batches of [`COVER_REFRESH_BATCH`] objects, each one
     /// transaction under the same locks the background cover refresh uses, so
@@ -7602,6 +7937,13 @@ impl DatabaseCore {
                 start = KeyBuilder::object(type_id, next);
             }
         }
+        // Every live object's covers now match the edge index, and every write
+        // since the pass began kept them so: record that readers may trust
+        // their peer ids.
+        if !self.cover_peers_sound() {
+            write_cover_peers_marker(&self.storage)?;
+            self.cover_peers_sound.store(true, std::sync::atomic::Ordering::Release);
+        }
         self.storage.release_file_pages();
         rhypedb_storage::mem::maybe_release_free_memory();
         Ok(stats)
@@ -7634,16 +7976,14 @@ impl DatabaseCore {
                     let edges = self.scan_prefix_raw(&txn, &KeyBuilder::edge_prefix(id, *rel_id))?;
                     for (target, _) in edges {
                         let key = KeyBuilder::reverse_edge(target, *rel_id, id);
-                        // An empty value is the valid "no cover" form (e.g. an
-                        // object's first to-one link, written before its other
-                        // target existed) and never an old copy: leave it, so
-                        // the pass only ever shrinks. (A missing entry would be
-                        // damage this pass doesn't invent a repair for.)
+                        // Every entry is rebuilt, empty ones included: an older
+                        // rhypedb wrote an object's first link with no cover
+                        // even once its other to-one targets existed, and left
+                        // covers listing a peer that was later relinked or
+                        // unlinked. (A missing entry would be damage this pass
+                        // doesn't invent a repair for.)
                         let Some(have) = self.storage.get(&txn, &key)? else { continue };
-                        if have.is_empty() {
-                            continue;
-                        }
-                        let want = build_covering_rev_value(self, &txn, type_name, id, field, target)?;
+                        let want = build_covering_rev_value(self, &txn, type_name, id, field, target, &[])?;
                         if !covers_equivalent(&have, &want) {
                             self.storage.put(&mut txn, &key, want)?;
                             stats.rev_edges_rewritten += 1;
@@ -7747,6 +8087,7 @@ impl DatabaseCore {
                     object_id,
                     &field.name,
                     target_id,
+                    &[],
                 )?;
                 let rev_key = KeyBuilder::reverse_edge(target_id, rel_id, object_id);
                 self.storage.put(txn, &rev_key, rev_value)?;
@@ -8312,8 +8653,14 @@ fn build_covering_rev_value(
     source_id: u64,
     field_name: &str,
     target_id: u64,
+    overrides: &[(&str, Option<u64>)],
 ) -> EngineResult<Bytes> {
     // Find OTHER forward 1:1 relation targets already in the edge index.
+    //
+    // `overrides` supplies the peer of a to-one relation whose edge THIS
+    // transaction is changing: a transaction's reads don't see its own
+    // buffered writes, so the edge index still shows the old peer (or none).
+    // `Some(t)` = the relation now points at `t`; `None` = it points nowhere.
     // Only return a non-empty covering value when at least one such target
     // exists — otherwise the carried fields can't satisfy any fusion lookup,
     // and writing them just bloats the reverse-edge index for no win. (At
@@ -8330,6 +8677,12 @@ fn build_covering_rev_value(
                 _ => continue,
             };
             if rel.is_many || other.inverse().is_some() {
+                continue;
+            }
+            if let Some((_, peer)) = overrides.iter().find(|(name, _)| *name == other.name) {
+                if let Some(peer) = peer {
+                    other_targets.push((other.name.clone(), *peer));
+                }
                 continue;
             }
             let rel_key = format!("{source_type}.{}", other.name);

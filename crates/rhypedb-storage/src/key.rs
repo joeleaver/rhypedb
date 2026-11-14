@@ -45,6 +45,14 @@ pub enum KeyPrefix {
     /// drives the in-memory BM25 corpus stats rebuild at open and the
     /// backfill's "already indexed" skip.
     FulltextDoc = b'l',
+    /// To-one peer-change guard: `p:<type_id>:<object_id>`. Never holds a
+    /// value — a transaction that changes one of an object's to-one links
+    /// TOMBSTONES it, purely so two such transactions on the same object have
+    /// intersecting write sets and the MVCC write-write check orders them.
+    /// (Each rebuilds the object's other reverse-edge covers from a snapshot
+    /// that can't see the other's change; without the conflict, both could
+    /// commit and leave covers listing a stale peer.)
+    PeerGuard = b'p',
 }
 
 pub const SEPARATOR: u8 = b':';
@@ -593,6 +601,18 @@ impl KeyBuilder {
     }
 
     /// Per-object generation counter: `g:<type_id>:<object_id>` → u64 BE.
+    /// To-one peer-change guard key: `p:<type_id>:<object_id>` (see
+    /// [`KeyPrefix::PeerGuard`]). Only ever tombstoned.
+    pub fn peer_guard(type_id: u64, object_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8);
+        buf.put_u8(KeyPrefix::PeerGuard as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(object_id);
+        buf.freeze()
+    }
+
     pub fn object_version(type_id: u64, object_id: u64) -> Bytes {
         let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8);
         buf.put_u8(KeyPrefix::Generation as u8);
@@ -1054,6 +1074,21 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.put_u64(type_id);
         buf.put_u64(field_id);
+        buf.freeze()
+    }
+
+    /// Cover-peer soundness marker: `c:C:` → 4-byte u32 BE format version.
+    /// Present once every reverse-edge cover's to-one peer ids are known to
+    /// match the edge index — from creation for a store written only by a
+    /// rhypedb that keeps them in step, or after `rewrite_covers` repaired an
+    /// older one. Readers trust a cover's peer ids only while it is present.
+    /// NOT schema-derived → exempted from the torn-write recovery clear.
+    pub fn catalog_cover_peers() -> Bytes {
+        let mut buf = BytesMut::with_capacity(4);
+        buf.put_u8(KeyPrefix::Catalog as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u8(b'C');
+        buf.put_u8(SEPARATOR);
         buf.freeze()
     }
 
