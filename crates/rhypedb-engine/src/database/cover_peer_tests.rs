@@ -257,3 +257,62 @@ fn cascade_on_an_old_store_ignores_stale_peers_and_leaves_no_dangling_edge() {
         "u2 still lists the cascade-deleted rating"
     );
 }
+
+#[test]
+fn linking_a_to_one_relation_again_replaces_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_options(schema(), dir.path(), no_sweeper()).unwrap();
+    let (u1, u2) = (named(&db, "User", "name", "a"), named(&db, "User", "name", "b"));
+    let m = named(&db, "Movie", "title", "m");
+    let r = rating(&db);
+    db.link("Rating", r, "user", u1, None).unwrap();
+    db.link("Rating", r, "movie", m, None).unwrap();
+    // No unlink first: a to-one relation still ends up with one target.
+    db.link("Rating", r, "user", u2, None).unwrap();
+    assert_eq!(db.get_link_ids("Rating", r, "user").unwrap(), vec![u2]);
+    assert!(db.get_link_ids("User", u1, "ratings").unwrap().is_empty(), "old reverse edge gone");
+    assert_eq!(movie_side_user_peer(&db, m, r), Some(u2));
+}
+
+#[test]
+fn an_old_store_whose_schema_carries_no_peers_opens_sound() {
+    // Only to-many relations: no reverse edge can carry a to-one peer.
+    let schema = parse_schema(
+        r#"
+        type Label { name: String  messages: [Message] @inverse(Message.labels) }
+        type Message { subject: String  labels: [Label] }
+        "#,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(schema.clone(), dir.path()).unwrap();
+        let l = named(&db, "Label", "name", "inbox");
+        let m = named(&db, "Message", "subject", "hi");
+        db.link("Message", m, "labels", l, None).unwrap();
+        let mut txn = db.storage.begin_txn();
+        db.storage.delete(&mut txn, &KeyBuilder::catalog_cover_peers()).unwrap();
+        db.storage.commit(&mut txn).unwrap();
+    }
+    let db = Database::open(schema, dir.path()).unwrap();
+    assert!(db.cover_peers_sound());
+}
+
+#[test]
+fn a_store_whose_reverse_edges_are_all_deleted_opens_sound() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open(schema(), dir.path()).unwrap();
+        let (u, m, r) = (named(&db, "User", "name", "u"), named(&db, "Movie", "title", "m"), rating(&db));
+        db.link("Rating", r, "user", u, None).unwrap();
+        db.link("Rating", r, "movie", m, None).unwrap();
+        db.unlink("Rating", r, "user", u).unwrap();
+        db.unlink("Rating", r, "movie", m).unwrap();
+        // Only tombstones remain under `r:`; drop the marker as an old store would lack it.
+        let mut txn = db.storage.begin_txn();
+        db.storage.delete(&mut txn, &KeyBuilder::catalog_cover_peers()).unwrap();
+        db.storage.commit(&mut txn).unwrap();
+    }
+    let db = Database::open(schema(), dir.path()).unwrap();
+    assert!(db.cover_peers_sound());
+}

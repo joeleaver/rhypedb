@@ -600,7 +600,6 @@ impl KeyBuilder {
         buf.freeze()
     }
 
-    /// Per-object generation counter: `g:<type_id>:<object_id>` → u64 BE.
     /// To-one peer-change guard key: `p:<type_id>:<object_id>` (see
     /// [`KeyPrefix::PeerGuard`]). Only ever tombstoned.
     pub fn peer_guard(type_id: u64, object_id: u64) -> Bytes {
@@ -613,6 +612,7 @@ impl KeyBuilder {
         buf.freeze()
     }
 
+    /// Per-object generation counter: `g:<type_id>:<object_id>` → u64 BE.
     pub fn object_version(type_id: u64, object_id: u64) -> Bytes {
         let mut buf = BytesMut::with_capacity(1 + 1 + 8 + 1 + 8);
         buf.put_u8(KeyPrefix::Generation as u8);

@@ -276,8 +276,11 @@ fn strip_cover_internals(db: &Database, objs: &mut [Object]) {
                 })
                 .unwrap_or_default()
         });
-        // Only a type with to-one relations gets peers nested into its covers.
-        if rels.is_empty() {
+        // Only a type with to-one relations gets peers nested into its covers,
+        // and a nested peer always brings its id (`<rel>: u64`): probe for
+        // one in place before paying for a decode, so a plain `o:` blob keeps
+        // its zero-copy path.
+        if !rels.iter().any(|r| find_u64_field_in_raw(raw, r).is_some()) {
             continue;
         }
         let mut fields = rhypedb_engine::object::deserialize_fields(raw);
@@ -501,11 +504,13 @@ fn execute_step(
                                 .is_some()
                         }) =>
                     {
+                        // An object decoded eagerly (no raw bytes) carries
+                        // no relation ids: it goes in with empty bytes and is
+                        // resolved through the edge index like any source
+                        // whose bytes lack the next hop.
                         Some(
                             objs.iter()
-                                .filter_map(|o| {
-                                    o.raw_fields.as_ref().map(|b| (o.id, b.clone()))
-                                })
+                                .map(|o| (o.id, o.raw_fields.clone().unwrap_or_default()))
                                 .collect(),
                         )
                     }
@@ -571,11 +576,11 @@ fn execute_step(
                     }
                 }
                 if !unresolved.is_empty() {
+                    // Already charged as part of `items` above: a to-one hop
+                    // yields at most one edge per source.
                     let groups = db
                         .get_links_many(&source_type_str, &unresolved, field_name)
                         .map_err(|e| QueryError::InvalidArgument(e.to_string()))?;
-                    let hop_edges: u64 = groups.iter().map(|g| g.len() as u64).sum();
-                    ctx.governor.charge(hop_edges)?;
                     for group in groups {
                         for (tid, _) in group {
                             if seen.insert(tid) {

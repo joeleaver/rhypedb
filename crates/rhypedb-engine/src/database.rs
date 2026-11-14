@@ -108,11 +108,29 @@ const COVER_PEERS_FORMAT: u32 = 1;
 /// that never linked anything — is trivially sound, so the marker is written
 /// now. Any other unmarked store was written by a rhypedb that let peer ids
 /// go stale and stays distrusted until `rewrite_covers` repairs it.
-fn open_cover_peers_state(storage: &LsmTree) -> EngineResult<bool> {
+fn open_cover_peers_state(storage: &LsmTree, schema: &Schema) -> EngineResult<bool> {
     let key = KeyBuilder::catalog_cover_peers();
     let snapshot = storage.read_snapshot();
     if let Some(v) = storage.get_at(snapshot, &key)? {
         return Ok(v.len() == 4 && u32::from_be_bytes(v[..4].try_into().unwrap()) >= COVER_PEERS_FORMAT);
+    }
+    // Readers only take peer ids of the CURRENT schema's to-one relations
+    // out of a reverse edge of the same source's OTHER relations. A schema
+    // with no type holding both has no peer a reader could trust wrongly —
+    // whatever older covers hold — so its store is sound as is.
+    let can_carry_peers = schema.types.values().any(|t| {
+        let forward = t
+            .fields
+            .iter()
+            .filter(|f| matches!(f.field_type, FieldType::Relation(_)) && f.inverse().is_none());
+        let (count, to_one) = forward.fold((0usize, false), |(n, one), f| {
+            (n + 1, one || matches!(&f.field_type, FieldType::Relation(r) if !r.is_many))
+        });
+        to_one && count >= 2
+    });
+    if !can_carry_peers {
+        write_cover_peers_marker(storage)?;
+        return Ok(true);
     }
     // Tombstone-correct existence probe: walk raw keys (tombstones included)
     // until one is live or the keyspace ends. `r:` keys are fixed-length, so
@@ -1453,7 +1471,7 @@ impl Database {
         let fulltext_fields = ft_plan.fields;
         let fulltext_stats = ft_plan.stats;
         let fulltext_builder = Arc::new(fulltext_build::FulltextBuilder::new(ft_plan.tasks));
-        let cover_peers_sound = open_cover_peers_state(&storage)?;
+        let cover_peers_sound = open_cover_peers_state(&storage, &schema)?;
 
         // Override the born-bit seed with persisted generations for objects
         // that have been UPDATED at least once. A `g:` key is written only on
@@ -6749,6 +6767,16 @@ impl DatabaseCore {
         // rebuild them in this transaction, or they keep the old peer.
         let to_one = !rel.is_many && field.inverse().is_none();
         let bumped = if to_one {
+            // A to-one relation holds one target: linking a new one replaces
+            // any other. (Keeping both left covers naming one while the edge
+            // index held two, and a cascade that trusted the cover left the
+            // other edge dangling.)
+            for (old_target, _) in self.scan_prefix_raw(&txn, &KeyBuilder::edge_prefix(source_id, rel_id))? {
+                if old_target != target_id {
+                    self.storage.delete(&mut txn, &KeyBuilder::edge(source_id, rel_id, old_target))?;
+                    self.storage.delete(&mut txn, &KeyBuilder::reverse_edge(old_target, rel_id, source_id))?;
+                }
+            }
             self.restage_peer_covers(&mut txn, source_type, source_id, &[(field_name, Some(target_id))])?;
             self.stage_peer_change_bump(&mut txn, source_type_id, source_id)?
         } else {
@@ -6861,20 +6889,27 @@ impl DatabaseCore {
         deleted: &HashMap<(u64, u64), Option<HashMap<String, serde_json::Value>>>,
         peer_losses: &[PeerLoss],
     ) -> EngineResult<Vec<(u64, u64)>> {
-        // Group by surviving source, keeping one entry per lost relation.
+        // Group by surviving source (in first-seen order), keeping one entry
+        // per lost relation. A deleted User can cost 100k Rating losses, so
+        // the grouping is hashed, not a scan per loss.
         let mut by_source: Vec<((u64, u64), Vec<&PeerLoss>)> = Vec::new();
+        let mut slot: HashMap<(u64, u64), usize> = HashMap::new();
         for loss in peer_losses {
             let key = (loss.source_type_id, loss.source_id);
             if deleted.contains_key(&key) {
                 continue;
             }
-            match by_source.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, losses)) => {
+            match slot.get(&key) {
+                Some(&i) => {
+                    let losses = &mut by_source[i].1;
                     if !losses.iter().any(|l| l.rel_id == loss.rel_id) {
                         losses.push(loss);
                     }
                 }
-                None => by_source.push((key, vec![loss])),
+                None => {
+                    slot.insert(key, by_source.len());
+                    by_source.push((key, vec![loss]));
+                }
             }
         }
         let mut bumped = Vec::new();
@@ -6984,11 +7019,14 @@ impl DatabaseCore {
             return Ok(false);
         }
         let new_version = self.bump_version(type_id, object_id);
-        self.storage.put(
+        if let Err(e) = self.storage.put(
             txn,
             &KeyBuilder::object_version(type_id, object_id),
             Bytes::copy_from_slice(&new_version.to_be_bytes()),
-        )?;
+        ) {
+            self.rollback_version(type_id, object_id);
+            return Err(e.into());
+        }
         Ok(true)
     }
 
