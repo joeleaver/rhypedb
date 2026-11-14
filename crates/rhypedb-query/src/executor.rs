@@ -219,6 +219,9 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
         }
         _ => {}
     }
+    if let QueryOutput::Objects(objs) = &mut result {
+        strip_cover_internals(ctx.db, objs);
+    }
 
     // P4 read authz: filter the terminal result through the `read` rule (no-op when rules are off);
     // every intermediate stage was filtered on the way in above.
@@ -246,6 +249,47 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
     }
 
     Ok(result)
+}
+
+/// Remove the bookkeeping a covered object carries from the result. 1:1
+/// fusion builds an Object straight from a peer's cover blob, and a cover of
+/// an object with to-one relations has that object's own peers nested inside
+/// it (`<rel>` ids plus `<rel>__cover` / `<rel>__cover_v`), for a further hop
+/// to fuse through. Once the pipeline ends they are internal state: a row
+/// must hold the same fields whether it came from a cover or from `o:`.
+fn strip_cover_internals(db: &Database, objs: &mut [Object]) {
+    let mut to_one: HashMap<String, Vec<String>> = HashMap::new();
+    for obj in objs.iter_mut() {
+        let Some(raw) = &obj.raw_fields else { continue };
+        let rels = to_one.entry(obj.type_name.clone()).or_insert_with(|| {
+            db.schema()
+                .get_type(&obj.type_name)
+                .map(|td| {
+                    td.fields
+                        .iter()
+                        .filter(|f| {
+                            matches!(&f.field_type, rhypedb_schema::FieldType::Relation(r) if !r.is_many)
+                                && f.inverse().is_none()
+                        })
+                        .map(|f| f.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        // Only a type with to-one relations gets peers nested into its covers.
+        if rels.is_empty() {
+            continue;
+        }
+        let mut fields = rhypedb_engine::object::deserialize_fields(raw);
+        let before = fields.len();
+        fields.retain(|name, _| {
+            !(rels.iter().any(|r| r == name) || name.ends_with("__cover") || name.ends_with("__cover_v"))
+        });
+        if fields.len() != before {
+            obj.fields = fields;
+            obj.raw_fields = None;
+        }
+    }
 }
 
 fn execute_source(
@@ -431,7 +475,14 @@ fn execute_step(
             // augments with `<next>__cover`. Re-entering this fast path
             // via the Objects branch extracts the 3rd-degree target from
             // raw_fields without another LSM probe.
-            let fusion_input: Option<Vec<(u64, Bytes)>> = if is_one_to_one_forward {
+            //
+            // The peer ids are only the truth when the store says so: one an
+            // older rhypedb wrote can carry a peer that was since relinked or
+            // unlinked, until `rewrite_covers` repairs it. Such a store takes
+            // the streaming path (an edge scan) for this hop.
+            let fusion_input: Option<Vec<(u64, Bytes)>> = if is_one_to_one_forward
+                && db.cover_peers_sound()
+            {
                 match &current {
                     QueryOutput::IdSetWithFields { items, .. }
                         if items.iter().any(|(_, bytes)| {
@@ -475,10 +526,17 @@ fn execute_step(
                 let mut covered_items: Vec<(u64, Bytes)> = Vec::with_capacity(items.len());
                 let mut id_only: Vec<u64> = Vec::new();
                 let mut any_covered = false;
-                for (_id, bytes) in items {
-                    if let Some(tid) = find_u64_field_in_raw(bytes, field_name.as_str())
-                        && seen.insert(tid)
-                    {
+                // Sources whose bytes don't name this hop's target. That is not
+                // proof the source has none: an object probed from `o:` (a
+                // stale cover's fallback) carries no relation ids at all. They
+                // are resolved through the edge index below, never dropped.
+                let mut unresolved: Vec<u64> = Vec::new();
+                for (source_id, bytes) in items {
+                    let Some(tid) = find_u64_field_in_raw(bytes, field_name.as_str()) else {
+                        unresolved.push(*source_id);
+                        continue;
+                    };
+                    if seen.insert(tid) {
                         // Cover staleness check: the cover writer stamped
                         // the target's generation at write time under
                         // `<field>__cover_v`. If the target has been updated
@@ -509,6 +567,20 @@ fn execute_step(
                             covered_items.push((tid, c));
                         } else {
                             id_only.push(tid);
+                        }
+                    }
+                }
+                if !unresolved.is_empty() {
+                    let groups = db
+                        .get_links_many(&source_type_str, &unresolved, field_name)
+                        .map_err(|e| QueryError::InvalidArgument(e.to_string()))?;
+                    let hop_edges: u64 = groups.iter().map(|g| g.len() as u64).sum();
+                    ctx.governor.charge(hop_edges)?;
+                    for group in groups {
+                        for (tid, _) in group {
+                            if seen.insert(tid) {
+                                id_only.push(tid);
+                            }
                         }
                     }
                 }
@@ -4764,5 +4836,103 @@ mod tests {
             db.delete("Rating", ids.3[4]).unwrap();
         }
         check("after updates");
+    }
+}
+
+/// 1:1 fusion reads each source's to-one peer id out of the bytes it carries
+/// (a reverse-edge cover, or a covered object). These pin that a peer missing
+/// from those bytes is resolved through the edge index rather than dropped,
+/// and that relinks are reflected — the two ways it used to return the wrong
+/// targets.
+#[cfg(test)]
+mod fusion_peer_tests {
+    use super::*;
+    use crate::parser::parse_query;
+    use rhypedb_engine::database::OpenOptions;
+    use rhypedb_schema::parser::parse_schema;
+
+    fn named(db: &Database, ty: &str, v: &str) -> u64 {
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String(v.into()));
+        db.create(ty, f).unwrap().id
+    }
+
+    fn ids(db: &Database, q: &str) -> Vec<u64> {
+        let q = parse_query(q).unwrap();
+        let mut ids: Vec<u64> = match execute(&ExecContext::new(db, None), &q).unwrap() {
+            QueryOutput::Objects(o) => o.iter().map(|o| o.id).collect(),
+            QueryOutput::IdSet { ids, .. } => ids,
+            other => panic!("unexpected {other:?}"),
+        };
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn inverse_then_to_one_follows_link_order_and_relinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type User { name: String  ratings: [Rating] @inverse(Rating.user) }
+            type Movie { name: String  ratings: [Rating] @inverse(Rating.movie) }
+            type Rating { stars: u32  user: User  movie: Movie }
+            "#,
+        )
+        .unwrap();
+        let db = Database::open(schema, dir.path()).unwrap();
+        let (u1, u2, u3) = (named(&db, "User", "u1"), named(&db, "User", "u2"), named(&db, "User", "u3"));
+        let m = named(&db, "Movie", "m");
+        let r1 = db.create("Rating", FieldMap::new()).unwrap().id;
+        let r2 = db.create("Rating", FieldMap::new()).unwrap().id;
+        db.link("Rating", r1, "user", u1, None).unwrap();
+        db.link("Rating", r1, "movie", m, None).unwrap();
+        // The other order: r2's Movie-side edge is written before its user.
+        db.link("Rating", r2, "movie", m, None).unwrap();
+        db.link("Rating", r2, "user", u2, None).unwrap();
+        let q = format!("Movie.get({m}).ratings.user");
+        assert_eq!(ids(&db, &q), vec![u1, u2]);
+
+        db.unlink("Rating", r1, "user", u1).unwrap();
+        db.link("Rating", r1, "user", u3, None).unwrap();
+        assert_eq!(ids(&db, &q), vec![u2, u3]);
+    }
+
+    #[test]
+    fn a_probed_object_in_a_mixed_hop_keeps_its_next_hop() {
+        // Movie.ratings → fused Users (from covers); updating u1 stales its
+        // cover so u1 is probed from `o:` — a blob with no relation ids. The
+        // next 1:1 hop (`country`) must still reach u1's country.
+        let dir = tempfile::tempdir().unwrap();
+        let schema = parse_schema(
+            r#"
+            type Country { name: String  users: [User] @inverse(User.country) }
+            type User { name: String  country: Country  ratings: [Rating] @inverse(Rating.user) }
+            type Movie { name: String  ratings: [Rating] @inverse(Rating.movie) }
+            type Rating { stars: u32  user: User  movie: Movie }
+            "#,
+        )
+        .unwrap();
+        let opts = OpenOptions {
+            background_cover_refresh: false,
+            ..Default::default()
+        };
+        let db = Database::open_with_options(schema, dir.path(), opts).unwrap();
+        let (c1, c2) = (named(&db, "Country", "c1"), named(&db, "Country", "c2"));
+        let (u1, u2) = (named(&db, "User", "u1"), named(&db, "User", "u2"));
+        db.link("User", u1, "country", c1, None).unwrap();
+        db.link("User", u2, "country", c2, None).unwrap();
+        let m = named(&db, "Movie", "m");
+        for u in [u1, u2] {
+            let r = db.create("Rating", FieldMap::new()).unwrap().id;
+            db.link("Rating", r, "user", u, None).unwrap();
+            db.link("Rating", r, "movie", m, None).unwrap();
+        }
+        let q = format!("Movie.get({m}).ratings.user.country");
+        assert_eq!(ids(&db, &q), vec![c1, c2]);
+
+        let mut f = FieldMap::new();
+        f.insert("name".into(), Value::String("renamed".into()));
+        db.update("User", u1, f).unwrap();
+        assert_eq!(ids(&db, &q), vec![c1, c2]);
     }
 }
