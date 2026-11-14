@@ -224,6 +224,8 @@ rhypedb keeps each object once, under its id. Two read-path caches can add copie
 
 So a text-heavy type costs about its own size plus small per-index and per-link entries. Embedded users can move the threshold with `OpenOptions::cover_max_bytes` (`usize::MAX` copies everything, `0` nothing); the server uses the default. A new threshold applies to entries written from then on. Entries written by older versions (before 2026-11), or under an earlier threshold, keep their copies until rewritten. To bring a whole database up to the current rules at once, embedded users call `Database::rewrite_covers()` and then compact (`db.storage().compact()`). The pass runs in small batches alongside normal traffic and is safe to interrupt and rerun. On a 2.2 GB mail store it cut reverse-entry data from 333 MB to 136 MB.
 
+Those stored target ids have to stay in step with the links themselves. Versions before 2026-11 let them drift: a reverse entry written before the object's other to-one link existed never learned about that link, and relinking or unlinking a to-one relation left the old id in the object's other reverse entries. A hop like `Movie.ratings.user` could then miss targets or return the old one. Current versions keep the ids in step on every link, unlink and delete. A database that an older version wrote with links in it starts out *distrusted*: `Database::cover_peers_sound()` returns `false`, and to-one hops read the links themselves instead of the stored ids. Results are correct, but those hops lose the shortcut. One `rewrite_covers()` run repairs the stored ids and records that the database can be trusted again; that record persists across restarts. New databases are trusted from the start.
+
 ## A complete example
 
 ```

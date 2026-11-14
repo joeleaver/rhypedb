@@ -51,6 +51,9 @@ pub(crate) fn admin_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Force-flush + compact. Mutating + expensive, so gated like the rest of
         // the admin surface. The handler lives in lib.rs next to /query.
         .route("/admin/compact", post(crate::handle_admin_compact))
+        // Rewrite stored covers to the current rules and repair their to-one
+        // target ids (an older rhypedb let them drift). Then compact.
+        .route("/admin/rewrite-covers", post(crate::handle_admin_rewrite_covers))
         // Physical backup: snapshot the live data dir. `POST /admin/backup`
         // writes a snapshot dir to a server path; `GET /admin/backup/stream`
         // streams the snapshot back as a tar.
