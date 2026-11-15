@@ -22,6 +22,8 @@ mod fulltext_build;
 mod versions;
 #[cfg(test)]
 mod cover_peer_tests;
+#[cfg(test)]
+mod link_peers_tests;
 pub(crate) use versions::VersionCounters;
 use crate::object::{
     FieldMap, Object, Value, deserialize_fields, deserialize_fields_projected, extract_field,
@@ -4590,6 +4592,39 @@ impl DatabaseCore {
         })
     }
 
+    /// The positional form of [`get_many_projected`](Self::get_many_projected)
+    /// for large batches: the `fields` of every existing object among `ids`
+    /// (sorted, deduplicated, missing ids skipped), laid out row-major in one
+    /// [`Columns`] — no `HashMap` and no type-name `String` per row. Each
+    /// `fields` name must be a live field of `type_name`.
+    pub fn get_many_columns(
+        &self,
+        type_name: &str,
+        ids: &[u64],
+        fields: &[&str],
+    ) -> EngineResult<Columns> {
+        let type_id = self.resolve_type_id(type_name)?;
+        for f in fields {
+            self.live_field(type_name, f)?;
+        }
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let blobs = self.multi_get_objects_at(self.storage.read_snapshot(), type_id, &sorted)?;
+        let mut out = Columns {
+            width: fields.len(),
+            ids: Vec::with_capacity(sorted.len()),
+            values: Vec::with_capacity(sorted.len() * fields.len()),
+        };
+        for (id, blob) in sorted.into_iter().zip(blobs) {
+            if let Some(blob) = blob {
+                out.ids.push(id);
+                crate::object::extract_fields_into(&blob, fields, &mut out.values);
+            }
+        }
+        Ok(out)
+    }
+
     fn get_many_decoded(
         &self,
         snapshot: u64,
@@ -4605,14 +4640,7 @@ impl DatabaseCore {
         sorted.sort_unstable();
         sorted.dedup();
 
-        // Build key buffers once, borrow them as &[u8] for the batch call.
-        let key_bufs: Vec<_> = sorted
-            .iter()
-            .map(|id| KeyBuilder::object(type_id, *id))
-            .collect();
-        let key_refs: Vec<&[u8]> = key_bufs.iter().map(|k| k.as_ref()).collect();
-
-        let values = self.storage.multi_get_at(snapshot, &key_refs)?;
+        let values = self.multi_get_objects_at(snapshot, type_id, &sorted)?;
 
         // Public API: return Objects with `fields` populated. Callers that
         // accept the lazy shortcut should use `get_many_lazy` instead.
@@ -4649,14 +4677,8 @@ impl DatabaseCore {
         sorted.sort_unstable();
         sorted.dedup();
 
-        let key_bufs: Vec<_> = sorted
-            .iter()
-            .map(|id| KeyBuilder::object(type_id, *id))
-            .collect();
-        let key_refs: Vec<&[u8]> = key_bufs.iter().map(|k| k.as_ref()).collect();
-
         let snapshot = self.storage.read_snapshot();
-        let values = self.storage.multi_get_at(snapshot, &key_refs)?;
+        let values = self.multi_get_objects_at(snapshot, type_id, &sorted)?;
 
         // While a field-type migration is in flight, the `o:` blob carries
         // `<field>__shadow` siblings the wire path must never ship. The lazy
@@ -7241,6 +7263,344 @@ impl DatabaseCore {
             .collect())
     }
 
+    /// Each link of `source_type.field_name` with the id of the linked
+    /// object's to-one `peer`: `(link_id, peer_id)` in link-id order, `None`
+    /// where the linked object has no peer — a label's messages, each with its
+    /// thread (GH #52).
+    ///
+    /// Through an `@inverse` field every reverse edge already lists the linked
+    /// object's to-one peer ids. While those are trusted
+    /// ([`cover_peers_sound`](Self::cover_peers_sound)) they are read in place,
+    /// with no FieldMap per link and no second lookup. A link whose bytes don't
+    /// name the peer, every link of a forward field, and every link of a store
+    /// whose copies aren't trusted yet are resolved through the peer
+    /// relation's edge index instead, in one batched scan at the same snapshot.
+    ///
+    /// `peer` must be a forward to-one relation of the linked type.
+    pub fn get_link_peer_ids(
+        &self,
+        source_type: &str,
+        source_id: u64,
+        field_name: &str,
+        peer: &str,
+    ) -> EngineResult<Vec<(u64, Option<u64>)>> {
+        let scan = self.link_scan(source_type, field_name)?;
+        let peer_rel = self.to_one_peer(&scan.target_type, peer)?;
+        let snapshot = self.storage.read_snapshot();
+        let entries = self
+            .storage
+            .scan_prefix_at(snapshot, &scan.prefix(source_id))?;
+        let trusted = scan.inverse && self.cover_peers_sound();
+
+        let mut out: Vec<(u64, Option<u64>)> = Vec::with_capacity(entries.len());
+        let mut unresolved: Vec<usize> = Vec::new();
+        for (key, value) in &entries {
+            let Some(link_id) = trailing_id(key) else {
+                continue;
+            };
+            let peer_id = if trusted {
+                crate::object::find_u64_field_in_raw(value, peer)
+            } else {
+                None
+            };
+            if peer_id.is_none() {
+                unresolved.push(out.len());
+            }
+            out.push((link_id, peer_id));
+        }
+        if !unresolved.is_empty() {
+            let ids: Vec<u64> = unresolved.iter().map(|&i| out[i].0).collect();
+            let peers = self.to_one_targets_at(snapshot, peer_rel.rel_id, &ids)?;
+            for (i, peer_id) in unresolved.into_iter().zip(peers) {
+                out[i].1 = peer_id;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The distinct to-one `peer`s of the objects linked from
+    /// `source_type.field_name`, ordered by one of the peer's fields — "the
+    /// newest threads among a label's messages" (GH #52) — returning the
+    /// `query.offset..offset + limit` window as objects of the peer type
+    /// carrying `query.fields`.
+    ///
+    /// Through an `@inverse` field whose copies are trusted
+    /// ([`cover_peers_sound`](Self::cover_peers_sound)), each reverse edge holds
+    /// the peer's id and, for a peer up to
+    /// [`OpenOptions::cover_max_bytes`], a copy of it stamped with the peer's
+    /// generation. A copy whose stamp matches the peer's current generation is
+    /// read in place; only peers without a current copy are looked up, in one
+    /// batched read at the scan's snapshot. Otherwise every peer resolves
+    /// through the edge index and is looked up, which gives the same result.
+    ///
+    /// Ordering: by `query.order_by`, descending when `query.descending`; a
+    /// peer with no value (absent or null) sorts after every peer with one;
+    /// equal values fall back to the peer id in the same direction. A link
+    /// whose peer no longer exists is skipped.
+    pub fn get_link_peers_top(
+        &self,
+        source_type: &str,
+        source_id: u64,
+        field_name: &str,
+        query: &LinkPeersTop<'_>,
+    ) -> EngineResult<Vec<Object>> {
+        let scan = self.link_scan(source_type, field_name)?;
+        let peer_rel = self.to_one_peer(&scan.target_type, query.peer)?;
+        let peer_type = peer_rel.target_type.as_str();
+        let peer_type_id = self.resolve_type_id(peer_type)?;
+        self.live_field(peer_type, query.order_by)?;
+        for f in query.fields {
+            self.live_field(peer_type, f)?;
+        }
+        let window = query.offset.saturating_add(query.limit);
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let snapshot = self.storage.read_snapshot();
+        let entries = self
+            .storage
+            .scan_prefix_at(snapshot, &scan.prefix(source_id))?;
+        let trusted = scan.inverse && self.cover_peers_sound();
+        let cover_name = format!("{}__cover", query.peer);
+        let cover_v_name = format!("{}__cover_v", query.peer);
+
+        // Every link's peer, with the peer's copy when this link holds a
+        // current one. One walk of each reverse-edge value finds the peer id,
+        // its copy and the copy's stamp.
+        let mut found: Vec<(u64, Option<Bytes>)> = Vec::with_capacity(entries.len());
+        let mut unresolved: Vec<u64> = Vec::new();
+        {
+            let counters = self.version_counters.read();
+            let (peer_name, cover_name, cover_v_name) =
+                (query.peer.as_bytes(), cover_name.as_bytes(), cover_v_name.as_bytes());
+            for (key, value) in &entries {
+                let Some(link_id) = trailing_id(key) else {
+                    continue;
+                };
+                let (mut peer_id, mut copy, mut stamped) = (None, None, 0u64);
+                if trusted {
+                    crate::object::for_each_raw_field(value, |name, tag, span| {
+                        if name == peer_name {
+                            peer_id = crate::object::raw_u64(tag, &value[span]);
+                        } else if name == cover_name && tag == 9 {
+                            copy = Some(value.slice(span));
+                        } else if name == cover_v_name {
+                            stamped = crate::object::raw_u64(tag, &value[span]).unwrap_or(0);
+                        }
+                        true
+                    });
+                }
+                let Some(peer_id) = peer_id else {
+                    unresolved.push(link_id);
+                    continue;
+                };
+                // Same freshness rule as the executor's fusion path: the copy
+                // is current when its stamp equals the peer's generation, and
+                // a generation of 0 (deleted, or never stamped) is never
+                // trusted.
+                let live = counters.get(peer_type_id, peer_id);
+                let copy = copy.filter(|_| stamped == live && live != 0);
+                found.push((peer_id, copy));
+            }
+        }
+        if !unresolved.is_empty() {
+            for peer_id in self
+                .to_one_targets_at(snapshot, peer_rel.rel_id, &unresolved)?
+                .into_iter()
+                .flatten()
+            {
+                found.push((peer_id, None));
+            }
+        }
+        // Distinct peers, keeping a current copy when any link has one: sort
+        // by peer with copies first, then keep each peer's first entry.
+        found.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.is_some().cmp(&a.1.is_some())));
+        found.dedup_by_key(|(id, _)| *id);
+        let peers = found;
+
+        // Peers without a current copy: one batched read at the snapshot. A
+        // missing object (deleted peer) drops out here.
+        let stale: Vec<u64> = peers
+            .iter()
+            .filter(|(_, copy)| copy.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        let stale_blobs = self.multi_get_objects_at(snapshot, peer_type_id, &stale)?;
+
+        let mut candidates: Vec<(Option<Value>, u64, Bytes)> = Vec::with_capacity(peers.len());
+        for (id, copy) in peers {
+            if let Some(blob) = copy {
+                candidates.push((order_key(&blob, query.order_by), id, blob));
+            }
+        }
+        for (id, blob) in stale.into_iter().zip(stale_blobs) {
+            if let Some(blob) = blob {
+                candidates.push((order_key(&blob, query.order_by), id, blob));
+            }
+        }
+
+        let cmp = |a: &(Option<Value>, u64, Bytes), b: &(Option<Value>, u64, Bytes)| {
+            peer_order(&a.0, a.1, &b.0, b.1, query.descending)
+        };
+        if window < candidates.len() {
+            candidates.select_nth_unstable_by(window, cmp);
+            candidates.truncate(window);
+        }
+        candidates.sort_unstable_by(cmp);
+
+        Ok(candidates
+            .into_iter()
+            .skip(query.offset)
+            .map(|(_, id, blob)| {
+                let mut fields = deserialize_fields_projected(&blob, query.fields);
+                self.strip_tombstoned_fields(peer_type, &mut fields);
+                Object {
+                    type_name: peer_type.to_string(),
+                    id,
+                    fields,
+                    raw_fields: None,
+                }
+            })
+            .collect())
+    }
+
+    /// Where the links of `source_type.field_name` live: the `e:` prefix of
+    /// its own relation, or for an `@inverse` field the `r:` prefix of the
+    /// relation it inverts.
+    fn link_scan(&self, source_type: &str, field_name: &str) -> EngineResult<LinkScan> {
+        let _ = self.resolve_type_id(source_type)?;
+        let type_def = self
+            .schema
+            .get_type(source_type)
+            .ok_or_else(|| EngineError::TypeNotFound(source_type.into()))?;
+        let field = type_def.get_field(field_name).ok_or_else(|| {
+            self.field_retired_error(source_type, field_name)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
+                    type_name: source_type.into(),
+                    field: field_name.into(),
+                })
+        })?;
+        let FieldType::Relation(rel) = &field.field_type else {
+            return Err(EngineError::TypeMismatch {
+                field: format!("{source_type}.{field_name}"),
+                expected: "a relation".into(),
+                got: format!("{:?}", field.field_type),
+            });
+        };
+        let (rel_key, inverse) = match field.inverse() {
+            Some(inv) => (format!("{}.{}", inv.type_name, inv.field_name), true),
+            None => (format!("{source_type}.{field_name}"), false),
+        };
+        let rel_id = *self.rel_ids.get(&rel_key).ok_or_else(|| EngineError::FieldNotFound {
+            type_name: source_type.into(),
+            field: field_name.into(),
+        })?;
+        Ok(LinkScan {
+            rel_id,
+            inverse,
+            target_type: rel.target_type.clone(),
+        })
+    }
+
+    /// `type_name.peer` as a forward to-one relation: its relation id and
+    /// target type. Anything else is a `TypeMismatch`.
+    fn to_one_peer(&self, type_name: &str, peer: &str) -> EngineResult<PeerRelation> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        let field = type_def.get_field(peer).ok_or_else(|| {
+            self.field_retired_error(type_name, peer)
+                .unwrap_or_else(|| EngineError::FieldNotFound {
+                    type_name: type_name.into(),
+                    field: peer.into(),
+                })
+        })?;
+        let rel = match &field.field_type {
+            FieldType::Relation(rel) if !rel.is_many && field.inverse().is_none() => rel,
+            other => {
+                return Err(EngineError::TypeMismatch {
+                    field: format!("{type_name}.{peer}"),
+                    expected: "a forward to-one relation".into(),
+                    got: format!("{other:?}"),
+                });
+            }
+        };
+        let rel_id = *self
+            .rel_ids
+            .get(&format!("{type_name}.{peer}"))
+            .ok_or_else(|| EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: peer.into(),
+            })?;
+        Ok(PeerRelation {
+            rel_id,
+            target_type: rel.target_type.clone(),
+        })
+    }
+
+    /// Err unless `type_name.field` is a live (not retired) stored field — not
+    /// a relation, whose ids live in the edge index (a relation name would read
+    /// as absent from an object but as an id from a copy in a reverse edge).
+    fn live_field(&self, type_name: &str, field: &str) -> EngineResult<()> {
+        let type_def = self
+            .schema
+            .get_type(type_name)
+            .ok_or_else(|| EngineError::TypeNotFound(type_name.into()))?;
+        if let Some(def) = type_def.get_field(field) {
+            if let FieldType::Relation(_) = def.field_type {
+                return Err(EngineError::TypeMismatch {
+                    field: format!("{type_name}.{field}"),
+                    expected: "a stored field, not a relation".into(),
+                    got: format!("{:?}", def.field_type),
+                });
+            }
+            return Ok(());
+        }
+        Err(self
+            .field_retired_error(type_name, field)
+            .unwrap_or_else(|| EngineError::FieldNotFound {
+                type_name: type_name.into(),
+                field: field.into(),
+            }))
+    }
+
+    /// The target of to-one relation `rel_id` for each of `source_ids` (same
+    /// order), read from the forward edge index at `snapshot` in one batched
+    /// scan. `None` where a source has no edge.
+    fn to_one_targets_at(
+        &self,
+        snapshot: u64,
+        rel_id: u64,
+        source_ids: &[u64],
+    ) -> EngineResult<Vec<Option<u64>>> {
+        let prefixes: Vec<Bytes> = source_ids
+            .iter()
+            .map(|id| KeyBuilder::edge_prefix(*id, rel_id))
+            .collect();
+        let refs: Vec<&[u8]> = prefixes.iter().map(|p| p.as_ref()).collect();
+        Ok(self
+            .storage
+            .multi_scan_prefix_at(snapshot, &refs)?
+            .into_iter()
+            .map(|entries| entries.first().and_then(|(k, _)| trailing_id(k)))
+            .collect())
+    }
+
+    /// The stored blobs of `ids` (sorted, deduplicated) of one type at
+    /// `snapshot`, `None` for a missing object. The keys are built into one
+    /// buffer instead of one allocation per id.
+    fn multi_get_objects_at(
+        &self,
+        snapshot: u64,
+        type_id: u64,
+        ids: &[u64],
+    ) -> EngineResult<Vec<Option<Bytes>>> {
+        let keys = ObjectKeys::new(type_id, ids);
+        Ok(self.storage.multi_get_at(snapshot, &keys.refs())?)
+    }
+
     /// Scan for keys with a given prefix within a transaction (used by
     /// write paths that need to see uncommitted state).
     fn scan_prefix(
@@ -8646,6 +9006,193 @@ fn build_inflight_cover(
         insert_target_cover(db, &mut effective, &link.0, nested, link.4);
     }
     Ok(serialize_fields(&effective))
+}
+
+/// Rows from [`DatabaseCore::get_many_columns`]: `ids[i]`'s values are
+/// `row(i)`, one per requested field in request order (`None` where the
+/// object has no value for it).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Columns {
+    width: usize,
+    /// The objects found, ascending.
+    pub ids: Vec<u64>,
+    values: Vec<Option<Value>>,
+}
+
+impl Columns {
+    /// Number of rows.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether no object was found.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Row `i`'s values, in requested-field order.
+    pub fn row(&self, i: usize) -> &[Option<Value>] {
+        &self.values[i * self.width..(i + 1) * self.width]
+    }
+
+    /// `(id, values)` per row, ascending by id.
+    pub fn rows(&self) -> impl Iterator<Item = (u64, &[Option<Value>])> {
+        self.ids.iter().enumerate().map(|(i, id)| (*id, self.row(i)))
+    }
+}
+
+/// The window and ordering for [`DatabaseCore::get_link_peers_top`].
+#[derive(Debug, Clone, Copy)]
+pub struct LinkPeersTop<'a> {
+    /// The forward to-one relation, on the linked type, whose targets are
+    /// ranked (`"thread"` on `Message`).
+    pub peer: &'a str,
+    /// The peer field to order by (`"latest"` on `Thread`).
+    pub order_by: &'a str,
+    /// Largest first when true.
+    pub descending: bool,
+    /// Ranked peers to skip before the window.
+    pub offset: usize,
+    /// Peers to return at most.
+    pub limit: usize,
+    /// Peer fields each returned object carries.
+    pub fields: &'a [&'a str],
+}
+
+/// See [`DatabaseCore::link_scan`].
+struct LinkScan {
+    rel_id: u64,
+    inverse: bool,
+    target_type: String,
+}
+
+impl LinkScan {
+    fn prefix(&self, source_id: u64) -> Bytes {
+        if self.inverse {
+            KeyBuilder::reverse_edge_prefix(source_id, self.rel_id)
+        } else {
+            KeyBuilder::edge_prefix(source_id, self.rel_id)
+        }
+    }
+}
+
+/// See [`DatabaseCore::to_one_peer`].
+struct PeerRelation {
+    rel_id: u64,
+    target_type: String,
+}
+
+/// The id at the end of an edge key (`e:`/`r:`, the linked object's id).
+fn trailing_id(key: &[u8]) -> Option<u64> {
+    let tail = key.len().checked_sub(8).map(|start| &key[start..])?;
+    Some(u64::from_be_bytes(tail.try_into().ok()?))
+}
+
+/// Object keys `o:<type>:<id>` for many ids, built into ONE buffer (they are
+/// fixed width) and handed out as slices — a batch read of 50k objects used to
+/// allocate 50k key buffers.
+struct ObjectKeys {
+    buf: Vec<u8>,
+    len: usize,
+}
+
+impl ObjectKeys {
+    fn new(type_id: u64, ids: &[u64]) -> Self {
+        let mut buf = Vec::new();
+        let mut len = 0;
+        for (i, id) in ids.iter().enumerate() {
+            let key = KeyBuilder::object(type_id, *id);
+            if i == 0 {
+                len = key.len();
+                buf.reserve_exact(len * ids.len());
+            }
+            buf.extend_from_slice(&key);
+        }
+        ObjectKeys { buf, len }
+    }
+
+    fn refs(&self) -> Vec<&[u8]> {
+        if self.len == 0 {
+            return Vec::new();
+        }
+        self.buf.chunks_exact(self.len).collect()
+    }
+}
+
+/// A peer's sort value: its `order_by` field, `None` when absent or null.
+fn order_key(blob: &Bytes, order_by: &str) -> Option<Value> {
+    match extract_field(blob, order_by) {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v),
+    }
+}
+
+/// [`DatabaseCore::get_link_peers_top`]'s order: present values before absent
+/// ones (in either direction), then the value, then the id, the last two
+/// reversed when `descending`.
+fn peer_order(
+    a: &Option<Value>,
+    a_id: u64,
+    b: &Option<Value>,
+    b_id: u64,
+    descending: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let by_value = match (a, b) {
+        (Some(_), None) => return Ordering::Less,
+        (None, Some(_)) => return Ordering::Greater,
+        (None, None) => Ordering::Equal,
+        (Some(x), Some(y)) => compare_scalar(x, y),
+    };
+    let ord = by_value.then(a_id.cmp(&b_id));
+    if descending { ord.reverse() } else { ord }
+}
+
+/// Total order over two stored values of one field. Same-kind values compare
+/// naturally (floats by `total_cmp`, integers across widths and signs
+/// exactly); values of different kinds — only possible across a field-type
+/// migration — order by kind so the sort stays total.
+fn compare_scalar(a: &Value, b: &Value) -> std::cmp::Ordering {
+    fn int(v: &Value) -> Option<i128> {
+        match v {
+            Value::U32(x) => Some(*x as i128),
+            Value::U64(x) => Some(*x as i128),
+            Value::I32(x) => Some(*x as i128),
+            Value::I64(x) => Some(*x as i128),
+            _ => None,
+        }
+    }
+    fn float(v: &Value) -> Option<f64> {
+        match v {
+            Value::F32(x) => Some(*x as f64),
+            Value::F64(x) => Some(*x),
+            _ => None,
+        }
+    }
+    fn kind(v: &Value) -> u8 {
+        match v {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::U32(_) | Value::U64(_) | Value::I32(_) | Value::I64(_) => 2,
+            Value::F32(_) | Value::F64(_) => 3,
+            Value::DateTime(_) => 4,
+            Value::String(_) => 5,
+            Value::Bytes(_) => 6,
+            Value::Json(_) => 7,
+        }
+    }
+    match (a, b) {
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+        (Value::Json(x), Value::Json(y)) => x.to_string().cmp(&y.to_string()),
+        _ => match (int(a), int(b), float(a), float(b)) {
+            (Some(x), Some(y), _, _) => x.cmp(&y),
+            (_, _, Some(x), Some(y)) => x.total_cmp(&y),
+            _ => kind(a).cmp(&kind(b)),
+        },
+    }
 }
 
 /// Embed one peer target's serialized object under `<name>__cover` with its
