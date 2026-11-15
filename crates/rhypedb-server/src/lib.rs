@@ -484,6 +484,37 @@ pub(crate) async fn handle_admin_compact(
     }))
 }
 
+/// Bring every stored cover up to the current rules (`Database::rewrite_covers`):
+/// shrinks covers an older rhypedb wrote and repairs their to-one target ids,
+/// after which `/status` reports `cover_peers_sound: true`. Runs in batches
+/// alongside normal traffic; safe to interrupt and rerun. Compact afterwards
+/// (`/admin/compact`) to reclaim the space it frees. Gated with the rest of
+/// the admin surface.
+pub(crate) async fn handle_admin_rewrite_covers(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let db = state.db();
+    let t0 = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || db.rewrite_covers()
+    })
+    .await;
+    let ms = t0.elapsed().as_millis();
+    match result {
+        Ok(Ok(stats)) => Json(serde_json::json!({
+            "ok": true,
+            "ms": ms,
+            "objects": stats.objects,
+            "rev_edges_rewritten": stats.rev_edges_rewritten,
+            "index_entries_rewritten": stats.index_entries_rewritten,
+            "cover_peers_sound": db.cover_peers_sound(),
+        })),
+        Ok(Err(e)) => Json(serde_json::json!({ "ok": false, "ms": ms, "error": e.to_string() })),
+        Err(e) => Json(serde_json::json!({ "ok": false, "ms": ms, "error": e.to_string() })),
+    }
+}
+
 async fn handle_status(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
@@ -568,6 +599,11 @@ async fn handle_status(
             "indexes": indexes,
         });
     }
+
+    // False for a store an older rhypedb wrote with links in it, until
+    // `POST /admin/rewrite-covers` repairs it: to-one hops then read the edge
+    // index instead of the reverse entries' stored target ids (correct, slower).
+    result["cover_peers_sound"] = serde_json::json!(db.cover_peers_sound());
 
     if let Some(vectorizer) = &state.vectorizer {
         let status = vectorizer.status();

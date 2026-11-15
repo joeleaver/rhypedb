@@ -214,6 +214,23 @@ curl -s -X POST http://127.0.0.1:4200/admin/compact \
 
 **Opening a large database.** Each data file records which object ids it holds, so startup rebuilds its set of live objects from those small records without reading object data. Files written by versions before 2026-11 lack the record. For those files, startup walks their object keys instead, which pages in roughly half of their object bytes on every open. A compaction rewrites them in the current format, after which opens stay fast; one `POST /admin/compact` (or `compact()` when embedding) converts an older data directory in one go.
 
+## Upgrading relation copies
+
+Reverse relation entries store their linking object's other to-one target ids (see [Storage cost of indexes and relations](schema.md#storage-cost-of-indexes-and-relations)). Versions before 2026-11 could let those ids drift from the links. A database that such a version wrote with links in it opens with `"cover_peers_sound": false` in `GET /status`. Queries stay correct, but hops through a to-one relation read the links themselves instead of the stored ids, so they run slower. One rewrite pass repairs the ids and shrinks oversized copies; compact afterwards to reclaim the freed space:
+
+```bash
+curl -s -X POST http://127.0.0.1:4200/admin/rewrite-covers \
+  -H "Authorization: Bearer $RHYPEDB_ADMIN_TOKEN"
+curl -s -X POST http://127.0.0.1:4200/admin/compact \
+  -H "Authorization: Bearer $RHYPEDB_ADMIN_TOKEN"
+```
+
+```json
+{ "ok": true, "ms": 5400, "objects": 120000, "rev_edges_rewritten": 3100, "index_entries_rewritten": 0, "cover_peers_sound": true }
+```
+
+The pass runs in small batches alongside normal traffic and is safe to interrupt and rerun. Once it completes, the database stays marked sound across restarts. Embedded users call `Database::rewrite_covers()` instead.
+
 ## Monitoring
 
 - **`GET /health`** — liveness. Returns `200 OK` with a short status string.

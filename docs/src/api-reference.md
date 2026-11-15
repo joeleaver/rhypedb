@@ -176,6 +176,7 @@ All routes below require `Authorization: Bearer <RHYPEDB_ADMIN_TOKEN>`. With the
 | `GET /admin/export/stream` | Download a logical export (`?types=&vectors=`). |
 | `POST /admin/import/stream` | Apply a streamed logical dump to the live DB (`?vectors=`). |
 | `POST /admin/compact` | Force flush + full compaction. |
+| `POST /admin/rewrite-covers` | Rewrite stored relation/index copies to the current rules and repair their to-one target ids (see [Operations](operations.md#upgrading-relation-copies)). |
 | `POST /admin/reload` | Hot-reload the schema (SDL in the request body). |
 
 **Start a migration:**
