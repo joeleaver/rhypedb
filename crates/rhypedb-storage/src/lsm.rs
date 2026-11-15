@@ -620,10 +620,11 @@ impl LsmCore {
         indexed.sort_unstable_by(|a, b| a.1.cmp(b.1));
         let sorted_prefixes: Vec<&[u8]> = indexed.iter().map(|(_, p)| *p).collect();
 
-        // Per-sorted-prefix accumulator. BTreeMap so the per-prefix output is
-        // returned in user-key order, matching `scan_prefix_at`.
-        let mut merged: Vec<std::collections::BTreeMap<Bytes, Option<Bytes>>> =
-            (0..n).map(|_| std::collections::BTreeMap::new()).collect();
+        // Per-sorted-prefix sorted runs, one per source, oldest first; merged
+        // newest-wins at the end (output in user-key order, matching
+        // `scan_prefix_at`).
+        let mut layers: Vec<Vec<Vec<(Bytes, Option<Bytes>)>>> =
+            (0..n).map(|_| Vec::new()).collect();
 
         let ssts_guard = self.sst_files.read();
         let immutables = self.immutable_memtables.read().clone();
@@ -639,8 +640,8 @@ impl LsmCore {
             }
             let layer = sst.multi_scan_prefix_versioned(&sorted_prefixes, version);
             for (sp_idx, entries) in layer.into_iter().enumerate() {
-                for (key, value) in entries {
-                    merged[sp_idx].insert(key, value);
+                if !entries.is_empty() {
+                    layers[sp_idx].push(entries);
                 }
             }
         }
@@ -649,8 +650,8 @@ impl LsmCore {
         for mt in immutables.iter() {
             let layer = mt.multi_scan_prefix(&sorted_prefixes, version);
             for (sp_idx, entries) in layer.into_iter().enumerate() {
-                for (key, value) in entries {
-                    merged[sp_idx].insert(key, value);
+                if !entries.is_empty() {
+                    layers[sp_idx].push(entries);
                 }
             }
         }
@@ -658,18 +659,15 @@ impl LsmCore {
         // Active memtable (newest).
         let layer = active.multi_scan_prefix(&sorted_prefixes, version);
         for (sp_idx, entries) in layer.into_iter().enumerate() {
-            for (key, value) in entries {
-                merged[sp_idx].insert(key, value);
+            if !entries.is_empty() {
+                layers[sp_idx].push(entries);
             }
         }
 
-        // Filter tombstones and restore input order.
+        // Merge, drop tombstones and restore input order.
         let mut out: Vec<Vec<(Bytes, Bytes)>> = (0..n).map(|_| Vec::new()).collect();
         for (sp_idx, (orig_idx, _)) in indexed.iter().enumerate() {
-            out[*orig_idx] = std::mem::take(&mut merged[sp_idx])
-                .into_iter()
-                .filter_map(|(k, v)| v.map(|val| (k, val)))
-                .collect();
+            out[*orig_idx] = merge_layers_newest_wins(std::mem::take(&mut layers[sp_idx]));
         }
         Ok(out)
     }
@@ -692,36 +690,26 @@ impl LsmCore {
         prefix: &[u8],
         predicate: &crate::zone::FieldPredicate,
     ) -> Result<Vec<(Bytes, Bytes)>> {
-        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
-            std::collections::BTreeMap::new();
+        let mut layers: Vec<Vec<(Bytes, Option<Bytes>)>> = Vec::new();
 
-        // SSTs first (oldest), so newer entries overwrite.
+        // SSTs first (oldest).
         let ssts = self.sst_files.read();
         for sst in ssts.iter() {
-            for (key, value) in sst.scan_prefix_filtered(prefix, version, predicate) {
-                merged.insert(key, value);
-            }
+            layers.push(sst.scan_prefix_filtered(prefix, version, predicate));
         }
         drop(ssts);
 
         // Immutable memtables (oldest first). No zone map — full scan_prefix.
         let immutables = self.immutable_memtables.read().clone();
         for mt in immutables.iter() {
-            for (key, value) in mt.scan_prefix(prefix, version) {
-                merged.insert(key, value);
-            }
+            layers.push(mt.scan_prefix(prefix, version));
         }
 
         // Active memtable (newest).
         let active = self.active_memtable.read().clone();
-        for (key, value) in active.scan_prefix(prefix, version) {
-            merged.insert(key, value);
-        }
+        layers.push(active.scan_prefix(prefix, version));
 
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
-            .collect())
+        Ok(merge_layers_newest_wins(layers))
     }
 
     /// Bounded prefix scan: returns at most `max_distinct` user keys, each
@@ -929,71 +917,32 @@ impl LsmCore {
         version: u64,
         prefix: &[u8],
     ) -> Result<Vec<(Bytes, Bytes)>> {
-        // Collect from all sources.
-        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
-            std::collections::BTreeMap::new();
-
-        // SSTs first (oldest), so newer entries overwrite.
+        // One sorted run per source, oldest first: SSTs, then immutable
+        // memtables, then the active memtable.
+        let mut layers: Vec<Vec<(Bytes, Option<Bytes>)>> = Vec::new();
         let ssts = self.sst_files.read();
         for sst in ssts.iter() {
-            for (key, value) in sst.scan_prefix(prefix, version) {
-                merged.insert(key, value);
-            }
+            layers.push(sst.scan_prefix(prefix, version));
         }
         drop(ssts);
-
-        // Immutable memtables (oldest first).
         let immutables = self.immutable_memtables.read().clone();
         for mt in immutables.iter() {
-            for (key, value) in mt.scan_prefix(prefix, version) {
-                merged.insert(key, value);
-            }
+            layers.push(mt.scan_prefix(prefix, version));
         }
-
-        // Active memtable (newest).
         let active = self.active_memtable.read().clone();
-        for (key, value) in active.scan_prefix(prefix, version) {
-            merged.insert(key, value);
-        }
+        layers.push(active.scan_prefix(prefix, version));
 
-        // Filter out tombstones.
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
-            .collect())
+        Ok(merge_layers_newest_wins(layers))
     }
 
     /// Count live user keys under `prefix` at `version` — tombstone-correct across
-    /// SSTs + memtables, WITHOUT retaining value payloads (only a per-key liveness
-    /// flag), so it is much lighter than `scan_prefix_at(..).len()` for large
-    /// values (object rows). O(n) in the keys under the prefix; intended for the
-    /// infrequently-polled metering counters, not a hot path.
+    /// SSTs + memtables. Values are held only as handles into the SST/memtable
+    /// buffers (no payload copies). O(n) in the keys under the prefix; intended
+    /// for the infrequently-polled metering counters, not a hot path.
     pub fn count_prefix_at(&self, version: u64, prefix: &[u8]) -> Result<u64> {
-        // Merge newest-wins across all levels, keeping only a liveness flag per key
-        // (value present = live, tombstone = dead) rather than the value bytes.
-        let mut merged: std::collections::BTreeMap<Bytes, bool> = std::collections::BTreeMap::new();
-
-        let ssts = self.sst_files.read();
-        for sst in ssts.iter() {
-            for (key, value) in sst.scan_prefix(prefix, version) {
-                merged.insert(key, value.is_some());
-            }
-        }
-        drop(ssts);
-
-        let immutables = self.immutable_memtables.read().clone();
-        for mt in immutables.iter() {
-            for (key, value) in mt.scan_prefix(prefix, version) {
-                merged.insert(key, value.is_some());
-            }
-        }
-
-        let active = self.active_memtable.read().clone();
-        for (key, value) in active.scan_prefix(prefix, version) {
-            merged.insert(key, value.is_some());
-        }
-
-        Ok(merged.values().filter(|live| **live).count() as u64)
+        // The merge keeps value handles (refcounts into the SST/memtable
+        // buffers), never copies of the payloads.
+        Ok(self.scan_prefix_at(version, prefix)?.len() as u64)
     }
 
     /// Write a key-value pair within a transaction.
@@ -1812,6 +1761,95 @@ impl VersionGc {
         }
         true
     }
+}
+
+
+/// Merge per-source sorted runs into one live, key-ordered result. `layers`
+/// is ordered OLDEST source first; each run holds at most one entry per key
+/// (each source's own newest visible version), in the source's scan order. For a key in
+/// several runs the newest source wins, and a winning tombstone (`None`) drops
+/// the key.
+///
+/// A k-way heap merge: `O(total · log k)` comparisons, one output Vec sized
+/// up front, no per-entry node allocation (the `BTreeMap` it replaced paid an
+/// insert-and-rebalance per entry, the top of the profile for a 55k-link
+/// scan, GH #52). A single non-empty run is returned as is.
+pub(crate) fn merge_layers_newest_wins(
+    mut layers: Vec<Vec<(Bytes, Option<Bytes>)>>,
+) -> Vec<(Bytes, Bytes)> {
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    layers.retain(|l| !l.is_empty());
+    // A source emits in INTERNAL-key order (`user_key ‖ inverted version`),
+    // which is user-key order except around prefix-related keys (`a` sorts
+    // after `a1` once the version bytes follow it). Re-sort such a run; the
+    // check is one linear pass and almost always passes.
+    for layer in &mut layers {
+        if !layer.is_sorted_by(|a, b| a.0 < b.0) {
+            layer.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+    }
+    if layers.len() <= 1 {
+        return layers
+            .pop()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect();
+    }
+
+    // Heap order: smallest key first; for equal keys the NEWEST source
+    // (highest rank) first, so it is the one emitted.
+    struct Head {
+        key: Bytes,
+        value: Option<Bytes>,
+        rank: usize,
+    }
+    impl PartialEq for Head {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other) == Ordering::Equal
+        }
+    }
+    impl Eq for Head {}
+    impl PartialOrd for Head {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Head {
+        fn cmp(&self, other: &Self) -> Ordering {
+            // BinaryHeap is a max-heap: invert the key order, keep rank order.
+            other.key.cmp(&self.key).then(self.rank.cmp(&other.rank))
+        }
+    }
+
+    let total: usize = layers.iter().map(Vec::len).sum();
+    let mut runs: Vec<std::vec::IntoIter<(Bytes, Option<Bytes>)>> =
+        layers.into_iter().map(Vec::into_iter).collect();
+    let mut heap = BinaryHeap::with_capacity(runs.len());
+    for (rank, run) in runs.iter_mut().enumerate() {
+        if let Some((key, value)) = run.next() {
+            heap.push(Head { key, value, rank });
+        }
+    }
+
+    let mut out: Vec<(Bytes, Bytes)> = Vec::with_capacity(total);
+    let mut last: Option<Bytes> = None;
+    while let Some(Head { key, value, rank }) = heap.pop() {
+        if let Some((k, v)) = runs[rank].next() {
+            heap.push(Head { key: k, value: v, rank });
+        }
+        // An older source's copy of a key already decided by a newer one.
+        if last.as_ref() == Some(&key) {
+            continue;
+        }
+        if let Some(v) = value {
+            out.push((key.clone(), v));
+        }
+        last = Some(key);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -4771,6 +4809,65 @@ mod tests {
 
     /// Unbounded scans merge layers into a map keyed by USER key, so they
     /// return true user-key order even where internal order differs.
+    /// The k-way merge against the `BTreeMap` overwrite-merge it replaced,
+    /// over random runs: overlapping keys, tombstones, prefix-related keys
+    /// (runs out of user-key order), empty runs, one run, many runs.
+    #[test]
+    fn merge_layers_matches_a_btreemap_overwrite_merge() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet: [&[u8]; 6] = [b"a", b"a1", b"a1\0", b"a10", b"b", b"ba"];
+        for case in 0..2_000 {
+            let n_layers = (next() % 7) as usize;
+            let mut layers: Vec<Vec<(Bytes, Option<Bytes>)>> = Vec::new();
+            for rank in 0..n_layers {
+                let mut keys: Vec<Vec<u8>> = Vec::new();
+                for _ in 0..(next() % 12) {
+                    let mut k = b"p:".to_vec();
+                    k.extend_from_slice(alphabet[(next() % 6) as usize]);
+                    k.push((next() % 4) as u8 + b'0');
+                    if next() % 3 == 0 {
+                        // Sometimes a key that is a prefix of others.
+                        k.pop();
+                    }
+                    keys.push(k);
+                }
+                keys.sort();
+                keys.dedup();
+                if next() % 4 == 0 {
+                    // A source's scan order may differ from user-key order.
+                    keys.reverse();
+                }
+                let run = keys
+                    .into_iter()
+                    .map(|k| {
+                        let v = (next() % 4 != 0)
+                            .then(|| Bytes::from(format!("{case}-{rank}")));
+                        (Bytes::from(k), v)
+                    })
+                    .collect();
+                layers.push(run);
+            }
+            let mut reference: std::collections::BTreeMap<Bytes, Option<Bytes>> =
+                std::collections::BTreeMap::new();
+            for run in &layers {
+                for (k, v) in run {
+                    reference.insert(k.clone(), v.clone());
+                }
+            }
+            let want: Vec<(Bytes, Bytes)> = reference
+                .into_iter()
+                .filter_map(|(k, v)| v.map(|v| (k, v)))
+                .collect();
+            assert_eq!(merge_layers_newest_wins(layers), want, "case {case}");
+        }
+    }
+
     #[test]
     fn unbounded_scans_return_user_key_order_for_prefix_related_keys() {
         for flush in [false, true] {

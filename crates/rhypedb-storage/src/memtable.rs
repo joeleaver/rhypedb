@@ -293,15 +293,15 @@ impl MemTable {
         let scan_start = InternalKey::new(prefix, u64::MAX);
         let scan_bytes = Bytes::copy_from_slice(scan_start.as_bytes());
 
-        let mut results = Vec::new();
-        let mut last_user_key: Option<Vec<u8>> = None;
+        let mut results: Vec<(Bytes, MemValue)> = Vec::new();
 
         for entry in self.map.range(scan_bytes..) {
             let key = entry.key();
             if key.len() < 8 {
                 continue;
             }
-            let user_key = &key[..key.len() - 8];
+            let user_key_len = key.len() - 8;
+            let user_key = &key[..user_key_len];
 
             // Stop if past the prefix range.
             if !user_key.starts_with(prefix) {
@@ -309,7 +309,7 @@ impl MemTable {
             }
 
             // Decode version.
-            let ver_bytes: [u8; 8] = key[key.len() - 8..].try_into().unwrap();
+            let ver_bytes: [u8; 8] = key[user_key_len..].try_into().unwrap();
             let entry_version = !u64::from_be_bytes(ver_bytes);
 
             // Skip if not visible at requested version.
@@ -317,16 +317,15 @@ impl MemTable {
                 continue;
             }
 
-            // Deduplicate: only take the first (latest) visible version per user key.
-            let same_key = last_user_key
-                .as_ref()
-                .is_some_and(|prev| prev.as_slice() == user_key);
-            if same_key {
+            // Deduplicate: only take the first (latest) visible version per
+            // user key. Versions of a key are adjacent and newest first, so
+            // the last emitted key is the only one an entry can repeat.
+            if results.last().is_some_and(|(prev, _)| prev.as_ref() == user_key) {
                 continue;
             }
 
-            last_user_key = Some(user_key.to_vec());
-            results.push((Bytes::copy_from_slice(user_key), entry.value().clone()));
+            // Zero-copy: the user key is a slice of the skiplist's own key.
+            results.push((key.slice(..user_key_len), entry.value().clone()));
         }
 
         results
