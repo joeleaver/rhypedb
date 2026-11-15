@@ -742,7 +742,7 @@ pub fn raw_u64(tag: u8, payload: &[u8]) -> Option<u64> {
 /// [`deserialize_fields_projected`]: no `HashMap`, no key `String`s, so a
 /// batch read of many rows can lay every row's values out in one `Vec`.
 /// `Value::Bytes` is sliced zero-copy from `data`. A name repeated in `wanted`
-/// fills only its first slot.
+/// fills each of its slots.
 pub fn extract_fields_into(data: &Bytes, wanted: &[&str], out: &mut Vec<Option<Value>>) {
     let base = out.len();
     out.resize(base + wanted.len(), None);
@@ -806,9 +806,14 @@ pub fn extract_fields_into(data: &Bytes, wanted: &[&str], out: &mut Vec<Option<V
                 11 => serde_json::from_slice(&data[p..p + value_len]).ok().map(Value::Json),
                 _ => None,
             };
-            if v.is_some() {
-                out[base + i] = v;
-                found += 1;
+            if let Some(v) = v {
+                // Every slot naming this field (a name may be repeated).
+                for (j, w) in wanted.iter().enumerate().skip(i) {
+                    if w.as_bytes() == name_bytes {
+                        out[base + j] = Some(v.clone());
+                        found += 1;
+                    }
+                }
                 if found == wanted.len() {
                     return;
                 }

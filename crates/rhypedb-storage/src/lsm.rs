@@ -935,13 +935,32 @@ impl LsmCore {
     }
 
     /// Count live user keys under `prefix` at `version` — tombstone-correct across
-    /// SSTs + memtables. Values are held only as handles into the SST/memtable
-    /// buffers (no payload copies). O(n) in the keys under the prefix; intended
-    /// for the infrequently-polled metering counters, not a hot path.
+    /// SSTs + memtables, WITHOUT retaining value payloads: each source's values
+    /// are reduced to a liveness marker as soon as that source is read, so an
+    /// LZ4 SST's decompressed blocks are released before the next source (the
+    /// query governor counts a type this way precisely to avoid materializing
+    /// it). O(n) in the keys under the prefix; intended for the
+    /// infrequently-polled metering counters, not a hot path.
     pub fn count_prefix_at(&self, version: u64, prefix: &[u8]) -> Result<u64> {
-        // The merge keeps value handles (refcounts into the SST/memtable
-        // buffers), never copies of the payloads.
-        Ok(self.scan_prefix_at(version, prefix)?.len() as u64)
+        let live = Bytes::new();
+        let marker = |run: Run| -> Run {
+            run.into_iter()
+                .map(|(k, v)| (k, v.map(|_| live.clone())))
+                .collect()
+        };
+        let mut layers: Vec<Run> = Vec::new();
+        let ssts = self.sst_files.read();
+        for sst in ssts.iter() {
+            layers.push(marker(sst.scan_prefix(prefix, version)));
+        }
+        drop(ssts);
+        let immutables = self.immutable_memtables.read().clone();
+        for mt in immutables.iter() {
+            layers.push(marker(mt.scan_prefix(prefix, version)));
+        }
+        let active = self.active_memtable.read().clone();
+        layers.push(marker(active.scan_prefix(prefix, version)));
+        Ok(merge_layers_newest_wins(layers).len() as u64)
     }
 
     /// Write a key-value pair within a transaction.
@@ -1761,7 +1780,6 @@ impl VersionGc {
         true
     }
 }
-
 
 /// One source's prefix-scan output: `(user_key, value)`, `None` = tombstone.
 type Run = Vec<(Bytes, Option<Bytes>)>;
@@ -4827,8 +4845,6 @@ mod tests {
         (dir, tree)
     }
 
-    /// Unbounded scans merge layers into a map keyed by USER key, so they
-    /// return true user-key order even where internal order differs.
     /// The k-way merge against the `BTreeMap` overwrite-merge it replaced,
     /// over random runs: overlapping keys, tombstones, prefix-related keys
     /// (runs out of user-key order), empty runs, one run, many runs.
@@ -4888,6 +4904,9 @@ mod tests {
         }
     }
 
+    /// Unbounded scans merge layers by USER key (re-sorting a source run that
+    /// is in internal-key order), so they return true user-key order even
+    /// where internal order differs.
     #[test]
     fn unbounded_scans_return_user_key_order_for_prefix_related_keys() {
         for flush in [false, true] {

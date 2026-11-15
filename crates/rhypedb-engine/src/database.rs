@@ -7286,11 +7286,14 @@ impl DatabaseCore {
     ) -> EngineResult<Vec<(u64, Option<u64>)>> {
         let scan = self.link_scan(source_type, field_name)?;
         let peer_rel = self.to_one_peer(&scan.target_type, peer)?;
+        // Read the trust flag BEFORE the snapshot: `rewrite_covers` sets it only
+        // after its last repair commits, so `true` here means the snapshot
+        // already holds repaired peer ids.
+        let trusted = scan.inverse && self.cover_peers_sound();
         let snapshot = self.storage.read_snapshot();
         let entries = self
             .storage
             .scan_prefix_at(snapshot, &scan.prefix(source_id))?;
-        let trusted = scan.inverse && self.cover_peers_sound();
 
         let mut out: Vec<(u64, Option<u64>)> = Vec::with_capacity(entries.len());
         let mut unresolved: Vec<usize> = Vec::new();
@@ -7357,11 +7360,14 @@ impl DatabaseCore {
             return Ok(Vec::new());
         }
 
+        // Read the trust flag BEFORE the snapshot: `rewrite_covers` sets it only
+        // after its last repair commits, so `true` here means the snapshot
+        // already holds repaired peer ids.
+        let trusted = scan.inverse && self.cover_peers_sound();
         let snapshot = self.storage.read_snapshot();
         let entries = self
             .storage
             .scan_prefix_at(snapshot, &scan.prefix(source_id))?;
-        let trusted = scan.inverse && self.cover_peers_sound();
         let cover_name = format!("{}__cover", query.peer);
         let cover_v_name = format!("{}__cover_v", query.peer);
 

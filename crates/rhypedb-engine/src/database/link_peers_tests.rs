@@ -414,6 +414,10 @@ fn get_many_columns_reads_values_by_position() {
     assert_eq!(cols.row(0), &[Some(Value::DateTime(5)), Some(Value::String("a".into()))]);
     assert_eq!(cols.row(1), &[None, Some(Value::String("b".into()))]);
     assert_eq!(cols.rows().count(), 2);
+    // A repeated name fills each of its slots.
+    let dup = db.get_many_columns("Thread", &[t1], &["key", "latest", "key"]).unwrap();
+    let a = Some(Value::String("a".into()));
+    assert_eq!(dup.row(0), &[a.clone(), Some(Value::DateTime(5)), a]);
     assert!(db.get_many_columns("Thread", &[], &["key"]).unwrap().is_empty());
     assert!(matches!(
         db.get_many_columns("Thread", &[t1], &["nope"]),
