@@ -623,8 +623,7 @@ impl LsmCore {
         // Per-sorted-prefix sorted runs, one per source, oldest first; merged
         // newest-wins at the end (output in user-key order, matching
         // `scan_prefix_at`).
-        let mut layers: Vec<Vec<Vec<(Bytes, Option<Bytes>)>>> =
-            (0..n).map(|_| Vec::new()).collect();
+        let mut layers: Vec<Vec<Run>> = (0..n).map(|_| Vec::new()).collect();
 
         let ssts_guard = self.sst_files.read();
         let immutables = self.immutable_memtables.read().clone();
@@ -1764,6 +1763,9 @@ impl VersionGc {
 }
 
 
+/// One source's prefix-scan output: `(user_key, value)`, `None` = tombstone.
+type Run = Vec<(Bytes, Option<Bytes>)>;
+
 /// Merge per-source sorted runs into one live, key-ordered result. `layers`
 /// is ordered OLDEST source first; each run holds at most one entry per key
 /// (each source's own newest visible version), in the source's scan order. For a key in
@@ -1774,9 +1776,7 @@ impl VersionGc {
 /// up front, no per-entry node allocation (the `BTreeMap` it replaced paid an
 /// insert-and-rebalance per entry, the top of the profile for a 55k-link
 /// scan, GH #52). A single non-empty run is returned as is.
-pub(crate) fn merge_layers_newest_wins(
-    mut layers: Vec<Vec<(Bytes, Option<Bytes>)>>,
-) -> Vec<(Bytes, Bytes)> {
+pub(crate) fn merge_layers_newest_wins(mut layers: Vec<Run>) -> Vec<(Bytes, Bytes)> {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
 
@@ -1835,19 +1835,39 @@ pub(crate) fn merge_layers_newest_wins(
     }
 
     let mut out: Vec<(Bytes, Bytes)> = Vec::with_capacity(total);
-    let mut last: Option<Bytes> = None;
-    while let Some(Head { key, value, rank }) = heap.pop() {
-        if let Some((k, v)) = runs[rank].next() {
-            heap.push(Head { key: k, value: v, rank });
-        }
+    // The last key decided: the last output entry's, or a winning tombstone's
+    // (kept aside so no key handle is cloned per entry).
+    let mut tombstone: Option<Bytes> = None;
+    let mut emit = |key: Bytes, value: Option<Bytes>| {
+        let decided = match &tombstone {
+            Some(t) => t.as_ref(),
+            None => out.last().map_or(&[][..], |(k, _)| k.as_ref()),
+        };
         // An older source's copy of a key already decided by a newer one.
-        if last.as_ref() == Some(&key) {
-            continue;
+        if (tombstone.is_some() || !out.is_empty()) && decided == key.as_ref() {
+            return;
         }
-        if let Some(v) = value {
-            out.push((key.clone(), v));
+        match value {
+            Some(v) => {
+                tombstone = None;
+                out.push((key, v));
+            }
+            None => tombstone = Some(key),
         }
-        last = Some(key);
+    };
+    while let Some(Head { key, value, rank }) = heap.pop() {
+        emit(key, value);
+        // Keep draining this run while it still holds the smallest key: runs
+        // that barely interleave (SSTs flushed over a growing id range) cost
+        // one comparison per entry instead of a heap push and pop.
+        for (k, v) in runs[rank].by_ref() {
+            let next = Head { key: k, value: v, rank };
+            if heap.peek().is_some_and(|top| *top > next) {
+                heap.push(next);
+                break;
+            }
+            emit(next.key, next.value);
+        }
     }
     out
 }
