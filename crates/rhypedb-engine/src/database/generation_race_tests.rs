@@ -417,3 +417,26 @@ fn a_rename_epoch_survives_reopen_without_per_object_entries() {
     assert!(movies.iter().all(|m| db.object_version("Movie", *m) == 2), "epoch 1 + own 1");
     assert_trusted_copies_use_current_names(&db, "User", "recommendation", "favourite", "Movie");
 }
+
+/// Second review on #54: a create rolled back on a type that has an epoch
+/// (after a rename) must leave nothing behind — no born bit, no generation
+/// that could make a deleted object's leftover copy read as fresh.
+#[test]
+fn a_failed_create_under_an_epoch_leaves_no_generation() {
+    let before = parse_schema("type Movie { title: String }").unwrap();
+    let after = parse_schema("type Movie { headline: String }").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = Database::open_with_options(before, dir.path(), no_sweeper()).unwrap();
+        named(&db, "Movie", "title", "m");
+        db.rename_field("Movie", "title", "headline").unwrap();
+    }
+    let db = Database::open_with_options(after, dir.path(), no_sweeper()).unwrap();
+    let existing = 1u64;
+    assert!(db.object_version("Movie", existing) > 1, "the type has an epoch");
+    // A restore that stages a fresh id, then refuses on an existing one.
+    let fresh = 500u64;
+    let rows = vec![(fresh, FieldMap::new()), (existing, FieldMap::new())];
+    assert!(db.restore_objects("Movie", rows, true).is_err());
+    assert_eq!(db.object_version("Movie", fresh), 0, "the refused create is rolled back");
+}

@@ -115,6 +115,15 @@ impl VersionCounters {
         }
     }
 
+    /// Undo a create's bump (own count 0 → 1) whose write didn't land: forget
+    /// the object while its own count is still 1. Compared on the OWN count,
+    /// not the generation, which includes the type epoch.
+    pub(crate) fn rollback_create(&mut self, type_id: u64, object_id: u64) {
+        if self.local(type_id, object_id) == 1 {
+            self.forget(type_id, object_id);
+        }
+    }
+
     /// Drop the object entirely (it was deleted): reads 0 afterwards.
     pub(crate) fn forget(&mut self, type_id: u64, object_id: u64) {
         self.updated.remove(&(type_id, object_id));
@@ -258,6 +267,12 @@ mod tests {
         assert_eq!(v.get(1, 10), 4);
         v.raise_epoch(1, 2);
         assert_eq!(v.epoch(1), 3, "raise never lowers");
+        // A create rolled back under an epoch is forgotten (its generation is
+        // epoch + 1, not 1).
+        let created = v.bump(1, 50);
+        assert_eq!(created, 4);
+        v.rollback_create(1, 50);
+        assert_eq!(v.get(1, 50), 0);
         v.forget(1, 10);
         assert_eq!(v.get(1, 10), 0, "deleted reads 0 whatever the epoch");
         assert_eq!(v.epochs_len(), 1);

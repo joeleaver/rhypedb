@@ -1961,6 +1961,15 @@ impl DatabaseCore {
         (v, own)
     }
 
+    /// Undo a create's born-at-1 bump whose write didn't land (see
+    /// [`VersionCounters::rollback_create`]).
+    fn rollback_create_version(&self, type_id: u64, object_id: u64) {
+        let mut counters = self.version_counters.write();
+        counters.rollback_create(type_id, object_id);
+        self.version_counter_count
+            .store(counters.updated_len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Undo the bump that returned `bumped` (see [`VersionCounters::rollback`]:
     /// a no-op once another writer bumped past it).
     fn rollback_version(&self, type_id: u64, object_id: u64, bumped: u64) {
@@ -3998,11 +4007,11 @@ impl DatabaseCore {
         // (born-at-1). If the write doesn't land, undo it so a future create
         // reusing nothing — and any cover stamping — sees a consistent counter.
         self.storage.put_batch(&mut txn, &puts).map_err(|e| {
-            self.rollback_version(type_id, object_id, 1);
+            self.rollback_create_version(type_id, object_id);
             EngineError::Storage(e)
         })?;
         let version = self.storage.commit(&mut txn).map_err(|e| {
-            self.rollback_version(type_id, object_id, 1);
+            self.rollback_create_version(type_id, object_id);
             match e {
                 rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
                 other => EngineError::Storage(other),
@@ -4318,7 +4327,7 @@ impl DatabaseCore {
                     // This row never bumped (bump is the last step), but every
                     // successfully-staged earlier row did — undo them all.
                     for id in &object_ids {
-                        self.rollback_version(type_id, *id, 1);
+                        self.rollback_create_version(type_id, *id);
                     }
                     return Err(e);
                 }
@@ -4329,7 +4338,7 @@ impl DatabaseCore {
         // in-memory generation should survive either.
         let rollback_all = |db: &Self| {
             for id in &object_ids {
-                db.rollback_version(type_id, *id, 1);
+                db.rollback_create_version(type_id, *id);
             }
         };
         if let Err(e) = self.storage.put_batch(&mut txn, &puts) {
@@ -4430,7 +4439,7 @@ impl DatabaseCore {
                 let key = KeyBuilder::object(type_id, *object_id);
                 if self.storage.get(&txn, &key).map_err(EngineError::Storage)?.is_some() {
                     for (id, _) in &staged {
-                        self.rollback_version(type_id, *id, 1);
+                        self.rollback_create_version(type_id, *id);
                     }
                     return Err(EngineError::RestoreObjectExists {
                         type_name: type_name.into(),
@@ -4450,7 +4459,7 @@ impl DatabaseCore {
                     // This row never bumped (bump is the last step); undo the
                     // earlier rows' in-memory generation bumps.
                     for (id, _) in &staged {
-                        self.rollback_version(type_id, *id, 1);
+                        self.rollback_create_version(type_id, *id);
                     }
                     return Err(e);
                 }
@@ -4459,7 +4468,7 @@ impl DatabaseCore {
 
         let rollback_all = |db: &Self| {
             for (id, _) in &staged {
-                db.rollback_version(type_id, *id, 1);
+                db.rollback_create_version(type_id, *id);
             }
         };
         if let Err(e) = self.storage.put_batch(&mut txn, &puts) {
@@ -13262,7 +13271,7 @@ mod tests {
     /// object_version` keeps holding and a covered read serves the STALE source
     /// value). Verified for BOTH the offline single-commit path and the
     /// chunked migration path. Fails (object_version stays 1) without the
-    /// stage_generation_bump fix.
+    /// bump (the offline path's type-epoch bump, the cutover's per-object one).
     #[test]
     fn field_type_change_bumps_generation_to_invalidate_covers() {
         use rhypedb_schema::{FieldType, ScalarType};
