@@ -24,6 +24,8 @@ mod versions;
 mod cover_peer_tests;
 #[cfg(test)]
 mod link_peers_tests;
+#[cfg(test)]
+mod generation_race_tests;
 pub(crate) use versions::VersionCounters;
 use crate::object::{
     FieldMap, Object, Value, deserialize_fields, deserialize_fields_projected, extract_field,
@@ -1908,6 +1910,28 @@ impl DatabaseCore {
         self.version_counters.read().get(type_id, object_id)
     }
 
+    /// The generation of an object as of `txn`'s snapshot — what a cover
+    /// writer stamps on a copy it read in that snapshot. The persisted `g:`
+    /// key when the object was ever updated, else 1 (born-at-1); the caller
+    /// has already read the object in this snapshot, so it exists.
+    ///
+    /// Not the live counter ([`object_version`](Self::object_version)): writers
+    /// bump that BEFORE committing, so a concurrent cover writer would stamp a
+    /// generation whose content its snapshot can't see yet, and readers would
+    /// trust the stale copy once the bump committed (GH #54).
+    fn snapshot_generation(
+        &self,
+        txn: &rhypedb_storage::mvcc::Transaction,
+        type_id: u64,
+        object_id: u64,
+    ) -> EngineResult<u64> {
+        let key = KeyBuilder::object_version(type_id, object_id);
+        Ok(match self.storage.get(txn, &key)? {
+            Some(v) if v.len() == 8 => u64::from_be_bytes(v[..].try_into().unwrap()),
+            _ => 1,
+        })
+    }
+
     fn bump_version(&self, type_id: u64, object_id: u64) -> u64 {
         let mut counters = self.version_counters.write();
         let v = counters.bump(type_id, object_id);
@@ -1916,9 +1940,11 @@ impl DatabaseCore {
         v
     }
 
-    fn rollback_version(&self, type_id: u64, object_id: u64) {
+    /// Undo the bump that returned `bumped` (see [`VersionCounters::rollback`]:
+    /// a no-op once another writer bumped past it).
+    fn rollback_version(&self, type_id: u64, object_id: u64, bumped: u64) {
         let mut counters = self.version_counters.write();
-        counters.rollback(type_id, object_id);
+        counters.rollback(type_id, object_id, bumped);
         self.version_counter_count
             .store(counters.updated_len(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -3091,7 +3117,7 @@ impl DatabaseCore {
                 // storage error — these must be rolled back, mirroring update()'s
                 // commit-failure handling, so the live handle's generation
                 // counters don't drift ahead of the durable `g:` keys.
-                let mut bumped: Vec<u64> = Vec::new();
+                let mut bumped: Vec<(u64, u64)> = Vec::new();
                 for (key, blob) in &chunk.live {
                     let object_id =
                         u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
@@ -3124,8 +3150,8 @@ impl DatabaseCore {
                                 }
                                 Some(_) => {
                                     self.storage.abort(&mut txn);
-                                    for oid in &bumped {
-                                        self.rollback_version(type_id, *oid);
+                                    for (oid, generation) in &bumped {
+                                        self.rollback_version(type_id, *oid, *generation);
                                     }
                                     // Rewind to Converting so resume re-backfills
                                     // the missing shadow rather than re-refusing.
@@ -3148,8 +3174,8 @@ impl DatabaseCore {
                             };
                             if found_cv != converter_version {
                                 self.storage.abort(&mut txn);
-                                for oid in &bumped {
-                                    self.rollback_version(type_id, *oid);
+                                for (oid, generation) in &bumped {
+                                    self.rollback_version(type_id, *oid, *generation);
                                 }
                                 crate::catalog::park_migration_failed_rewind(
                                     &self.storage,
@@ -3188,7 +3214,7 @@ impl DatabaseCore {
                             // place, so resume re-promotes the row and redoes the
                             // (idempotent) cover maintenance; a torn tail that
                             // keeps `o:` necessarily kept every earlier write too.
-                            self.rewrite_object_and_maintain_covers(
+                            let generation = self.rewrite_object_and_maintain_covers(
                                 &mut txn,
                                 &type_name,
                                 type_id,
@@ -3198,7 +3224,7 @@ impl DatabaseCore {
                                 &old_indexed_snapshot,
                                 true,
                             )?;
-                            bumped.push(object_id);
+                            bumped.push((object_id, generation));
                             self.storage.put(&mut txn, key, serialized.clone())?;
                         }
                     }
@@ -3217,16 +3243,16 @@ impl DatabaseCore {
                         // Release the conflicted txn's snapshot + undo this
                         // attempt's generation bumps before re-scanning.
                         self.storage.abort(&mut txn);
-                        for oid in &bumped {
-                            self.rollback_version(type_id, *oid);
+                        for (oid, generation) in &bumped {
+                            self.rollback_version(type_id, *oid, *generation);
                         }
                         attempts += 1;
                         continue;
                     }
                     Err(e) => {
                         self.storage.abort(&mut txn);
-                        for oid in &bumped {
-                            self.rollback_version(type_id, *oid);
+                        for (oid, generation) in &bumped {
+                            self.rollback_version(type_id, *oid, *generation);
                         }
                         return Err(match e {
                             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
@@ -3336,7 +3362,7 @@ impl DatabaseCore {
                 let next_cursor =
                     u64::from_be_bytes(high_water[high_water.len() - 8..].try_into().unwrap());
 
-                let mut bumped: Vec<u64> = Vec::new();
+                let mut bumped: Vec<(u64, u64)> = Vec::new();
                 for (key, blob) in &chunk.live {
                     let object_id =
                         u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
@@ -3367,7 +3393,7 @@ impl DatabaseCore {
                     let serialized = serialize_fields(&fields);
                     // Cover/index maintenance FIRST, stripped o: blob LAST (the
                     // write that flips this row's "already stripped?" decision).
-                    self.rewrite_object_and_maintain_covers(
+                    let generation = self.rewrite_object_and_maintain_covers(
                         &mut txn,
                         &type_name,
                         type_id,
@@ -3377,7 +3403,7 @@ impl DatabaseCore {
                         &old_indexed_snapshot,
                         true,
                     )?;
-                    bumped.push(object_id);
+                    bumped.push((object_id, generation));
                     self.storage.put(&mut txn, key, serialized.clone())?;
                 }
 
@@ -3391,16 +3417,16 @@ impl DatabaseCore {
                         if attempts < WRITE_CONFLICT_RETRIES =>
                     {
                         self.storage.abort(&mut txn);
-                        for oid in &bumped {
-                            self.rollback_version(type_id, *oid);
+                        for (oid, generation) in &bumped {
+                            self.rollback_version(type_id, *oid, *generation);
                         }
                         attempts += 1;
                         continue;
                     }
                     Err(e) => {
                         self.storage.abort(&mut txn);
-                        for oid in &bumped {
-                            self.rollback_version(type_id, *oid);
+                        for (oid, generation) in &bumped {
+                            self.rollback_version(type_id, *oid, *generation);
                         }
                         return Err(match e {
                             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
@@ -3957,11 +3983,11 @@ impl DatabaseCore {
         // (born-at-1). If the write doesn't land, undo it so a future create
         // reusing nothing — and any cover stamping — sees a consistent counter.
         self.storage.put_batch(&mut txn, &puts).map_err(|e| {
-            self.rollback_version(type_id, object_id);
+            self.rollback_version(type_id, object_id, 1);
             EngineError::Storage(e)
         })?;
         let version = self.storage.commit(&mut txn).map_err(|e| {
-            self.rollback_version(type_id, object_id);
+            self.rollback_version(type_id, object_id, 1);
             match e {
                 rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
                 other => EngineError::Storage(other),
@@ -4070,7 +4096,7 @@ impl DatabaseCore {
                             object_id: target_id,
                         }
                     })?;
-                    let target_version = self.object_version(&rel.target_type, target_id);
+                    let target_version = self.snapshot_generation(txn, target_type_id, target_id)?;
                     let rel_key = format!("{type_name}.{field_name}");
                     let rel_id =
                         *self
@@ -4277,7 +4303,7 @@ impl DatabaseCore {
                     // This row never bumped (bump is the last step), but every
                     // successfully-staged earlier row did — undo them all.
                     for id in &object_ids {
-                        self.rollback_version(type_id, *id);
+                        self.rollback_version(type_id, *id, 1);
                     }
                     return Err(e);
                 }
@@ -4288,7 +4314,7 @@ impl DatabaseCore {
         // in-memory generation should survive either.
         let rollback_all = |db: &Self| {
             for id in &object_ids {
-                db.rollback_version(type_id, *id);
+                db.rollback_version(type_id, *id, 1);
             }
         };
         if let Err(e) = self.storage.put_batch(&mut txn, &puts) {
@@ -4389,7 +4415,7 @@ impl DatabaseCore {
                 let key = KeyBuilder::object(type_id, *object_id);
                 if self.storage.get(&txn, &key).map_err(EngineError::Storage)?.is_some() {
                     for (id, _) in &staged {
-                        self.rollback_version(type_id, *id);
+                        self.rollback_version(type_id, *id, 1);
                     }
                     return Err(EngineError::RestoreObjectExists {
                         type_name: type_name.into(),
@@ -4409,7 +4435,7 @@ impl DatabaseCore {
                     // This row never bumped (bump is the last step); undo the
                     // earlier rows' in-memory generation bumps.
                     for (id, _) in &staged {
-                        self.rollback_version(type_id, *id);
+                        self.rollback_version(type_id, *id, 1);
                     }
                     return Err(e);
                 }
@@ -4418,7 +4444,7 @@ impl DatabaseCore {
 
         let rollback_all = |db: &Self| {
             for (id, _) in &staged {
-                db.rollback_version(type_id, *id);
+                db.rollback_version(type_id, *id, 1);
             }
         };
         if let Err(e) = self.storage.put_batch(&mut txn, &puts) {
@@ -5995,7 +6021,7 @@ impl DatabaseCore {
         // covers, and bump this object's generation — shared with the card-2
         // cutover via `rewrite_object_and_maintain_covers` so cutover provably
         // touches every keyspace a normal update touches (see that method).
-        self.rewrite_object_and_maintain_covers(
+        let bumped = self.rewrite_object_and_maintain_covers(
             &mut txn,
             type_name,
             type_id,
@@ -6006,12 +6032,15 @@ impl DatabaseCore {
             any_update,
         )?;
 
-        self.storage.put(&mut txn, &key, serialized)?;
+        if let Err(e) = self.storage.put(&mut txn, &key, serialized) {
+            self.rollback_version(type_id, object_id, bumped);
+            return Err(e.into());
+        }
         let version = self.storage.commit(&mut txn).map_err(|e| {
-            // The commit didn't land — undo the in-memory bump so future
-            // updates don't skip a generation and so the stamped versions
-            // in existing rev_edges still match a successful next write.
-            self.rollback_version(type_id, object_id);
+            // The commit didn't land — undo the in-memory bump (unless a later
+            // writer already bumped past it) so the object's copies don't read
+            // as stale until its next update.
+            self.rollback_version(type_id, object_id, bumped);
             match e {
                 rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
                 other => EngineError::Storage(other),
@@ -6070,7 +6099,7 @@ impl DatabaseCore {
         serialized: &Bytes,
         old_indexed_snapshot: &[Option<Value>],
         any_update: bool,
-    ) -> EngineResult<()> {
+    ) -> EngineResult<u64> {
         // Maintain secondary index entries for any @indexed fields. Covering
         // value = the new serialized fields, so subsequent filter_scans can
         // read full Objects from the index without per-id LSM probes.
@@ -6141,13 +6170,19 @@ impl DatabaseCore {
         // those specific targets. Bounded write cost (one in-memory bump +
         // one persisted `g:` put) regardless of how many incoming references
         // this object has — that fan-in could be millions.
+        //
+        // Returns the new generation: the caller rolls it back
+        // (`rollback_version`) if the transaction doesn't commit.
         let new_version = self.bump_version(type_id, object_id);
-        self.storage.put(
+        if let Err(e) = self.storage.put(
             txn,
             &KeyBuilder::object_version(type_id, object_id),
             Bytes::copy_from_slice(&new_version.to_be_bytes()),
-        )?;
-        Ok(())
+        ) {
+            self.rollback_version(type_id, object_id, new_version);
+            return Err(e.into());
+        }
+        Ok(new_version)
     }
 
     /// Delete an object, enforcing @on_delete policies on all inbound relationships.
@@ -6217,15 +6252,15 @@ impl DatabaseCore {
 
         let tombstones = arena.into_keys();
         if let Err(e) = self.storage.delete_batch(&mut txn, &tombstones) {
-            for (t, id) in &bumped {
-                self.rollback_version(*t, *id);
+            for (t, id, generation) in &bumped {
+                self.rollback_version(*t, *id, *generation);
             }
             return Err(e.into());
         }
 
         let version = self.storage.commit(&mut txn).map_err(|e| {
-            for (t, id) in &bumped {
-                self.rollback_version(*t, *id);
+            for (t, id, generation) in &bumped {
+                self.rollback_version(*t, *id, *generation);
             }
             match e {
                 rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
@@ -6233,7 +6268,7 @@ impl DatabaseCore {
             }
         })?;
         self.apply_fulltext_delta(&ft_delta);
-        for (t, id) in &bumped {
+        for (t, id, _) in &bumped {
             self.enqueue_cover_refresh(*t, *id);
         }
 
@@ -6802,19 +6837,19 @@ impl DatabaseCore {
             self.restage_peer_covers(&mut txn, source_type, source_id, &[(field_name, Some(target_id))])?;
             self.stage_peer_change_bump(&mut txn, source_type_id, source_id)?
         } else {
-            false
+            None
         };
 
         self.storage.commit(&mut txn).map_err(|e| {
-            if bumped {
-                self.rollback_version(source_type_id, source_id);
+            if let Some(generation) = bumped {
+                self.rollback_version(source_type_id, source_id, generation);
             }
             match e {
                 rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
                 other => EngineError::Storage(other),
             }
         })?;
-        if bumped {
+        if bumped.is_some() {
             self.enqueue_cover_refresh(source_type_id, source_id);
         }
 
@@ -6879,19 +6914,19 @@ impl DatabaseCore {
             self.restage_peer_covers(&mut txn, source_type, source_id, &[(field_name, remaining)])?;
             self.stage_peer_change_bump(&mut txn, source_type_id, source_id)?
         } else {
-            false
+            None
         };
 
         self.storage.commit(&mut txn).map_err(|e| {
-            if bumped {
-                self.rollback_version(source_type_id, source_id);
+            if let Some(generation) = bumped {
+                self.rollback_version(source_type_id, source_id, generation);
             }
             match e {
                 rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
                 other => EngineError::Storage(other),
             }
         })?;
-        if bumped {
+        if bumped.is_some() {
             self.enqueue_cover_refresh(source_type_id, source_id);
         }
 
@@ -6910,7 +6945,7 @@ impl DatabaseCore {
         txn: &mut rhypedb_storage::mvcc::Transaction,
         deleted: &HashMap<(u64, u64), Option<HashMap<String, serde_json::Value>>>,
         peer_losses: &[PeerLoss],
-    ) -> EngineResult<Vec<(u64, u64)>> {
+    ) -> EngineResult<Vec<(u64, u64, u64)>> {
         // Group by surviving source (in first-seen order), keeping one entry
         // per lost relation. A deleted User can cost 100k Rating losses, so
         // the grouping is hashed, not a scan per loss.
@@ -6950,15 +6985,17 @@ impl DatabaseCore {
                     overrides.push((loss.field.as_str(), remaining));
                 }
                 self.restage_peer_covers(txn, source_type, *source_id, &overrides)?;
-                if self.stage_peer_change_bump(txn, *source_type_id, *source_id)? {
-                    bumped.push((*source_type_id, *source_id));
+                if let Some(generation) =
+                    self.stage_peer_change_bump(txn, *source_type_id, *source_id)?
+                {
+                    bumped.push((*source_type_id, *source_id, generation));
                 }
             }
             Ok(())
         })();
         if let Err(e) = staged {
-            for (t, id) in &bumped {
-                self.rollback_version(*t, *id);
+            for (t, id, generation) in &bumped {
+                self.rollback_version(*t, *id, *generation);
             }
             return Err(e);
         }
@@ -7032,13 +7069,13 @@ impl DatabaseCore {
         txn: &mut rhypedb_storage::mvcc::Transaction,
         type_id: u64,
         object_id: u64,
-    ) -> EngineResult<bool> {
+    ) -> EngineResult<Option<u64>> {
         let embedded = self
             .incoming_relations
             .get(&type_id)
             .is_some_and(|incoming| incoming.iter().any(|inc| !inc.is_many && inc.embeds_target));
         if !embedded {
-            return Ok(false);
+            return Ok(None);
         }
         let new_version = self.bump_version(type_id, object_id);
         if let Err(e) = self.storage.put(
@@ -7046,10 +7083,10 @@ impl DatabaseCore {
             &KeyBuilder::object_version(type_id, object_id),
             Bytes::copy_from_slice(&new_version.to_be_bytes()),
         ) {
-            self.rollback_version(type_id, object_id);
+            self.rollback_version(type_id, object_id, new_version);
             return Err(e.into());
         }
-        Ok(true)
+        Ok(Some(new_version))
     }
 
     /// Hand `(type_id, object_id)` to the cover-refresh worker (after a
@@ -9348,7 +9385,7 @@ fn build_covering_rev_value(
             if let Ok(Some(target_data)) = db.storage.get(txn, &target_key) {
                 let nested =
                     with_nested_forward_covers(db, txn, &rel.target_type, target_data, *tid)?;
-                let target_version = db.object_version(&rel.target_type, *tid);
+                let target_version = db.snapshot_generation(txn, target_type_id, *tid)?;
                 insert_target_cover(db, &mut effective, name, nested, target_version);
             }
         }
@@ -9429,7 +9466,7 @@ fn with_nested_forward_covers(
         wrote_any = true;
         effective.insert(field.name.clone(), Value::U64(next_tid));
         // Card 2: the next-hop blob is embedded verbatim — strip its shadows.
-        let next_v = db.object_version(&rel.target_type, next_tid);
+        let next_v = db.snapshot_generation(txn, next_type_id, next_tid)?;
         insert_target_cover(
             db,
             &mut effective,
@@ -9839,6 +9876,19 @@ impl crate::catalog::FieldCoverMaintainer for DatabaseCore {
             }
         }
         out
+    }
+
+    fn live_generation(&self, type_id: u64, object_id: u64) -> u64 {
+        self.version_counters.read().get(type_id, object_id)
+    }
+
+    fn raise_generation(&self, type_id: u64, object_id: u64, generation: u64) {
+        let mut counters = self.version_counters.write();
+        if counters.get(type_id, object_id) < generation {
+            counters.set(type_id, object_id, generation);
+        }
+        self.version_counter_count
+            .store(counters.updated_len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn rename_index_cover_puts(

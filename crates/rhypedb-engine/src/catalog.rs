@@ -1229,7 +1229,8 @@ pub(crate) fn apply_migration_with_cover(
     let mut txn = storage.begin_txn();
     let snap = txn.snapshot();
 
-    let result = (|| -> EngineResult<(MigrationReport, bool)> {
+    #[allow(clippy::type_complexity)]
+    let result = (|| -> EngineResult<(MigrationReport, bool, Vec<(u64, u64, u64)>)> {
         // Read current format. We support v1, v2, v3 catalogs as input.
         let fv_raw = storage
             .get(&txn, &KeyBuilder::catalog_format())?
@@ -1336,10 +1337,18 @@ pub(crate) fn apply_migration_with_cover(
         // verbs via the `overlay`, folded forward after each verb.
         let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
         let mut deletes: Vec<Bytes> = Vec::new();
+        let mut renamed_type_ids: Vec<u64> = Vec::new();
         let now_ms = now_unix_millis();
         for verb in verbs {
             let puts_before = puts.len();
             let deletes_before = deletes.len();
+            let renamed_before = report.renamed_fields.len();
+            // The renamed field's type, by STABLE id, resolved the way the
+            // verb resolves it (against the catalog as earlier verbs left it).
+            let field_type_id = match verb {
+                RenameVerb::Field { type_name, .. } => cat.type_ids.get(type_name.as_str()).copied(),
+                RenameVerb::Type { .. } => None,
+            };
             match verb {
                 RenameVerb::Type { old, new } => {
                     apply_type_rename_verb(
@@ -1410,12 +1419,18 @@ pub(crate) fn apply_migration_with_cover(
             if multi_verb {
                 overlay.absorb(&puts[puts_before..], &deletes[deletes_before..]);
             }
+            if let Some(type_id) = field_type_id
+                && report.renamed_fields.len() > renamed_before
+                && !renamed_type_ids.contains(&type_id)
+            {
+                renamed_type_ids.push(type_id);
+            }
         }
 
         if report.renamed_types.is_empty() && report.renamed_fields.is_empty() {
             // No-op plan. Abort the txn; don't bump format or touch
             // digest.
-            return Ok((report, false));
+            return Ok((report, false, Vec::new()));
         }
 
         // For a multi-verb plan the overlay's net state IS the commit write-set:
@@ -1456,17 +1471,50 @@ pub(crate) fn apply_migration_with_cover(
         // changes, and rewrites the digest in its tail commit. Net
         // effect: one fast-path miss on the first post-rename open,
         // then steady fast-path forever after.
+        // Retire every copy of a renamed type's objects (GH #54). Reverse-edge
+        // covers hold copies of OTHER objects (`<peer>__cover`, nested inside
+        // further copies too), named by field — and a rename changes names
+        // without changing content, so nothing else would mark those copies
+        // stale: readers would keep returning the old name. Bump each object's
+        // generation in this same atomic batch, past both its persisted and its
+        // in-memory value so no generation is ever handed out twice; readers
+        // then probe `o:` (already rewritten above) until a cover is rebuilt
+        // (`rewrite_covers`, or the object's next change).
+        let mut raised: Vec<(u64, u64, u64)> = Vec::new();
+        for &type_id in &renamed_type_ids {
+            for (key, _) in overlay.scan_prefix_at(storage, snap, &KeyBuilder::object_prefix(type_id))? {
+                let Some(id_bytes) = key.len().checked_sub(8).map(|s| &key[s..]) else {
+                    continue;
+                };
+                let object_id = u64::from_be_bytes(id_bytes.try_into().unwrap());
+                let g_key = KeyBuilder::object_version(type_id, object_id);
+                let persisted = match overlay.get_at(storage, snap, &g_key)? {
+                    Some(v) if v.len() == 8 => u64::from_be_bytes(v[..].try_into().unwrap()),
+                    _ => 1,
+                };
+                let live = cover.map_or(0, |c| c.live_generation(type_id, object_id));
+                let generation = persisted.max(live) + 1;
+                puts.push((g_key, Bytes::copy_from_slice(&generation.to_be_bytes())));
+                raised.push((type_id, object_id, generation));
+            }
+        }
+
         storage.put_batch(&mut txn, &puts)?;
         if !deletes.is_empty() {
             storage.delete_batch(&mut txn, &deletes)?;
         }
-        Ok((report, true))
+        Ok((report, true, raised))
     })();
 
     match result {
-        Ok((report, wrote)) => {
+        Ok((report, wrote, raised)) => {
             if wrote {
                 storage.commit(&mut txn)?;
+                if let Some(c) = cover {
+                    for (type_id, object_id, generation) in raised {
+                        c.raise_generation(type_id, object_id, generation);
+                    }
+                }
             } else {
                 storage.abort(&mut txn);
             }
@@ -2347,6 +2395,14 @@ pub(crate) trait FieldCoverMaintainer {
         serialized: &Bytes,
         current_field_name: &std::collections::HashMap<u64, String>,
     ) -> Vec<(Bytes, Bytes)>;
+
+    /// The object's in-memory generation (0 when unknown). A rename bumps past
+    /// both this and the persisted `g:` value, so no generation is reused.
+    fn live_generation(&self, type_id: u64, object_id: u64) -> u64;
+
+    /// After a rename's batch committed: raise the object's in-memory
+    /// generation to at least `generation` (the persisted `g:` it now has).
+    fn raise_generation(&self, type_id: u64, object_id: u64, generation: u64);
 }
 
 pub(crate) fn apply_field_type_change(

@@ -73,12 +73,17 @@ impl VersionCounters {
         next
     }
 
-    /// Undo one [`bump`](Self::bump) whose write didn't land (n → n-1; 1 → 0
-    /// forgets the object). A no-op at 0.
-    pub(crate) fn rollback(&mut self, type_id: u64, object_id: u64) {
-        let current = self.get(type_id, object_id);
-        if current > 0 {
-            self.set(type_id, object_id, current - 1);
+    /// Undo the [`bump`](Self::bump) that returned `bumped`, whose write
+    /// didn't land: back to `bumped - 1` (1 → 0 forgets the object) — but only
+    /// while the counter still reads `bumped`. Once another writer has bumped
+    /// past it, the counter is left alone: that later generation may already
+    /// be committed, and taking the counter below it would let the next bump
+    /// hand the same generation out twice (GH #54). A skipped generation is
+    /// harmless — cover stamps come from persisted generations, so it only
+    /// makes copies read as stale until the next committed bump.
+    pub(crate) fn rollback(&mut self, type_id: u64, object_id: u64, bumped: u64) {
+        if bumped > 0 && self.get(type_id, object_id) == bumped {
+            self.set(type_id, object_id, bumped - 1);
         }
     }
 
@@ -116,8 +121,8 @@ impl VersionCounters {
 mod tests {
     use super::*;
 
-    /// Reference model: the old one-entry-per-live-object map, with the old
-    /// bump / rollback / forget rules verbatim.
+    /// Reference model: the old one-entry-per-live-object map, with the
+    /// bump / rollback / forget rules.
     #[derive(Default)]
     struct OldMap(HashMap<(u64, u64), u64>);
     impl OldMap {
@@ -129,13 +134,12 @@ mod tests {
             *e += 1;
             *e
         }
-        fn rollback(&mut self, t: u64, i: u64) {
-            if let Some(v) = self.0.get_mut(&(t, i)) {
-                if *v > 0 {
-                    *v -= 1;
-                }
-                if *v == 0 {
+        fn rollback(&mut self, t: u64, i: u64, bumped: u64) {
+            if bumped > 0 && self.get(t, i) == bumped {
+                if bumped == 1 {
                     self.0.remove(&(t, i));
+                } else {
+                    self.0.insert((t, i), bumped - 1);
                 }
             }
         }
@@ -161,8 +165,10 @@ mod tests {
             match next() % 8 {
                 0..=3 => assert_eq!(new.bump(t, i), old.bump(t, i)),
                 4 => {
-                    new.rollback(t, i);
-                    old.rollback(t, i);
+                    // Roll back the current bump, a stale one, or one never made.
+                    let bumped = old.get(t, i).saturating_sub(next() % 2);
+                    new.rollback(t, i, bumped);
+                    old.rollback(t, i, bumped);
                 }
                 5 => {
                     new.forget(t, i);
@@ -179,6 +185,23 @@ mod tests {
             }
         }
         assert_eq!(new.updated_len(), old.0.values().filter(|&&v| v > 1).count());
+    }
+
+    /// GH #54 race 2: a failed writer whose bump was overtaken leaves the
+    /// newer generation alone; one whose bump is still newest restores.
+    #[test]
+    fn rollback_only_undoes_the_newest_bump() {
+        let mut v = VersionCounters::default();
+        v.mark_born(1, 10);
+        let t1 = v.bump(1, 10); // 2
+        let t3 = v.bump(1, 10); // 3
+        v.rollback(1, 10, t1);
+        assert_eq!(v.get(1, 10), t3, "overtaken: untouched");
+        v.rollback(1, 10, t3);
+        assert_eq!(v.get(1, 10), 2, "newest: restored");
+        let born = v.bump(1, 11); // create: 0 -> 1
+        v.rollback(1, 11, born);
+        assert_eq!(v.get(1, 11), 0, "a rolled-back create is forgotten");
     }
 
     #[test]
