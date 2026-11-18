@@ -257,41 +257,38 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
 /// it (`<rel>` ids plus `<rel>__cover` / `<rel>__cover_v`), for a further hop
 /// to fuse through. Once the pipeline ends they are internal state: a row
 /// must hold the same fields whether it came from a cover or from `o:`.
+///
+/// A row keeps exactly its type's declared stored fields: relation names and
+/// any name the type no longer declares (a relation's pre-rename name nested
+/// in an older copy, say) are dropped. The check walks the stored names in
+/// place, so a blob that holds only declared fields keeps its zero-copy path.
 fn strip_cover_internals(db: &Database, objs: &mut [Object]) {
-    let mut to_one: HashMap<String, Vec<String>> = HashMap::new();
+    let mut plain: HashMap<String, Option<Vec<String>>> = HashMap::new();
     for obj in objs.iter_mut() {
         let Some(raw) = &obj.raw_fields else { continue };
-        let rels = to_one.entry(obj.type_name.clone()).or_insert_with(|| {
-            db.schema()
-                .get_type(&obj.type_name)
-                .map(|td| {
-                    td.fields
-                        .iter()
-                        .filter(|f| {
-                            matches!(&f.field_type, rhypedb_schema::FieldType::Relation(r) if !r.is_many)
-                                && f.inverse().is_none()
-                        })
-                        .map(|f| f.name.clone())
-                        .collect()
-                })
-                .unwrap_or_default()
+        let keep = plain.entry(obj.type_name.clone()).or_insert_with(|| {
+            db.schema().get_type(&obj.type_name).map(|td| {
+                td.fields
+                    .iter()
+                    .filter(|f| !matches!(&f.field_type, rhypedb_schema::FieldType::Relation(_)))
+                    .map(|f| f.name.clone())
+                    .collect()
+            })
         });
-        // Only a type with to-one relations gets peers nested into its covers,
-        // and a nested peer always brings its id (`<rel>: u64`): probe for
-        // one in place before paying for a decode, so a plain `o:` blob keeps
-        // its zero-copy path.
-        if !rels.iter().any(|r| find_u64_field_in_raw(raw, r).is_some()) {
+        // A type the schema doesn't know is left as stored, never emptied.
+        let Some(keep) = keep else { continue };
+        let mut foreign = false;
+        rhypedb_engine::object::for_each_raw_field(raw, |name, _, _| {
+            foreign = !keep.iter().any(|k| k.as_bytes() == name);
+            !foreign
+        });
+        if !foreign {
             continue;
         }
         let mut fields = rhypedb_engine::object::deserialize_fields(raw);
-        let before = fields.len();
-        fields.retain(|name, _| {
-            !(rels.iter().any(|r| r == name) || name.ends_with("__cover") || name.ends_with("__cover_v"))
-        });
-        if fields.len() != before {
-            obj.fields = fields;
-            obj.raw_fields = None;
-        }
+        fields.retain(|name, _| keep.iter().any(|k| k == name));
+        obj.fields = fields;
+        obj.raw_fields = None;
     }
 }
 
@@ -4939,5 +4936,53 @@ mod fusion_peer_tests {
         f.insert("name".into(), Value::String("renamed".into()));
         db.update("User", u1, f).unwrap();
         assert_eq!(ids(&db, &q), vec![c1, c2]);
+    }
+    /// GH #54: a field rename must not leave fused rows carrying the old
+    /// name — the copies in reverse-edge covers predate the rename.
+    #[test]
+    fn a_fused_hop_after_a_rename_returns_the_new_field_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = r#"
+            type User { name: String  favourite: Movie  recommendation: Movie }
+            type Movie { NAME: String  recommended_to: [User] @inverse(User.recommendation) }
+        "#;
+        let opts = || OpenOptions {
+            background_cover_refresh: false,
+            ..Default::default()
+        };
+        let rows = |db: &Database, q: &str| -> Vec<FieldMap> {
+            let q = parse_query(q).unwrap();
+            match execute(&ExecContext::new(db, None), &q).unwrap() {
+                QueryOutput::Objects(mut o) => o
+                    .iter_mut()
+                    .map(|o| {
+                        o.ensure_fields_deserialized();
+                        o.fields.clone()
+                    })
+                    .collect(),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        let (m1, m2);
+        {
+            let db = Database::open_with_options(parse_schema(&before.replace("NAME", "title")).unwrap(), dir.path(), opts()).unwrap();
+            let mut f = FieldMap::new();
+            f.insert("title".into(), Value::String("Inception".into()));
+            m1 = db.create("Movie", f).unwrap().id;
+            m2 = db.create("Movie", FieldMap::new()).unwrap().id;
+            let u = db.create("User", FieldMap::new()).unwrap().id;
+            db.link("User", u, "favourite", m1, None).unwrap();
+            db.link("User", u, "recommendation", m2, None).unwrap();
+            let got = rows(&db, &format!("Movie.get({m2}).recommended_to.favourite"));
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].get("title"), Some(&Value::String("Inception".into())));
+            db.rename_field("Movie", "title", "headline").unwrap();
+        }
+        let db = Database::open_with_options(parse_schema(&before.replace("NAME", "headline")).unwrap(), dir.path(), opts()).unwrap();
+        let got = rows(&db, &format!("Movie.get({m2}).recommended_to.favourite"));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].get("headline"), Some(&Value::String("Inception".into())), "{got:?}");
+        assert!(!got[0].contains_key("title"), "old name leaked: {got:?}");
+        let _ = m1;
     }
 }
