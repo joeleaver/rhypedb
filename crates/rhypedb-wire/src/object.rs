@@ -671,6 +671,158 @@ pub fn deserialize_fields_projected(data: &Bytes, wanted: &[&str]) -> FieldMap {
     fields
 }
 
+/// One pass over a serialized FieldMap (the `serialize_fields` format): calls
+/// `f(name, tag, payload)` for each field, where `payload` is the byte range
+/// of its value inside `data` (past any length prefix). `f` returns `false`
+/// to stop early. Stops silently at malformed data. For a reader that wants
+/// several fields of one blob without walking it once per field.
+pub fn for_each_raw_field(
+    data: &[u8],
+    mut f: impl FnMut(&[u8], u8, std::ops::Range<usize>) -> bool,
+) {
+    if data.len() < 2 {
+        return;
+    }
+    let count = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let mut pos = 2;
+    for _ in 0..count {
+        if pos + 2 > data.len() {
+            return;
+        }
+        let name_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + name_len + 1 > data.len() {
+            return;
+        }
+        let name = &data[pos..pos + name_len];
+        pos += name_len;
+        let tag = data[pos];
+        pos += 1;
+        let value_len = match tag {
+            0 => 0,
+            2 | 4 | 6 => 4,
+            3 | 5 | 7 | 10 => 8,
+            8 => 1,
+            1 | 9 | 11 => {
+                if pos + 4 > data.len() {
+                    return;
+                }
+                let l = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                l
+            }
+            _ => return,
+        };
+        if pos + value_len > data.len() {
+            return;
+        }
+        if !f(name, tag, pos..pos + value_len) {
+            return;
+        }
+        pos += value_len;
+    }
+}
+
+/// An integer field's value as `find_u64_field_in_raw` reads it (U32 / U64 /
+/// I32 / I64 widened to u64), from a tag and payload that
+/// [`for_each_raw_field`] reported. `None` for any other type.
+pub fn raw_u64(tag: u8, payload: &[u8]) -> Option<u64> {
+    match (tag, payload.len()) {
+        (2, 4) => Some(u32::from_be_bytes(payload.try_into().ok()?) as u64),
+        (3, 8) => Some(u64::from_be_bytes(payload.try_into().ok()?)),
+        (4, 4) => Some(i32::from_be_bytes(payload.try_into().ok()?) as u64),
+        (5, 8) => Some(i64::from_be_bytes(payload.try_into().ok()?) as u64),
+        _ => None,
+    }
+}
+
+/// Append the values of `wanted` from a serialized FieldMap to `out`, in
+/// `wanted` order: exactly `wanted.len()` entries, `None` for a field that is
+/// absent or malformed. The positional form of
+/// [`deserialize_fields_projected`]: no `HashMap`, no key `String`s, so a
+/// batch read of many rows can lay every row's values out in one `Vec`.
+/// `Value::Bytes` is sliced zero-copy from `data`. A name repeated in `wanted`
+/// fills each of its slots.
+pub fn extract_fields_into(data: &Bytes, wanted: &[&str], out: &mut Vec<Option<Value>>) {
+    let base = out.len();
+    out.resize(base + wanted.len(), None);
+    if data.len() < 2 || wanted.is_empty() {
+        return;
+    }
+    let mut found = 0usize;
+    let mut pos = 0;
+    let count = u16::from_be_bytes([data[0], data[1]]) as usize;
+    pos += 2;
+    for _ in 0..count {
+        if pos + 2 > data.len() {
+            return;
+        }
+        let name_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if pos + name_len + 1 > data.len() {
+            return;
+        }
+        let name_bytes = &data[pos..pos + name_len];
+        let slot = wanted.iter().position(|w| w.as_bytes() == name_bytes);
+        pos += name_len;
+        let tag = data[pos];
+        pos += 1;
+        let value_len = match tag {
+            0 => 0,
+            2 | 4 | 6 => 4,
+            3 | 5 | 7 | 10 => 8,
+            8 => 1,
+            1 | 9 | 11 => {
+                if pos + 4 > data.len() {
+                    return;
+                }
+                let l = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                l
+            }
+            _ => return,
+        };
+        if pos + value_len > data.len() {
+            return;
+        }
+        if let Some(i) = slot
+            && out[base + i].is_none()
+        {
+            let p = pos;
+            let v = match tag {
+                0 => Some(Value::Null),
+                1 => std::str::from_utf8(&data[p..p + value_len])
+                    .ok()
+                    .map(|s| Value::String(s.to_string())),
+                2 => Some(Value::U32(u32::from_be_bytes(data[p..p + 4].try_into().unwrap()))),
+                3 => Some(Value::U64(u64::from_be_bytes(data[p..p + 8].try_into().unwrap()))),
+                4 => Some(Value::I32(i32::from_be_bytes(data[p..p + 4].try_into().unwrap()))),
+                5 => Some(Value::I64(i64::from_be_bytes(data[p..p + 8].try_into().unwrap()))),
+                6 => Some(Value::F32(f32::from_be_bytes(data[p..p + 4].try_into().unwrap()))),
+                7 => Some(Value::F64(f64::from_be_bytes(data[p..p + 8].try_into().unwrap()))),
+                8 => Some(Value::Bool(data[p] != 0)),
+                9 => Some(Value::Bytes(data.slice(p..p + value_len))),
+                10 => Some(Value::DateTime(i64::from_be_bytes(data[p..p + 8].try_into().unwrap()))),
+                11 => serde_json::from_slice(&data[p..p + value_len]).ok().map(Value::Json),
+                _ => None,
+            };
+            if let Some(v) = v {
+                // Every slot naming this field (a name may be repeated).
+                for (j, w) in wanted.iter().enumerate().skip(i) {
+                    if w.as_bytes() == name_bytes {
+                        out[base + j] = Some(v.clone());
+                        found += 1;
+                    }
+                }
+                if found == wanted.len() {
+                    return;
+                }
+            }
+        }
+        pos += value_len;
+    }
+}
+
 /// Deserialize a FieldMap from stored bytes.
 pub fn deserialize_fields(data: &[u8]) -> FieldMap {
     let mut fields = HashMap::new();

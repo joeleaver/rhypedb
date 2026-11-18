@@ -2085,8 +2085,7 @@ impl SstReader {
         if max_distinct == 0 {
             return Vec::new();
         }
-        let mut results = Vec::new();
-        let mut last_user_key: Option<Vec<u8>> = None;
+        let mut results: Vec<(Bytes, Option<Bytes>)> = Vec::new();
 
         let start = self.prefix_start_offset(prefix);
 
@@ -2113,17 +2112,16 @@ impl SstReader {
                 continue;
             }
 
-            let same_key = last_user_key
-                .as_ref()
-                .is_some_and(|prev| prev.as_slice() == user_key);
-            if same_key {
+            // Versions of a key are adjacent and newest first: only the last
+            // emitted key can repeat (no per-key copy to remember it).
+            let last = results.last().map(|(k, _)| k.as_ref());
+            if last == Some(user_key) {
                 continue;
             }
 
             if max_distinct != usize::MAX {
-                crate::key::debug_assert_prefix_free(last_user_key.as_deref(), user_key);
+                crate::key::debug_assert_prefix_free(last, user_key);
             }
-            last_user_key = Some(user_key.to_vec());
             // Zero-copy slice into the iterator's key Bytes (which already
             // shares the SstReader's data refcount).
             let user_key_len = key.len() - 8;
