@@ -267,7 +267,21 @@ fn strip_cover_internals(db: &Database, objs: &mut [Object]) {
     for obj in objs.iter_mut() {
         let Some(raw) = &obj.raw_fields else { continue };
         let keep = plain.entry(obj.type_name.clone()).or_insert_with(|| {
-            db.schema().get_type(&obj.type_name).map(|td| {
+            let schema = db.schema();
+            // Only a to-one relation's target is ever copied into a cover, so
+            // only rows of such a type can come from one; any other type's
+            // rows are plain `o:` reads and skip the check entirely.
+            let copied = schema.types.values().any(|t| {
+                t.fields.iter().any(|f| {
+                    matches!(&f.field_type, rhypedb_schema::FieldType::Relation(r)
+                        if !r.is_many && r.target_type == obj.type_name)
+                        && f.inverse().is_none()
+                })
+            });
+            if !copied {
+                return None;
+            }
+            schema.get_type(&obj.type_name).map(|td| {
                 td.fields
                     .iter()
                     .filter(|f| !matches!(&f.field_type, rhypedb_schema::FieldType::Relation(_)))
@@ -275,7 +289,8 @@ fn strip_cover_internals(db: &Database, objs: &mut [Object]) {
                     .collect()
             })
         });
-        // A type the schema doesn't know is left as stored, never emptied.
+        // A type never copied, or one the schema doesn't know, is left as
+        // stored (never emptied).
         let Some(keep) = keep else { continue };
         let mut foreign = false;
         rhypedb_engine::object::for_each_raw_field(raw, |name, _, _| {

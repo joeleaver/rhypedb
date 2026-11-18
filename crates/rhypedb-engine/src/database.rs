@@ -1500,6 +1500,18 @@ impl Database {
                     );
                 }
             }
+            // Per-type epochs (`t:`), added to every object's own count.
+            if let Ok(entries) = storage.scan_prefix(&txn2, &KeyBuilder::type_epoch_prefix()) {
+                for (key, value) in entries {
+                    if key.len() != 1 + 1 + 8 || value.len() != 8 {
+                        continue;
+                    }
+                    version_counters.raise_epoch(
+                        u64::from_be_bytes(key[2..10].try_into().unwrap()),
+                        u64::from_be_bytes(value[..].try_into().unwrap()),
+                    );
+                }
+            }
             drop(txn2);
         }
 
@@ -1911,9 +1923,10 @@ impl DatabaseCore {
     }
 
     /// The generation of an object as of `txn`'s snapshot — what a cover
-    /// writer stamps on a copy it read in that snapshot. The persisted `g:`
-    /// key when the object was ever updated, else 1 (born-at-1); the caller
-    /// has already read the object in this snapshot, so it exists.
+    /// writer stamps on a copy it read in that snapshot: the type's persisted
+    /// epoch (`t:`, else 0) plus the object's own count (its `g:` key when it
+    /// was ever updated, else 1 — born-at-1); the caller has already read the
+    /// object in this snapshot, so it exists.
     ///
     /// Not the live counter ([`object_version`](Self::object_version)): writers
     /// bump that BEFORE committing, so a concurrent cover writer would stamp a
@@ -1925,19 +1938,27 @@ impl DatabaseCore {
         type_id: u64,
         object_id: u64,
     ) -> EngineResult<u64> {
-        let key = KeyBuilder::object_version(type_id, object_id);
-        Ok(match self.storage.get(txn, &key)? {
-            Some(v) if v.len() == 8 => u64::from_be_bytes(v[..].try_into().unwrap()),
-            _ => 1,
-        })
+        let read = |key: Bytes, absent: u64| -> EngineResult<u64> {
+            Ok(match self.storage.get(txn, &key)? {
+                Some(v) if v.len() == 8 => u64::from_be_bytes(v[..].try_into().unwrap()),
+                _ => absent,
+            })
+        };
+        let own = read(KeyBuilder::object_version(type_id, object_id), 1)?;
+        let epoch = read(KeyBuilder::type_epoch(type_id), 0)?;
+        Ok(epoch + own)
     }
 
-    fn bump_version(&self, type_id: u64, object_id: u64) -> u64 {
+    /// Bump the object's generation; returns `(generation, own count)` — the
+    /// generation to roll back with, and the value its `g:` key persists (the
+    /// generation without the type epoch).
+    fn bump_version(&self, type_id: u64, object_id: u64) -> (u64, u64) {
         let mut counters = self.version_counters.write();
         let v = counters.bump(type_id, object_id);
+        let own = counters.local(type_id, object_id);
         self.version_counter_count
             .store(counters.updated_len(), std::sync::atomic::Ordering::Relaxed);
-        v
+        (v, own)
     }
 
     /// Undo the bump that returned `bumped` (see [`VersionCounters::rollback`]:
@@ -3117,7 +3138,7 @@ impl DatabaseCore {
                 // storage error — these must be rolled back, mirroring update()'s
                 // commit-failure handling, so the live handle's generation
                 // counters don't drift ahead of the durable `g:` keys.
-                let mut bumped: Vec<(u64, u64)> = Vec::new();
+                let mut bumped = PendingBumps::new(self, type_id);
                 for (key, blob) in &chunk.live {
                     let object_id =
                         u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
@@ -3150,9 +3171,7 @@ impl DatabaseCore {
                                 }
                                 Some(_) => {
                                     self.storage.abort(&mut txn);
-                                    for (oid, generation) in &bumped {
-                                        self.rollback_version(type_id, *oid, *generation);
-                                    }
+                                    bumped.roll_back();
                                     // Rewind to Converting so resume re-backfills
                                     // the missing shadow rather than re-refusing.
                                     crate::catalog::park_migration_failed_rewind(
@@ -3174,9 +3193,7 @@ impl DatabaseCore {
                             };
                             if found_cv != converter_version {
                                 self.storage.abort(&mut txn);
-                                for (oid, generation) in &bumped {
-                                    self.rollback_version(type_id, *oid, *generation);
-                                }
+                                bumped.roll_back();
                                 crate::catalog::park_migration_failed_rewind(
                                     &self.storage,
                                     plan_id,
@@ -3236,24 +3253,23 @@ impl DatabaseCore {
                 let (k, v) = crate::catalog::migration_plan_record(&plan_after);
                 self.storage.put(&mut txn, &k, v)?;
                 match self.storage.commit(&mut txn) {
-                    Ok(_) => break Some((plan_after, more)),
+                    Ok(_) => {
+                        bumped.committed();
+                        break Some((plan_after, more));
+                    }
                     Err(rhypedb_storage::Error::WriteConflict)
                         if attempts < WRITE_CONFLICT_RETRIES =>
                     {
                         // Release the conflicted txn's snapshot + undo this
                         // attempt's generation bumps before re-scanning.
                         self.storage.abort(&mut txn);
-                        for (oid, generation) in &bumped {
-                            self.rollback_version(type_id, *oid, *generation);
-                        }
+                        bumped.roll_back();
                         attempts += 1;
                         continue;
                     }
                     Err(e) => {
                         self.storage.abort(&mut txn);
-                        for (oid, generation) in &bumped {
-                            self.rollback_version(type_id, *oid, *generation);
-                        }
+                        bumped.roll_back();
                         return Err(match e {
                             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
                             other => EngineError::Storage(other),
@@ -3362,7 +3378,7 @@ impl DatabaseCore {
                 let next_cursor =
                     u64::from_be_bytes(high_water[high_water.len() - 8..].try_into().unwrap());
 
-                let mut bumped: Vec<(u64, u64)> = Vec::new();
+                let mut bumped = PendingBumps::new(self, type_id);
                 for (key, blob) in &chunk.live {
                     let object_id =
                         u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
@@ -3412,22 +3428,21 @@ impl DatabaseCore {
                 let (k, v) = crate::catalog::migration_plan_record(&plan_after);
                 self.storage.put(&mut txn, &k, v)?;
                 match self.storage.commit(&mut txn) {
-                    Ok(_) => break Some((plan_after, more)),
+                    Ok(_) => {
+                        bumped.committed();
+                        break Some((plan_after, more));
+                    }
                     Err(rhypedb_storage::Error::WriteConflict)
                         if attempts < WRITE_CONFLICT_RETRIES =>
                     {
                         self.storage.abort(&mut txn);
-                        for (oid, generation) in &bumped {
-                            self.rollback_version(type_id, *oid, *generation);
-                        }
+                        bumped.roll_back();
                         attempts += 1;
                         continue;
                     }
                     Err(e) => {
                         self.storage.abort(&mut txn);
-                        for (oid, generation) in &bumped {
-                            self.rollback_version(type_id, *oid, *generation);
-                        }
+                        bumped.roll_back();
                         return Err(match e {
                             rhypedb_storage::Error::WriteConflict => EngineError::WriteConflict,
                             other => EngineError::Storage(other),
@@ -4229,7 +4244,7 @@ impl DatabaseCore {
         // never-updated deletes carry no generation write-amp. Done last so a
         // staging error above leaves no in-memory bump to undo; the caller
         // rolls this back if the commit doesn't land.
-        self.bump_version(type_id, object_id);
+        let _ = self.bump_version(type_id, object_id);
 
         Ok(scalar_fields)
     }
@@ -6173,11 +6188,11 @@ impl DatabaseCore {
         //
         // Returns the new generation: the caller rolls it back
         // (`rollback_version`) if the transaction doesn't commit.
-        let new_version = self.bump_version(type_id, object_id);
+        let (new_version, own) = self.bump_version(type_id, object_id);
         if let Err(e) = self.storage.put(
             txn,
             &KeyBuilder::object_version(type_id, object_id),
-            Bytes::copy_from_slice(&new_version.to_be_bytes()),
+            Bytes::copy_from_slice(&own.to_be_bytes()),
         ) {
             self.rollback_version(type_id, object_id, new_version);
             return Err(e.into());
@@ -7077,11 +7092,11 @@ impl DatabaseCore {
         if !embedded {
             return Ok(None);
         }
-        let new_version = self.bump_version(type_id, object_id);
+        let (new_version, own) = self.bump_version(type_id, object_id);
         if let Err(e) = self.storage.put(
             txn,
             &KeyBuilder::object_version(type_id, object_id),
-            Bytes::copy_from_slice(&new_version.to_be_bytes()),
+            Bytes::copy_from_slice(&own.to_be_bytes()),
         ) {
             self.rollback_version(type_id, object_id, new_version);
             return Err(e.into());
@@ -9051,6 +9066,45 @@ fn build_inflight_cover(
     Ok(serialize_fields(&effective))
 }
 
+/// A cutover chunk's in-memory generation bumps, rolled back on every way out
+/// of the chunk — an explicit abort, a retry, or an early `?` return — unless
+/// the chunk committed. A leaked bump only makes copies read as stale until the
+/// next committed bump, but nothing should leak it.
+struct PendingBumps<'a> {
+    db: &'a DatabaseCore,
+    type_id: u64,
+    bumps: Vec<(u64, u64)>,
+}
+
+impl<'a> PendingBumps<'a> {
+    fn new(db: &'a DatabaseCore, type_id: u64) -> Self {
+        PendingBumps { db, type_id, bumps: Vec::new() }
+    }
+
+    /// Record `(object_id, generation)` as bumped by this chunk.
+    fn push(&mut self, bump: (u64, u64)) {
+        self.bumps.push(bump);
+    }
+
+    /// Undo every recorded bump now (the chunk is being aborted).
+    fn roll_back(&mut self) {
+        for (object_id, generation) in self.bumps.drain(..) {
+            self.db.rollback_version(self.type_id, object_id, generation);
+        }
+    }
+
+    /// The chunk committed: keep its bumps.
+    fn committed(&mut self) {
+        self.bumps.clear();
+    }
+}
+
+impl Drop for PendingBumps<'_> {
+    fn drop(&mut self) {
+        self.roll_back();
+    }
+}
+
 /// Rows from [`DatabaseCore::get_many_columns`]: `ids[i]`'s values are
 /// `row(i)`, one per requested field in request order (`None` where the
 /// object has no value for it).
@@ -9878,17 +9932,12 @@ impl crate::catalog::FieldCoverMaintainer for DatabaseCore {
         out
     }
 
-    fn live_generation(&self, type_id: u64, object_id: u64) -> u64 {
-        self.version_counters.read().get(type_id, object_id)
+    fn live_epoch(&self, type_id: u64) -> u64 {
+        self.version_counters.read().epoch(type_id)
     }
 
-    fn raise_generation(&self, type_id: u64, object_id: u64, generation: u64) {
-        let mut counters = self.version_counters.write();
-        if counters.get(type_id, object_id) < generation {
-            counters.set(type_id, object_id, generation);
-        }
-        self.version_counter_count
-            .store(counters.updated_len(), std::sync::atomic::Ordering::Relaxed);
+    fn raise_epoch(&self, type_id: u64, epoch: u64) {
+        self.version_counters.write().raise_epoch(type_id, epoch);
     }
 
     fn rename_index_cover_puts(

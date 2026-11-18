@@ -75,8 +75,9 @@ fn assert_trusted_copy_is_current(db: &Database, movie: u64, rating: u64, user: 
 }
 
 /// Apply an update of `user.name` as `update` would commit it, after its
-/// in-memory bump to `generation` already happened.
-fn commit_update_by_hand(db: &Database, user: u64, name: &str, generation: u64) {
+/// in-memory bump already happened (`own`: the object's own count, which its
+/// `g:` key persists).
+fn commit_update_by_hand(db: &Database, user: u64, name: &str, own: u64) {
     let type_id = db.type_ids["User"];
     let mut fields = db.get("User", user).unwrap().fields;
     fields.insert("name".into(), Value::String(name.into()));
@@ -88,7 +89,7 @@ fn commit_update_by_hand(db: &Database, user: u64, name: &str, generation: u64) 
         .put(
             &mut txn,
             &KeyBuilder::object_version(type_id, user),
-            Bytes::copy_from_slice(&generation.to_be_bytes()),
+            Bytes::copy_from_slice(&own.to_be_bytes()),
         )
         .unwrap();
     db.storage.commit(&mut txn).unwrap();
@@ -108,11 +109,11 @@ fn a_copy_built_during_an_uncommitted_bump_never_reads_as_fresh() {
 
     // T1: in-flight update — bumped in memory, not committed.
     let type_id = db.type_ids["User"];
-    let bumped = db.bump_version(type_id, u);
+    let (_, own) = db.bump_version(type_id, u);
     // T2: copies the user (still "old" in its snapshot) into the Movie side.
     db.link("Rating", r, "user", u, None).unwrap();
     // T1 commits "new".
-    commit_update_by_hand(&db, u, "new", bumped);
+    commit_update_by_hand(&db, u, "new", own);
 
     assert_trusted_copy_is_current(&db, m, r, u);
     let (_, stamp) = movie_side_user_copy(&db, m, r);
@@ -153,9 +154,9 @@ fn a_failed_writer_never_rolls_back_a_later_committed_bump() {
     db.link("Rating", r, "movie", m, None).unwrap();
     let type_id = db.type_ids["User"];
 
-    let t1 = db.bump_version(type_id, u); // T1: 1 → 2, in flight
-    let t3 = db.bump_version(type_id, u); // T3: 2 → 3
-    commit_update_by_hand(&db, u, "t3", t3); // T3 commits generation 3
+    let (t1, _) = db.bump_version(type_id, u); // T1: 1 → 2, in flight
+    let (t3, t3_own) = db.bump_version(type_id, u); // T3: 2 → 3
+    commit_update_by_hand(&db, u, "t3", t3_own); // T3 commits generation 3
     db.rollback_version(type_id, u, t1); // T1's commit failed
     assert_eq!(db.object_version("User", u), t3, "T3's committed bump survives");
 
@@ -178,7 +179,7 @@ fn a_failed_writer_restores_its_own_bump() {
     let u = named(&db, "User", "name", "v1");
     let type_id = db.type_ids["User"];
     let before = db.object_version("User", u);
-    let bumped = db.bump_version(type_id, u);
+    let (bumped, _) = db.bump_version(type_id, u);
     db.rollback_version(type_id, u, bumped);
     assert_eq!(db.object_version("User", u), before);
 }
@@ -310,4 +311,109 @@ fn a_relation_rename_retires_the_copies_nesting_the_old_name() {
     }
     let db = Database::open_with_options(after, dir.path(), no_sweeper()).unwrap();
     assert_trusted_copies_use_current_names(&db, "A", "c", "b", "B");
+}
+
+/// Review finding on #54: a consuming field-type change hands the new handle
+/// the SAME in-memory counters. Its type-wide bump must reach them, or a copy
+/// rebuilt on the new handle is stamped one generation ahead of memory and the
+/// next update makes that stale copy read as fresh.
+#[test]
+fn a_consuming_type_change_keeps_the_shared_counters_in_step() {
+    let before = parse_schema(
+        r#"
+        type User { name: String  favourite: Movie  recommendation: Movie }
+        type Movie { score: u32 }
+        "#,
+    )
+    .unwrap();
+    let after = parse_schema(
+        r#"
+        type User { name: String  favourite: Movie  recommendation: Movie }
+        type Movie { score: f64 }
+        "#,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_with_options(before, dir.path(), no_sweeper()).unwrap();
+    let u = named(&db, "User", "name", "u");
+    let mut f = FieldMap::new();
+    f.insert("score".into(), Value::U32(3));
+    let m1 = db.create("Movie", f).unwrap().id;
+    let m2 = db.create("Movie", FieldMap::new()).unwrap().id;
+    db.link("User", u, "favourite", m1, None).unwrap();
+    db.link("User", u, "recommendation", m2, None).unwrap();
+    assert!(assert_trusted_copies_use_current_names(&db, "User", "recommendation", "favourite", "Movie") > 0);
+
+    let (_, db) = db
+        .change_field_type_consuming(
+            "Movie",
+            "score",
+            rhypedb_schema::FieldType::Scalar(rhypedb_schema::ScalarType::F64),
+            |_, v| match v {
+                Value::U32(x) => Ok(Value::F64(*x as f64)),
+                other => Ok(other.clone()),
+            },
+            after,
+        )
+        .unwrap();
+    // Old copies (score: U32) must no longer read as fresh.
+    let copy_is_trusted = |db: &Database| {
+        let rel = db.rel_ids["User.recommendation"];
+        let value = db
+            .storage
+            .get_at(db.storage.read_snapshot(), &KeyBuilder::reverse_edge(m2, rel, u))
+            .unwrap()
+            .unwrap();
+        let stamp = find_u64_field_in_raw(&value, "favourite__cover_v").unwrap();
+        let copy = find_bytes_field_in_raw(&value, "favourite__cover").unwrap();
+        (stamp == db.object_version("Movie", m1), deserialize_fields(&copy))
+    };
+    assert!(!copy_is_trusted(&db).0, "the pre-change copy is retired");
+
+    // Rebuild the copy on the new handle, then update the movie.
+    db.unlink("User", u, "recommendation", m2).unwrap();
+    db.link("User", u, "recommendation", m2, None).unwrap();
+    let (trusted, copy) = copy_is_trusted(&db);
+    assert!(trusted, "a copy rebuilt after the change is current");
+    assert_eq!(copy["score"], Value::F64(3.0));
+    let mut f = FieldMap::new();
+    f.insert("score".into(), Value::F64(9.0));
+    db.update("Movie", m1, f).unwrap();
+    let (trusted, copy) = copy_is_trusted(&db);
+    assert!(!trusted, "after the update that copy is stale, and must read so: {copy:?}");
+}
+
+/// The epoch persists: a reopened store keeps every object of a renamed type
+/// past the generations its old copies carry, and costs no per-object entry.
+#[test]
+fn a_rename_epoch_survives_reopen_without_per_object_entries() {
+    let before = parse_schema(
+        r#"
+        type User { name: String  favourite: Movie  recommendation: Movie }
+        type Movie { title: String }
+        "#,
+    )
+    .unwrap();
+    let after = parse_schema(
+        r#"
+        type User { name: String  favourite: Movie  recommendation: Movie }
+        type Movie { headline: String }
+        "#,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let movies: Vec<u64>;
+    {
+        let db = Database::open_with_options(before, dir.path(), no_sweeper()).unwrap();
+        movies = (0..50).map(|i| named(&db, "Movie", "title", &format!("m{i}"))).collect();
+        let u = named(&db, "User", "name", "u");
+        db.link("User", u, "favourite", movies[0], None).unwrap();
+        db.link("User", u, "recommendation", movies[1], None).unwrap();
+        let updated_before = db.version_counters.read().updated_len();
+        db.rename_field("Movie", "title", "headline").unwrap();
+        assert_eq!(db.version_counters.read().updated_len(), updated_before, "no per-object entries");
+    }
+    let db = Database::open_with_options(after, dir.path(), no_sweeper()).unwrap();
+    assert!(movies.iter().all(|m| db.object_version("Movie", *m) == 2), "epoch 1 + own 1");
+    assert_trusted_copies_use_current_names(&db, "User", "recommendation", "favourite", "Movie");
 }
