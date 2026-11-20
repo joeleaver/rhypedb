@@ -2551,7 +2551,7 @@ checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 
 [[package]]
 name = "rhypedb-authz"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2563,7 +2563,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "rhypedb-codegen",
@@ -2578,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rhypedb-subscribe",
  "rhypedb-wire",
@@ -2591,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-codegen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "rhypedb-schema",
@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-embed"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fastembed",
  "hf-hub",
@@ -2610,7 +2610,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-engine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-query"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "rhypedb-authz",
@@ -2648,14 +2648,14 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-schema"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "rhypedb-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "bytes",
@@ -2706,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-subscribe"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "parking_lot",
  "serde",
@@ -2715,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-vector"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "boxcar",
  "parking_lot",
@@ -2725,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "rhypedb-wire"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
