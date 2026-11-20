@@ -53,6 +53,12 @@ pub enum KeyPrefix {
     /// that can't see the other's change; without the conflict, both could
     /// commit and leave covers listing a stale peer.)
     PeerGuard = b'p',
+    /// Per-type generation epoch: `t:<type_id>` → u64 BE. An object's
+    /// generation is its type's epoch plus its own count (`g:`, or 1 when
+    /// never updated), so one put retires every copy of every object of a
+    /// type — a field rename or type change, which alters every object at
+    /// once.
+    TypeEpoch = b't',
 }
 
 pub const SEPARATOR: u8 = b':';
@@ -610,6 +616,21 @@ impl KeyBuilder {
         buf.put_u8(SEPARATOR);
         buf.put_u64(object_id);
         buf.freeze()
+    }
+
+    /// Per-type generation epoch: `t:<type_id>` → u64 BE (see
+    /// [`KeyPrefix::TypeEpoch`]).
+    pub fn type_epoch(type_id: u64) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + 1 + 8);
+        buf.put_u8(KeyPrefix::TypeEpoch as u8);
+        buf.put_u8(SEPARATOR);
+        buf.put_u64(type_id);
+        buf.freeze()
+    }
+
+    /// Prefix of every [`type_epoch`](Self::type_epoch) key.
+    pub fn type_epoch_prefix() -> Bytes {
+        Bytes::from_static(&[KeyPrefix::TypeEpoch as u8, SEPARATOR])
     }
 
     /// Per-object generation counter: `g:<type_id>:<object_id>` → u64 BE.

@@ -1229,7 +1229,8 @@ pub(crate) fn apply_migration_with_cover(
     let mut txn = storage.begin_txn();
     let snap = txn.snapshot();
 
-    let result = (|| -> EngineResult<(MigrationReport, bool)> {
+    #[allow(clippy::type_complexity)]
+    let result = (|| -> EngineResult<(MigrationReport, bool, Vec<(u64, u64)>)> {
         // Read current format. We support v1, v2, v3 catalogs as input.
         let fv_raw = storage
             .get(&txn, &KeyBuilder::catalog_format())?
@@ -1336,10 +1337,18 @@ pub(crate) fn apply_migration_with_cover(
         // verbs via the `overlay`, folded forward after each verb.
         let mut puts: Vec<(Bytes, Bytes)> = Vec::new();
         let mut deletes: Vec<Bytes> = Vec::new();
+        let mut renamed_type_ids: Vec<u64> = Vec::new();
         let now_ms = now_unix_millis();
         for verb in verbs {
             let puts_before = puts.len();
             let deletes_before = deletes.len();
+            let renamed_before = report.renamed_fields.len();
+            // The renamed field's type, by STABLE id, resolved the way the
+            // verb resolves it (against the catalog as earlier verbs left it).
+            let field_type_id = match verb {
+                RenameVerb::Field { type_name, .. } => cat.type_ids.get(type_name.as_str()).copied(),
+                RenameVerb::Type { .. } => None,
+            };
             match verb {
                 RenameVerb::Type { old, new } => {
                     apply_type_rename_verb(
@@ -1410,12 +1419,18 @@ pub(crate) fn apply_migration_with_cover(
             if multi_verb {
                 overlay.absorb(&puts[puts_before..], &deletes[deletes_before..]);
             }
+            if let Some(type_id) = field_type_id
+                && report.renamed_fields.len() > renamed_before
+                && !renamed_type_ids.contains(&type_id)
+            {
+                renamed_type_ids.push(type_id);
+            }
         }
 
         if report.renamed_types.is_empty() && report.renamed_fields.is_empty() {
             // No-op plan. Abort the txn; don't bump format or touch
             // digest.
-            return Ok((report, false));
+            return Ok((report, false, Vec::new()));
         }
 
         // For a multi-verb plan the overlay's net state IS the commit write-set:
@@ -1456,17 +1471,36 @@ pub(crate) fn apply_migration_with_cover(
         // changes, and rewrites the digest in its tail commit. Net
         // effect: one fast-path miss on the first post-rename open,
         // then steady fast-path forever after.
+        // Retire every copy of a renamed type's objects (GH #54). Reverse-edge
+        // covers hold copies of OTHER objects (`<peer>__cover`, nested inside
+        // further copies too), named by field — and a rename changes names
+        // without changing content, so nothing else would mark those copies
+        // stale: readers would keep returning the old name. One epoch bump per
+        // renamed type, in this same atomic batch, moves every object of it to
+        // a generation no copy carries; readers then probe `o:` (already
+        // rewritten above) until a cover is rebuilt.
+        let mut raised: Vec<(u64, u64)> = Vec::new();
+        for &type_id in &renamed_type_ids {
+            let epoch = stage_epoch_bump(storage, snap, Some(&overlay), cover, type_id, &mut puts)?;
+            raised.push((type_id, epoch));
+        }
+
         storage.put_batch(&mut txn, &puts)?;
         if !deletes.is_empty() {
             storage.delete_batch(&mut txn, &deletes)?;
         }
-        Ok((report, true))
+        Ok((report, true, raised))
     })();
 
     match result {
-        Ok((report, wrote)) => {
+        Ok((report, wrote, raised)) => {
             if wrote {
                 storage.commit(&mut txn)?;
+                if let Some(c) = cover {
+                    for (type_id, epoch) in raised {
+                        c.raise_epoch(type_id, epoch);
+                    }
+                }
             } else {
                 storage.abort(&mut txn);
             }
@@ -2302,7 +2336,7 @@ fn apply_relation_rename_verb(
 /// field-type change must stage so a covered query on a SIBLING `@indexed`
 /// field stops serving the migrated field's stale source value. The covering
 /// payload is a full copy of the object blob with NO generation stamp, so the
-/// `stage_generation_bump` this verb already does can't invalidate it — it must
+/// epoch bump this verb already does can't invalidate it — it must
 /// be REWRITTEN. The catalog can't reach the engine's `@indexed` metadata +
 /// index-key encoding (they live on `Database`), so it asks an implementor (the
 /// `Database`) for the extra puts — inverting the dependency so catalog stays
@@ -2347,6 +2381,43 @@ pub(crate) trait FieldCoverMaintainer {
         serialized: &Bytes,
         current_field_name: &std::collections::HashMap<u64, String>,
     ) -> Vec<(Bytes, Bytes)>;
+
+    /// The type's in-memory generation epoch. An epoch bump goes past both this
+    /// and the persisted `t:` value, so no generation is handed out twice.
+    fn live_epoch(&self, type_id: u64) -> u64;
+
+    /// After a batch that bumped the type's `t:` key committed: raise the
+    /// in-memory epoch to at least `epoch`. The handle a consuming migration
+    /// hands over shares these counters, so this is what keeps it in step.
+    fn raise_epoch(&self, type_id: u64, epoch: u64);
+}
+
+/// Stage a bump of `type_id`'s generation epoch into `puts` and return the new
+/// epoch, to pass to [`FieldCoverMaintainer::raise_epoch`] once the batch
+/// commits. Every object of the type moves to a generation no copy was
+/// stamped with, so every copy of it in a reverse edge reads as stale — the
+/// one write a change to every object of a type at once needs (GH #54).
+fn stage_epoch_bump(
+    storage: &LsmTree,
+    snap: u64,
+    overlay: Option<&WriteOverlay>,
+    cover: Option<&dyn FieldCoverMaintainer>,
+    type_id: u64,
+    puts: &mut Vec<(Bytes, Bytes)>,
+) -> EngineResult<u64> {
+    let key = KeyBuilder::type_epoch(type_id);
+    let stored = match overlay {
+        Some(o) => o.get_at(storage, snap, &key)?,
+        None => storage.get_at(snap, &key)?,
+    };
+    let persisted = match stored {
+        Some(v) if v.len() == 8 => u64::from_be_bytes(v[..].try_into().unwrap()),
+        _ => 0,
+    };
+    let live = cover.map_or(0, |c| c.live_epoch(type_id));
+    let epoch = persisted.max(live) + 1;
+    puts.push((key, Bytes::copy_from_slice(&epoch.to_be_bytes())));
+    Ok(epoch)
 }
 
 pub(crate) fn apply_field_type_change(
@@ -2360,7 +2431,8 @@ pub(crate) fn apply_field_type_change(
     let mut txn = storage.begin_txn();
     let snap = txn.snapshot();
 
-    let result = (|| -> EngineResult<(MigrationReport, bool)> {
+    #[allow(clippy::type_complexity)]
+    let result = (|| -> EngineResult<(MigrationReport, bool, Option<(u64, u64)>)> {
         let fv_raw = storage
             .get(&txn, &KeyBuilder::catalog_format())?
             .ok_or_else(|| {
@@ -2410,6 +2482,16 @@ pub(crate) fn apply_field_type_change(
         let entries = storage.scan_prefix_at(snap, &prefix)?;
 
         let mut puts: Vec<(Bytes, Bytes)> = Vec::with_capacity(entries.len() + 4);
+        // Retire every copy of this type's objects. A field-type change
+        // rewrites each `o:` blob without the normal update path, so no
+        // object's generation would move and every copy in a reverse edge
+        // would keep matching — serving the source value. One epoch bump moves
+        // every object of the type to a generation no copy carries. Staged
+        // FIRST, before any converted blob, so the batch can never hold a
+        // converted blob without it. The in-memory epoch is raised after the
+        // commit: a consuming migration's new handle shares these counters
+        // (GH #54).
+        let epoch = stage_epoch_bump(storage, snap, None, cover, type_id, &mut puts)?;
         let mut objects_converted: u64 = 0;
         for (key, data) in entries {
             if key.len() < 8 {
@@ -2438,10 +2520,6 @@ pub(crate) fn apply_field_type_change(
                         },
                     ));
                 }
-                // Bump the generation BEFORE the converted blob so a covered
-                // read re-probes the new value instead of serving the stale
-                // cover (see stage_generation_bump).
-                stage_generation_bump(storage, &txn, type_id, object_id, &mut puts)?;
                 fields.insert(verb.field_name.clone(), new_value);
                 let new_blob = crate::object::serialize_fields(&fields);
                 // Refresh sibling @indexed covering payloads with the new blob
@@ -2515,13 +2593,16 @@ pub(crate) fn apply_field_type_change(
             field_id: field_entry.id,
             objects_converted,
         });
-        Ok((report, true))
+        Ok((report, true, Some((type_id, epoch))))
     })();
 
     match result {
-        Ok((report, wrote)) => {
+        Ok((report, wrote, raised)) => {
             if wrote {
                 storage.commit(&mut txn)?;
+                if let (Some(c), Some((type_id, epoch))) = (cover, raised) {
+                    c.raise_epoch(type_id, epoch);
+                }
             } else {
                 storage.abort(&mut txn);
             }
@@ -2665,46 +2746,6 @@ fn validate_field_type_change(
         })
     })?;
     Ok((field_entry, type_id))
-}
-
-/// Stage a generation bump for a migrated object so rev-edge COVERS that
-/// embed its old field value are invalidated.
-///
-/// Rev-edge 1:1-forward covers cache a copy of the target's FieldMap plus a
-/// `<field>__cover_v` stamp = the target's generation at cover-write time. The
-/// fusion reader serves the cached cover iff `cover_v == object_version(target)`
-/// (executor.rs). A field-type change rewrites the object's `o:` blob WITHOUT
-/// going through the normal update path, so the generation never moves — and
-/// because of born-at-1 EVERY live object is generation >= 1, so `cover_v ==
-/// object_version` still holds and a covered read serves the STALE source
-/// value. Bumping the generation here (write the `g:` object_version key =
-/// current + 1; born-at-1 default of 1 when the key is absent) makes the
-/// staleness check re-probe the converted `o:` blob.
-///
-/// MUST be staged BEFORE the converted blob in the same batch: with per-entry
-/// WAL framing a torn tail drops a suffix, so "blob converted, generation not
-/// bumped" (which idempotent-on-target resume would then SKIP, stranding a
-/// stale cover forever) must be impossible. Over-bumping on a re-do is
-/// harmless — the generation is a monotonic staleness counter, not a count.
-/// The live handle's in-memory `version_counters` is left stale (the migrate
-/// handle is stale post-change → reopen rebuilds it from these `g:` keys).
-fn stage_generation_bump(
-    storage: &LsmTree,
-    txn: &rhypedb_storage::mvcc::Transaction,
-    type_id: u64,
-    object_id: u64,
-    puts: &mut Vec<(Bytes, Bytes)>,
-) -> EngineResult<()> {
-    let g_key = KeyBuilder::object_version(type_id, object_id);
-    let current = match storage.get(txn, &g_key)? {
-        Some(b) if b.len() == 8 => u64::from_be_bytes(b[..].try_into().unwrap()),
-        _ => 1, // born-at-1: a live object with no g: key is generation 1
-    };
-    puts.push((
-        g_key,
-        Bytes::copy_from_slice(&current.saturating_add(1).to_be_bytes()),
-    ));
-    Ok(())
 }
 
 fn is_scalar_kind(k: u8) -> bool {
