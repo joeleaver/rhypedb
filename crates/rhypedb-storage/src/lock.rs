@@ -7,19 +7,23 @@
 //!
 //! This guard layers two protections, deliberately scoped:
 //!
-//! 1. **Advisory `flock` (same-host guard).** [`DataDirGuard::acquire`] takes a
-//!    non-blocking exclusive `flock(2)` on `<data_dir>/LOCK`, held for the life
-//!    of the guard and released by the kernel when the process exits — so a
-//!    crash drops it automatically and there is no stale-lock problem (unlike a
-//!    bare pid-file). This is correct and complete for a second opener on the
-//!    SAME host, including another container sharing the host kernel.
+//! 1. **OS file lock (same-host guard).** [`DataDirGuard::acquire`] takes a
+//!    non-blocking exclusive lock on `<data_dir>/LOCK` with
+//!    [`File::try_lock`] — `flock(2)` on unix, `LockFileEx` on Windows — held
+//!    for the life of the guard and released by the OS when the process exits,
+//!    so a crash drops it automatically and there is no stale-lock problem
+//!    (unlike a bare pid-file). This is correct and complete for a second
+//!    opener on the SAME host, including another container sharing the host
+//!    kernel. On Windows the lock is mandatory: no other handle can read or
+//!    write the file while it is held, which is why the guard reads its own
+//!    token back through the handle it holds.
 //!
-//! 2. **Owner-fence token (defence in depth).** `flock` is unreliable — and
+//! 2. **Owner-fence token (defence in depth).** File locks are unreliable — and
 //!    sometimes a silent no-op — on network/overlay filesystems (NFS &c.),
 //!    exactly where a cross-host double-open is possible. So `acquire` also
 //!    stamps a random `owner_id` into the LOCK file, and [`DataDirGuard::verify_owner`]
 //!    re-reads it at every DESTRUCTIVE boundary (SST flush, compaction). A
-//!    second process that got past a no-op flock will have stamped its own
+//!    second process that got past a no-op lock will have stamped its own
 //!    `owner_id`; we detect the mismatch and fail loud (poisoning the guard)
 //!    BEFORE overwriting its SSTs / truncating its WAL.
 //!
@@ -39,8 +43,9 @@ const LOCK_FILE: &str = "LOCK";
 /// Held for the lifetime of an open [`crate::lsm::LsmTree`]. Dropping it closes
 /// the LOCK file, which releases the OS advisory lock.
 pub struct DataDirGuard {
-    /// Kept open purely to hold the `flock`; closing it releases the lock.
-    _file: File,
+    /// Holds the OS lock (closing it releases the lock) and is the handle
+    /// `verify_owner` reads the owner token through.
+    file: File,
     lock_path: PathBuf,
     /// Our fence token, stamped into the LOCK file at acquire time.
     owner_id: u128,
@@ -80,7 +85,7 @@ impl DataDirGuard {
         write_metadata(&file, owner_id)?;
 
         Ok(Self {
-            _file: file,
+            file,
             lock_path,
             owner_id,
             fenced: AtomicBool::new(false),
@@ -104,7 +109,7 @@ impl DataDirGuard {
         if self.fenced.load(Ordering::Acquire) {
             return Err(self.ownership_lost_err());
         }
-        match read_owner_id(&self.lock_path) {
+        match read_held(&self.file, &self.lock_path).ok().as_deref().and_then(parse_owner_id) {
             Some(id) if id == self.owner_id => Ok(()),
             _ => {
                 self.fenced.store(true, Ordering::Release);
@@ -148,8 +153,7 @@ fn write_metadata(file: &File, owner_id: u128) -> Result<()> {
     Ok(())
 }
 
-fn read_owner_id(path: &Path) -> Option<u128> {
-    let s = std::fs::read_to_string(path).ok()?;
+fn parse_owner_id(s: &str) -> Option<u128> {
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("owner_id=") {
             return u128::from_str_radix(rest.trim(), 16).ok();
@@ -159,7 +163,8 @@ fn read_owner_id(path: &Path) -> Option<u128> {
 }
 
 /// A one-line "pid N on host H" summary of the current holder, for the
-/// refusal message. `None` if the LOCK file has no readable metadata.
+/// refusal message. `None` if the LOCK file has no readable metadata — always
+/// the case on Windows, where the holder's mandatory lock refuses our read.
 fn read_holder_summary(path: &Path) -> Option<String> {
     let s = std::fs::read_to_string(path).ok()?;
     let mut pid = None;
@@ -178,29 +183,57 @@ fn read_holder_summary(path: &Path) -> Option<String> {
     }
 }
 
-#[cfg(unix)]
+/// Non-blocking exclusive OS lock on the whole LOCK file: `flock(LOCK_EX |
+/// LOCK_NB)` on unix, `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK |
+/// LOCKFILE_FAIL_IMMEDIATELY)` on Windows (both via [`File::try_lock`]).
+/// `Ok(false)` means another holder has it.
 fn try_lock_exclusive(file: &File) -> Result<bool> {
-    use std::os::unix::io::AsRawFd;
-    let fd = file.as_raw_fd();
-    // SAFETY: `fd` is a valid open descriptor owned by `file` for the duration
-    // of this call. `flock` only inspects it.
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if ret == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        // The lock is held by someone else (EWOULDBLOCK == EAGAIN on Linux).
-        Some(libc::EWOULDBLOCK) => Ok(false),
-        _ => Err(Error::Io(err)),
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        // A platform with no file locking (e.g. WASI): proceed unlocked, as
+        // before `File::try_lock`; layer 2 (the owner fence) still turns a
+        // concurrent open into a halting error instead of silent corruption.
+        Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+            Ok(true)
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(Error::Io(e)),
     }
 }
 
-#[cfg(not(unix))]
-fn try_lock_exclusive(_file: &File) -> Result<bool> {
-    // No portable advisory lock here; layer 2 (the owner fence) still makes a
-    // concurrent open detectable rather than silently destructive.
-    Ok(true)
+/// Read the whole LOCK file through the handle we hold, with positional reads
+/// so concurrent `verify_owner` calls (flush and compaction) never share a
+/// cursor. Reading through OUR handle matters on Windows: `LockFileEx` locks
+/// are mandatory, so opening the file again by path and reading it fails with
+/// `ERROR_LOCK_VIOLATION` even inside the holding process.
+#[cfg(any(unix, windows))]
+fn read_held(file: &File, _path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let offset = buf.len() as u64;
+        #[cfg(unix)]
+        let n = file.read_at(&mut chunk, offset)?;
+        #[cfg(windows)]
+        let n = file.seek_read(&mut chunk, offset)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// No positional reads in std here, and no mandatory lock to dodge either, so
+/// read by path.
+#[cfg(not(any(unix, windows)))]
+fn read_held(_file: &File, path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
 }
 
 #[cfg(unix)]
@@ -217,7 +250,27 @@ fn hostname() -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn hostname() -> String {
+    use windows_sys::Win32::System::SystemInformation::{
+        ComputerNamePhysicalDnsHostname, GetComputerNameExW,
+    };
+    // A DNS host name is at most 255 characters; +1 for the terminator.
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` is a writable buffer of `len` UTF-16 units that we own;
+    // on success the call writes at most `len` units and stores the count
+    // (excluding the terminator) back into `len`.
+    let ok = unsafe {
+        GetComputerNameExW(ComputerNamePhysicalDnsHostname, buf.as_mut_ptr(), &mut len)
+    };
+    if ok == 0 {
+        return "unknown".to_string();
+    }
+    String::from_utf16_lossy(&buf[..len as usize])
+}
+
+#[cfg(not(any(unix, windows)))]
 fn hostname() -> String {
     "unknown".to_string()
 }
@@ -227,7 +280,6 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[cfg(unix)]
     #[test]
     fn second_acquire_refused_while_first_held() {
         let dir = tempdir().unwrap();
@@ -243,6 +295,29 @@ mod tests {
         let _g2 = DataDirGuard::acquire(dir.path()).unwrap();
     }
 
+    #[test]
+    fn verify_owner_reads_back_own_token() {
+        // On Windows this is the regression test for reading through the held
+        // handle: a fresh open-by-path read hits the mandatory lock.
+        let dir = tempdir().unwrap();
+        let g = DataDirGuard::acquire(dir.path()).unwrap();
+        for _ in 0..3 {
+            g.verify_owner().unwrap();
+        }
+        assert!(g.check_fenced().is_ok());
+    }
+
+    #[test]
+    fn hostname_is_reported() {
+        assert!(!hostname().is_empty());
+        #[cfg(any(unix, windows))]
+        assert_ne!(hostname(), "unknown");
+    }
+
+    // Stamping LOCK by path while the guard holds it simulates a no-op lock
+    // (network FS). On Windows the mandatory lock refuses that write, which is
+    // the protection itself, so there is nothing to simulate.
+    #[cfg(unix)]
     #[test]
     fn verify_owner_detects_foreign_stamp() {
         let dir = tempdir().unwrap();
@@ -264,6 +339,8 @@ mod tests {
         assert!(g.check_fenced().is_err());
     }
 
+    // Reads LOCK by path while held: refused on Windows (mandatory lock).
+    #[cfg(unix)]
     #[test]
     fn holder_summary_reports_pid_and_host() {
         let dir = tempdir().unwrap();
