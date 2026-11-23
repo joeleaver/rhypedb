@@ -146,14 +146,20 @@ pub struct LsmCore {
     /// `Drop for LsmTree` has joined the compaction worker (the worker's own
     /// reference is gone by then), so the lock is released only once nothing
     /// is still touching the files.
-    dir_guard: crate::lock::DataDirGuard,
+    /// `None` for an in-memory tree ([`LsmTree::open_in_memory`]): there is
+    /// no directory to guard.
+    dir_guard: Option<crate::lock::DataDirGuard>,
     config: LsmConfig,
+    /// `true` for a tree opened with [`LsmTree::open_in_memory`]: no WAL, no
+    /// files, SSTs held as bytes, compaction inline.
+    in_memory: bool,
     active_memtable: Arc<RwLock<Arc<MemTable>>>,
     immutable_memtables: Arc<RwLock<Vec<Arc<MemTable>>>>,
     /// Oldest → newest. `Arc` so a compaction can hold its inputs for a long
     /// streaming merge without holding this lock (which would stall flushes).
     sst_files: Arc<RwLock<Vec<Arc<SstReader>>>>,
-    wal: Arc<parking_lot::Mutex<Wal>>,
+    /// `None` for an in-memory tree: nothing survives the process anyway.
+    wal: Option<Arc<parking_lot::Mutex<Wal>>>,
     txn_manager: Arc<TransactionManager>,
     /// Coordinates concurrent writers against `flush()`. Every writer holds
     /// `.read()` across its `[WAL append + memtable write]` pair; `flush()`
@@ -346,12 +352,13 @@ impl LsmTree {
 
         let background_compaction = config.background_compaction;
         let core = Arc::new(LsmCore {
-            dir_guard,
+            dir_guard: Some(dir_guard),
             config,
+            in_memory: false,
             active_memtable: Arc::new(RwLock::new(memtable)),
             immutable_memtables: Arc::new(RwLock::new(Vec::new())),
             sst_files: Arc::new(RwLock::new(sst_readers)),
-            wal: Arc::new(parking_lot::Mutex::new(wal)),
+            wal: Some(Arc::new(parking_lot::Mutex::new(wal))),
             txn_manager,
             flush_lock: parking_lot::RwLock::new(()),
             next_sst_id: std::sync::atomic::AtomicU64::new(max_sst_id + 1),
@@ -384,6 +391,44 @@ impl LsmTree {
         Ok(Arc::new(LsmTree {
             core,
             compaction_handle: parking_lot::Mutex::new(compaction_handle),
+        }))
+    }
+
+    /// Open an empty tree that lives in memory only: no directory, no WAL, no
+    /// lock file, no file mappings and no threads. SSTs are written into
+    /// buffers in the same format as on disk (so every read path, bloom, zone
+    /// map and id summary is the one an on-disk tree uses), and compaction runs
+    /// inline on the writer that crosses the threshold
+    /// (`background_compaction` is ignored). Everything is gone when the last
+    /// handle drops.
+    ///
+    /// For a derived, disposable index that is rebuilt when it opens, and for
+    /// targets without a filesystem or threads (`wasm32-unknown-unknown`).
+    /// `config.data_dir` is never touched; [`LsmCore::data_dir`] reports it.
+    /// [`LsmCore::snapshot_to`] is refused.
+    pub fn open_in_memory(mut config: LsmConfig) -> Result<Arc<Self>> {
+        config.background_compaction = false;
+        config.sync_on_commit = false;
+        let core = Arc::new(LsmCore {
+            dir_guard: None,
+            config,
+            in_memory: true,
+            active_memtable: Arc::new(RwLock::new(Arc::new(MemTable::new()))),
+            immutable_memtables: Arc::new(RwLock::new(Vec::new())),
+            sst_files: Arc::new(RwLock::new(Vec::new())),
+            wal: None,
+            txn_manager: Arc::new(TransactionManager::recover_at_version(0)),
+            flush_lock: parking_lot::RwLock::new(()),
+            next_sst_id: std::sync::atomic::AtomicU64::new(1),
+            compaction_mutex: parking_lot::Mutex::new(()),
+            compaction_state: Arc::new((
+                parking_lot::Mutex::new(CompactionState::default()),
+                parking_lot::Condvar::new(),
+            )),
+        });
+        Ok(Arc::new(LsmTree {
+            core,
+            compaction_handle: parking_lot::Mutex::new(None),
         }))
     }
 }
@@ -1032,7 +1077,9 @@ impl LsmCore {
         // Fail fast if a concurrent opener has been detected (poisoned guard):
         // cheap atomic load, no I/O. Keeps us from writing into a data dir a
         // second process has stamped (see `crate::lock`).
-        self.dir_guard.check_fenced()?;
+        if let Some(guard) = &self.dir_guard {
+            guard.check_fenced()?;
+        }
         // Apply the transaction's buffered writes durably, then publish.
         //
         // Lock order: `flush_lock.read()` (coordinate with flush's WAL truncate,
@@ -1048,8 +1095,8 @@ impl LsmCore {
         let version = {
             let _fg = self.flush_lock.read();
             self.txn_manager.commit(txn, |commit_version, writes| {
-                {
-                    let mut wal = self.wal.lock();
+                if let Some(wal) = &self.wal {
+                    let mut wal = wal.lock();
                     wal.append_txn(writes, commit_version)?;
                     if self.config.sync_on_commit {
                         wal.sync()?;
@@ -1139,7 +1186,7 @@ impl LsmCore {
         // we still own the data dir BEFORE touching either — on a foreign
         // owner-stamp this poisons the guard and aborts here, rather than
         // clobbering the other writer.
-        self.dir_guard.verify_owner()?;
+        self.verify_owner()?;
         // Rotate memtable: current becomes immutable, new empty one becomes active.
         let old_memtable = {
             let mut active = self.active_memtable.write();
@@ -1156,6 +1203,10 @@ impl LsmCore {
         // CRASH BOUNDARY: memtable rotated + staged in RAM; nothing durable has
         // changed (no SST, WAL not truncated) — reopen recovers wholly from WAL.
         crash_inject::hit(Site::FlushAfterMemtableRotate);
+
+        if self.in_memory {
+            return self.flush_to_memory(old_memtable);
+        }
 
         // Write SST file.
         let sst_id = self
@@ -1203,7 +1254,9 @@ impl LsmCore {
         // double-replay (the data-loss bug this ordering was fixed to prevent).
         crash_inject::hit(Site::FlushBeforeWalTruncate);
         let new_wal = Wal::create_fresh(&wal_path)?;
-        *self.wal.lock() = new_wal;
+        if let Some(wal) = &self.wal {
+            *wal.lock() = new_wal;
+        }
         // CRASH BOUNDARY: WAL truncated to a fresh header; flushed data lives
         // only in the SST now.
         crash_inject::hit(Site::FlushAfterWalTruncate);
@@ -1231,6 +1284,12 @@ impl LsmCore {
     /// The WAL is mutable, so it is always copied (never linked) — post-flush it
     /// is header-only.
     pub fn snapshot_to(&self, dst: &Path) -> Result<SstSnapshotManifest> {
+        if self.in_memory {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "an in-memory tree has no files to snapshot",
+            )));
+        }
         let _fg = self.flush_lock.write();
         // All committed data into immutable SSTs; WAL becomes header-only.
         self.flush_locked()?;
@@ -1349,7 +1408,7 @@ impl LsmCore {
     fn compact_inner(&self, scope: CompactionScope) -> Result<bool> {
         // Destructive boundary: compaction writes a merged SST and unlinks the
         // inputs. Confirm data-dir ownership before mutating the SST set.
-        self.dir_guard.verify_owner()?;
+        self.verify_owner()?;
 
         // Capture the EXACT set of SSTs being merged while holding the read
         // lock. `flush()` only ever APPENDS to `sst_files`, and the read lock
@@ -1379,6 +1438,9 @@ impl LsmCore {
         };
         let merged_paths: Vec<PathBuf> =
             inputs.iter().map(|s| s.path().to_path_buf()).collect();
+        if self.in_memory {
+            return self.compact_in_memory(inputs, merged_paths, bottommost, min_snapshot);
+        }
 
         let sst_id = self
             .next_sst_id
@@ -1498,7 +1560,94 @@ impl LsmCore {
     /// completed `append_txn`) survive, as across a SIGKILL.
     #[cfg(feature = "crash-fuzz")]
     pub fn discard_for_crash_recovery(&self) {
-        self.wal.lock().forget_unflushed_buffer();
+        if let Some(wal) = &self.wal {
+            wal.lock().forget_unflushed_buffer();
+        }
+    }
+
+    /// Whether this tree was opened with [`LsmTree::open_in_memory`] (no
+    /// files: [`data_dir`](Self::data_dir) names nothing on disk).
+    pub fn is_in_memory(&self) -> bool {
+        self.in_memory
+    }
+
+    /// The data-dir ownership check at a destructive boundary; nothing to
+    /// check for an in-memory tree.
+    fn verify_owner(&self) -> Result<()> {
+        match &self.dir_guard {
+            Some(guard) => guard.verify_owner(),
+            None => Ok(()),
+        }
+    }
+
+    /// The in-memory tail of [`flush_locked`](Self::flush_locked): the rotated
+    /// memtable becomes an SST held as bytes. No WAL to truncate.
+    fn flush_to_memory(&self, old_memtable: Arc<MemTable>) -> Result<()> {
+        let sst_id = self
+            .next_sst_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut writer = SstWriter::new_in_memory(
+            format!("{sst_id:08}.sst"),
+            self.config.zone_extractor.clone(),
+            self.config.block_compression,
+            old_memtable.len(),
+        )?;
+        for (key, value) in old_memtable.iter() {
+            writer.add(&key, &value)?;
+        }
+        let (_, reader) = writer.finish_in_memory()?;
+        self.sst_files.write().push(Arc::new(reader));
+        self.immutable_memtables
+            .write()
+            .retain(|mt| !Arc::ptr_eq(mt, &old_memtable));
+        Ok(())
+    }
+
+    /// The in-memory body of [`compact_inner`](Self::compact_inner): the same
+    /// k-way merge and version GC, into an SST held as bytes, spliced in where
+    /// the run was. The inputs are freed when their last reader lets go.
+    fn compact_in_memory(
+        &self,
+        inputs: Vec<Arc<SstReader>>,
+        merged_paths: Vec<PathBuf>,
+        bottommost: bool,
+        min_snapshot: u64,
+    ) -> Result<bool> {
+        let sst_id = self
+            .next_sst_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let key_bound: usize = inputs.iter().map(|s| s.max_entry_count()).sum();
+        let mut writer = SstWriter::new_in_memory(
+            format!("{sst_id:08}.sst"),
+            self.config.zone_extractor.clone(),
+            self.config.block_compression,
+            key_bound,
+        )?;
+        let mut merge = KWayMerge::new(&inputs)?;
+        let mut gc = VersionGc::new(min_snapshot, bottommost);
+        while let Some((key, value)) = merge.next_entry()? {
+            if gc.keep(&key, value.is_none()) {
+                writer.add(&key, &value)?;
+            }
+        }
+        drop(merge);
+        let (meta, reader) = writer.finish_in_memory()?;
+        let merged: HashSet<&Path> = merged_paths.iter().map(|p| p.as_path()).collect();
+        let mut output = (meta.entry_count > 0).then(|| Arc::new(reader));
+        let mut ssts = self.sst_files.write();
+        let old = std::mem::take(&mut *ssts);
+        let mut spliced = Vec::with_capacity(old.len() + 1);
+        for s in old {
+            if merged.contains(s.path()) {
+                if let Some(r) = output.take() {
+                    spliced.push(r);
+                }
+            } else {
+                spliced.push(s);
+            }
+        }
+        *ssts = spliced;
+        Ok(true)
     }
 }
 

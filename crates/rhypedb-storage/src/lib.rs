@@ -11,6 +11,7 @@ pub mod mem;
 pub mod error;
 pub mod mvcc;
 pub mod zone;
+pub mod time;
 
 pub use error::{Error, Result};
 pub use sst::SstCompression;

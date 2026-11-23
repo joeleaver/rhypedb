@@ -152,8 +152,14 @@ impl PrincipalSource for JwtSource {
 
 /// Seconds since the Unix epoch, saturating at 0 if the clock is somehow before it.
 fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    // `std::time::SystemTime::now` panics on wasm32-unknown-unknown; there the
+    // JavaScript host's clock answers (see `rhypedb_storage::time`).
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    use std::time::{SystemTime, UNIX_EPOCH};
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    use web_time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }

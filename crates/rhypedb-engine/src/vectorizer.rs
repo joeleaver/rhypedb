@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -784,8 +786,9 @@ impl Vectorizer {
         for index_key in &index_keys {
             let snapshot_path = self.snapshot_path(index_key);
 
-            // Try loading from snapshot.
-            if snapshot_path.exists() {
+            // Try loading from snapshot (an in-memory database has none: its
+            // storage names no directory).
+            if !self.storage.is_in_memory() && snapshot_path.exists() {
                 match std::fs::File::open(&snapshot_path) {
                     Ok(file) => {
                         let mut reader = std::io::BufReader::new(file);
@@ -963,7 +966,9 @@ impl Vectorizer {
     }
 
     fn save_single_snapshot(&self, index_key: &str, index: &QuantizedIndex) {
-        if index.is_empty() {
+        // An in-memory database writes no files: its index is rebuilt from
+        // nothing whenever it opens.
+        if index.is_empty() || self.storage.is_in_memory() {
             return;
         }
         let path = self.snapshot_path(index_key);

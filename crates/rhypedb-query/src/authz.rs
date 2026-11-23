@@ -785,7 +785,7 @@ mod tests {
         let mut c = ctx_with(db, r, principal);
         c.governor = crate::governor::Governor::new(
             crate::governor::GovernorLimits { max_rows_scanned, ..crate::governor::GovernorLimits::UNLIMITED },
-            std::time::Instant::now(),
+            rhypedb_engine::time::Instant::now(),
         );
         c
     }

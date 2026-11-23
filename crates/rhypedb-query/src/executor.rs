@@ -2927,7 +2927,7 @@ mod tests {
         };
         let run = |q: &str| {
             let mut ctx = ExecContext::new(&db, None);
-            ctx.governor = Governor::new(limits, std::time::Instant::now());
+            ctx.governor = Governor::new(limits, rhypedb_engine::time::Instant::now());
             execute(&ctx, &crate::parser::parse_query(q).unwrap())
         };
         let words = |n: usize| vec!["w"; n].join(" ");
@@ -3424,7 +3424,7 @@ mod tests {
         limits: crate::governor::GovernorLimits,
     ) -> ExecContext<'a> {
         let mut ctx = ExecContext::new(db, None);
-        ctx.governor = Governor::new(limits, std::time::Instant::now());
+        ctx.governor = Governor::new(limits, rhypedb_engine::time::Instant::now());
         ctx
     }
 
@@ -4664,7 +4664,7 @@ mod tests {
         };
         let run = |q: &str| {
             let mut ctx = ExecContext::new(&db, None);
-            ctx.governor = Governor::new(limits, std::time::Instant::now());
+            ctx.governor = Governor::new(limits, rhypedb_engine::time::Instant::now());
             execute(&ctx, &parse_query(q).unwrap())
         };
         assert_eq!(objects(run("Item.limit(20)").unwrap()).len(), 20);

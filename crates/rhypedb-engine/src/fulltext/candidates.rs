@@ -92,7 +92,7 @@ impl FulltextCandidates {
         &self,
         restrict: Option<&HashSet<u64>>,
         k: usize,
-        deadline: Option<std::time::Instant>,
+        deadline: Option<crate::time::Instant>,
     ) -> EngineResult<Vec<FulltextHit>> {
         let merged = self.merge_prefixes(None)?;
         let postings = self.lists(&merged);
@@ -108,7 +108,7 @@ impl FulltextCandidates {
         &self,
         visible: &HashSet<u64>,
         k: usize,
-        deadline: Option<std::time::Instant>,
+        deadline: Option<crate::time::Instant>,
     ) -> EngineResult<Vec<FulltextHit>> {
         let merged = self.merge_prefixes(Some(visible))?;
         let postings = self.lists(&merged);

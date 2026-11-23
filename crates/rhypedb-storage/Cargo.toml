@@ -40,5 +40,13 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# wasm32-unknown-unknown (a browser Web Worker): `std::time::Instant::now` and
+# `SystemTime::now` panic there, so `web-time` supplies the JavaScript host's
+# clock; `getrandom`'s `wasm_js` backend answers `rand` (and `tempfile`) from
+# `crypto.getRandomValues`. Neither is built for any other target.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+web-time = "1"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }

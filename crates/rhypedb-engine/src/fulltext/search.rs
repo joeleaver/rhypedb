@@ -100,7 +100,7 @@ pub fn score_query_with<L: Borrow<PostingList>>(
     restrict: Option<&HashSet<u64>>,
     scope: RestrictScope,
     k: usize,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<crate::time::Instant>,
 ) -> Result<Vec<FulltextHit>, DeadlineExceeded> {
     if k == 0 || stats.doc_count == 0 {
         return Ok(Vec::new());
@@ -110,7 +110,7 @@ pub fn score_query_with<L: Borrow<PostingList>>(
     let mut tick = move || -> Result<(), DeadlineExceeded> {
         visited += 1;
         if visited.is_multiple_of(DEADLINE_CHECK_EVERY)
-            && deadline.is_some_and(|d| std::time::Instant::now() >= d)
+            && deadline.is_some_and(|d| crate::time::Instant::now() >= d)
         {
             return Err(DeadlineExceeded);
         }
