@@ -13714,8 +13714,14 @@ mod tests {
 
     /// Card 5 AC `progress_eta_within_25pct_of_actual_on_uniform_load`: with a
     /// converter that takes a fixed time per row (uniform load), the rate-based
-    /// ETA sampled mid-flight predicts the actual completion within 25%.
+    /// ETA sampled mid-flight predicts the actual end of conversion within 25%.
     /// Single-partition for deterministic linear pacing.
+    ///
+    /// The ETA extrapolates the conversion rate, so it predicts when the last
+    /// row converts, not when cutover finishes. "Actual" is therefore the
+    /// moment every row has converted. Measuring to `wait_for_migration` adds
+    /// cutover, negligible on Linux but ~1.4s on a Windows CI runner, which
+    /// failed the bound with a uniform rate.
     ///
     /// "Uniform" is the PREMISE, and a loaded machine can break it: `sleep(2ms)`
     /// overshoots by a varying amount, so a run can slow down after the sample
@@ -13767,6 +13773,7 @@ mod tests {
             // sample once 70–95% has, while still converting.
             let mut sample = None;
             let mut later: Option<(u64, Duration)> = None;
+            let mut conversion_done: Option<Duration> = None;
             for _ in 0..10_000 {
                 let p = db.query_migration_progress(handle.plan_id).unwrap();
                 let running = p.status == crate::catalog::MigrationStatus::Running;
@@ -13782,6 +13789,11 @@ mod tests {
                     && (280..=380).contains(&p.objects_converted)
                 {
                     later = Some((p.objects_converted, t0.elapsed()));
+                } else if later.is_some()
+                    && (p.objects_converted >= p.total_objects
+                        || p.phase != crate::catalog::MigrationPhase::Converting)
+                {
+                    conversion_done = Some(t0.elapsed());
                     break;
                 } else if !p.status.quiesces() {
                     break; // finished before a sample — handled below
@@ -13789,10 +13801,13 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             db.wait_for_migration(handle.plan_id).unwrap();
-            let actual = t0.elapsed();
             let (p, at_sample) = sample.expect("should have caught an in-flight sample");
             let Some((later_done, at_later)) = later else {
                 skewed.push(format!("attempt {attempt}: no second in-flight sample"));
+                continue;
+            };
+            let Some(actual) = conversion_done else {
+                skewed.push(format!("attempt {attempt}: missed the end of conversion"));
                 continue;
             };
 
@@ -13816,8 +13831,8 @@ mod tests {
             let hi = actual_ms * 125 / 100;
             assert!(
                 predicted_total_ms >= lo && predicted_total_ms <= hi,
-                "ETA predicted total {predicted_total_ms}ms not within 25% of actual {actual_ms}ms \
-                 under uniform load (rate skew {:.0}%, sampled at {} / {} converted)",
+                "ETA predicted total {predicted_total_ms}ms not within 25% of actual conversion \
+                 time {actual_ms}ms under uniform load (rate skew {:.0}%, sampled at {} / {} converted)",
                 skew * 100.0,
                 p.objects_converted,
                 p.total_objects
