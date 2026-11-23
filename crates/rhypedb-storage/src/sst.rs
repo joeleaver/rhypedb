@@ -151,6 +151,40 @@ impl<W: Write> Write for CountingWriter<'_, W> {
     }
 }
 
+/// Where an SST's bytes go while it is written: a buffered temp file for an
+/// on-disk tree, or a growing buffer for an in-memory one
+/// ([`SstWriter::new_in_memory`]). One enum, not a trait object, so the file
+/// path keeps its static dispatch.
+enum Sink {
+    File(BufWriter<File>),
+    Memory(Vec<u8>),
+}
+
+impl Write for Sink {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Sink::File(w) => w.write(buf),
+            Sink::Memory(v) => v.write(buf),
+        }
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            Sink::File(w) => w.write_all(buf),
+            Sink::Memory(v) => v.write_all(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Sink::File(w) => w.flush(),
+            Sink::Memory(_) => Ok(()),
+        }
+    }
+}
+
 /// A writer's sparse index while the data region is still being written.
 /// Entries are serialized exactly as they will appear in the file
 /// (`[key_len u32][key][block_offset u64]`) into an anonymous temp file next to
@@ -159,7 +193,7 @@ impl<W: Write> Write for CountingWriter<'_, W> {
 /// ~84 MB while compacting a 13M-entry file. The temp file is unlinked from
 /// the start (`tempfile::tempfile_in`), so a crash can't leave it behind.
 struct IndexSpill {
-    out: BufWriter<File>,
+    out: Sink,
     count: usize,
     first_key: Option<Bytes>,
     last_key: Vec<u8>,
@@ -167,12 +201,17 @@ struct IndexSpill {
 
 impl IndexSpill {
     fn new(dir: &Path) -> Result<Self> {
-        Ok(Self {
-            out: BufWriter::new(tempfile::tempfile_in(dir)?),
-            count: 0,
-            first_key: None,
-            last_key: Vec::new(),
-        })
+        Ok(Self::with_sink(Sink::File(BufWriter::new(tempfile::tempfile_in(dir)?))))
+    }
+
+    /// An in-memory writer's index: the entries wait in a buffer (there is no
+    /// file to spill to, and an in-memory tree is small by construction).
+    fn in_memory() -> Self {
+        Self::with_sink(Sink::Memory(Vec::new()))
+    }
+
+    fn with_sink(out: Sink) -> Self {
+        Self { out, count: 0, first_key: None, last_key: Vec::new() }
     }
 
     fn push(&mut self, key: &[u8], offset: u64) -> Result<()> {
@@ -191,9 +230,17 @@ impl IndexSpill {
     /// Append the spilled entries to `dst`; returns the bytes copied.
     fn copy_into(self, dst: &mut impl Write) -> Result<u64> {
         use std::io::Seek;
-        let mut file = self.out.into_inner().map_err(|e| e.into_error())?;
-        file.rewind()?;
-        Ok(std::io::copy(&mut file, dst)?)
+        match self.out {
+            Sink::File(out) => {
+                let mut file = out.into_inner().map_err(|e| e.into_error())?;
+                file.rewind()?;
+                Ok(std::io::copy(&mut file, dst)?)
+            }
+            Sink::Memory(buf) => {
+                dst.write_all(&buf)?;
+                Ok(buf.len() as u64)
+            }
+        }
     }
 }
 
@@ -278,7 +325,7 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 
 /// Writer for creating SST files from sorted key-value pairs.
 pub struct SstWriter {
-    writer: BufWriter<File>,
+    writer: Sink,
     index: IndexSpill,
     current_offset: u64,
     entry_count: usize,
@@ -386,7 +433,42 @@ impl SstWriter {
         // block reopen.
         let tmp_path = tmp_path_for(&path);
         let file = File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
+        let index = IndexSpill::new(path.parent().unwrap_or(Path::new(".")))?;
+        Self::with_sink(Sink::File(BufWriter::new(file)), index, path, tmp_path, zone_extractor, compression)
+    }
+
+    /// A writer whose SST is built in memory and touches no file: finish it
+    /// with [`finish_in_memory`](Self::finish_in_memory), which hands back a
+    /// reader over the bytes. `name` only identifies the table (an in-memory
+    /// tree tells its tables apart by it); nothing is created there. The same
+    /// format as a file, byte for byte, so every read path is shared.
+    pub fn new_in_memory(
+        name: impl AsRef<Path>,
+        zone_extractor: Option<ZoneFieldExtractor>,
+        compression: SstCompression,
+        max_distinct_keys: usize,
+    ) -> Result<Self> {
+        let path = name.as_ref().to_path_buf();
+        let mut w = Self::with_sink(
+            Sink::Memory(Vec::new()),
+            IndexSpill::in_memory(),
+            path.clone(),
+            path,
+            zone_extractor,
+            compression,
+        )?;
+        w.bloom_keys = BloomKeys::Streaming(BloomFilter::new(max_distinct_keys));
+        Ok(w)
+    }
+
+    fn with_sink(
+        mut writer: Sink,
+        index: IndexSpill,
+        path: PathBuf,
+        tmp_path: PathBuf,
+        zone_extractor: Option<ZoneFieldExtractor>,
+        compression: SstCompression,
+    ) -> Result<Self> {
 
         // Write file header. The version records the data-region format so the
         // reader knows whether to decompress.
@@ -399,7 +481,7 @@ impl SstWriter {
 
         Ok(Self {
             writer,
-            index: IndexSpill::new(path.parent().unwrap_or(Path::new(".")))?,
+            index,
             current_offset: (SST_MAGIC.len() + 4) as u64, // past header
             entry_count: 0,
             path,
@@ -533,6 +615,56 @@ impl SstWriter {
 
     /// Finalize the SST file by writing the index, zone map, bloom filter, and footer.
     pub fn finish(mut self) -> Result<SstMeta> {
+        let (entry_count, first_key, last_key) = self.write_tail()?;
+        let Sink::File(writer) = &self.writer else {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "an in-memory SST is finished with finish_in_memory",
+            )));
+        };
+        writer.get_ref().sync_all()?;
+
+        // Atomically publish the fully-written, fsync'd file, then fsync the
+        // directory so the rename itself is durable. Before this point only the
+        // `.tmp` exists; after it the final `.sst` exists in full. There is no
+        // window where a partial `.sst` is visible to recovery.
+        std::fs::rename(&self.tmp_path, &self.path)?;
+        sync_parent_dir(&self.path);
+
+        Ok(SstMeta {
+            path: self.path,
+            entry_count,
+            first_key,
+            last_key,
+        })
+    }
+
+    /// Finalize an SST begun with [`new_in_memory`](Self::new_in_memory) and
+    /// open it for reads.
+    pub fn finish_in_memory(mut self) -> Result<(SstMeta, SstReader)> {
+        let (entry_count, first_key, last_key) = self.write_tail()?;
+        let Sink::Memory(buf) = std::mem::replace(&mut self.writer, Sink::Memory(Vec::new())) else {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "an SST file is finished with finish",
+            )));
+        };
+        let reader = SstReader::from_bytes(self.path.clone(), Bytes::from(buf))?;
+        Ok((
+            SstMeta {
+                path: self.path,
+                entry_count,
+                first_key,
+                last_key,
+            },
+            reader,
+        ))
+    }
+
+    /// Everything after the data region: index, zone map, bloom, meta block
+    /// and footer, flushed to the sink. Returns `(entry_count, first_key,
+    /// last_key)`.
+    fn write_tail(&mut self) -> Result<(usize, Option<Bytes>, Option<Bytes>)> {
         // Flush the final (partial) block so the data region is complete before
         // the index region begins.
         self.flush_block()?;
@@ -542,7 +674,8 @@ impl SstWriter {
         let index_count = self.index.count;
         let first_key = self.index.first_key.clone();
         let last_key = (index_count > 0).then(|| Bytes::copy_from_slice(&self.index.last_key));
-        let bytes_written = self.index.copy_into(&mut self.writer)?;
+        let index = std::mem::replace(&mut self.index, IndexSpill::in_memory());
+        let bytes_written = index.copy_into(&mut self.writer)?;
 
         // Zone map block (v4): per-block min/max for opted-in fields. When
         // no extractor is configured, this writes just the empty header
@@ -605,21 +738,7 @@ impl SstWriter {
         footer.put_slice(SST_MAGIC);
         self.writer.write_all(&footer)?;
         self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
-
-        // Atomically publish the fully-written, fsync'd file, then fsync the
-        // directory so the rename itself is durable. Before this point only the
-        // `.tmp` exists; after it the final `.sst` exists in full. There is no
-        // window where a partial `.sst` is visible to recovery.
-        std::fs::rename(&self.tmp_path, &self.path)?;
-        sync_parent_dir(&self.path);
-
-        Ok(SstMeta {
-            path: self.path,
-            entry_count: self.entry_count,
-            first_key,
-            last_key,
-        })
+        Ok((self.entry_count, first_key, last_key))
     }
 
     pub fn path(&self) -> &Path {
@@ -795,6 +914,17 @@ impl SstReader {
         let _ = mmap.advise(memmap2::Advice::Random);
         let mapping = (mmap.as_ptr() as usize, mmap.len());
         let data: Bytes = Bytes::from_owner(mmap);
+        Self::from_data(path, data, mapping)
+    }
+
+    /// A reader over SST bytes already in memory (what
+    /// [`SstWriter::finish_in_memory`] produces). `path` names the table only;
+    /// it is never opened. Page release is a no-op: there is no file mapping.
+    pub fn from_bytes(path: impl Into<PathBuf>, data: Bytes) -> Result<Self> {
+        Self::from_data(path.into(), data, (0, 0))
+    }
+
+    fn from_data(path: PathBuf, data: Bytes, mapping: (usize, usize)) -> Result<Self> {
 
         if data.len() < SST_MAGIC.len() + 4 + FOOTER_V1_SIZE {
             return Err(Error::SstCorrupted("file too small".into()));

@@ -18,3 +18,6 @@ pub use error::{CatalogError, EngineError, EngineResult};
 // happens, but the only thing query code does with it is forward query AST
 // comparison operators.
 pub use rhypedb_storage::zone::CompareOp;
+/// The clock (std's, or the JavaScript host's on `wasm32-unknown-unknown`);
+/// see [`rhypedb_storage::time`].
+pub use rhypedb_storage::time;

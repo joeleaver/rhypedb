@@ -52,3 +52,7 @@ rust-stemmers = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# `tests/in_memory.rs` under Node on wasm32-unknown-unknown.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"

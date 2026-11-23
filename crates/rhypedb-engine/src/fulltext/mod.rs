@@ -250,7 +250,7 @@ pub struct FulltextLimits {
     pub max_postings: Option<u64>,
     /// Wall-clock deadline, checked before every scan chunk; past it the scan
     /// fails closed with `FulltextDeadlineExceeded`.
-    pub deadline: Option<std::time::Instant>,
+    pub deadline: Option<crate::time::Instant>,
     /// Keep each prefix expansion unmerged and apply the
     /// [`MAX_PREFIX_EXPANSION`] cap at scoring instead of during the scan, so
     /// `FulltextCandidates::score_visible` can count only terms that occur in

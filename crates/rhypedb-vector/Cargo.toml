@@ -13,4 +13,10 @@ boxcar = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 
+# wasm32-unknown-unknown (a browser Web Worker): `getrandom`'s `wasm_js`
+# backend answers `rand` from `crypto.getRandomValues`. Not built for any other
+# target.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [dev-dependencies]

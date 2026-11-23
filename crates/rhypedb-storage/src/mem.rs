@@ -20,7 +20,9 @@
 //! have no `malloc_trim`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::Instant;
 
 /// Minimum time between automatic releases.
 pub const MIN_RELEASE_INTERVAL: Duration = Duration::from_secs(2);

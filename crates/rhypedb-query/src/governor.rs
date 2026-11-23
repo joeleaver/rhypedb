@@ -26,7 +26,9 @@
 //! - Wall-clock per query ([`Governor::check_deadline`]).
 
 use std::cell::Cell;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use rhypedb_engine::time::Instant;
 
 use crate::error::{QueryError, QueryResult};
 

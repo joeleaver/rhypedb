@@ -791,7 +791,7 @@ impl DatabaseCore {
     /// opened with `background_fulltext_build: false` never runs its tasks,
     /// so it returns `false` unless there were none.
     pub fn wait_for_fulltext_builds(&self, timeout: std::time::Duration) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = crate::time::Instant::now() + timeout;
         loop {
             if self.fulltext_builder.failed.load(Ordering::Acquire) > 0 {
                 return false;
@@ -799,12 +799,19 @@ impl DatabaseCore {
             if self.fulltext_builder.pending.load(Ordering::Acquire) == 0 {
                 return true;
             }
-            if std::time::Instant::now() >= deadline {
+            if crate::time::Instant::now() >= deadline {
                 return false;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+}
+
+/// Run the pending tasks of `builder` (the builder of `core`) to completion on the calling thread (what
+/// `Database::run_deferred_work` does for an in-memory database, which never
+/// starts the builder thread).
+pub(super) fn run_fulltext_tasks(core: std::sync::Weak<DatabaseCore>, builder: &Arc<FulltextBuilder>) {
+    fulltext_builder_main(core, Arc::clone(builder));
 }
 
 impl super::Database {

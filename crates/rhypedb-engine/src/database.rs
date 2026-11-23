@@ -524,6 +524,11 @@ pub struct DatabaseCore {
     cover_refresh_tx: parking_lot::Mutex<Option<std::sync::mpsc::Sender<(u64, u64)>>>,
     /// Join handle for the cover-refresh worker thread. Taken on drop.
     cover_refresh_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The receiving end of `cover_refresh_tx` when no worker thread holds it:
+    /// a database opened with [`Database::open_in_memory`] queues its cover
+    /// refreshes here, and [`Database::run_deferred_work`] drains them on the
+    /// caller's thread. `None` for a database with a worker (or none at all).
+    cover_refresh_deferred: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<(u64, u64)>>>,
     /// Cover-refresh worker counters.
     pub(crate) cover_refresh_stats: CoverRefreshStats,
     /// A `Weak` to this very `Database`, stashed right after `Arc::new` so a
@@ -1184,7 +1189,37 @@ impl Database {
         data_dir: impl AsRef<Path>,
         options: OpenOptions,
     ) -> EngineResult<Arc<Self>> {
-        let mut config = LsmConfig::new(data_dir);
+        Self::open_storage(schema, LsmConfig::new(data_dir), options, false)
+    }
+
+    /// Open an empty database that lives in memory only, for an index that is
+    /// derived and rebuilt whenever it opens (and for targets with no
+    /// filesystem and no threads, such as `wasm32-unknown-unknown` in a Web
+    /// Worker). Storage is [`LsmTree::open_in_memory`]: no directory, WAL, lock
+    /// file or file mapping, SSTs held as bytes in the on-disk format, and
+    /// compaction inline on the writer that crosses its threshold.
+    ///
+    /// No thread is ever started. The work an on-disk database hands its
+    /// background threads waits instead for
+    /// [`run_deferred_work`](Self::run_deferred_work), which the caller drives
+    /// on its own schedule: cover refreshes when `options.background_cover_refresh`, and
+    /// full-text backfills and sweeps when `options.background_fulltext_build`
+    /// (a fresh database has none; a schema change on a populated type
+    /// queues one). Leaving that work undone never makes a read wrong: a stale
+    /// cover is detected and read through, and every write indexes its own
+    /// text. `options.sync_on_commit` has no effect (there is no WAL).
+    /// Backups, snapshots and field-type migrations need files or threads and
+    /// are refused.
+    pub fn open_in_memory(schema: Schema, options: OpenOptions) -> EngineResult<Arc<Self>> {
+        Self::open_storage(schema, LsmConfig::new(""), options, true)
+    }
+
+    fn open_storage(
+        schema: Schema,
+        mut config: LsmConfig,
+        options: OpenOptions,
+        in_memory: bool,
+    ) -> EngineResult<Arc<Self>> {
         // Wire a zone-field extractor that pulls integer field values out of
         // object entries' FieldMap blobs at SST flush/compaction time. Lets
         // `filter_scan` skip blocks whose min/max bounds rule out the
@@ -1206,7 +1241,11 @@ impl Database {
         }));
         config.sync_on_commit = options.sync_on_commit;
         config.block_compression = options.block_compression;
-        let storage = LsmTree::open(config)?;
+        let storage = if in_memory {
+            LsmTree::open_in_memory(config)?
+        } else {
+            LsmTree::open(config)?
+        };
         Self::rebuild_with_arc_storage(
             storage,
             schema,
@@ -1589,6 +1628,7 @@ impl Database {
             },
             cover_refresh_tx: parking_lot::Mutex::new(None),
             cover_refresh_handle: parking_lot::Mutex::new(None),
+            cover_refresh_deferred: parking_lot::Mutex::new(None),
             cover_refresh_stats: CoverRefreshStats::default(),
             self_weak: parking_lot::Mutex::new(std::sync::Weak::new()),
             migration_drivers: parking_lot::Mutex::new(HashMap::new()),
@@ -1631,7 +1671,14 @@ impl Database {
         // runs its `Drop`: once the last handle drops, `Drop` closes the channel
         // and joins it. Skipped when the caller opts out via
         // `OpenOptions::background_cover_refresh`.
-        if options.background_cover_refresh {
+        // An in-memory database starts no thread at all: the same queue is
+        // drained by `run_deferred_work` on the caller's thread.
+        let in_memory = db.storage.is_in_memory();
+        if options.background_cover_refresh && in_memory {
+            let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
+            *db.cover_refresh_tx.lock() = Some(tx);
+            *db.cover_refresh_deferred.lock() = Some(rx);
+        } else if options.background_cover_refresh {
             let (tx, rx) = std::sync::mpsc::channel::<(u64, u64)>();
             let weak = Arc::downgrade(&db.core);
             let handle = std::thread::Builder::new()
@@ -1644,7 +1691,8 @@ impl Database {
 
         // Full-text backfills / generation sweeps, if the marker reconcile
         // produced any. Same `Weak` discipline as the cover-refresh worker.
-        if options.background_fulltext_build {
+        // (In memory, `run_deferred_work` runs them on the caller's thread.)
+        if options.background_fulltext_build && !in_memory {
             db.core.spawn_fulltext_builder()?;
         }
 
@@ -2702,6 +2750,13 @@ impl DatabaseCore {
         converter: crate::catalog::RegisteredConverter,
     ) -> EngineResult<()> {
         use std::sync::atomic::AtomicU8;
+        // A driver is a thread; an in-memory database starts none.
+        if self.storage.is_in_memory() {
+            return Err(EngineError::Storage(rhypedb_storage::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "field-type migrations need a database on disk",
+            ))));
+        }
         let weak = self.self_weak.lock().clone();
         let storage = Arc::clone(&self.storage);
         let events = Arc::clone(&self.migration_events);
@@ -7113,6 +7168,45 @@ impl DatabaseCore {
         Ok(Some(new_version))
     }
 
+    /// Run, on the calling thread, the work a database opened with
+    /// [`Database::open_in_memory`] defers instead of handing to
+    /// background threads: every queued cover refresh (coalesced per target)
+    /// and every pending full-text backfill or sweep. Returns how many units
+    /// ran (refreshed targets plus finished full-text tasks); `0` means there
+    /// was nothing to do. A no-op for a database with background threads.
+    ///
+    /// Call it when the caller is idle (after a batch of writes, or on a
+    /// timer). Never calling it costs only speed: stale covers are read
+    /// through, and the queue grows by one entry per object update.
+    pub fn run_deferred_work(&self) -> usize {
+        let mut done = 0usize;
+        let round: Vec<(u64, u64)> = {
+            let rx = self.cover_refresh_deferred.lock();
+            match rx.as_ref() {
+                Some(rx) => {
+                    let mut seen = std::collections::HashSet::new();
+                    rx.try_iter().filter(|t| seen.insert(*t)).collect()
+                }
+                None => Vec::new(),
+            }
+        };
+        for (type_id, object_id) in round {
+            // Best-effort, as in the worker: the next update re-enqueues a
+            // target whose refresh failed, and readers detect staleness.
+            let _ = self.refresh_covers_for_target(type_id, object_id);
+            done += 1;
+        }
+        if self.storage.is_in_memory() {
+            let before = self.fulltext_builder.pending.load(Ordering::Acquire);
+            if before > 0 {
+                fulltext_build::run_fulltext_tasks(self.self_weak.lock().clone(), &self.fulltext_builder);
+                let after = self.fulltext_builder.pending.load(Ordering::Acquire);
+                done += before.saturating_sub(after);
+            }
+        }
+        done
+    }
+
     /// Hand `(type_id, object_id)` to the cover-refresh worker (after a
     /// committed generation bump). A closed channel (drop in progress) is
     /// fine: readers still detect the stale covers via `__cover_v`.
@@ -7793,8 +7887,8 @@ impl DatabaseCore {
             .map(|m| (m.plan_id, m.converter_name))
             .collect();
 
-        let created_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let created_at_ms = crate::time::SystemTime::now()
+            .duration_since(crate::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
@@ -7893,8 +7987,8 @@ impl DatabaseCore {
             type_names.iter().map(String::as_str).collect();
         let chunk_size = LOGICAL_EXPORT_CHUNK_SIZE;
 
-        let created_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let created_at_ms = crate::time::SystemTime::now()
+            .duration_since(crate::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let vectors_tag = match opts.vectors {
@@ -10513,7 +10607,7 @@ impl DatabaseCore {
         let mut start = prefix.clone();
         loop {
             if let Some(deadline) = limits.deadline
-                && std::time::Instant::now() >= deadline
+                && crate::time::Instant::now() >= deadline
             {
                 return Err(EngineError::FulltextDeadlineExceeded {
                     type_name: type_name.into(),

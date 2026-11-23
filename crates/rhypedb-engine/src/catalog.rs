@@ -61,7 +61,7 @@ use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::lsm::LsmTree;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::time::{SystemTime, UNIX_EPOCH};
 
 /// Process-wide mutex serialising catalog open/reconcile operations.
 ///

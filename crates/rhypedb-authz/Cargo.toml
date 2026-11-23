@@ -23,6 +23,12 @@ thiserror = { workspace = true }
 # weight is pulled into the authz crate.
 rhypedb-schema = { workspace = true }
 
+# wasm32-unknown-unknown (a browser Web Worker): `SystemTime::now` panics
+# there, so `web-time` supplies the JavaScript host's clock. Not built for any
+# other target.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+web-time = "1"
+
 [dev-dependencies]
 # The verify half is exercised against tokens minted by an in-test signer, so
 # tests need the signing side of ed25519-dalek even though the crate itself only
