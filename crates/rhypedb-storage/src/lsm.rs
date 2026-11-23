@@ -140,7 +140,7 @@ impl std::ops::Deref for LsmTree {
 /// The state behind an [`LsmTree`] handle (reached through it via `Deref`).
 /// Shared with the background compaction worker.
 pub struct LsmCore {
-    /// Single-writer guard for `config.data_dir`: an advisory `flock` (held for
+    /// Single-writer guard for `config.data_dir`: an OS file lock (held for
     /// this tree's lifetime, released when this field drops) plus an owner-fence
     /// token re-checked at destructive boundaries. The core drops only after
     /// `Drop for LsmTree` has joined the compaction worker (the worker's own
@@ -3470,6 +3470,9 @@ mod tests {
         let _t2 = LsmTree::open(test_config(dir.path())).unwrap();
     }
 
+    // Stamps LOCK by path while held, simulating a no-op lock; Windows'
+    // mandatory lock refuses the write (see `crate::lock`).
+    #[cfg(unix)]
     #[test]
     fn flush_halts_when_owner_token_stomped() {
         let dir = tempfile::tempdir().unwrap();
@@ -3506,6 +3509,7 @@ mod tests {
 
     /// Sorted list of `*.sst` filenames in a data dir's `sst/` subdir — used to
     /// assert a halted destructive boundary did NOT touch the on-disk SST set.
+    #[cfg(unix)] // only the unix-only owner-fence tests use it
     fn sst_file_names(sst_dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(sst_dir)
             .unwrap()
@@ -3521,6 +3525,9 @@ mod tests {
     /// boundary; compaction is a separate `verify_owner` call site). A foreign
     /// owner-stamp must halt compaction BEFORE it writes the merged SST or unlinks
     /// any input — proven by the SST set being byte-for-byte unchanged after the halt.
+    // Stamps LOCK by path while held, simulating a no-op lock; Windows'
+    // mandatory lock refuses the write (see `crate::lock`).
+    #[cfg(unix)]
     #[test]
     fn compaction_halts_when_owner_token_stomped() {
         let dir = tempfile::tempdir().unwrap();
@@ -3575,6 +3582,9 @@ mod tests {
     /// return an error. After a halted flush, a cold reopen must still recover
     /// both the SST-resident group AND the WAL-resident group: a halt that
     /// truncated the WAL or wrote a colliding SST first would lose/corrupt one.
+    // Stamps LOCK by path while held, simulating a no-op lock; Windows'
+    // mandatory lock refuses the write (see `crate::lock`).
+    #[cfg(unix)]
     #[test]
     fn owner_fence_halt_preserves_committed_data() {
         let dir = tempfile::tempdir().unwrap();

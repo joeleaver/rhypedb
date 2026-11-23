@@ -2532,7 +2532,14 @@ mod tests {
             );
             assert_eq!(r.max_version().unwrap(), 900);
             assert_eq!(r.max_entry_count(), 4);
-            let all: Vec<_> = r.iter().collect();
+            // Copy out of the mmap: `iter` hands back zero-copy slices, and a
+            // live slice keeps the file mapped. Windows refuses to rewrite a
+            // mapped file (ERROR_USER_MAPPED_FILE), so nothing may still point
+            // into it when `strip_meta_to_legacy` runs.
+            let all: Vec<_> = r
+                .iter()
+                .map(|(k, v)| (Bytes::copy_from_slice(&k), v.map(|b| Bytes::copy_from_slice(&b))))
+                .collect();
             drop(r);
 
             strip_meta_to_legacy(&path);

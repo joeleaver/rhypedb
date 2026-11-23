@@ -34,11 +34,14 @@ rand = { workspace = true }
 thiserror = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
-# Advisory `flock(2)` on the data dir (layer 1 of the single-writer guard).
-# Target-gated: the lock engages only on unix; other platforms fall through to
-# the owner-fence (layer 2), which makes a double-open detectable regardless.
+# `gethostname` for the LOCK file's diagnostics, plus `malloc_trim`/`madvise`.
+# (The data-dir lock itself is `std::fs::File::try_lock` on every platform.)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `GetComputerNameExW` for the LOCK file's `host=` diagnostic on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 # wasm32-unknown-unknown (a browser Web Worker): `std::time::Instant::now` and
 # `SystemTime::now` panic there, so `web-time` supplies the JavaScript host's
