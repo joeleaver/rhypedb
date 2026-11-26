@@ -167,6 +167,31 @@ Post.get(7).delete()
 
 `delete` honours the `@on_delete` policies declared in your schema (`remove` / `cascade` / `deny`).
 
+#### Guarded writes (compare-and-set)
+
+A write after a filter re-checks that filter on every object, atomically with the write, so a filter on a field's old value works as compare-and-set:
+
+```
+Account.filter(.handle == "h" && .step == 41).update({ step: 42 })
+Ledger.filter(.key == "k" && .high_water < 900).update({ high_water: 900 })
+Session.filter(.token == "t" && .revoked == false).delete()
+```
+
+The filter selects objects on a snapshot. Each selected object is then written in its own transaction, which re-reads the object and evaluates the filter again on its **current committed version**:
+
+- If the object is gone, or no longer matches, it is skipped: not written, not returned by `update`, and no change event is emitted.
+- If it still matches, the write commits only if no other transaction has written the object since that read. If one has, the write is retried from a fresh read and a fresh check; the database does this internally, so contention shows up as a skipped object, not as an error.
+
+So any number of concurrent statements guarded on the same old value apply **exactly once**: one writes the object, and every other one finds it no longer matches. The caller tells which happened from the result: `update` returns only the objects it wrote (an empty list when it wrote none). `delete`, `link` and `unlink` return no rows, so to learn whether a guarded delete applied, re-read the object (or guard an `update` instead).
+
+The guarantee covers `.update`, `.delete`, `.link` and `.unlink`, and the predicates it re-checks are the ones about the written objects themselves: the source filter and every `.filter()` after the last traversal. `.limit`, `.offset`, `.similar` and `.matches` in between keep them. A filter **before** a traversal constrained other objects, which the write does not lock, so it is not re-checked: `User.filter(.active == true).posts.delete()` deletes the posts of users that were active when the filter ran.
+
+Writes without a filter behave as before: `T.get(id).update(...)` writes the object as it is now and fails if it does not exist; `T.update(...)` (every object) skips an object deleted since the scan.
+
+The guarantee is **per object, not per statement**. A statement that writes several objects runs one transaction per object, so another reader can see some of them written and others not yet, and an error part-way (a unique-constraint violation, say) leaves the objects before it written. Use one object as the compare-and-set point when several must change together.
+
+A write gives up with a write-conflict error only after many consecutive conflicts on the same object (other writers changing it continuously while it still matches); retrying the statement is then safe.
+
 ### Links — `.link`, `.unlink`
 
 Create or remove a relationship between objects. Edge-field values (if the relationship declares any) go in the optional object literal.

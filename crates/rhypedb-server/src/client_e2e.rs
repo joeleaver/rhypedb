@@ -25,6 +25,11 @@ use rhypedb_client::{
 mod generated;
 use generated::{Doc, Thing, User};
 
+// Concurrent guarded (compare-and-set) updates over the wire; reuses this
+// module's real-server harness.
+#[path = "client_e2e_cas.rs"]
+mod cas;
+
 /// The schema the fixture was generated from. Kept byte-identical to the SDL fed
 /// to `rhypedb-codegen` (asserted by `generated_fixture_is_in_sync`). `Thing`
 /// exercises DateTime/Bytes/Json round-trips; `Tag` is relation-only (its

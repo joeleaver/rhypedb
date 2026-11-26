@@ -19,6 +19,7 @@ use crate::fulltext::{
 };
 
 mod fulltext_build;
+mod guarded;
 mod versions;
 #[cfg(test)]
 mod cover_peer_tests;
@@ -26,7 +27,10 @@ mod cover_peer_tests;
 mod link_peers_tests;
 #[cfg(test)]
 mod generation_race_tests;
+#[cfg(test)]
+mod guarded_tests;
 pub(crate) use versions::VersionCounters;
+pub use guarded::ObjectGuard;
 use crate::object::{
     FieldMap, Object, Value, deserialize_fields, deserialize_fields_projected, extract_field,
     serialize_fields,
@@ -5961,6 +5965,26 @@ impl DatabaseCore {
         updates: FieldMap,
         origin: Option<u64>,
     ) -> EngineResult<Object> {
+        self.update_once(type_name, object_id, updates, origin, None)?
+            .ok_or_else(|| EngineError::ObjectNotFound {
+                type_name: type_name.into(),
+                object_id,
+            })
+    }
+
+    /// One update attempt in one transaction. With `guard`, the object is
+    /// written only if it exists and `guard` accepts its current committed
+    /// fields; otherwise nothing is staged and the result is `Ok(None)`.
+    /// Without one, a missing object is `ObjectNotFound` (never `Ok(None)`).
+    /// [`update_if`](Self::update_if) owns the conflict retry.
+    fn update_once(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        updates: FieldMap,
+        origin: Option<u64>,
+        guard: Option<ObjectGuard<'_>>,
+    ) -> EngineResult<Option<Object>> {
         let _migration_guard = self.migration_lock.read();
         let _maintenance_guard = self.maintenance_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
@@ -5988,15 +6012,24 @@ impl DatabaseCore {
         let key = KeyBuilder::object(type_id, object_id);
         let mut txn = self.storage.begin_txn();
 
-        let existing_data =
-            self.storage
-                .get(&txn, &key)?
-                .ok_or_else(|| EngineError::ObjectNotFound {
-                    type_name: type_name.into(),
-                    object_id,
-                })?;
+        let Some(existing_data) = self.storage.get(&txn, &key)? else {
+            if guard.is_some() {
+                return Ok(None); // gone since the filter ran: no longer matches
+            }
+            return Err(EngineError::ObjectNotFound {
+                type_name: type_name.into(),
+                object_id,
+            });
+        };
 
         let mut fields = deserialize_fields(&existing_data);
+        // The compare half of compare-and-set: decided on the version this
+        // transaction read. The `o:` put below puts the key in the write set,
+        // so a writer that commits after our snapshot makes this commit fail
+        // with `WriteConflict` (and `update_if` re-reads and re-decides).
+        if guard.is_some_and(|g| !g(&fields)) {
+            return Ok(None);
+        }
 
         // Check unique constraints for updated fields. This touches a SINGLE
         // object, so there are no earlier rows whose buffered unique puts a
@@ -6142,12 +6175,12 @@ impl DatabaseCore {
                 Some(fields_to_json(&fields))
             });
 
-        Ok(Object {
+        Ok(Some(Object {
             type_name: type_name.into(),
             id: object_id,
             fields,
             raw_fields: None,
-        })
+        }))
     }
 
     /// Stage all cover/index maintenance for an object whose `o:` blob is being
@@ -6282,11 +6315,33 @@ impl DatabaseCore {
         object_id: u64,
         origin: Option<u64>,
     ) -> EngineResult<()> {
+        self.delete_once(type_name, object_id, origin, None).map(|_| ())
+    }
+
+    /// One delete attempt in one transaction. With `guard`, the object is
+    /// deleted only if it exists and `guard` accepts its current committed
+    /// fields; otherwise nothing is staged and the result is `Ok(false)`.
+    /// Without one, a missing object is `ObjectNotFound`.
+    /// [`delete_if`](Self::delete_if) owns the conflict retry.
+    fn delete_once(
+        &self,
+        type_name: &str,
+        object_id: u64,
+        origin: Option<u64>,
+        guard: Option<ObjectGuard<'_>>,
+    ) -> EngineResult<bool> {
         let _migration_guard = self.migration_lock.read();
         let _maintenance_guard = self.maintenance_lock.read();
         let type_id = self.resolve_type_id(type_name)?;
 
         let mut txn = self.storage.begin_txn();
+        // The tombstone of the `o:` key puts it in the write set, so the guard's
+        // decision is protected against a later commit to the object.
+        if let Some(g) = guard
+            && !self.guard_accepts(&txn, type_id, object_id, g)?
+        {
+            return Ok(false);
+        }
         // type_id keyed instead of (String, u64) — drops a String alloc
         // per cascaded object. At K=100 that's 100 fewer allocations per
         // User delete. The value is the deleted object's scalar fields,
@@ -6368,7 +6423,7 @@ impl DatabaseCore {
                 .publish_with(version, ChangeKind::Delete, type_name, del_id, origin, || fields);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Internal recursive delete. The `deleted` set prevents infinite loops
@@ -6772,6 +6827,23 @@ impl DatabaseCore {
         target_id: u64,
         edge_fields: Option<FieldMap>,
     ) -> EngineResult<()> {
+        self.link_once(source_type, source_id, field_name, target_id, edge_fields, None)
+            .map(|_| ())
+    }
+
+    /// One link attempt in one transaction. With `guard`, the edge is written
+    /// only if the SOURCE exists and `guard` accepts its current committed
+    /// fields (`Ok(false)` otherwise); a missing target is still an error.
+    /// [`link_if`](Self::link_if) owns the conflict retry.
+    fn link_once(
+        &self,
+        source_type: &str,
+        source_id: u64,
+        field_name: &str,
+        target_id: u64,
+        edge_fields: Option<FieldMap>,
+        guard: Option<ObjectGuard<'_>>,
+    ) -> EngineResult<bool> {
         let _migration_guard = self.migration_lock.read();
         let _maintenance_guard = self.maintenance_lock.read();
         let source_type_id = self.resolve_type_id(source_type)?;
@@ -6824,6 +6896,13 @@ impl DatabaseCore {
 
         let mut txn = self.storage.begin_txn();
 
+        // A link does not write the source's `o:` blob, so the guard records a
+        // read guard on it: a later commit to the source fails this one.
+        if let Some(g) = guard
+            && !self.guard_accepts_and_pin(&mut txn, source_type_id, source_id, g)?
+        {
+            return Ok(false);
+        }
         let source_key = KeyBuilder::object(source_type_id, source_id);
         let source_data = self.storage.get(&txn, &source_key)?;
         if source_data.is_none() {
@@ -6932,7 +7011,7 @@ impl DatabaseCore {
             self.enqueue_cover_refresh(source_type_id, source_id);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Remove a relationship between two objects.
@@ -6943,6 +7022,22 @@ impl DatabaseCore {
         field_name: &str,
         target_id: u64,
     ) -> EngineResult<()> {
+        self.unlink_once(source_type, source_id, field_name, target_id, None)
+            .map(|_| ())
+    }
+
+    /// One unlink attempt in one transaction. With `guard`, the edge is removed
+    /// only if the source exists and `guard` accepts its current committed
+    /// fields (`Ok(false)` otherwise). [`unlink_if`](Self::unlink_if) owns the
+    /// conflict retry.
+    fn unlink_once(
+        &self,
+        source_type: &str,
+        source_id: u64,
+        field_name: &str,
+        target_id: u64,
+        guard: Option<ObjectGuard<'_>>,
+    ) -> EngineResult<bool> {
         let _migration_guard = self.migration_lock.read();
         let _maintenance_guard = self.maintenance_lock.read();
         let source_type_id = self.resolve_type_id(source_type)?;
@@ -6968,6 +7063,11 @@ impl DatabaseCore {
         }
 
         let mut txn = self.storage.begin_txn();
+        if let Some(g) = guard
+            && !self.guard_accepts_and_pin(&mut txn, source_type_id, source_id, g)?
+        {
+            return Ok(false);
+        }
 
         let edge_key = KeyBuilder::edge(source_id, rel_id, target_id);
         let rev_key = KeyBuilder::reverse_edge(target_id, rel_id, source_id);
@@ -7009,7 +7109,7 @@ impl DatabaseCore {
             self.enqueue_cover_refresh(source_type_id, source_id);
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// The cascade-delete half of [`restage_peer_covers`](Self::restage_peer_covers):
