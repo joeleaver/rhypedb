@@ -11,6 +11,9 @@ use crate::ast::*;
 use crate::error::{QueryError, QueryResult};
 use crate::governor::Governor;
 
+mod mutate;
+use mutate::WriteGuard;
+
 /// Result of executing a query (intermediate or terminal).
 ///
 /// `IdSet` is the streaming traversal variant: between `Step::Traverse` hops we
@@ -187,7 +190,14 @@ pub fn execute(ctx: &ExecContext<'_>, query: &Query) -> QueryResult<QueryOutput>
             result = crate::authz::read_filter_stage(ctx, result)?;
             unfiltered = false;
         }
-        result = execute_step(ctx, result, step, &query.source)?;
+        // A write re-checks the predicates that selected its objects, inside
+        // each object's own transaction (compare-and-set; see `mutate`).
+        let guard = if step.is_write() {
+            mutate::write_guard(&query.source, &query.steps[..i])
+        } else {
+            WriteGuard::Point
+        };
+        result = execute_step(ctx, result, step, &query.source, &guard)?;
         if !matches!(
             step,
             Step::Filter { .. } | Step::Limit { .. } | Step::Offset { .. } | Step::Matches { .. } | Step::Similar { .. }
@@ -439,6 +449,7 @@ fn execute_step(
     current: QueryOutput,
     step: &Step,
     source: &Source,
+    guard: &WriteGuard<'_>,
 ) -> QueryResult<QueryOutput> {
     let db = ctx.db;
     match step {
@@ -772,10 +783,14 @@ fn execute_step(
                 &ids,
                 Some(&field_map),
             )?;
+            // An object the guard skips (gone, or no longer matching) is
+            // neither written nor returned.
             let mut updated = Vec::with_capacity(ids.len());
             for id in &ids {
                 ctx.governor.check_deadline()?;
-                updated.push(db.update(&type_name, *id, field_map.clone())?);
+                if let Some(obj) = mutate::update_one(db, guard, &type_name, *id, &field_map)? {
+                    updated.push(obj);
+                }
             }
             if updated.len() == 1 {
                 Ok(QueryOutput::Single(updated.remove(0)))
@@ -795,7 +810,7 @@ fn execute_step(
             crate::authz::gate_write(ctx, rhypedb_authz::Op::Delete, &type_name, &ids, None)?;
             for id in ids {
                 ctx.governor.check_deadline()?;
-                db.delete(&type_name, id)?;
+                mutate::delete_one(db, guard, &type_name, id)?;
             }
             Ok(QueryOutput::Done)
         }
@@ -830,7 +845,8 @@ fn execute_step(
                 )?)
             };
             for id in ids {
-                db.link(&source_type, id, &field_name, *target_id, edge_map.clone())?;
+                let src = (source_type.as_str(), id, field_name.as_str());
+                mutate::link_one(db, guard, src, *target_id, edge_map.as_ref())?;
             }
             Ok(QueryOutput::Done)
         }
@@ -845,7 +861,8 @@ fn execute_step(
             crate::authz::gate_write(ctx, rhypedb_authz::Op::Update, &source_type, &ids, None)?;
             let field_name = resolve_relation_field(db, &source_type, target_type)?;
             for id in ids {
-                db.unlink(&source_type, id, &field_name, *target_id)?;
+                let src = (source_type.as_str(), id, field_name.as_str());
+                mutate::unlink_one(db, guard, src, *target_id)?;
             }
             Ok(QueryOutput::Done)
         }

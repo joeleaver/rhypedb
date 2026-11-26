@@ -167,6 +167,7 @@ impl TransactionManager {
             snapshot,
             writes: Vec::new(),
             index: HashMap::default(),
+            read_guards: Vec::new(),
             hold: Some(Arc::clone(&self.active_snapshots)),
         }
     }
@@ -206,6 +207,15 @@ impl TransactionManager {
             .collect();
         write_set.sort_unstable();
         write_set.dedup();
+        // Read guards join the conflict check but are not logged: they are not
+        // writes, so no later transaction can conflict with them.
+        let mut guard_set: Vec<u64> = txn
+            .read_guards
+            .iter()
+            .map(|k| self.key_hasher.hash_one(k))
+            .collect();
+        guard_set.sort_unstable();
+        guard_set.dedup();
 
         let mut state = self.commit_mu.lock();
 
@@ -222,7 +232,9 @@ impl TransactionManager {
             if committed.commit_version <= txn.snapshot {
                 continue;
             }
-            if sorted_intersect(&write_set, &committed.write_set) {
+            if sorted_intersect(&write_set, &committed.write_set)
+                || sorted_intersect(&guard_set, &committed.write_set)
+            {
                 // Conflict: return WITHOUT applying or consuming a version.
                 return Err(Error::WriteConflict);
             }
@@ -331,6 +343,10 @@ pub struct Transaction {
     writes: Vec<(Bytes, Option<Bytes>)>,
     /// key → index into `writes`, for O(1) last-write-wins coalescing.
     index: HashMap<Bytes, usize, ahash::RandomState>,
+    /// Keys this transaction READ and decided on, without writing them (see
+    /// [`record_read_guard`](Self::record_read_guard)). Checked for conflicts
+    /// at commit exactly like `writes`, but never applied or logged.
+    read_guards: Vec<Bytes>,
     /// The live hold on `snapshot` in the manager's active set; `Some` until the
     /// txn is finished (commit/abort) or dropped. `take()`-on-release makes the
     /// release exactly-once across commit/abort/drop. It owns no write path, so
@@ -361,6 +377,20 @@ impl Transaction {
     /// Buffer a delete (tombstone) for `key` (last write per key wins).
     pub fn record_delete(&mut self, key: Bytes) {
         self.upsert(key, None);
+    }
+
+    /// Make the commit fail with `WriteConflict` if any transaction that
+    /// committed after this one's snapshot wrote `key`, as if this transaction
+    /// had written it too, but without writing it.
+    ///
+    /// Snapshot isolation only checks write-write overlap, so a decision taken
+    /// on a key the transaction reads but does not write (write skew) is not
+    /// otherwise protected. A guard closes that gap for the one key: the engine
+    /// uses it to make a filter-guarded link/unlink compare-and-set on the
+    /// source object's blob. It has no effect on a transaction with no writes,
+    /// which commits nothing.
+    pub fn record_read_guard(&mut self, key: Bytes) {
+        self.read_guards.push(key);
     }
 
     fn upsert(&mut self, key: Bytes, value: Option<Bytes>) {
@@ -400,254 +430,4 @@ impl Drop for Transaction {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // A no-op apply: the manager-level tests exercise version + conflict logic,
-    // not the WAL/memtable apply (that is covered at the LsmTree level).
-    fn noop_apply(_v: u64, _w: &[(Bytes, Option<Bytes>)]) -> Result<()> {
-        Ok(())
-    }
-
-    #[test]
-    fn basic_commit() {
-        let tm = TransactionManager::new();
-        let mut txn = tm.begin();
-        txn.record_put(Bytes::from("key1"), Bytes::from("v"));
-        let version = tm.commit(&mut txn, noop_apply).unwrap();
-        assert!(version > 0);
-    }
-
-    #[test]
-    fn no_conflict_on_disjoint_writes() {
-        let tm = TransactionManager::new();
-
-        let mut txn1 = tm.begin();
-        let mut txn2 = tm.begin();
-
-        txn1.record_put(Bytes::from("key1"), Bytes::from("v"));
-        txn2.record_put(Bytes::from("key2"), Bytes::from("v"));
-
-        tm.commit(&mut txn1, noop_apply).unwrap();
-        tm.commit(&mut txn2, noop_apply).unwrap(); // different keys → ok
-    }
-
-    #[test]
-    fn conflict_on_overlapping_writes() {
-        let tm = TransactionManager::new();
-
-        let mut txn1 = tm.begin();
-        let mut txn2 = tm.begin();
-
-        txn1.record_put(Bytes::from("key1"), Bytes::from("a"));
-        txn2.record_put(Bytes::from("key1"), Bytes::from("b")); // same key
-
-        tm.commit(&mut txn1, noop_apply).unwrap();
-        let result = tm.commit(&mut txn2, noop_apply);
-        assert!(matches!(result, Err(Error::WriteConflict)));
-        tm.abort(&mut txn2);
-    }
-
-    #[test]
-    fn later_snapshot_sees_committed_writes() {
-        let tm = TransactionManager::new();
-
-        let mut txn1 = tm.begin();
-        txn1.record_put(Bytes::from("key1"), Bytes::from("v"));
-        let v1 = tm.commit(&mut txn1, noop_apply).unwrap();
-
-        let mut txn2 = tm.begin();
-        txn2.record_put(Bytes::from("key1"), Bytes::from("v"));
-        let v2 = tm.commit(&mut txn2, noop_apply).unwrap();
-        assert!(v2 > v1);
-    }
-
-    #[test]
-    fn read_only_transactions_always_commit() {
-        let tm = TransactionManager::new();
-        let mut txn = tm.begin();
-        // No writes buffered.
-        let version = tm.commit(&mut txn, noop_apply).unwrap();
-        assert_eq!(version, txn.snapshot());
-        // A read-only commit consumes no version.
-        assert_eq!(tm.current_version(), 0);
-    }
-
-    #[test]
-    fn visible_version_only_advances_on_a_writing_commit() {
-        let tm = TransactionManager::new();
-        assert_eq!(tm.current_version(), 0);
-        let mut t = tm.begin();
-        t.record_put(Bytes::from("k"), Bytes::from("v"));
-        let v = tm.commit(&mut t, noop_apply).unwrap();
-        assert_eq!(tm.current_version(), v);
-    }
-
-    #[test]
-    fn last_write_wins_coalesces_per_key() {
-        let tm = TransactionManager::new();
-        let mut t = tm.begin();
-        t.record_put(Bytes::from("k"), Bytes::from("v1"));
-        t.record_delete(Bytes::from("k"));
-        t.record_put(Bytes::from("k"), Bytes::from("v2"));
-        assert_eq!(t.writes().len(), 1, "one entry per key");
-        assert_eq!(t.writes()[0].1.as_deref(), Some(&b"v2"[..]));
-    }
-
-    #[test]
-    fn min_active_snapshot_tracking() {
-        let tm = TransactionManager::new();
-        let txn1 = tm.begin();
-        let _txn2 = tm.begin();
-        assert_eq!(tm.min_active_snapshot(), txn1.snapshot());
-    }
-
-    #[test]
-    fn abort_releases_snapshot() {
-        let tm = TransactionManager::new();
-        let mut txn = tm.begin();
-        tm.abort(&mut txn);
-        assert_eq!(tm.min_active_snapshot(), u64::MAX);
-    }
-
-    #[test]
-    fn dropped_read_only_txn_releases_snapshot() {
-        let tm = TransactionManager::new();
-        let txn = tm.begin();
-        assert_eq!(tm.min_active_snapshot(), 0);
-        drop(txn);
-        assert_eq!(tm.min_active_snapshot(), u64::MAX);
-        assert_eq!(tm.active_snapshot_stats(), (0, 0));
-    }
-
-    #[test]
-    fn dropped_read_write_txn_releases_snapshot_and_applies_nothing() {
-        let tm = TransactionManager::new();
-        let mut txn = tm.begin();
-        txn.record_put(Bytes::from("k"), Bytes::from("v"));
-        drop(txn);
-        assert_eq!(tm.min_active_snapshot(), u64::MAX);
-        // Nothing was committed: no version consumed or published.
-        assert_eq!(tm.current_version(), 0);
-        let mut t2 = tm.begin();
-        t2.record_put(Bytes::from("k"), Bytes::from("v2"));
-        assert_eq!(tm.commit(&mut t2, noop_apply).unwrap(), 1);
-    }
-
-    #[test]
-    fn shared_snapshot_refcount_survives_one_drop() {
-        let tm = TransactionManager::new();
-        let a = tm.begin();
-        let b = tm.begin();
-        assert_eq!(a.snapshot(), b.snapshot());
-        assert_eq!(tm.active_snapshot_stats(), (1, 2));
-        drop(a);
-        // b still holds the shared snapshot value.
-        assert_eq!(tm.min_active_snapshot(), b.snapshot());
-        assert_eq!(tm.active_snapshot_stats(), (1, 1));
-        drop(b);
-        assert_eq!(tm.min_active_snapshot(), u64::MAX);
-    }
-
-    #[test]
-    fn commit_or_abort_then_drop_releases_exactly_once() {
-        let tm = TransactionManager::new();
-        // Three txns share snapshot 0; finishing-then-dropping two of them must
-        // not over-decrement the count the third still relies on.
-        let mut ro = tm.begin();
-        let mut rw = tm.begin();
-        let witness = tm.begin();
-        let mut aborted = tm.begin();
-        assert_eq!(tm.active_snapshot_stats(), (1, 4));
-
-        tm.commit(&mut ro, noop_apply).unwrap(); // read-only fast path
-        drop(ro);
-        rw.record_put(Bytes::from("k"), Bytes::from("v"));
-        tm.commit(&mut rw, noop_apply).unwrap(); // writing commit
-        drop(rw);
-        tm.abort(&mut aborted);
-        tm.abort(&mut aborted); // a second abort is a no-op too
-        drop(aborted);
-
-        assert_eq!(tm.active_snapshot_stats(), (1, 1));
-        assert_eq!(tm.min_active_snapshot(), witness.snapshot());
-        drop(witness);
-        assert_eq!(tm.min_active_snapshot(), u64::MAX);
-    }
-
-    /// A transaction that stays open while more commits land than the conflict
-    /// log keeps must not slip a write-write conflict through: the conflicting
-    /// commit's entry may have been trimmed, so the log can no longer prove the
-    /// commit safe — it must refuse (conservatively), never silently overwrite.
-    #[test]
-    fn long_txn_conflict_is_detected_after_log_overflow() {
-        let tm = TransactionManager::new();
-        let mut long = tm.begin();
-        long.record_put(Bytes::from("K"), Bytes::from("long"));
-
-        let mut rival = tm.begin();
-        rival.record_put(Bytes::from("K"), Bytes::from("rival"));
-        tm.commit(&mut rival, noop_apply).unwrap();
-
-        // Far more unrelated commits than the log's capacity. Each writes many
-        // keys so a key-count cap is crossed too.
-        for i in 0..1_100u32 {
-            let mut t = tm.begin();
-            for j in 0..2_000u32 {
-                t.record_put(Bytes::from(format!("other-{i}-{j}")), Bytes::from("x"));
-            }
-            tm.commit(&mut t, noop_apply).unwrap();
-        }
-
-        assert!(
-            matches!(tm.commit(&mut long, noop_apply), Err(Error::WriteConflict)),
-            "lost update: the rival's write to K was overwritten"
-        );
-    }
-
-    /// The trim must not make a long transaction that touched NOTHING in
-    /// common fail... unless the log really had to drop entries it needed.
-    /// Without overflow, a disjoint long transaction commits fine.
-    #[test]
-    fn long_disjoint_txn_commits_without_overflow() {
-        let tm = TransactionManager::new();
-        let mut long = tm.begin();
-        long.record_put(Bytes::from("mine"), Bytes::from("v"));
-        for i in 0..2_000u32 {
-            let mut t = tm.begin();
-            t.record_put(Bytes::from(format!("other-{i}")), Bytes::from("x"));
-            tm.commit(&mut t, noop_apply).unwrap();
-        }
-        tm.commit(&mut long, noop_apply).unwrap();
-    }
-
-    #[test]
-    fn conflict_loser_dropped_without_abort_releases() {
-        let tm = TransactionManager::new();
-        let mut t1 = tm.begin();
-        let mut t2 = tm.begin();
-        t1.record_put(Bytes::from("k"), Bytes::from("a"));
-        t2.record_put(Bytes::from("k"), Bytes::from("b"));
-        tm.commit(&mut t1, noop_apply).unwrap();
-        assert!(matches!(tm.commit(&mut t2, noop_apply), Err(Error::WriteConflict)));
-        drop(t2); // the `?`-propagation shape: no explicit abort
-        assert_eq!(tm.min_active_snapshot(), u64::MAX);
-    }
-
-    #[test]
-    fn apply_error_burns_version_but_does_not_publish() {
-        let tm = TransactionManager::new();
-        let mut t = tm.begin();
-        t.record_put(Bytes::from("k"), Bytes::from("v"));
-        let r = tm.commit(&mut t, |_v, _w| Err(Error::WalCorrupted("boom".into())));
-        assert!(r.is_err());
-        // The failed version (1) is NOT published — readers don't see it.
-        assert_eq!(tm.current_version(), 0);
-        tm.abort(&mut t);
-        // The failed version is BURNED, not reused: the next good commit gets 2,
-        // so it can never alias a page-cached-but-abandoned batch at version 1.
-        let mut t2 = tm.begin();
-        t2.record_put(Bytes::from("k2"), Bytes::from("v"));
-        assert_eq!(tm.commit(&mut t2, noop_apply).unwrap(), 2);
-    }
-}
+mod tests;

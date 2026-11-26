@@ -182,6 +182,8 @@ On Firecracker VM snapshot, the vectorization queue is persisted in the WAL. On 
 - **Snapshot reads** — each transaction sees a consistent point-in-time. Readers never block writers.
 - **Write-write conflict detection** — at commit time, check for overlapping write sets with concurrently committed transactions. Conflict → abort + retry.
 - **Snapshot isolation by default, serializable opt-in.** Snapshot isolation tracks write sets (cheap). Serializable also tracks read sets (more aborts, rarely needed).
+- **Read guards** — a transaction can name a key it read and decided on without writing it (`Transaction::record_read_guard`); the commit then conflicts with any later write to that key, closing write skew for that one key.
+- **Guarded writes are compare-and-set.** A write after a filter (`T.filter(p).update/delete/link/unlink`) re-evaluates `p` on each object inside that object's write transaction (the object key is written or read-guarded, so a concurrent commit conflicts) and skips objects that no longer match; conflicts retry from a fresh read. Per object, not per statement. See `docs/src/queries.md`, "Guarded writes".
 
 ### Version Cleanup
 
