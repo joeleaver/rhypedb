@@ -45,20 +45,25 @@ fn step_of(db: &Database, id: u64) -> u64 {
     }
 }
 
-fn step_is(want: u64) -> impl Fn(&FieldMap) -> bool {
-    move |f| f.get("step") == Some(&Value::U64(want))
+fn step_is(want: u64) -> impl Fn(&GuardView<'_>) -> bool {
+    move |v| v.fields().get("step") == Some(&Value::U64(want))
 }
 
 /// A guard for `step == want` that, on its FIRST call only, commits
 /// `step = competing` to `id` first: the write lands after the guarded
 /// attempt's snapshot, exactly the stale-filter race.
-fn racing_guard(db: &Database, id: u64, want: u64, competing: u64) -> impl Fn(&FieldMap) -> bool {
+fn racing_guard(
+    db: &Database,
+    id: u64,
+    want: u64,
+    competing: u64,
+) -> impl Fn(&GuardView<'_>) -> bool {
     let raced = Cell::new(false);
-    move |f| {
+    move |v| {
         if !raced.replace(true) {
             db.update("Account", id, step_fields(competing)).unwrap();
         }
-        f.get("step") == Some(&Value::U64(want))
+        v.fields().get("step") == Some(&Value::U64(want))
     }
 }
 
@@ -139,10 +144,10 @@ fn update_if_gives_up_after_bounded_conflicts() {
     let id = create(&db, 0);
     let calls = Cell::new(0usize);
     // Every attempt loses to a fresh competing commit that keeps the guard true.
-    let guard = |f: &FieldMap| {
+    let guard = |v: &GuardView<'_>| {
         calls.set(calls.get() + 1);
         db.update("Account", id, step_fields(0)).unwrap();
-        f.get("step") == Some(&Value::U64(0))
+        v.fields().get("step") == Some(&Value::U64(0))
     };
     let out = db.update_if("Account", id, &step_fields(1), None, &guard);
     assert!(matches!(out, Err(EngineError::WriteConflict)), "{out:?}");

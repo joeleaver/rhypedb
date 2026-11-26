@@ -12,10 +12,11 @@
 //!   written and the call reports "not applied" (`None` / `false`);
 //! * the guard accepts: the write is staged, and the object's `o:` key is in
 //!   the commit's conflict set (written by update and delete, pinned with a
-//!   read guard by link and unlink, which do not write it). A writer that
-//!   committed to the object after this transaction's snapshot makes the
-//!   commit fail with `WriteConflict`, so the decision can never rest on a
-//!   stale read.
+//!   read guard by link and unlink, which do not write it), and so is every
+//!   other key the guard read through its `GuardView` (`guard_view.rs`). A
+//!   writer that committed to any of them after this transaction's snapshot
+//!   makes the commit fail with `WriteConflict`, so the decision can never
+//!   rest on a stale read.
 //!
 //! On `WriteConflict` the attempt is retried from scratch: a fresh snapshot, a
 //! fresh read, a fresh guard decision. This is safe because nothing from the
@@ -34,10 +35,13 @@ use crate::object::{FieldMap, Object, deserialize_fields};
 use rhypedb_storage::key::KeyBuilder;
 use rhypedb_storage::mvcc::Transaction;
 
-/// A guard over an object's current committed fields: `true` = still matches,
-/// write it; `false` = skip it. It must be a pure function of the fields (it
-/// may run more than once per object, once per attempt).
-pub type ObjectGuard<'a> = &'a dyn Fn(&FieldMap) -> bool;
+/// A guard over an object's current committed version: `true` = still
+/// matches, write it; `false` = skip it. It sees the object's fields and may
+/// read other stored state (relations, other objects) through the
+/// [`GuardView`](super::GuardView), all at the write's snapshot; whatever it
+/// read joins the commit's conflict check. It runs once per attempt, so it
+/// must decide from what it reads, not from what an earlier attempt saw.
+pub type ObjectGuard<'a> = &'a dyn Fn(&super::GuardView<'_>) -> bool;
 
 /// Attempts per guarded write before a `WriteConflict` is surfaced. Each
 /// conflict means another transaction committed to a key this one touched,
@@ -137,38 +141,30 @@ impl DatabaseCore {
         })
     }
 
-    /// Whether the object exists at `txn`'s snapshot and `guard` accepts its
-    /// fields. Reads only: the caller's writes must put the `o:` key in the
-    /// conflict set (a delete tombstones it), or use
-    /// [`guard_accepts_and_pin`](Self::guard_accepts_and_pin).
+    /// Whether the object exists at `txn`'s snapshot and `guard` accepts it.
+    /// When it does, the object's `o:` key and everything the guard read
+    /// through its [`GuardView`](super::GuardView) are pinned with read guards,
+    /// so the commit conflicts with any later write to them (needed by callers
+    /// that do not write the `o:` key themselves: link and unlink).
     pub(super) fn guard_accepts(
         &self,
-        txn: &Transaction,
-        type_id: u64,
+        txn: &mut Transaction,
+        (type_name, type_id): (&str, u64),
         object_id: u64,
         guard: ObjectGuard<'_>,
     ) -> EngineResult<bool> {
         let key = KeyBuilder::object(type_id, object_id);
-        Ok(match self.storage.get(txn, &key)? {
-            Some(blob) => guard(&deserialize_fields(&blob)),
-            None => false,
-        })
-    }
-
-    /// [`guard_accepts`](Self::guard_accepts), and when it does, pin the
-    /// object's `o:` key with a read guard so the commit conflicts with any
-    /// later write to the object, for callers (link, unlink) that do not write
-    /// that key themselves.
-    pub(super) fn guard_accepts_and_pin(
-        &self,
-        txn: &mut Transaction,
-        type_id: u64,
-        object_id: u64,
-        guard: ObjectGuard<'_>,
-    ) -> EngineResult<bool> {
-        let accepted = self.guard_accepts(txn, type_id, object_id, guard)?;
+        let Some(blob) = self.storage.get(txn, &key)? else {
+            return Ok(false);
+        };
+        let accepted = self.run_guard(
+            txn,
+            (type_name, object_id),
+            &deserialize_fields(&blob),
+            guard,
+        );
         if accepted {
-            txn.record_read_guard(KeyBuilder::object(type_id, object_id));
+            txn.record_read_guard(key);
         }
         Ok(accepted)
     }

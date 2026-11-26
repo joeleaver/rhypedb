@@ -194,6 +194,20 @@ The guarantee is **per object, not per statement**. A statement that writes seve
 
 A write gives up with a write-conflict error only after many consecutive conflicts on the same object (other writers changing it continuously while it still matches); retrying the statement is then safe.
 
+#### Security rules are checked atomically with the write
+
+Under security rules, the `update` and `delete` rules (and the `update` rule that gates `.link` / `.unlink` on the source object) are decided **inside each object's write transaction, on the version of the object that write is based on** — for point writes (`T.get(id).update(...)`) as well as filtered ones. Everything the rule reads joins that transaction's conflict check:
+
+- the object's own fields (`resource.ownerUid`);
+- the edges of every relation the rule follows (`resource.editors`, including `@inverse` fields) — an edge added, removed or replaced by another writer counts;
+- the fields of the linked objects it reads (`resource.editors.uid`).
+
+If another transaction changes any of these after the write's snapshot, the write is retried from a fresh read and the rule is evaluated again. So a write lands only if the rule allowed it on the state it actually committed over: revoking ownership, removing an editor or adding someone to a deny-list takes effect for every write that commits after the change, with no window in between. A denied object is reported as a permission error and nothing is written for it (no field, index, edge or change event).
+
+The rule is also checked once on the query's snapshot before any object is written, so a statement the rules refuse on any of its objects is normally refused whole. Like the compare-and-set guarantee above, the atomic check is **per object**: if a rule input changes while a multi-object statement is running, the objects written before the change stay written and the statement stops with a permission error at the first object the rule now refuses.
+
+A `create` rule sees only the incoming fields (`request.*`), which no other writer can change, so it has nothing to race.
+
 ### Links — `.link`, `.unlink`
 
 Create or remove a relationship between objects. Edge-field values (if the relationship declares any) go in the optional object literal.

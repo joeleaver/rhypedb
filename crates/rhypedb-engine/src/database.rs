@@ -19,6 +19,7 @@ use crate::fulltext::{
 };
 
 mod fulltext_build;
+mod guard_view;
 mod guarded;
 mod versions;
 #[cfg(test)]
@@ -28,8 +29,11 @@ mod link_peers_tests;
 #[cfg(test)]
 mod generation_race_tests;
 #[cfg(test)]
+mod guard_view_tests;
+#[cfg(test)]
 mod guarded_tests;
 pub(crate) use versions::VersionCounters;
+pub use guard_view::GuardView;
 pub use guarded::ObjectGuard;
 use crate::object::{
     FieldMap, Object, Value, deserialize_fields, deserialize_fields_projected, extract_field,
@@ -4282,6 +4286,7 @@ impl DatabaseCore {
         // "first link empty, second link covers" asymmetry.
         for (i, link) in links.iter().enumerate() {
             let (field_name, target_id, _, _, _, rel_id, _) = link;
+            guard_view::claim_edge_sets(txn, object_id, *rel_id, *target_id);
             puts.push((
                 KeyBuilder::edge(object_id, *rel_id, *target_id),
                 Bytes::new(),
@@ -6027,7 +6032,9 @@ impl DatabaseCore {
         // transaction read. The `o:` put below puts the key in the write set,
         // so a writer that commits after our snapshot makes this commit fail
         // with `WriteConflict` (and `update_if` re-reads and re-decides).
-        if guard.is_some_and(|g| !g(&fields)) {
+        if let Some(g) = guard
+            && !self.run_guard(&mut txn, (type_name, object_id), &fields, g)
+        {
             return Ok(None);
         }
 
@@ -6338,7 +6345,7 @@ impl DatabaseCore {
         // The tombstone of the `o:` key puts it in the write set, so the guard's
         // decision is protected against a later commit to the object.
         if let Some(g) = guard
-            && !self.guard_accepts(&txn, type_id, object_id, g)?
+            && !self.guard_accepts(&mut txn, (type_name, type_id), object_id, g)?
         {
             return Ok(false);
         }
@@ -6899,7 +6906,7 @@ impl DatabaseCore {
         // A link does not write the source's `o:` blob, so the guard records a
         // read guard on it: a later commit to the source fails this one.
         if let Some(g) = guard
-            && !self.guard_accepts_and_pin(&mut txn, source_type_id, source_id, g)?
+            && !self.guard_accepts(&mut txn, (source_type, source_type_id), source_id, g)?
         {
             return Ok(false);
         }
@@ -6976,6 +6983,7 @@ impl DatabaseCore {
 
         self.storage.put(&mut txn, &edge_key, edge_value)?;
         self.storage.put(&mut txn, &rev_key, rev_value)?;
+        guard_view::claim_edge_sets(&mut txn, source_id, rel_id, target_id);
 
         // A to-one link changes a peer id that the source's OTHER reverse
         // edges carry (and that covers embedding the source carry nested):
@@ -7064,7 +7072,7 @@ impl DatabaseCore {
 
         let mut txn = self.storage.begin_txn();
         if let Some(g) = guard
-            && !self.guard_accepts_and_pin(&mut txn, source_type_id, source_id, g)?
+            && !self.guard_accepts(&mut txn, (source_type, source_type_id), source_id, g)?
         {
             return Ok(false);
         }
@@ -7082,6 +7090,7 @@ impl DatabaseCore {
 
         self.storage.delete(&mut txn, &edge_key)?;
         self.storage.delete(&mut txn, &rev_key)?;
+        guard_view::claim_edge_sets(&mut txn, source_id, rel_id, target_id);
 
         let bumped = if existed {
             // The relation's peer from now on: any OTHER edge it still has.
