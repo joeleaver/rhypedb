@@ -12,6 +12,10 @@ use crate::sst::{SstCompression, SstReader, SstWriter};
 use crate::wal::{RecordType, Wal};
 use crate::{Error, Result};
 
+mod bounded_scan;
+
+pub use bounded_scan::ChunkScan;
+
 const DEFAULT_MEMTABLE_FLUSH_SIZE: usize = 4 * 1024 * 1024; // 4MB
 const DEFAULT_COMPACT_TRIGGER_SSTS: usize = 4;
 
@@ -185,36 +189,6 @@ pub struct LsmCore {
     /// which `Drop` signals shutdown).
     compaction_state:
         Arc<(parking_lot::Mutex<CompactionState>, parking_lot::Condvar)>,
-}
-
-/// One bounded, tombstone-aware step of a resumable range scan
-/// (`LsmTree::scan_chunk_raw`). Built for chunked work that must walk an
-/// entire key range exactly once across crashes — e.g. shadow-field
-/// field-type migrations.
-#[derive(Debug, Clone)]
-pub struct ChunkScan {
-    /// Live (non-tombstone) entries in this chunk, ascending by key. Drawn
-    /// from the globally-smallest `max_distinct` RAW keys at/after the start
-    /// point; may be shorter than `max_distinct` (or empty) when the chunk
-    /// straddles a run of tombstones.
-    pub live: Vec<(Bytes, Bytes)>,
-    /// Highest RAW user key visited this chunk, INCLUDING tombstones. `None`
-    /// iff no key — live or tombstoned — exists at/after the start point
-    /// within `prefix` (the range is exhausted). A resumable caller advances
-    /// its cursor to this key so a tombstone run longer than `max_distinct`
-    /// cannot strand live keys beyond it (which a `scan_from_at_limited`
-    /// caller, seeing only live keys, would do).
-    pub high_water: Option<Bytes>,
-    /// `true` when more keys may exist strictly past `high_water`: either a
-    /// source saturated its `max_distinct` window, or the merged set held
-    /// more than `max_distinct` distinct keys. `false` PROVES the range ends
-    /// at `high_water`. NEVER infer end-of-range from `live.len() <
-    /// max_distinct`; only `!more` (or `high_water == None`) is sound.
-    pub more: bool,
-    /// RAW keys taken this chunk, live AND tombstoned (`>= live.len()`). A
-    /// caller that budgets work must charge this, not `live.len()`: a long
-    /// tombstone run is real merge work that yields no live rows.
-    pub visited: usize,
 }
 
 /// Best-effort unlink of the partial `<sst_path>.tmp` an [`SstWriter`] leaves
@@ -754,204 +728,6 @@ impl LsmCore {
         layers.push(active.scan_prefix(prefix, version));
 
         Ok(merge_layers_newest_wins(layers))
-    }
-
-    /// Bounded prefix scan: returns at most `max_distinct` user keys, each
-    /// the latest visible version. Designed for `LIMIT N` push-down on
-    /// secondary indexes where the result set is sorted by (encoded_value,
-    /// object_id) and the caller only wants the first N matches.
-    ///
-    /// **Per-layer scan cap.** Each layer is asked for up to `max_distinct`
-    /// user keys. For workloads where the same key is rarely tombstoned, the
-    /// merged set already contains the first `max_distinct` results — the
-    /// per-layer walk stops after ~N entries instead of scanning the full
-    /// prefix. For workloads where the top layer tombstones the first N
-    /// entries of a lower layer, the merged result may contain fewer than
-    /// `max_distinct` live entries. Callers tolerant of that (secondary
-    /// indexes on append-mostly data) should prefer this; transactional
-    /// reads should not.
-    pub fn scan_prefix_at_limited(
-        &self,
-        version: u64,
-        prefix: &[u8],
-        max_distinct: usize,
-    ) -> Result<Vec<(Bytes, Bytes)>> {
-        if max_distinct == 0 {
-            return Ok(Vec::new());
-        }
-        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
-            std::collections::BTreeMap::new();
-
-        let ssts = self.sst_files.read();
-        for sst in ssts.iter() {
-            for (key, value) in sst.scan_prefix_max(prefix, version, max_distinct) {
-                merged.insert(key, value);
-            }
-        }
-        drop(ssts);
-
-        let immutables = self.immutable_memtables.read().clone();
-        for mt in immutables.iter() {
-            for (key, value) in mt.scan_prefix_max(prefix, version, max_distinct) {
-                merged.insert(key, value);
-            }
-        }
-
-        let active = self.active_memtable.read().clone();
-        for (key, value) in active.scan_prefix_max(prefix, version, max_distinct) {
-            merged.insert(key, value);
-        }
-
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
-            .take(max_distinct)
-            .collect())
-    }
-
-    /// Seek-then-scan bounded range scan. Skip everything below
-    /// `start_user_key`, then emit at most `max_distinct` live user keys
-    /// from within the `prefix` range. Same tombstone-shadow caveat as
-    /// `scan_prefix_at_limited`.
-    pub fn scan_from_at_limited(
-        &self,
-        version: u64,
-        prefix: &[u8],
-        start_user_key: &[u8],
-        max_distinct: usize,
-    ) -> Result<Vec<(Bytes, Bytes)>> {
-        if max_distinct == 0 {
-            return Ok(Vec::new());
-        }
-        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
-            std::collections::BTreeMap::new();
-
-        let ssts = self.sst_files.read();
-        for sst in ssts.iter() {
-            for (key, value) in sst.scan_from_max(prefix, start_user_key, version, max_distinct) {
-                merged.insert(key, value);
-            }
-        }
-        drop(ssts);
-
-        let immutables = self.immutable_memtables.read().clone();
-        for mt in immutables.iter() {
-            for (key, value) in mt.scan_from_max(prefix, start_user_key, version, max_distinct) {
-                merged.insert(key, value);
-            }
-        }
-
-        let active = self.active_memtable.read().clone();
-        for (key, value) in active.scan_from_max(prefix, start_user_key, version, max_distinct) {
-            merged.insert(key, value);
-        }
-
-        Ok(merged
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
-            .take(max_distinct)
-            .collect())
-    }
-
-    /// Tombstone-aware bounded range scan for resumable chunked work.
-    ///
-    /// Unlike `scan_from_at_limited`, which drops tombstones BEFORE applying
-    /// the `max_distinct` cap (so neither its result count nor its max live
-    /// key can detect end-of-range across a tombstone run longer than the
-    /// cap), this returns the live entries PLUS a tombstone-inclusive
-    /// `high_water` and a sound `more` flag. A caller advances its cursor to
-    /// `high_water` each step and stops only when `!more` (or `high_water`
-    /// is `None`). See [`ChunkScan`].
-    ///
-    /// `start_user_key` is inclusive (same seek semantics as
-    /// `scan_from_at_limited`); pass the key strictly after the last cursor
-    /// to avoid re-visiting it.
-    ///
-    /// Requires a PREFIX-FREE keyspace under `prefix` (no user key a strict
-    /// prefix of another): fixed-length ids or escaped-and-terminated values.
-    /// See [`crate::key::debug_assert_prefix_free`] for why, and for the
-    /// debug-build guard that enforces it.
-    pub fn scan_chunk_raw(
-        &self,
-        version: u64,
-        prefix: &[u8],
-        start_user_key: &[u8],
-        max_distinct: usize,
-    ) -> Result<ChunkScan> {
-        if max_distinct == 0 {
-            return Ok(ChunkScan {
-                live: Vec::new(),
-                high_water: None,
-                more: false,
-                visited: 0,
-            });
-        }
-        let mut merged: std::collections::BTreeMap<Bytes, Option<Bytes>> =
-            std::collections::BTreeMap::new();
-        // A source is "saturated" when it returns a full `max_distinct`
-        // window — it may hold more keys past the window we can't see yet.
-        let mut source_saturated = false;
-
-        let ssts = self.sst_files.read();
-        for sst in ssts.iter() {
-            let rows = sst.scan_from_max(prefix, start_user_key, version, max_distinct);
-            source_saturated |= rows.len() == max_distinct;
-            for (key, value) in rows {
-                merged.insert(key, value);
-            }
-        }
-        drop(ssts);
-
-        let immutables = self.immutable_memtables.read().clone();
-        for mt in immutables.iter() {
-            let rows = mt.scan_from_max(prefix, start_user_key, version, max_distinct);
-            source_saturated |= rows.len() == max_distinct;
-            for (key, value) in rows {
-                merged.insert(key, value);
-            }
-        }
-
-        let active = self.active_memtable.read().clone();
-        let rows = active.scan_from_max(prefix, start_user_key, version, max_distinct);
-        source_saturated |= rows.len() == max_distinct;
-        for (key, value) in rows {
-            merged.insert(key, value);
-        }
-
-        // More keys may lie past `high_water` if either a source saturated
-        // its window OR the merged (deduped) set already holds more than we
-        // will take — the latter catches the case where several unsaturated
-        // sources together overflow `max_distinct` distinct keys (a pure
-        // any-source-saturated test would falsely report exhaustion here and
-        // strand the overflow).
-        let more = source_saturated || merged.len() > max_distinct;
-
-        // Take the globally-smallest `max_distinct` RAW keys (tombstones
-        // included). Each source contributed its own smallest `max_distinct`
-        // keys, so every key in the true global smallest-`max_distinct` is
-        // present: a key with < `max_distinct` keys below it across all
-        // sources has < `max_distinct` keys below it in whichever source
-        // holds it, so it sits inside that source's returned window.
-        let mut high_water: Option<Bytes> = None;
-        let mut live: Vec<(Bytes, Bytes)> = Vec::new();
-        let mut visited = 0usize;
-        for (k, v) in merged.into_iter().take(max_distinct) {
-            visited += 1;
-            match v {
-                Some(val) => {
-                    high_water = Some(k.clone());
-                    live.push((k, val));
-                }
-                None => high_water = Some(k),
-            }
-        }
-
-        Ok(ChunkScan {
-            live,
-            high_water,
-            more,
-            visited,
-        })
     }
 
     /// Scan for all keys with the given prefix, visible at the given snapshot
@@ -2148,11 +1924,11 @@ mod tests {
     }
 
     // The load-bearing correctness property: a run of tombstones LONGER than
-    // the chunk size must not strand the live keys beyond it. A
-    // `scan_from_at_limited` caller (which sees only live keys) would land
-    // its cursor inside the run, get an empty result, and wrongly conclude
-    // end-of-range. scan_chunk_raw's tombstone-inclusive high_water walks
-    // straight through.
+    // the chunk size must not strand the live keys beyond it. A caller that
+    // resumed from the last LIVE key a one-shot bounded window returned would
+    // land its cursor inside the run, get an empty window, and wrongly
+    // conclude end-of-range. scan_chunk_raw's tombstone-inclusive high_water
+    // walks straight through.
     #[test]
     fn scan_chunk_raw_walks_through_long_tombstone_run() {
         let dir = tempfile::tempdir().unwrap();

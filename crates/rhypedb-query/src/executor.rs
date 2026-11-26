@@ -1711,11 +1711,11 @@ fn literal_to_value(lit: &Literal, target: Option<rhypedb_schema::ScalarType>) -
 /// post-scan filter). A type within budget is then materialized in full and
 /// charged.
 ///
-/// NB: a previous `scan_type_limited(cap+1)` bound was removed — its underlying
-/// *limited* storage scan stops after N DISTINCT keys INCLUDING tombstones, so
-/// leading deleted-but-uncompacted rows could make it return fewer live rows than
-/// exist, silently corrupting `Type.limit(N)` and the filter fallback. The
-/// count-then-scan here is correct because the count merges the WHOLE prefix.
+/// NB: a previous `scan_type_limited(cap+1)` bound was removed — the *limited*
+/// storage scan it used then stopped after N DISTINCT keys INCLUDING tombstones,
+/// so leading deleted-but-uncompacted rows could make it return fewer live rows
+/// than exist, silently corrupting `Type.limit(N)` (those scans now count only
+/// live keys). The count-then-scan here is correct: the count merges the WHOLE prefix.
 /// Field names a predicate reads (the projection needed to evaluate it).
 fn predicate_fields<'a>(predicate: &'a Predicate, out: &mut Vec<&'a str>) {
     match predicate {
@@ -1986,8 +1986,8 @@ fn plan_and(
     }
 
     // 3) Single most-selective @indexed generator (v1), pushed UNBOUNDED so the
-    //    candidate set is tombstone-sound and complete (a *bounded* index scan
-    //    counts tombstones against its budget and could under-return).
+    //    candidate set is complete: the residual conjuncts filter it afterwards,
+    //    so a limit on the generator alone could cut rows the residual keeps.
     let Some(generator) = conjuncts
         .iter()
         .copied()
