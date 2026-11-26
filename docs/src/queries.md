@@ -186,6 +186,8 @@ So any number of concurrent statements guarded on the same old value apply **exa
 
 The guarantee covers `.update`, `.delete`, `.link` and `.unlink`, and the predicates it re-checks are the ones about the written objects themselves: the source filter and every `.filter()` after the last traversal. `.limit`, `.offset`, `.similar` and `.matches` in between keep them. A filter **before** a traversal constrained other objects, which the write does not lock, so it is not re-checked: `User.filter(.active == true).posts.delete()` deletes the posts of users that were active when the filter ran.
 
+`.limit` picks the objects before the re-check, not after it. In the queue-claim pattern `Job.filter(.status == "queued").limit(1).update({status: "taken"})`, a statement that loses the race returns no rows; it does not move on to the next queued job. Retry the statement to claim another.
+
 Writes without a filter behave as before: `T.get(id).update(...)` writes the object as it is now and fails if it does not exist; `T.update(...)` (every object) skips an object deleted since the scan.
 
 The guarantee is **per object, not per statement**. A statement that writes several objects runs one transaction per object, so another reader can see some of them written and others not yet, and an error part-way (a unique-constraint violation, say) leaves the objects before it written. Use one object as the compare-and-set point when several must change together.
