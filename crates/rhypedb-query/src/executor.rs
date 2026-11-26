@@ -773,10 +773,10 @@ fn execute_step(
                 ctx.governor.charge(db.fulltext_stored_words(&type_name, &ids, Some(&field_map))?)?;
             }
             // P4 write authz: gate each PRE-mutation object against the `update` rule, with the
-            // incoming fields visible as `request.*` (no-op when rules off). P0-DBA-6: checking the
-            // stored object before the write stops a rule like `resource.author == request.auth.uid`
-            // from being defeated by the same update that rewrites `author`.
-            crate::authz::gate_write(
+            // incoming fields visible as `request.*` (`None` when rules off), inside its write
+            // transaction. P0-DBA-6: checking the stored object before the write stops a rule like
+            // `resource.author == request.auth.uid` from being defeated by the same update.
+            let gate = crate::authz::WriteGate::prepare(
                 ctx,
                 rhypedb_authz::Op::Update,
                 &type_name,
@@ -788,7 +788,7 @@ fn execute_step(
             let mut updated = Vec::with_capacity(ids.len());
             for id in &ids {
                 ctx.governor.check_deadline()?;
-                if let Some(obj) = mutate::update_one(db, guard, &type_name, *id, &field_map)? {
+                if let Some(obj) = mutate::update_one(db, (guard, gate.as_ref()), &type_name, *id, &field_map)? {
                     updated.push(obj);
                 }
             }
@@ -807,10 +807,11 @@ fn execute_step(
                 ctx.governor.charge(db.fulltext_stored_words(&type_name, &ids, None)?)?;
             }
             // P4 write authz: gate each pre-mutation object against the `delete` rule (no-op off).
-            crate::authz::gate_write(ctx, rhypedb_authz::Op::Delete, &type_name, &ids, None)?;
+            let gate =
+                crate::authz::WriteGate::prepare(ctx, rhypedb_authz::Op::Delete, &type_name, &ids, None)?;
             for id in ids {
                 ctx.governor.check_deadline()?;
-                mutate::delete_one(db, guard, &type_name, id)?;
+                mutate::delete_one(db, (guard, gate.as_ref()), &type_name, id)?;
             }
             Ok(QueryOutput::Done)
         }
@@ -824,7 +825,8 @@ fn execute_step(
             ctx.governor.charge(ids.len() as u64)?;
             // P4 write authz: a link mutates the source object's relationships → gate it as an
             // `update` on the source type (no-op when rules off).
-            crate::authz::gate_write(ctx, rhypedb_authz::Op::Update, &source_type, &ids, None)?;
+            let gate =
+                crate::authz::WriteGate::prepare(ctx, rhypedb_authz::Op::Update, &source_type, &ids, None)?;
             // Resolve the relation field once — every source row has the
             // same type at this point. (Resolved before coercing the edge
             // fields, which need the relation's declared edge-field types.)
@@ -846,7 +848,7 @@ fn execute_step(
             };
             for id in ids {
                 let src = (source_type.as_str(), id, field_name.as_str());
-                mutate::link_one(db, guard, src, *target_id, edge_map.as_ref())?;
+                mutate::link_one(db, (guard, gate.as_ref()), src, *target_id, edge_map.as_ref())?;
             }
             Ok(QueryOutput::Done)
         }
@@ -858,11 +860,12 @@ fn execute_step(
             let (source_type, ids) = ids_from_output(current, source)?;
             ctx.governor.charge(ids.len() as u64)?;
             // P4 write authz: an unlink mutates the source object's relationships → gate as `update`.
-            crate::authz::gate_write(ctx, rhypedb_authz::Op::Update, &source_type, &ids, None)?;
+            let gate =
+                crate::authz::WriteGate::prepare(ctx, rhypedb_authz::Op::Update, &source_type, &ids, None)?;
             let field_name = resolve_relation_field(db, &source_type, target_type)?;
             for id in ids {
                 let src = (source_type.as_str(), id, field_name.as_str());
-                mutate::unlink_one(db, guard, src, *target_id)?;
+                mutate::unlink_one(db, (guard, gate.as_ref()), src, *target_id)?;
             }
             Ok(QueryOutput::Done)
         }

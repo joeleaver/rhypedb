@@ -297,3 +297,48 @@ fn read_guards_are_not_logged_as_writes() {
     later.record_put(Bytes::from("src"), Bytes::from("v"));
     tm.commit(&mut later, noop_apply).unwrap();
 }
+
+#[test]
+fn conflict_token_fails_an_older_reader_that_guarded_it() {
+    let tm = TransactionManager::new();
+    let mut reader = tm.begin();
+    let mut writer = tm.begin();
+    // `reader` decided on a set (guarding its token); `writer` adds a member
+    // under a key `reader` never saw, and claims the set's token.
+    reader.record_read_guard(Bytes::from("set"));
+    reader.record_put(Bytes::from("obj"), Bytes::from("v"));
+    writer.record_put(Bytes::from("member-new"), Bytes::from("m"));
+    writer.record_conflict_token(Bytes::from("set"));
+    tm.commit(&mut writer, noop_apply).unwrap();
+    assert!(matches!(
+        tm.commit(&mut reader, noop_apply),
+        Err(Error::WriteConflict)
+    ));
+}
+
+#[test]
+fn conflict_tokens_are_never_applied() {
+    let tm = TransactionManager::new();
+    let mut txn = tm.begin();
+    txn.record_put(Bytes::from("k"), Bytes::from("v"));
+    txn.record_conflict_token(Bytes::from("token"));
+    tm.commit(&mut txn, |_v, writes| {
+        assert_eq!(writes.len(), 1, "a token is not a write");
+        assert_eq!(writes[0].0, Bytes::from("k"));
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn conflict_token_ignores_readers_with_a_later_snapshot() {
+    let tm = TransactionManager::new();
+    let mut writer = tm.begin();
+    writer.record_put(Bytes::from("member"), Bytes::from("m"));
+    writer.record_conflict_token(Bytes::from("set"));
+    tm.commit(&mut writer, noop_apply).unwrap();
+    let mut reader = tm.begin();
+    reader.record_read_guard(Bytes::from("set"));
+    reader.record_put(Bytes::from("obj"), Bytes::from("v"));
+    tm.commit(&mut reader, noop_apply).unwrap();
+}

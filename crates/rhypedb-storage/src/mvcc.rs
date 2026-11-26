@@ -168,6 +168,7 @@ impl TransactionManager {
             writes: Vec::new(),
             index: HashMap::default(),
             read_guards: Vec::new(),
+            conflict_tokens: Vec::new(),
             hold: Some(Arc::clone(&self.active_snapshots)),
         }
     }
@@ -200,10 +201,14 @@ impl TransactionManager {
         }
 
         // Fingerprint our keys once, outside the lock.
+        // Conflict tokens join the write set (so a later transaction guarding
+        // one conflicts with this commit) but, unlike writes, are never applied.
         let mut write_set: Vec<u64> = txn
             .writes
             .iter()
-            .map(|(k, _)| self.key_hasher.hash_one(k))
+            .map(|(k, _)| k)
+            .chain(txn.conflict_tokens.iter())
+            .map(|k| self.key_hasher.hash_one(k))
             .collect();
         write_set.sort_unstable();
         write_set.dedup();
@@ -347,6 +352,10 @@ pub struct Transaction {
     /// [`record_read_guard`](Self::record_read_guard)). Checked for conflicts
     /// at commit exactly like `writes`, but never applied or logged.
     read_guards: Vec<Bytes>,
+    /// Keys this transaction claims for conflict detection only (see
+    /// [`record_conflict_token`](Self::record_conflict_token)): fingerprinted
+    /// into the committed write set, never applied, logged or persisted.
+    conflict_tokens: Vec<Bytes>,
     /// The live hold on `snapshot` in the manager's active set; `Some` until the
     /// txn is finished (commit/abort) or dropped. `take()`-on-release makes the
     /// release exactly-once across commit/abort/drop. It owns no write path, so
@@ -391,6 +400,22 @@ impl Transaction {
     /// which commits nothing.
     pub fn record_read_guard(&mut self, key: Bytes) {
         self.read_guards.push(key);
+    }
+
+    /// Claim `key` in this transaction's write set for conflict detection,
+    /// without writing it: once this transaction commits, any transaction with
+    /// an older snapshot that wrote, or [read-guarded](Self::record_read_guard),
+    /// `key` fails its commit with `WriteConflict`.
+    ///
+    /// A token names something no single stored key does, such as "the set of
+    /// edges of one relation of one object". Adding an edge writes a key no
+    /// earlier reader could have read (a phantom), so a reader that decided on
+    /// the whole set guards the set's token, and every writer that changes the
+    /// set claims it. Tokens live only in the in-memory commit log: they are
+    /// never applied to the memtable, written to the WAL or stored on disk. Like
+    /// a read guard, a token has no effect on a transaction with no writes.
+    pub fn record_conflict_token(&mut self, key: Bytes) {
+        self.conflict_tokens.push(key);
     }
 
     fn upsert(&mut self, key: Bytes, value: Option<Bytes>) {
