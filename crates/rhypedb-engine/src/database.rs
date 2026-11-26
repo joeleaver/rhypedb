@@ -10681,8 +10681,8 @@ impl DatabaseCore {
     }
 
     /// Walk every live posting row under `prefix` at `snapshot` in bounded,
-    /// tombstone-correct chunks (`scan_chunk_raw`, never the under-returning
-    /// `*_limited` scans) and hand each `(key, value)` to `visit`.
+    /// tombstone-correct chunks (`scan_chunk_raw`, which reports the tombstones
+    /// it walks; `*_limited` scans hide them) and hand each `(key, value)` on.
     ///
     /// `postings_scanned` is charged per RAW row visited — tombstones too, a
     /// long run of them is real merge work — and checked against
