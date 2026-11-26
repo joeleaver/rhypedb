@@ -328,9 +328,18 @@ fn force(db: &Database, id: u64, fields: FieldMap) {
 /// list holds a few hundred other users, so evaluating the rule takes long enough that, under the
 /// pre-fix check (on a separate read before the write), nearly every round's block landed between
 /// mallory's check and her write.
+///
+/// Every round is a real race: after unblocking, the flipper waits until one of mallory's writes
+/// has applied before it blocks her again, so the block always lands while her tight loop is
+/// already into its next attempt. A fixed sleep could not promise that: under load a single
+/// evaluation can outlast it, and then the writer only ever saw the blocked state. The wait is
+/// bounded by a generous deadline, so a writer that stops making progress fails the test rather
+/// than hanging it.
 #[test]
 fn concurrent_rule_input_changes_never_let_a_denied_write_land() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    const ROUNDS: usize = 300;
     let db = Database::open_in_memory(
         parse_schema(SCHEMA).unwrap(),
         rhypedb_engine::database::OpenOptions::default(),
@@ -344,7 +353,10 @@ fn concurrent_rule_input_changes_never_let_a_denied_write_land() {
     let mallory = user(&db, "mallory");
     let rules = "match Post { allow update: if !(request.auth.uid in resource.blocked.uid); }";
     let (stop, applied) = (AtomicBool::new(false), AtomicUsize::new(0));
-    let pause = std::time::Duration::from_millis(1);
+    // Long enough for a write that passed a stale check to land.
+    let pause = Duration::from_millis(1);
+    // How long one unblocked window may wait for mallory's next write to apply.
+    let progress_deadline = Duration::from_secs(60);
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let c = ctx(&db, rules, "mallory");
@@ -362,23 +374,33 @@ fn concurrent_rule_input_changes_never_let_a_denied_write_land() {
                 }
             }
         });
-        for round in 0..300 {
+        let fail = |msg: String| -> ! {
+            stop.store(true, Ordering::Relaxed);
+            panic!("{msg}");
+        };
+        for round in 0..ROUNDS {
             db.link("Post", p, "blocked", mallory, None).unwrap();
             force(&db, p, strings(&[("title", "")]));
-            // Long enough for a write that passed a stale check to land.
             std::thread::sleep(pause);
             let seen = title(&db, p);
             if seen != s("") {
-                stop.store(true, Ordering::Relaxed);
-                panic!("round {round}: blocked mallory's write landed ({seen:?})");
+                fail(format!(
+                    "round {round}: blocked mallory's write landed ({seen:?})"
+                ));
             }
+            let before = applied.load(Ordering::Relaxed);
             db.unlink("Post", p, "blocked", mallory).unwrap();
-            std::thread::sleep(pause);
+            let started = Instant::now();
+            while applied.load(Ordering::Relaxed) == before {
+                if started.elapsed() > progress_deadline {
+                    fail(format!(
+                        "round {round}: mallory's writes made no progress while unblocked"
+                    ));
+                }
+                std::thread::sleep(Duration::from_micros(50));
+            }
         }
         stop.store(true, Ordering::Relaxed);
     });
-    assert!(
-        applied.load(Ordering::Relaxed) > 0,
-        "the writer never raced the flipper"
-    );
+    assert!(applied.load(Ordering::Relaxed) >= ROUNDS);
 }
